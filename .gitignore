@@ -1,0 +1,29 @@
+# Databases — never versioned. Production data lives outside history.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Manual and automatic backups
+backend/backups/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Local environment / secrets
+.env
+.env.*
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/

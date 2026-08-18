@@ -1,0 +1,1405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Wings Theory — POS</title>
+<style>
+:root{
+  --amber:#FFA000; --amber-deep:#FF6D00; --gold:#FFD54F;
+  --ink:#0D0D0D; --charcoal:#1A1A1A;
+  --bg:#F6F5F2; --card:#FFFFFF; --sunken:#F1EFEA;
+  --text:#211E1A; --text-2:#6E675F; --text-3:#A39C92; --border:#E7E2DA;
+  --ok-fill:#2E8B57; --ok-text:#1B6E3C; --ok-wash:#E7F5EC;
+  --bad-fill:#C0392B; --bad-text:#B3261E; --bad-wash:#FBEAE8;
+  --sh:0 1px 2px rgba(20,16,10,.07);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  font-size:15px;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+button{font:inherit;cursor:pointer;-webkit-tap-highlight-color:transparent}
+input{font:inherit}
+svg{width:18px;height:18px}
+.hide{display:none!important}
+.field{width:100%;height:46px;border:1px solid var(--border);border-radius:10px;padding:0 14px;
+  font-size:16px;background:var(--card);color:var(--text)}
+.field:focus{outline:none;border-color:var(--amber)}
+.btn{display:flex;align-items:center;justify-content:center;gap:8px;height:46px;border-radius:10px;
+  border:0;font-weight:700;font-size:15px}
+.btn-p{background:linear-gradient(135deg,var(--amber),var(--amber-deep));color:#1A1200}
+.btn-p:active{filter:brightness(.94)}
+.btn-p:disabled{opacity:.45}
+.btn-s{background:var(--sunken);color:var(--text)}
+.chip{font-size:10.5px;font-weight:700;padding:3px 8px;border-radius:99px;letter-spacing:.02em}
+.chip.ok{background:var(--ok-wash);color:var(--ok-text)}
+.chip.bad{background:var(--bad-wash);color:var(--bad-text)}
+.chip.warn{background:#FFF3DC;color:#8A5A00}
+.chip.mute{background:var(--sunken);color:var(--text-2)}
+
+/* ---------- login ---------- */
+#login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  background:var(--ink);padding:20px}
+.login-box{background:var(--card);border-radius:16px;padding:32px 28px;width:100%;max-width:360px;
+  box-shadow:0 20px 50px rgba(0,0,0,.3)}
+.login-mark{height:44px;display:inline-flex;align-items:center;margin-bottom:14px}
+.login-mark img{height:100%;width:auto;display:block}
+.login-box h1{font-size:20px;margin:0 0 4px;letter-spacing:-.01em}
+.login-box p{color:var(--text-3);font-size:13px;margin:0 0 22px}
+.login-box .field{margin-bottom:12px}
+.pass-wrap{position:relative}
+.login-box .pass-wrap{margin-bottom:12px}
+.login-box .pass-wrap .field{margin-bottom:0;padding-right:42px}
+.pass-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;
+  padding:8px;border-radius:8px;display:flex;color:var(--text-3);cursor:pointer}
+.pass-toggle:hover{color:var(--text)}
+.pass-toggle svg{width:17px;height:17px;display:block}
+#loginErr{color:var(--bad-text);font-size:13px;margin:10px 0 0;min-height:16px}
+
+/* ================= APP SHELL — three panes ================= */
+#app{display:none;height:100vh}
+.shell{display:grid;grid-template-columns:204px 1fr 366px;height:100vh;min-width:0}
+
+/* ---------- 1. left rail ----------
+   Sized to the artwork, not guessed: logo.png is 4.13:1, so a 30px-tall
+   lockup is 124px wide. The rail used to be 84px — the logo hung 40px past
+   its own background, which is the overlap that was visible on screen.
+   The rail is now wide enough to contain it, and collapses to the wing
+   mark (near-square, 0.88:1) when there isn't room for the full lockup. */
+.rail{background:var(--ink);display:flex;flex-direction:column;
+  padding:16px 12px;gap:4px;overflow:hidden;min-width:0}
+.rail-logo{padding:4px 2px 18px;display:flex;align-items:center;min-width:0}
+.rail-logo img{display:block;max-width:100%;height:auto}
+.rail-logo .full{width:158px}
+.rail-logo .mark{display:none;height:34px;width:auto;margin:0 auto}
+.rail-nav{display:flex;flex-direction:column;gap:4px;min-width:0}
+.rail-btn{width:100%;background:none;border:0;color:rgba(255,255,255,.6);border-radius:10px;
+  padding:11px 12px;display:flex;align-items:center;gap:11px;
+  font-size:13px;font-weight:600;letter-spacing:.01em;text-align:left;min-width:0}
+.rail-btn svg{width:19px;height:19px;flex-shrink:0}
+.rail-btn span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rail-btn:hover{background:rgba(255,255,255,.05);color:rgba(255,255,255,.85)}
+.rail-btn.on{background:rgba(255,160,0,.15);color:var(--gold)}
+.rail-spacer{flex:1}
+.rail-btn.rail-logout{color:rgba(255,255,255,.42)}
+
+/* ---------- 2. center stage ---------- */
+.stage{min-width:0;display:flex;flex-direction:column;height:100vh;overflow:hidden}
+.topbar{display:flex;align-items:center;gap:10px;padding:14px 18px 10px;flex-shrink:0}
+.search-wrap{flex:1;position:relative;max-width:460px}
+.search-wrap svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--text-3)}
+.search-wrap input{padding-left:38px}
+.who-badge{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2)}
+#connDot{width:8px;height:8px;border-radius:99px;background:var(--ok-fill);flex-shrink:0}
+#connDot.off{background:var(--bad-fill)}
+
+#errBanner{background:var(--bad-wash);color:var(--bad-text);padding:10px 18px;font-size:13px;
+  display:flex;align-items:center;gap:10px;flex-shrink:0;margin:0 18px 10px;border-radius:9px}
+#errBanner button{background:none;border:1px solid var(--bad-text);border-radius:7px;
+  padding:4px 10px;font-size:12px;color:var(--bad-text);margin-left:auto}
+
+.cats{display:flex;gap:7px;overflow-x:auto;padding:0 18px 12px;flex-shrink:0}
+.cat{flex-shrink:0;padding:8px 16px;border-radius:99px;border:1px solid var(--border);
+  background:var(--card);font-size:13px;font-weight:600;color:var(--text-2)}
+.cat.on{background:var(--charcoal);border-color:var(--charcoal);color:#fff}
+
+#grid{flex:1;overflow-y:auto;padding:2px 18px 24px;display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:12px;align-content:start}
+.card{border:1px solid var(--border);border-radius:14px;background:var(--card);overflow:hidden;
+  text-align:left;box-shadow:var(--sh);display:flex;flex-direction:column;transition:transform .1s ease}
+.card:active{transform:scale(.97)}
+.card.blocked{opacity:.5}
+.tile{height:84px;display:flex;align-items:center;justify-content:center;flex-shrink:0;position:relative}
+.tile b{font-size:26px;font-weight:800;color:rgba(255,255,255,.92);letter-spacing:-.02em}
+.tile .flav{position:absolute;top:7px;right:7px;background:rgba(0,0,0,.28);color:#fff;
+  font-size:9px;font-weight:700;padding:2px 6px;border-radius:99px;letter-spacing:.03em}
+.card .body{padding:10px 11px 11px;display:flex;flex-direction:column;gap:7px;flex:1}
+.card .nm{font-size:13px;font-weight:700;line-height:1.28;min-height:2.5em}
+.card .row{display:flex;align-items:center;gap:6px;margin-top:auto}
+.card .price{font-size:14.5px;font-weight:800;color:var(--amber-deep)}
+.card .why{font-size:10px;color:var(--bad-text);line-height:1.3;min-height:2.2em}
+.addbtn{margin-left:auto;background:var(--charcoal);color:#fff;border:0;border-radius:8px;
+  padding:6px 12px;font-size:11.5px;font-weight:700;letter-spacing:.02em;display:flex;align-items:center;gap:4px}
+.addbtn svg{width:13px;height:13px}
+.addbtn:active{background:var(--amber-deep)}
+
+.empty{grid-column:1/-1;text-align:center;color:var(--text-3);padding:70px 20px;font-size:14px}
+
+/* ---------- orders / history view ---------- */
+.list-topbar{display:flex;align-items:center;gap:10px;padding:16px 18px 10px;flex-shrink:0}
+.list-topbar h2{font-size:17px;margin:0}
+.list-topbar button{margin-left:auto;background:var(--sunken);border:0;border-radius:9px;
+  padding:7px 14px;font-size:12.5px;font-weight:600;color:var(--text-2)}
+#ordersList{flex:1;overflow-y:auto;padding:2px 18px 24px;display:flex;flex-direction:column;gap:8px}
+.order-row{border:1px solid var(--border);border-radius:12px;background:var(--card);padding:12px 14px;
+  display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+.order-row .or-main{display:flex;align-items:center;gap:9px;min-width:160px}
+.order-row .or-main b{font-size:13.5px}
+.order-row .or-meta{display:flex;gap:14px;font-size:12px;color:var(--text-2);flex:1;flex-wrap:wrap}
+.order-row .or-meta .amt{font-weight:800;color:var(--text);font-variant-numeric:tabular-nums;margin-left:auto}
+.order-row .or-actions{display:flex;gap:8px}
+.order-row .or-actions button{background:var(--sunken);border:0;border-radius:8px;padding:6px 12px;
+  font-size:12px;font-weight:600;color:var(--text)}
+.order-row .or-actions button.danger{background:var(--bad-wash);color:var(--bad-text)}
+
+/* ---------- 3. right order panel ---------- */
+.cartp{background:var(--card);border-left:1px solid var(--border);display:flex;flex-direction:column;height:100vh}
+.cart-h{padding:16px 16px 0;flex-shrink:0}
+.cart-title{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px}
+.cart-title h2{font-size:16px;margin:0;letter-spacing:-.01em}
+.cart-title .sub{display:block;font-size:11.5px;font-weight:500;color:var(--text-3);margin-top:3px}
+.clear-link{margin-left:auto;background:none;border:0;padding:4px 2px;font-size:11.5px;
+  font-weight:700;color:var(--text-3);flex-shrink:0}
+.clear-link:hover{color:var(--bad-text)}
+.type-badge{margin-left:8px;display:inline-flex;align-items:center;gap:6px;flex-shrink:0;
+  background:#FFF3DC;color:#8A5A00;border-radius:9px;padding:7px 11px;font-size:11px;
+  font-weight:800;letter-spacing:.06em;text-transform:uppercase}
+.type-badge svg{width:14px;height:14px}
+.order-type{display:flex;gap:6px;margin-bottom:14px}
+.order-type button{flex:1;padding:9px 4px;border-radius:9px;border:1px solid var(--border);
+  background:var(--sunken);font-size:12.5px;font-weight:700;color:var(--text-2);transition:.12s}
+.order-type button.on{background:linear-gradient(135deg,var(--amber),var(--amber-deep));
+  border-color:transparent;color:#1A1200}
+
+/* column header row, matching the reference's Order / Qty / Amount grid */
+.cart-cols{display:grid;grid-template-columns:1fr 92px 78px;gap:8px;align-items:center;
+  padding:9px 16px;background:var(--sunken);flex-shrink:0;
+  font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--text-2)}
+.cart-cols .c2{text-align:center}
+.cart-cols .c3{text-align:right}
+.cart-cols .cart-count{display:inline-flex;align-items:center;justify-content:center;
+  background:var(--charcoal);color:#fff;border-radius:99px;min-width:19px;height:19px;padding:0 6px;
+  font-size:10.5px;margin-left:5px}
+.cart-cols .cart-count.bump{animation:bump .28s ease}
+@keyframes bump{50%{transform:scale(1.32)}}
+
+#cartItems{flex:1;overflow-y:auto;padding:2px 0}
+.empty-cart{text-align:center;color:var(--text-3);padding:50px 16px;font-size:13px}
+.ci{display:grid;grid-template-columns:1fr 92px 78px;gap:8px;align-items:start;
+  padding:12px 16px;border-bottom:1px solid var(--sunken)}
+.ci-nm{font-size:13px;font-weight:700;line-height:1.32;min-width:0}
+.ci-note{display:block;font-size:11px;font-weight:600;color:var(--amber-deep);margin-top:3px;line-height:1.35}
+.ci-mid{display:flex;flex-direction:column;align-items:center;gap:6px}
+.ci-amt{text-align:right;font-size:13px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap}
+.ci-unit{display:block;font-size:10.5px;font-weight:500;color:var(--text-3);margin-top:2px}
+.qty{display:flex;align-items:center;gap:6px}
+.qty button{width:25px;height:25px;border-radius:7px;border:1px solid var(--border);
+  background:var(--sunken);font-size:15px;line-height:1;color:var(--text)}
+.qty button:active{background:var(--amber);border-color:var(--amber)}
+.qty b{font-size:13px;min-width:15px;text-align:center;font-variant-numeric:tabular-nums}
+/* Stands in for the quantity stepper on an unlimited line, which is sized by
+   its Heads control alone. */
+.qty-fixed{font-size:10.5px;font-weight:600;color:var(--text-3);white-space:nowrap}
+.ci-acts{display:flex;gap:8px;justify-content:center}
+.ci-link{background:none;border:0;padding:0;font-size:11px;font-weight:700;color:var(--text-3)}
+.ci-link:hover{color:var(--text)}
+.ci-link.rm:hover{color:var(--bad-text)}
+.heads{grid-column:1/-1;display:flex;align-items:center;gap:8px;margin-top:8px;
+  font-size:11.5px;color:var(--text-2)}
+.heads .qty button{width:22px;height:22px;font-size:13px}
+
+.cart-f{border-top:1px solid var(--border);flex-shrink:0}
+.tot-block{background:var(--sunken);padding:13px 16px}
+.tot-row{display:flex;justify-content:space-between;font-size:12.5px;color:var(--text-2);margin-bottom:5px}
+.tot-row span:last-child{font-variant-numeric:tabular-nums;font-weight:600;color:var(--text)}
+.tot-row.grand{font-size:17px;font-weight:800;color:var(--text);margin:9px 0 0;padding-top:10px;
+  border-top:1px solid var(--border)}
+.tot-row.grand span:last-child{font-weight:800}
+.cart-actions{padding:12px 16px 14px}
+#punchBtn{width:100%;font-size:16px;height:52px}
+.cart-foot{display:flex;align-items:center;justify-content:center;gap:8px;padding:0 16px 14px;
+  font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--text-3);text-transform:uppercase}
+.cart-foot img{height:13px;width:auto;opacity:.75}
+
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--charcoal);
+  color:#fff;padding:12px 20px;border-radius:11px;font-size:14px;z-index:80;
+  box-shadow:0 8px 26px rgba(0,0,0,.3);animation:up .2s ease both}
+@keyframes up{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
+
+/* Below ~1180px the full lockup no longer fits a comfortable rail, so the
+   rail narrows and swaps to the wing mark. Labels go with it — an icon rail
+   is legible; a clipped word is not. */
+@media (max-width:1180px){
+  .shell{grid-template-columns:72px 1fr 330px}
+  .rail{padding:14px 8px;align-items:center}
+  .rail-logo{padding:2px 0 14px;justify-content:center}
+  .rail-logo .full{display:none}
+  .rail-logo .mark{display:block}
+  .rail-btn{flex-direction:column;gap:5px;padding:10px 2px 8px;font-size:10px;justify-content:center}
+  .rail-btn span{max-width:100%}
+}
+@media (max-width:860px){
+  .shell{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr) auto}
+  .rail{flex-direction:row;align-items:center;padding:8px 12px;height:auto;gap:8px}
+  .rail-logo{padding:0 8px 0 0}
+  .rail-logo .mark{height:26px;margin:0}
+  .rail-nav{flex-direction:row;gap:6px}
+  .rail-btn{flex-direction:row;gap:7px;padding:8px 12px;font-size:12px;width:auto}
+  .rail-spacer{flex:1}
+  .stage{height:auto;min-height:0}
+  .cartp{border-left:0;border-top:1px solid var(--border);height:auto;max-height:52vh}
+  #grid{padding-bottom:16px}
+}
+/* Below ~480px even icon+label buttons don't fit four-across next to the
+   logo — the labels were truncating to unreadable fragments ("Or...",
+   "His..."). Icon-only is legible; a clipped word is not. aria-label/title
+   on each button (see markup) keep them identifiable without the text. */
+@media (max-width:480px){
+  .rail-logo .mark{height:22px}
+  .rail-nav{gap:2px}
+  .rail-btn{padding:8px;gap:0}
+  .rail-btn span{display:none}
+}
+
+/* ---------- customization ---------- */
+.scrim2{position:fixed;inset:0;background:rgba(16,14,10,.42);z-index:150;display:flex;
+  align-items:center;justify-content:center;padding:20px}
+.cust-box{background:var(--card);border-radius:16px;padding:22px 22px 18px;width:100%;max-width:420px;
+  box-shadow:0 20px 50px rgba(0,0,0,.3);max-height:86vh;display:flex;flex-direction:column}
+.cust-box h3{margin:0 0 2px;font-size:17px}
+.cust-box .cust-sub{color:var(--text-3);font-size:12.5px;margin:0 0 14px}
+.cust-slot{margin-bottom:14px}
+.cust-slot .lbl{font-size:12px;font-weight:700;color:var(--text-2);margin-bottom:8px;
+  display:flex;align-items:center;gap:6px}
+.cust-slot .lbl .req{color:var(--bad-text);font-weight:800}
+.chipgrid{display:flex;flex-wrap:wrap;gap:7px;max-height:150px;overflow-y:auto;padding:2px}
+.chipgrid button{padding:8px 13px;border-radius:99px;border:1px solid var(--border);
+  background:var(--sunken);font-size:12.5px;font-weight:600;color:var(--text)}
+.chipgrid button.on{background:var(--amber);border-color:var(--amber-deep);color:#1A1200}
+.cust-actions{display:flex;gap:10px;margin-top:6px;flex-shrink:0}
+.cust-actions .btn-s{flex:1}
+.cust-actions .btn-p{flex:2}
+
+/* ---------- unlimited refills ----------
+   The refill panel is a working screen, not a form: the round number, the
+   piece count and the arithmetic behind it are stated before anything is
+   pressed, and an included flavour is visually a different thing from one
+   that will add to the bill. */
+.rf-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;
+  margin-bottom:12px;display:flex;flex-wrap:wrap;align-items:center;gap:12px}
+.rf-card .no{font-size:17px;font-weight:800}
+.rf-card .meta{color:var(--muted);font-size:13px;display:flex;gap:14px;flex-wrap:wrap}
+.rf-card .meta b{color:var(--text);font-weight:700}
+.rf-card .go{margin-left:auto}
+
+.refill-box{background:var(--card);border-radius:16px;width:100%;max-width:520px;
+  max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+.refill-scroll{overflow-y:auto;padding:20px}
+.refill-actions{display:flex;gap:10px;padding:14px 20px;border-top:1px solid var(--border);flex-shrink:0}
+.refill-actions .btn-s{flex:1}
+.refill-actions .btn-p{flex:2}
+.rf-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:16px}
+.rf-head h3{margin:0;font-size:19px}
+.rf-sub{margin:3px 0 0;color:var(--muted);font-size:13px}
+.rf-head .chip{margin-left:auto}
+.chip{font-size:11px;font-weight:800;letter-spacing:.04em;border-radius:99px;padding:4px 11px;
+  text-transform:uppercase}
+.chip.ok{background:#E8F8EC;color:#1D6B34} .chip.warn{background:#FFF4E5;color:#8A5A00}
+.chip.bad{background:#FEECEB;color:#B3261E} .chip.mute{background:#F0F1F3;color:var(--muted)}
+
+.rf-now{background:#FFF8E7;border:1px solid #F3DFAE;border-radius:12px;padding:14px 16px;
+  margin-bottom:18px}
+.rf-now-l{font-size:11px;font-weight:800;letter-spacing:.08em;color:#8A5A00}
+.rf-now-v{display:flex;align-items:baseline;gap:12px;margin-top:4px}
+.rf-now-v b{font-size:26px;font-weight:800;letter-spacing:-.02em}
+.rf-now-v span{font-size:17px;font-weight:700;color:#8A5A00}
+.rf-now-f{font-size:12.5px;color:#8A5A00;margin-top:4px}
+
+.rf-sect{font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--muted);margin:0 0 8px}
+.rf-flavors{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px}
+.rf-fl{text-align:left;border:1.5px solid var(--border);background:var(--card);border-radius:11px;
+  padding:11px 12px;display:flex;flex-direction:column;gap:2px;min-height:56px;justify-content:center}
+.rf-fl:disabled{opacity:.45}
+.rf-fl.on{border-color:var(--amber);background:#FFF8E7}
+.rf-fl .n{font-size:13.5px;font-weight:700;line-height:1.25}
+.rf-fl .p{font-size:11.5px;font-weight:700;color:var(--ok-text)}
+.rf-fl .p.add{color:#B3261E}
+
+.rf-prev{display:flex;flex-direction:column;gap:6px;margin-bottom:18px}
+.rf-r{display:flex;align-items:center;gap:10px;font-size:13.5px;padding:8px 11px;
+  border:1px solid var(--border);border-radius:9px}
+.rf-r .n{font-weight:800;min-width:26px}
+.rf-r .f{flex:1}
+.rf-r .a{color:#B3261E;font-weight:700;font-size:12.5px}
+.rf-r.gone{opacity:.5;text-decoration:line-through}
+.rf-r button{background:none;border:1px solid var(--border);border-radius:7px;padding:3px 9px;
+  font-size:11.5px;color:var(--muted)}
+.rf-empty{color:var(--muted);font-size:13px;padding:10px 0}
+
+.rf-tot{border-top:1px solid var(--border);padding-top:12px;font-size:13.5px}
+.rf-tot .row{display:flex;justify-content:space-between;padding:3px 0}
+.rf-tot .row.grand{font-weight:800;font-size:15px;border-top:1px solid var(--border);
+  margin-top:6px;padding-top:8px}
+#rfErr{color:var(--bad-text);font-size:12.5px;margin-top:10px;min-height:15px}
+
+/* Refill history on the printed receipt. Deliberately below the totals rule:
+   it is the operational record of what was served, not part of the settled
+   financial figures above it. */
+.rc-rf{font-size:10.5px;line-height:1.5}
+.rc-rf .h{font-weight:800;letter-spacing:.06em;margin:6px 0 3px}
+.rc-rf .r{display:flex;justify-content:space-between;gap:8px}
+.rc-rf .r span:last-child{white-space:nowrap}
+.rc-rf .v{opacity:.55;text-decoration:line-through}
+
+/* ---------- payment + receipt ---------- */
+.pay-box{background:var(--card);border-radius:16px;padding:26px 24px;width:100%;max-width:360px;
+  box-shadow:0 20px 50px rgba(0,0,0,.3)}
+.pay-box h3{margin:0 0 4px;font-size:18px}
+.pay-box .due-lbl{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--text-3)}
+.pay-box .amt-due{font-size:30px;font-weight:800;margin:2px 0 16px;font-variant-numeric:tabular-nums}
+.pay-box .method{display:inline-flex;align-items:center;gap:6px;background:var(--sunken);
+  border-radius:9px;padding:6px 12px;font-size:12.5px;font-weight:700;color:var(--text-2);margin-bottom:14px}
+.pay-box label{display:block;font-size:12.5px;font-weight:600;color:var(--text-2);margin-bottom:6px}
+.quick-cash{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 4px}
+.quick-cash button{flex:1;min-width:64px;height:38px;border-radius:9px;border:1px solid var(--border);
+  background:var(--sunken);font-size:13px;font-weight:600;color:var(--text)}
+.quick-cash button:active{background:var(--amber);color:var(--charcoal)}
+.change-line{display:flex;justify-content:space-between;margin-top:14px;padding-top:12px;
+  border-top:1px solid var(--sunken);font-size:14px;font-weight:700}
+.pay-actions{display:flex;gap:10px;margin-top:18px}
+.pay-actions .btn-s{flex:1}
+.pay-actions .btn-p{flex:2}
+
+/* Thermal-roll proportions and a monospace body, so what is on screen is
+   what comes out of an 80mm printer rather than a web card that reflows. */
+.receipt-box{background:#FDFCF9;border-radius:14px;padding:0;width:100%;max-width:330px;
+  box-shadow:0 20px 50px rgba(0,0,0,.3);overflow:hidden;display:flex;flex-direction:column;max-height:88vh}
+.receipt-scroll{overflow-y:auto;padding:20px 20px 8px;
+  font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;color:#1A1713}
+#rcLogo{display:block;height:44px;width:auto;margin:0 auto 8px}
+.rc-head{text-align:center;margin-bottom:12px}
+.rc-head h2{font-size:13px;margin:0 0 3px;letter-spacing:.06em;font-weight:800}
+.rc-head .rc-sub{font-size:9px;color:#8A8178;margin:0;letter-spacing:.14em}
+.rc-rule{border-top:1px dashed #C9C2B8;margin:9px 0}
+.rc-meta{font-size:11px;line-height:1.75}
+.rc-meta div{display:flex;justify-content:space-between;gap:10px}
+.rc-meta span:first-child{color:#8A8178}
+.rc-ith{display:grid;grid-template-columns:1fr 26px 62px;gap:6px;font-size:9.5px;
+  letter-spacing:.06em;color:#8A8178;padding-bottom:3px}
+.rc-ith .r{text-align:right}
+.rc-ith .c{text-align:center}
+.rc-item{display:grid;grid-template-columns:1fr 26px 62px;gap:6px;font-size:11px;
+  line-height:1.5;margin:5px 0}
+.rc-item .c{text-align:center}
+.rc-item .r{text-align:right;font-variant-numeric:tabular-nums}
+.rc-item .note{grid-column:1/-1;font-size:9.5px;color:#9A6512;padding-left:8px}
+.rc-count{font-size:10.5px;color:#8A8178;margin:8px 0 0}
+.rc-totals{font-size:11.5px;line-height:1.85}
+.rc-totals .row{display:flex;justify-content:space-between;gap:10px}
+.rc-totals .row span:last-child{font-variant-numeric:tabular-nums}
+.rc-totals .row.grand{font-size:14px;font-weight:800;margin-top:5px;padding-top:5px;
+  border-top:1px solid #1A1713}
+.rc-foot{text-align:center;font-size:10.5px;color:#5C554D;margin:14px 0 2px;line-height:1.7;font-weight:700}
+.rc-social{text-align:center;font-size:9.5px;color:#8A8178;margin:6px 0 2px;letter-spacing:.05em}
+.receipt-actions{display:flex;gap:10px;padding:14px 20px;border-top:1px solid var(--border);flex-shrink:0}
+.receipt-actions .btn-s{flex:1}
+.receipt-actions .btn-p{flex:2}
+
+@media print{
+  body *{visibility:hidden}
+  #receiptModal, #receiptModal *{visibility:visible}
+  #receiptModal{position:fixed;inset:0;background:#fff;padding:0;display:block}
+  .receipt-box{box-shadow:none;max-width:100%;max-height:none;border-radius:0;background:#fff}
+  .receipt-scroll{overflow:visible;padding:0}
+  .receipt-actions{display:none}
+  @page{margin:6mm}
+}
+</style>
+<link rel="stylesheet" href="/assets/brand.css">
+</head>
+<body>
+
+<div id="login">
+  <div class="login-box">
+    <div class="login-mark"><img src="/img/logo.png" alt="Wings Theory"></div>
+    <h1>Wings Theory</h1>
+    <p>Cashier sign in</p>
+    <input class="field" id="luser" placeholder="Username" autocomplete="username">
+    <div class="pass-wrap">
+      <input class="field" id="lpass" type="password" placeholder="Password" autocomplete="current-password">
+      <button type="button" class="pass-toggle" id="passToggle" aria-label="Show password" aria-pressed="false"></button>
+    </div>
+    <button class="btn btn-p" id="loginBtn">Sign in</button>
+    <div id="loginErr"></div>
+  </div>
+</div>
+
+<div id="app">
+  <div class="shell">
+    <nav class="rail">
+      <div class="rail-logo">
+        <img class="full" src="/img/logo.png" alt="Wings Theory">
+        <img class="mark" src="/img/wing.png" alt="Wings Theory">
+      </div>
+      <div class="rail-nav">
+        <button class="rail-btn on" data-view="menu" title="POS" aria-label="POS">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h7v9H3zM14 3h7v5h-7zM14 12h7v9h-7zM3 16h7v5H3z"/></svg>
+          <span>POS</span>
+        </button>
+        <button class="rail-btn" data-view="current" title="Orders" aria-label="Orders">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg>
+          <span>Orders</span>
+        </button>
+        <button class="rail-btn" data-view="refills" title="Unlimited refills" aria-label="Unlimited refills">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M8 7H4l-2 6a4 4 0 0 0 8 0zM20 7h-4l-2 6a4 4 0 0 0 8 0zM7 21h10"/></svg>
+          <span>Refills</span>
+        </button>
+        <button class="rail-btn" data-view="history" title="History" aria-label="History">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2"/></svg>
+          <span>History</span>
+        </button>
+      </div>
+      <div class="rail-spacer"></div>
+      <button class="rail-btn rail-logout" id="logoutBtn" title="Logout" aria-label="Logout">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg>
+        <span>Logout</span>
+      </button>
+    </nav>
+
+    <div class="stage">
+      <div id="menuView">
+        <div class="topbar">
+          <label class="search-wrap">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3"/></svg>
+            <input class="field" id="search" placeholder="Search menu…">
+          </label>
+          <div class="who-badge"><span id="connDot"></span><span id="whoName"></span></div>
+        </div>
+        <div id="errBanner" class="hide"></div>
+        <div class="cats" id="cats"></div>
+        <div id="grid"></div>
+      </div>
+
+      <div id="ordersView" class="hide">
+        <div class="list-topbar">
+          <h2 id="ordersTitle">Current Orders</h2>
+          <button id="ordersRefresh">Refresh</button>
+        </div>
+        <div id="ordersList"></div>
+      </div>
+
+      <div id="refillsView" class="hide">
+        <div class="list-topbar">
+          <h2>Unlimited Tables</h2>
+          <button id="refillsRefresh">Refresh</button>
+        </div>
+        <div id="refillsList"></div>
+      </div>
+    </div>
+
+    <aside class="cartp">
+      <div class="cart-h">
+        <div class="cart-title">
+          <div>
+            <h2>Order Details</h2>
+            <span class="sub" id="orderMeta">New order</span>
+          </div>
+          <button class="clear-link" id="clearBtn">Clear</button>
+          <span class="type-badge" id="typeBadge">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 2v7c0 1.1.9 2 2 2h1a2 2 0 0 0 2-2V2M6 2v20M18 2v20M18 12c2 0 3-1 3-4V2h-3"/></svg>
+            <span id="typeBadgeTxt">Dine In</span>
+          </span>
+        </div>
+        <div class="order-type" id="orderType">
+          <button class="on" data-type="Dine In">Dine In</button>
+          <button data-type="Takeout">Takeout</button>
+        </div>
+      </div>
+      <div class="cart-cols">
+        <span class="c1">Order <span class="cart-count" id="cartCount">0</span></span>
+        <span class="c2">Qty</span>
+        <span class="c3">Amount</span>
+      </div>
+      <div id="cartItems"><div class="empty-cart">Tap a menu item to start an order.</div></div>
+      <div class="cart-f">
+        <div class="tot-block">
+          <div class="tot-row"><span>Subtotal</span><span id="subT">₱0</span></div>
+          <div class="tot-row"><span>Service charge (10%)</span><span id="svcT">₱0</span></div>
+          <div class="tot-row grand"><span>Total</span><span id="grandT">₱0</span></div>
+        </div>
+        <div class="cart-actions">
+          <button class="btn btn-p" id="punchBtn" disabled>Charge ₱0</button>
+        </div>
+        <div class="cart-foot">
+          <span>Thank you!</span>
+          <img src="/img/tagline.png" alt="Flavor. Science. Perfection.">
+        </div>
+      </div>
+    </aside>
+  </div>
+</div>
+
+<div class="scrim2 hide" id="custModal">
+  <div class="cust-box">
+    <h3 id="custName"></h3>
+    <p class="cust-sub">Pick a flavor to add this to the order.</p>
+    <div id="custSlots"></div>
+    <div class="cust-actions">
+      <button class="btn btn-s" id="custCancel">Cancel</button>
+      <button class="btn btn-p" id="custConfirm" disabled>Add to order</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim2 hide" id="payModal">
+  <div class="pay-box">
+    <h3>Payment</h3>
+    <div class="due-lbl">Total due</div>
+    <div class="amt-due" id="payDue">₱0</div>
+    <div class="method">Cash</div>
+    <label for="payCash">Amount received</label>
+    <input class="field" id="payCash" type="number" min="0" step="1" inputmode="decimal">
+    <div class="quick-cash" id="quickCash"></div>
+    <div class="change-line"><span>Change</span><span id="payChange">₱0</span></div>
+    <div id="payErr" style="color:var(--bad-text);font-size:12.5px;margin-top:8px;display:none"></div>
+    <div class="pay-actions">
+      <button class="btn btn-s" id="payCancel">Cancel</button>
+      <button class="btn btn-p" id="payConfirm">Confirm payment</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim2 hide" id="refillModal">
+  <div class="refill-box">
+    <div class="refill-scroll">
+      <div class="rf-head">
+        <div>
+          <h3 id="rfTitle">Unlimited Wings</h3>
+          <p class="rf-sub" id="rfSub"></p>
+        </div>
+        <span class="chip" id="rfStatus"></span>
+      </div>
+
+      <div class="rf-now">
+        <div class="rf-now-l">CURRENT REFILL</div>
+        <div class="rf-now-v"><b id="rfNo">#1</b><span id="rfPieces">6 PCS</span></div>
+        <div class="rf-now-f" id="rfMath"></div>
+      </div>
+
+      <div class="rf-sect">SELECT FLAVOR</div>
+      <div class="rf-flavors" id="rfFlavors"></div>
+
+      <div class="rf-sect" id="rfPrevLbl">PREVIOUS REFILLS</div>
+      <div class="rf-prev" id="rfPrev"></div>
+
+      <div class="rf-tot" id="rfTotals"></div>
+      <div id="rfErr"></div>
+    </div>
+    <div class="refill-actions">
+      <button class="btn btn-s" id="rfClose">Close</button>
+      <button class="btn btn-s" id="rfEnd">End session</button>
+      <button class="btn btn-p" id="rfServe" disabled>Serve refill</button>
+    </div>
+  </div>
+</div>
+
+<div class="scrim2 hide" id="receiptModal">
+  <div class="receipt-box">
+    <div class="receipt-scroll">
+      <img id="rcLogo" src="/img/logo.png" alt="Wings Theory">
+      <div class="rc-head">
+        <h2>WINGS THEORY RESTAURANT</h2>
+        <p class="rc-sub">TESTED. TASTED. PERFECTED.</p>
+      </div>
+      <div class="rc-rule"></div>
+      <div class="rc-meta">
+        <div><span>ORDER #</span><span id="rcOrderNo"></span></div>
+        <div><span>DATE</span><span id="rcDate"></span></div>
+        <div><span>TIME</span><span id="rcTime"></span></div>
+        <div><span>CASHIER</span><span id="rcCashier"></span></div>
+        <div><span>TYPE</span><span id="rcType"></span></div>
+      </div>
+      <div class="rc-rule"></div>
+      <div class="rc-ith"><span>ITEM</span><span class="c">QTY</span><span class="r">AMOUNT</span></div>
+      <div class="rc-rule"></div>
+      <div id="rcItems"></div>
+      <p class="rc-count">TOTAL ITEMS: <span id="rcCount"></span></p>
+      <div class="rc-rule"></div>
+      <div class="rc-totals">
+        <div class="row"><span>SUBTOTAL</span><span id="rcSub"></span></div>
+        <div class="row"><span>SERVICE CHARGE</span><span id="rcSvc"></span></div>
+        <div class="row grand"><span>TOTAL</span><span id="rcTotal"></span></div>
+        <div class="row"><span>CASH</span><span id="rcCash"></span></div>
+        <div class="row"><span>CHANGE</span><span id="rcChange"></span></div>
+      </div>
+      <div class="rc-rule"></div>
+      <div class="rc-rf" id="rcRefills"></div>
+      <p class="rc-foot">THANK YOU!<br>COME BACK FOR MORE FLAVOR.</p>
+      <p class="rc-social">@wingstheoryph</p>
+    </div>
+    <div class="receipt-actions">
+      <button class="btn btn-s" id="rcClose">Close</button>
+      <button class="btn btn-p" id="rcPrint">Print receipt</button>
+    </div>
+  </div>
+</div>
+
+<script src="/assets/brand.js"></script>
+<script>
+const API = location.origin;
+// Namespaced per app on purpose: /pos, /kds and /console used to share the
+// same 'wt_token' key. Logging into one and then opening another silently
+// reused that session — a cashier token has no inventory permissions, every
+// console API call 403'd, and the page just sat there blank with nothing
+// but a toast that had already faded by the time anyone looked. Each app
+// now keeps its own session so opening one never breaks another.
+const NS = 'wt_pos_';
+const ALLOWED_ROLES = ['cashier', 'admin'];
+let TOKEN = localStorage.getItem(NS + 'token');
+let ROLE = localStorage.getItem(NS + 'role');
+let NAME = localStorage.getItem(NS + 'name');
+let MENU = [];
+let FLAVORS = [];
+let CART = [];      // [{menuId, name, price, qty, unli, heads, note}]
+let CAT = 'All';
+let Q = '';
+let VIEW = 'menu';  // 'menu' | 'current' | 'refills' | 'history'
+let CART_HAD_UNLI = false;   // did the sale just rung up open a session?
+let ORDER_TYPE = 'Dine In';
+let PENDING_ITEM = null;
+let PENDING_PICKS = [];
+let EDIT_LINE_INDEX = null;
+// One idempotency key per checkout attempt. Minted when the payment sheet
+// opens and cleared only once the sale actually lands, so a retry — double
+// tap, flaky Wi-Fi, impatient re-submit — replays the same key and the
+// server hands back the original order instead of charging twice.
+let CHECKOUT_KEY = null;
+
+const $ = s => document.querySelector(s);
+
+/* Two error shapes come from this backend:
+     FastAPI HTTPException -> { detail: "a string" }
+     domain WTError        -> { code, message: "a string", detail: {...} }
+   `body.detail || body.message` was wrong: a WTError with no extra context
+   carries `detail: {}`, an EMPTY OBJECT, which is truthy in JavaScript — so
+   it won every time and the cashier saw "[object Object]" instead of the
+   real reason (e.g. "not enough stock"). Prefer the human message. */
+function apiErrorMessage(body, status) {
+  if (body) {
+    if (typeof body.message === 'string' && body.message) return body.message;
+    if (typeof body.detail === 'string' && body.detail) return body.detail;
+  }
+  if (status === 401) return 'Session expired — please sign in again.';
+  if (status === 403) return 'Your account does not have permission for this.';
+  return 'HTTP ' + status;
+}
+
+const peso = n => '₱' + Math.round(n || 0).toLocaleString('en-PH');
+
+async function api(path, opts = {}) {
+  const r = await fetch(API + path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}), ...(opts.headers || {}) },
+  });
+  if (r.status === 401) { doLogout(); throw new Error('session expired'); }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(apiErrorMessage(body, r.status));
+  return body;
+}
+
+/* ---------------- auth ---------------- */
+async function showApp() {
+  $('#login').style.display = 'none';
+  $('#app').style.display = 'block';
+  $('#whoName').textContent = `${NAME} · ${ROLE}`;
+  loadMenu();
+  api('/pos/flavors').then(d => { FLAVORS = d.flavors; }).catch(() => {});
+  setInterval(pingConn, 15000);
+}
+function doLogout() {
+  localStorage.removeItem(NS + 'token'); localStorage.removeItem(NS + 'role'); localStorage.removeItem(NS + 'name');
+  TOKEN = null; location.reload();
+}
+$('#logoutBtn').onclick = doLogout;
+$('#loginBtn').onclick = async () => {
+  const u = $('#luser').value.trim(), p = $('#lpass').value;
+  $('#loginErr').textContent = ''; $('#loginBtn').disabled = true;
+  try {
+    const r = await fetch(API + '/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p }),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(apiErrorMessage(body, r.status) || 'invalid credentials');
+    if (!ALLOWED_ROLES.includes(body.role))
+      throw new Error(`'${body.role}' accounts cannot use the POS terminal`);
+    TOKEN = body.token; ROLE = body.role; NAME = body.display_name;
+    localStorage.setItem(NS + 'token', TOKEN); localStorage.setItem(NS + 'role', ROLE); localStorage.setItem(NS + 'name', NAME);
+    showApp();
+  } catch (e) {
+    $('#loginErr').textContent = e.message || 'Could not reach the server';
+  } finally { $('#loginBtn').disabled = false; }
+};
+$('#lpass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#loginBtn').click(); });
+
+const EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a13.16 13.16 0 0 1-1.67 2.68M6.61 6.61A13.5 13.5 0 0 0 1 11s4 7 11 7a9.26 9.26 0 0 0 4.39-1.02M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>';
+$('#passToggle').innerHTML = EYE;
+$('#passToggle').addEventListener('click', () => {
+  const showing = $('#lpass').type === 'text';
+  $('#lpass').type = showing ? 'password' : 'text';
+  $('#passToggle').innerHTML = showing ? EYE : EYE_OFF;
+  $('#passToggle').setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+  $('#passToggle').setAttribute('aria-pressed', showing ? 'false' : 'true');
+});
+
+async function pingConn() {
+  try { await fetch(API + '/pos/menu', { headers: { Authorization: 'Bearer ' + TOKEN } }); $('#connDot').classList.remove('off'); }
+  catch { $('#connDot').classList.add('off'); }
+}
+
+/* ---------------- view switching ---------------- */
+document.querySelectorAll('.rail-btn[data-view]').forEach(b => {
+  b.addEventListener('click', () => setView(b.dataset.view));
+});
+function setView(v) {
+  VIEW = v;
+  document.querySelectorAll('.rail-btn[data-view]').forEach(b => b.classList.toggle('on', b.dataset.view === v));
+  $('#menuView').classList.toggle('hide', v !== 'menu');
+  $('#ordersView').classList.toggle('hide', v !== 'current' && v !== 'history');
+  $('#refillsView').classList.toggle('hide', v !== 'refills');
+  if (v === 'current' || v === 'history') {
+    $('#ordersTitle').textContent = v === 'current' ? 'Current Orders' : 'Order History';
+    loadOrders(v);
+  } else if (v === 'refills') {
+    loadRefillSessions();
+  }
+}
+$('#ordersRefresh').onclick = () => loadOrders(VIEW);
+$('#refillsRefresh').onclick = () => loadRefillSessions();
+
+/* ---------------- menu ---------------- */
+function showError(msg) {
+  const b = $('#errBanner');
+  b.innerHTML = `<span>${msg}</span><button id="retryBtn">Retry</button>`;
+  b.classList.remove('hide');
+  $('#retryBtn').onclick = loadMenu;
+}
+function clearError() { $('#errBanner').classList.add('hide'); }
+
+async function loadMenu() {
+  try {
+    const d = await api('/pos/menu');
+    MENU = d.items;
+    clearError();
+    paintCats(); paintGrid();
+  } catch (e) {
+    showError('Could not load the menu: ' + e.message);
+  }
+}
+/* block_reason is written for the console's diagnosis view — "2 unmapped
+   ingredient(s)", "no recipe linked" — which means nothing to a cashier and
+   isn't anything they can fix from the till. A real stock-out ("out of
+   stock: Chicken Wings") is the one case worth naming; everything else is
+   just "not available right now" from where a cashier is standing. Only the
+   display here changes — the console still sees the original reason. */
+function humanizeBlockReason(reason) {
+  if (!reason) return 'Out of stock';
+  if (reason.startsWith('out of stock:')) {
+    const ing = reason.split(':').slice(1).join(':').trim();
+    return ing ? `Out of stock — no more ${ing}` : 'Out of stock';
+  }
+  if (reason === 'an unlimited stream is out of stock') return 'Out of stock';
+  return 'Not available right now';
+}
+// A stable, muted accent per category (no food photos exist yet — an
+// invented stock photo would be worse than an honest placeholder tile), and
+// a monogram instead of guessing what a specific dish looks like.
+const TILE_PALETTE = ['#8A4B23', '#5C6B3D', '#6B4A70', '#8A3B3B', '#3D5A70', '#7A6A2E', '#4A6B5C'];
+function tileColor(cat) {
+  let h = 0;
+  for (let i = 0; i < cat.length; i++) h = (h * 31 + cat.charCodeAt(i)) >>> 0;
+  return TILE_PALETTE[h % TILE_PALETTE.length];
+}
+function paintCats() {
+  const cats = ['All', ...new Set(MENU.map(m => m.category))];
+  $('#cats').innerHTML = cats.map(c =>
+    `<button class="cat ${c === CAT ? 'on' : ''}" data-cat="${c}">${c}</button>`).join('');
+}
+function paintGrid() {
+  const list = MENU.filter(m => (CAT === 'All' || m.category === CAT) &&
+    m.name.toLowerCase().includes(Q.toLowerCase()));
+  $('#grid').innerHTML = list.length ? list.map(m => `
+    <button class="card ${m.sellable ? '' : 'blocked'}" data-add="${m.menu_item_pk}">
+      <div class="tile" style="background:${tileColor(m.category)}">
+        <b>${m.name.charAt(0)}</b>
+        ${m.flavor_slots ? `<span class="flav">${m.flavor_slots > 1 ? m.flavor_slots + ' flavors' : 'pick flavor'}</span>` : ''}
+      </div>
+      <div class="body">
+        <div class="nm">${m.name}</div>
+        ${m.sellable
+          ? `<div class="row"><span class="price">₱${m.price}</span>
+             <span class="addbtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Add</span></div>`
+          : `<div class="why">${humanizeBlockReason(m.block_reason)}</div>
+             <div class="row"><span class="price">₱${m.price}</span><span class="chip bad">Out of stock</span></div>`}
+      </div>
+    </button>`).join('')
+    : `<div class="empty">No items match "${Q}"</div>`;
+}
+$('#search').oninput = e => { Q = e.target.value; paintGrid(); };
+$('#cats').onclick = e => { const b = e.target.closest('[data-cat]'); if (b) { CAT = b.dataset.cat; paintCats(); paintGrid(); } };
+$('#grid').onclick = e => {
+  const b = e.target.closest('[data-add]'); if (!b) return;
+  const m = MENU.find(x => x.menu_item_pk == b.dataset.add);
+  if (!m.sellable) { toast(`${m.name}: ${humanizeBlockReason(m.block_reason)}`); return; }
+  if (m.flavor_slots > 0) { openCustomize(m); return; }
+  addToCart(m, null);
+  bumpCartCount();
+};
+
+/* ---------------- flavor customization ---------------- */
+// Only Wing Rack (2 slots) and Sulit Deal (1 slot) actually have a
+// customer-choice flavor line in their recipe (flavor_slots comes straight
+// from the recipe, computed server-side) — every other item skips this
+// entirely, so nothing gets an unnecessary customization step.
+async function openCustomize(item, noteToEdit, editIndex) {
+  if (!FLAVORS.length) {
+    try { FLAVORS = (await api('/pos/flavors')).flavors; }
+    catch (e) { toast('Could not load flavors: ' + e.message); return; }
+  }
+  PENDING_ITEM = item;
+  EDIT_LINE_INDEX = editIndex ?? null;
+  const n = item.flavor_slots;
+  PENDING_PICKS = noteToEdit ? parseFlavorNote(noteToEdit, n) : new Array(n).fill(null);
+  $('#custName').textContent = item.name;
+  renderCustomSlots();
+  $('#custModal').classList.remove('hide');
+}
+function renderCustomSlots() {
+  const n = PENDING_ITEM.flavor_slots;
+  $('#custSlots').innerHTML = Array.from({ length: n }).map((_, i) => `
+    <div class="cust-slot">
+      <div class="lbl">${n > 1 ? `Flavor ${i + 1}` : 'Flavor'} <span class="req">*</span></div>
+      <div class="chipgrid" data-slot="${i}">
+        ${FLAVORS.map(f => `<button type="button" data-slot="${i}" data-f="${f}" class="${PENDING_PICKS[i] === f ? 'on' : ''}">${f}</button>`).join('')}
+      </div>
+    </div>`).join('');
+  $('#custConfirm').disabled = PENDING_PICKS.some(p => !p);
+}
+$('#custSlots').onclick = e => {
+  const b = e.target.closest('button[data-f]'); if (!b) return;
+  PENDING_PICKS[parseInt(b.dataset.slot, 10)] = b.dataset.f;
+  renderCustomSlots();
+};
+$('#custCancel').onclick = () => $('#custModal').classList.add('hide');
+function flavorNote(picks) {
+  return (picks.length > 1 ? 'Flavors: ' : 'Flavor: ') + picks.join(', ');
+}
+function parseFlavorNote(note, n) {
+  const parts = note.replace(/^Flavors?:\s*/, '').split(',').map(s => s.trim());
+  const out = new Array(n).fill(null);
+  parts.forEach((p, i) => { if (i < n) out[i] = p; });
+  return out;
+}
+$('#custConfirm').onclick = () => {
+  if (PENDING_PICKS.some(p => !p)) return;
+  const note = flavorNote(PENDING_PICKS);
+  if (EDIT_LINE_INDEX != null) {
+    CART[EDIT_LINE_INDEX].note = note;
+    paintCart();
+  } else {
+    addToCart(PENDING_ITEM, note);
+    bumpCartCount();
+  }
+  $('#custModal').classList.add('hide');
+};
+
+/* ---------------- cart ---------------- */
+function addToCart(m, note) {
+  const line = CART.find(l => l.menuId === m.menu_item_pk && (l.note || null) === (note || null));
+  // An unlimited line is sized by Heads, never by line quantity — the server
+  // multiplies lambda by BOTH, so a second tap here used to reserve two
+  // covers' worth of wings for every head. The line is already in the cart;
+  // the control that means "another cover" is Heads, so say so rather than
+  // silently doubling the deduction. (Left as a no-op deliberately: how many
+  // heads one tap represents is a pricing question, not a UI one.)
+  if (line && line.unli) toast('Already in the cart — set Heads for the number of covers.');
+  else if (line) line.qty++;
+  else CART.push({ menuId: m.menu_item_pk, name: m.name, price: m.price, qty: 1,
+                   unli: m.is_unli, heads: m.is_unli ? 2 : 0, note: note || null });
+  paintCart();
+}
+function bumpCartCount() {
+  const el = $('#cartCount');
+  el.classList.remove('bump'); void el.offsetWidth; el.classList.add('bump');
+}
+function paintCart() {
+  const box = $('#cartItems');
+  box.innerHTML = CART.length ? CART.map((l, i) => `
+    <div class="ci">
+      <div class="ci-nm">${l.name}${l.note ? `<span class="ci-note">${l.note}</span>` : ''}</div>
+      <div class="ci-mid">
+        ${l.unli
+          // No quantity stepper on an unlimited line: Heads below is the only
+          // control that sizes it, and offering both invited a punch the
+          // server now has to refuse.
+          ? `<div class="qty-fixed">Sized by heads</div>`
+          : `<div class="qty"><button data-q="${i}:-1">−</button><b>${l.qty}</b><button data-q="${i}:1">+</button></div>`}
+        <div class="ci-acts">
+          ${l.note ? `<button class="ci-link" data-edit="${i}">Edit</button>` : ''}
+          <button class="ci-link rm" data-rm="${i}">Remove</button>
+        </div>
+      </div>
+      <div class="ci-amt">₱${(l.price * l.qty).toLocaleString()}
+        ${l.qty > 1 ? `<span class="ci-unit">₱${l.price.toLocaleString()} each</span>` : ''}
+      </div>
+      ${l.unli ? `<div class="heads">Heads
+        <div class="qty"><button data-h="${i}:-1">−</button><b>${l.heads}</b><button data-h="${i}:1">+</button></div>
+      </div>` : ''}
+    </div>`).join('') : '<div class="empty-cart">Tap a menu item to start an order.</div>';
+
+  $('#cartCount').textContent = CART.reduce((s, l) => s + l.qty, 0);
+  const { sub, svc, total } = cartTotals();
+  $('#subT').textContent = peso(sub);
+  $('#svcT').textContent = peso(svc);
+  $('#grandT').textContent = peso(total);
+  $('#punchBtn').textContent = `Charge ${peso(total)}`;
+  $('#punchBtn').disabled = CART.length === 0;
+}
+$('#cartItems').onclick = e => {
+  const q = e.target.closest('[data-q]');
+  if (q) { const [i, d] = q.dataset.q.split(':').map(Number); CART[i].qty += d; if (CART[i].qty < 1) CART.splice(i, 1); paintCart(); return; }
+  const h = e.target.closest('[data-h]');
+  if (h) { const [i, d] = h.dataset.h.split(':').map(Number); CART[i].heads = Math.max(1, CART[i].heads + d); paintCart(); return; }
+  const rm = e.target.closest('[data-rm]');
+  if (rm) { CART.splice(parseInt(rm.dataset.rm, 10), 1); paintCart(); return; }
+  const ed = e.target.closest('[data-edit]');
+  if (ed) {
+    const i = parseInt(ed.dataset.edit, 10);
+    const line = CART[i];
+    const item = MENU.find(m => m.menu_item_pk === line.menuId);
+    if (item) openCustomize(item, line.note, i);
+  }
+};
+$('#clearBtn').onclick = () => { CART = []; paintCart(); };
+$('#orderType').onclick = e => {
+  const b = e.target.closest('button[data-type]'); if (!b) return;
+  ORDER_TYPE = b.dataset.type;
+  document.querySelectorAll('#orderType button').forEach(x => x.classList.toggle('on', x === b));
+  $('#typeBadgeTxt').textContent = ORDER_TYPE;
+};
+// The date/time line under "Order Details". Ticks each minute so a terminal
+// left open overnight isn't showing yesterday's timestamp at the counter.
+function paintOrderMeta() {
+  $('#orderMeta').textContent = new Date().toLocaleString('en-PH',
+    { weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}
+paintOrderMeta();
+setInterval(paintOrderMeta, 60000);
+
+function cartTotals() {
+  const sub = CART.reduce((s, l) => s + l.price * l.qty, 0);
+  const svc = Math.round(sub * 0.10 * 100) / 100;
+  return { sub, svc, total: sub + svc };
+}
+
+/* ---------------- payment ---------------- */
+function newCheckoutKey() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return 'ck-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+}
+$('#punchBtn').onclick = () => {
+  if (!CART.length) return;
+  const { total } = cartTotals();
+  CHECKOUT_KEY = newCheckoutKey();   // this attempt gets exactly one key
+  $('#payDue').textContent = peso(total);
+  $('#payCash').value = Math.ceil(total);
+  $('#payErr').style.display = 'none';
+  renderQuickCash(total);
+  updateChange();
+  $('#payModal').classList.remove('hide');
+  $('#payCash').focus(); $('#payCash').select();
+};
+function renderQuickCash(total) {
+  const steps = [50, 100, 200, 500, 1000];
+  const amounts = [Math.ceil(total), ...steps.map(s => Math.ceil(total / s) * s)]
+    .filter((v, i, arr) => arr.indexOf(v) === i && v > 0)
+    .sort((a, b) => a - b)
+    .slice(0, 4);
+  $('#quickCash').innerHTML = amounts.map(v =>
+    `<button type="button" data-amt="${v}">₱${v.toLocaleString()}</button>`).join('');
+}
+$('#quickCash').onclick = e => {
+  const b = e.target.closest('button[data-amt]');
+  if (!b) return;
+  $('#payCash').value = b.dataset.amt;
+  updateChange();
+};
+function updateChange() {
+  const { total } = cartTotals();
+  const cash = parseFloat($('#payCash').value) || 0;
+  const change = cash - total;
+  $('#payChange').textContent = peso(Math.max(0, change));
+  $('#payChange').style.color = change < 0 ? 'var(--bad-text)' : '';
+}
+$('#payCash').addEventListener('input', updateChange);
+$('#payCancel').onclick = () => $('#payModal').classList.add('hide');
+$('#payCash').addEventListener('keydown', e => { if (e.key === 'Enter') $('#payConfirm').click(); });
+
+$('#payConfirm').onclick = async () => {
+  const { total } = cartTotals();
+  const cash = parseFloat($('#payCash').value);
+  if (!cash || cash < total) {
+    $('#payErr').textContent = 'Amount received must cover the total.';
+    $('#payErr').style.display = 'block';
+    return;
+  }
+  $('#payErr').style.display = 'none';
+  $('#payConfirm').disabled = true;   // first line of defence: no second tap
+  try {
+    const headCount = Math.max(0, ...CART.filter(l => l.unli).map(l => l.heads), 0);
+    if (!CHECKOUT_KEY) CHECKOUT_KEY = newCheckoutKey();
+    const body = {
+      table_label: ORDER_TYPE,
+      head_count: headCount,
+      lines: CART.map(l => ({ menu_item_pk: l.menuId, qty: l.qty, note: l.note || null })),
+      cash_received: cash,
+      // Second line of defence, and the one that actually holds: if this
+      // request is retried for any reason the server returns the original
+      // order rather than creating another one.
+      client_request_id: CHECKOUT_KEY,
+    };
+    const itemsSnapshot = CART.map(l => ({ name: l.name, qty: l.qty, price: l.price, note: l.note }));
+    CART_HAD_UNLI = CART.some(l => l.unli);
+    const r = await api('/pos/orders', { method: 'POST', body: JSON.stringify(body) });
+    $('#payModal').classList.add('hide');
+    CHECKOUT_KEY = null;               // this sale is done; the next one gets a fresh key
+    CART = []; paintCart(); loadMenu();
+    if (r.duplicate) toast('That order was already recorded — showing the original receipt.');
+    showReceipt({ ...r, table_label: ORDER_TYPE }, itemsSnapshot, NAME);
+    // An unlimited sale opens a session at checkout. Take the cashier
+    // straight to it once the receipt is closed — the first round is the
+    // next thing that happens at that table.
+    if (CART_HAD_UNLI) {
+      const btn = $('#rcClose');
+      btn.dataset.thenRefill = r.order_id;
+    }
+  } catch (e) {
+    $('#payErr').textContent = e.message;
+    $('#payErr').style.display = 'block';
+  } finally {
+    $('#payConfirm').disabled = false;
+  }
+};
+
+/* ---------------- current orders / history ---------------- */
+const STATUS_LABEL = { punched: 'Punched', in_progress: 'Cooking', ready: 'Ready', served: 'Served', void: 'Voided' };
+const STATUS_CHIP = { punched: 'warn', in_progress: 'warn', ready: 'ok', served: 'mute', void: 'bad' };
+const OPEN_STATUSES = ['punched', 'in_progress', 'ready'];
+
+async function loadOrders(view) {
+  $('#ordersList').innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const d = await api('/pos/orders?status=' + (view === 'current' ? 'open' : 'all') + '&limit=100');
+    renderOrdersList(d.orders, view);
+  } catch (e) {
+    $('#ordersList').innerHTML = `<div class="empty">Could not load orders: ${e.message}</div>`;
+  }
+}
+function renderOrdersList(orders, view) {
+  $('#ordersList').innerHTML = orders.length ? orders.map(o => `
+    <div class="order-row">
+      <div class="or-main"><b>${o.order_no}</b><span class="chip ${STATUS_CHIP[o.status] || 'mute'}">${STATUS_LABEL[o.status] || o.status}</span></div>
+      <div class="or-meta">
+        <span>${o.table_label || '—'}</span>
+        <span>${o.line_count} item${o.line_count === 1 ? '' : 's'}</span>
+        <span>${fmtTime(o.created_at)}</span>
+        <span class="amt">${o.total != null ? peso(o.total) : '—'}</span>
+      </div>
+      <div class="or-actions">
+        <button data-view-order="${o.id}">View</button>
+        ${OPEN_STATUSES.includes(o.status) ? `<button class="danger" data-void-order="${o.id}">Void</button>` : ''}
+      </div>
+    </div>`).join('')
+    : `<div class="empty">${view === 'current' ? 'No open orders right now.' : 'No orders yet.'}</div>`;
+}
+function fmtTime(iso) {
+  try { return new Date(iso.replace(' ', 'T') + 'Z').toLocaleString('en-PH', { dateStyle: 'short', timeStyle: 'short' }); }
+  catch { return iso; }
+}
+$('#ordersList').onclick = async e => {
+  const v = e.target.closest('[data-view-order]');
+  if (v) {
+    try {
+      // The receipt endpoint returns the settled sale plus the unlimited
+      // session hanging off it, so reopening a ticket from History shows the
+      // rounds served since — without the stored order having moved.
+      const rec = await api('/pos/orders/' + v.dataset.viewOrder + '/receipt');
+      const items = rec.lines.map(l => ({ name: l.name, qty: l.qty, price: l.unit_price, note: l.note }));
+      showReceipt(rec.order, items, rec.order.created_by, rec);
+    } catch (e) { toast(e.message); }
+    return;
+  }
+  const x = e.target.closest('[data-void-order]');
+  if (x) {
+    if (!confirm('Void this order? This cannot be undone.')) return;
+    try {
+      await api(`/pos/orders/${x.dataset.voidOrder}/void`, { method: 'POST', body: JSON.stringify({ reason: 'voided at till' }) });
+      toast('Order voided.');
+      loadOrders(VIEW);
+    } catch (e) { toast(e.message); }
+  }
+};
+
+/* ---------------- unlimited refills ----------------
+   The till's view of a table that is still eating. Everything shown here —
+   the piece count, the flavour list, every price — comes from the server.
+   No flavour price is written in this file; a special flavour is whatever
+   the owner configured in the console, read back through /unli/flavors. */
+let RF = null;            // { session, flavors, selected, key }
+let RF_FLAVORS = null;
+
+async function loadRefillSessions() {
+  $('#refillsList').innerHTML = `<div class="empty">Loading…</div>`;
+  try {
+    const d = await api('/unli/sessions?status=active');
+    $('#refillsList').innerHTML = d.sessions.length ? d.sessions.map(s => `
+      <div class="rf-card">
+        <div>
+          <div class="no">${s.order_no}</div>
+          <div class="meta">
+            <span>${s.table_label || 'Walk-in'}</span>
+            <span><b>${s.head_count}</b> head${s.head_count === 1 ? '' : 's'}</span>
+            <span><b>${s.served_refills}</b> refill${s.served_refills === 1 ? '' : 's'}</span>
+            <span><b>${s.pieces_served}</b> pcs served</span>
+            ${s.addon_total ? `<span class="a">add-ons <b>${peso(s.addon_total)}</b></span>` : ''}
+          </div>
+        </div>
+        <button class="btn btn-p go" data-refill-session="${s.session_id}">Refill</button>
+      </div>`).join('')
+      : `<div class="empty">No unlimited tables are open right now.</div>`;
+  } catch (e) {
+    $('#refillsList').innerHTML = `<div class="empty">Could not load: ${e.message}</div>`;
+  }
+}
+
+$('#refillsList').onclick = e => {
+  const b = e.target.closest('[data-refill-session]');
+  if (b) openRefillPanel(parseInt(b.dataset.refillSession, 10));
+};
+
+async function openRefillPanel(sessionId) {
+  try {
+    if (!RF_FLAVORS) RF_FLAVORS = (await api('/unli/flavors')).flavors;
+    const session = await api('/unli/sessions/' + sessionId);
+    // A fresh idempotency key per opening of the panel, replaced after every
+    // successful serve — same discipline as the checkout key, and the reason
+    // a double-tap cannot serve the table twice.
+    RF = { session, selected: null, key: newRefillKey() };
+    paintRefillPanel();
+    $('#refillModal').classList.remove('hide');
+  } catch (e) { toast(e.message); }
+}
+
+function newRefillKey() {
+  return 'rf-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+}
+
+function paintRefillPanel() {
+  const s = RF.session;
+  $('#rfTitle').textContent = 'Unlimited Wings';
+  $('#rfSub').textContent = `${s.order_no} · ${s.table_label || 'Walk-in'} · ${s.head_count} head${s.head_count === 1 ? '' : 's'}`;
+  const st = $('#rfStatus');
+  st.textContent = s.status;
+  st.className = 'chip ' + (s.status === 'active' ? 'ok' : s.status === 'completed' ? 'mute' : 'bad');
+
+  $('#rfNo').textContent = '#' + s.next_refill_no;
+  $('#rfPieces').textContent = s.pieces_next_refill + ' PCS';
+  $('#rfMath').textContent =
+    `${s.pieces_per_head} pcs × ${s.head_count} head${s.head_count === 1 ? '' : 's'}`
+    + ` · ${s.served_refills} refill${s.served_refills === 1 ? '' : 's'} so far`
+    + ` · ${s.pieces_served} pcs served`;
+
+  const live = s.status === 'active';
+  $('#rfFlavors').innerHTML = RF_FLAVORS.map(f => `
+    <button class="rf-fl ${RF.selected === f.id ? 'on' : ''}" data-flavor="${f.id}" ${live ? '' : 'disabled'}>
+      <span class="n">${f.display_name}</span>
+      <span class="p ${f.flavor_type === 'special' ? 'add' : ''}">${
+        f.flavor_type === 'special' ? '+' + peso(f.addon_price) : 'Included'}</span>
+    </button>`).join('');
+
+  const prev = s.refills || [];
+  $('#rfPrevLbl').style.display = prev.length ? '' : 'none';
+  $('#rfPrev').innerHTML = prev.length ? prev.map(r => {
+    const dead = r.status === 'voided' || r.status === 'cancelled';
+    return `<div class="rf-r ${dead ? 'gone' : ''}">
+      <span class="n">#${r.refill_no}</span>
+      <span class="f">${r.flavor_name} — ${r.pieces} pcs</span>
+      ${r.flavor_type === 'special' && !dead ? `<span class="a">+${peso(r.addon_amount)}</span>` : ''}
+      ${r.status === 'pending' ? `<span class="chip warn">with kitchen</span>` : ''}
+      ${dead ? `<span class="chip mute">${r.status}</span>` : ''}
+      ${!dead && live ? `<button data-void-refill="${r.id}">Void</button>` : ''}
+    </div>`;
+  }).join('') : '';
+
+  const addons = s.addon_total || 0;
+  $('#rfTotals').innerHTML = `
+    <div class="row"><span>Original order total</span><span>${peso(s.order_total || 0)}</span></div>
+    <div class="row"><span>Special-flavor add-ons</span><span>${peso(addons)}</span></div>
+    <div class="row grand"><span>Current total</span><span>${peso(s.current_total || s.order_total || 0)}</span></div>`;
+
+  $('#rfErr').textContent = '';
+  $('#rfServe').disabled = !live || !RF.selected;
+  $('#rfServe').textContent = live
+    ? `Serve refill #${s.next_refill_no}` : 'Session ' + s.status;
+  $('#rfEnd').style.display = live ? '' : 'none';
+}
+
+$('#rfFlavors').onclick = e => {
+  const b = e.target.closest('[data-flavor]');
+  if (!b || b.disabled) return;
+  RF.selected = parseInt(b.dataset.flavor, 10);
+  paintRefillPanel();
+};
+
+$('#rfPrev').onclick = async e => {
+  const b = e.target.closest('[data-void-refill]');
+  if (!b) return;
+  if (!confirm('Void this refill? If the kitchen already made it, the sauce is written off as wastage and any special-flavor charge is reversed.')) return;
+  b.disabled = true;
+  try {
+    await api(`/unli/refills/${b.dataset.voidRefill}/void`,
+              { method: 'POST', body: JSON.stringify({ reason: 'voided at till' }) });
+    toast('Refill voided.');
+    RF.session = await api('/unli/sessions/' + RF.session.session_id);
+    paintRefillPanel();
+  } catch (err) { $('#rfErr').textContent = err.message; b.disabled = false; }
+};
+
+$('#rfServe').onclick = async () => {
+  if (!RF || !RF.selected) return;
+  const btn = $('#rfServe');
+  btn.disabled = true;                      // first line of defence
+  $('#rfErr').textContent = '';
+  try {
+    const r = await api(`/unli/sessions/${RF.session.session_id}/refills`, {
+      method: 'POST',
+      body: JSON.stringify({
+        flavor_id: RF.selected,
+        // Second line of defence, and the one that holds: a retry replays the
+        // round already recorded rather than serving the table again.
+        client_request_id: RF.key,
+      }),
+    });
+    RF.key = newRefillKey();                // this round is done
+    RF.selected = null;
+    toast(r.duplicate
+      ? 'That refill was already recorded.'
+      : `Refill #${r.refill_no} sent to the kitchen — ${r.pieces} pcs ${r.flavor_name}.`);
+    RF.session = await api('/unli/sessions/' + RF.session.session_id);
+    paintRefillPanel();
+    loadRefillSessions();
+  } catch (e) {
+    $('#rfErr').textContent = e.message;
+    btn.disabled = false;
+  }
+};
+
+$('#rfEnd').onclick = async () => {
+  if (!RF) return;
+  if (!confirm('End this unlimited session? No further refills can be served unless a manager reopens it.')) return;
+  try {
+    await api(`/unli/sessions/${RF.session.session_id}/close`,
+              { method: 'POST', body: JSON.stringify({ status: 'completed' }) });
+    toast('Session ended.');
+    $('#refillModal').classList.add('hide');
+    loadRefillSessions();
+  } catch (e) { $('#rfErr').textContent = e.message; }
+};
+
+$('#rfClose').onclick = () => { $('#refillModal').classList.add('hide'); RF = null; };
+
+/* ---------------- receipt ---------------- */
+/* The refill block on the receipt. Rendered from the server's session
+   payload, below the totals rule, because it is the operational record of
+   what was served — the financial figures above it are the settled sale and
+   are never recomputed here. */
+function renderReceiptRefills(rec) {
+  const box = $('#rcRefills');
+  if (!rec || !rec.session || !rec.session.refills || !rec.session.refills.length) {
+    box.innerHTML = '';
+    return;
+  }
+  const s = rec.session;
+  const live = s.refills.filter(r => r.status === 'served');
+  const rows = s.refills.map(r => {
+    const dead = r.status === 'voided' || r.status === 'cancelled';
+    const tag = dead ? r.status.toUpperCase()
+      : r.flavor_type === 'special' ? 'SPECIAL FLAVOR +' + peso(r.addon_amount)
+      : 'INCLUDED';
+    return `<div class="r ${dead ? 'v' : ''}">
+      <span>REFILL #${r.refill_no} · ${r.pieces} PCS · ${r.flavor_name.toUpperCase()}</span>
+      <span>${tag}</span></div>`;
+  }).join('');
+  box.innerHTML = `
+    <div class="h">REFILL HISTORY</div>
+    ${rows}
+    <div class="r" style="margin-top:5px"><span>TOTAL REFILLS</span><span>${live.length}</span></div>
+    <div class="r"><span>TOTAL PIECES SERVED</span><span>${s.pieces_served}</span></div>
+    ${rec.addon_total ? `
+      <div class="rc-rule" style="margin:6px 0"></div>
+      <div class="r"><span>ORIGINAL ORDER TOTAL</span><span>${peso(rec.original_total)}</span></div>
+      <div class="r"><span>ADDITIONAL ADD-ONS</span><span>${peso(rec.addon_total)}</span></div>
+      <div class="r" style="font-weight:800"><span>CURRENT TOTAL</span><span>${peso(rec.current_total)}</span></div>`
+    : ''}
+    <div class="rc-rule" style="margin:6px 0"></div>`;
+}
+
+function showReceipt(order, items, cashierName, rec) {
+  // An order opened from History prints with the timestamp it was actually
+  // rung up at; a fresh sale has no stored timestamp yet, so it uses now.
+  const when = order.created_at
+    ? new Date(order.created_at.replace(' ', 'T') + 'Z')
+    : new Date();
+  $('#rcOrderNo').textContent = order.order_no;
+  $('#rcType').textContent = order.table_label || '—';
+  $('#rcDate').textContent = when.toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: '2-digit' });
+  $('#rcTime').textContent = when.toLocaleTimeString('en-PH', { hour: '2-digit', minute: '2-digit' });
+  $('#rcCashier').textContent = cashierName || '—';
+  $('#rcItems').innerHTML = items.map(i => `
+    <div class="rc-item">
+      <span>${i.name}</span><span class="c">${i.qty}</span>
+      <span class="r">${(i.price * i.qty).toLocaleString('en-PH', { minimumFractionDigits: 2 })}</span>
+      ${i.note ? `<span class="note">${i.note}</span>` : ''}
+    </div>
+  `).join('');
+  $('#rcCount').textContent = items.reduce((s, i) => s + i.qty, 0);
+  // Orders punched before the payment columns existed (migration 0008) have
+  // these as NULL, not zero — "not recorded" reads honestly, "₱0" would not.
+  $('#rcSub').textContent = order.subtotal != null ? peso(order.subtotal) : '—';
+  $('#rcSvc').textContent = order.service_charge != null ? peso(order.service_charge) : '—';
+  $('#rcTotal').textContent = order.total != null ? peso(order.total) : '—';
+  $('#rcCash').textContent = order.cash_received != null ? peso(order.cash_received) : '—';
+  $('#rcChange').textContent = order.change_due != null ? peso(order.change_due) : '—';
+  renderReceiptRefills(rec);
+  $('#receiptModal').classList.remove('hide');
+}
+$('#rcClose').onclick = async e => {
+  $('#receiptModal').classList.add('hide');
+  const orderId = e.currentTarget.dataset.thenRefill;
+  if (!orderId) return;
+  delete e.currentTarget.dataset.thenRefill;
+  CART_HAD_UNLI = false;
+  try {
+    const s = await api(`/unli/orders/${orderId}/session`);
+    setView('refills');
+    openRefillPanel(s.session_id);
+  } catch { /* no session (not an unlimited sale after all) — stay put */ }
+};
+$('#rcPrint').onclick = () => window.print();
+
+function toast(msg) {
+  document.querySelectorAll('.toast').forEach(t => t.remove());
+  const t = document.createElement('div'); t.className = 'toast'; t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 3200);
+}
+
+if (TOKEN && ROLE && NAME && ALLOWED_ROLES.includes(ROLE)) showApp();
+else if (TOKEN) doLogout();   // stale/wrong-role session — clear it, show login instead of a blank app
+// Arriving from the landing page's unified sign-in already ran the brand
+// intro once there; only a cold direct visit to /pos plays it here too.
+else if (new URLSearchParams(location.search).get('intro') !== 'done') WingsIntro.play();
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "db_sha256_16": "80cf01fddee4eed5",
+  "schema_version": 12,
+  "ingredients": 111,
+  "orders": 9,
+  "stock_ledger_rows": 180,
+  "reservations_held": 0,
+  "fefo_open_batches": 92,
+  "fk_check_violations": 0,
+  "integrity_check": "ok",
+  "fefo_invariant_violations": 0,
+  "ledger_balance_violations": 0
+}

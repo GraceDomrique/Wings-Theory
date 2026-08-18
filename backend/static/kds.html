@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Wings Theory — Kitchen</title>
+<style>
+:root{
+  --bg:#F7F8FA; --card:#FFFFFF; --line:#E5E7EB; --txt:#1F2328; --mute:#6B7280;
+  --amber:#F4B400; --ok:#34C759; --warn:#FF9500; --bad:#FF453A;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  -webkit-tap-highlight-color:transparent;overscroll-behavior:none}
+button{font:inherit;cursor:pointer;-webkit-tap-highlight-color:transparent}
+input{font:inherit}
+.hide{display:none!important}
+
+#login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:20px;background:#1A1A1A}
+.login-box{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:32px 28px;
+  width:100%;max-width:360px}
+.login-mark{height:44px;display:inline-flex;align-items:center;margin-bottom:14px}
+.login-mark img{height:100%;width:auto;display:block}
+.login-box h1{font-size:20px;margin:0 0 4px}
+.login-box p{color:var(--mute);font-size:13px;margin:0 0 22px}
+.field{width:100%;height:48px;border:1px solid var(--line);background:#F7F8FA;color:var(--txt);
+  border-radius:10px;padding:0 14px;font-size:17px;margin-bottom:12px}
+.field:focus{outline:none;border-color:var(--amber)}
+.pass-wrap{position:relative;margin-bottom:12px}
+.pass-wrap .field{margin-bottom:0;padding-right:42px}
+.pass-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;
+  padding:8px;border-radius:8px;display:flex;color:var(--mute);cursor:pointer}
+.pass-toggle:hover{color:var(--txt)}
+.pass-toggle svg{width:17px;height:17px;display:block}
+.btn{display:flex;align-items:center;justify-content:center;height:48px;border-radius:10px;
+  border:0;font-weight:700;font-size:16px;width:100%;background:var(--amber);color:#1F1F1F}
+.btn:disabled{opacity:.5}
+#loginErr{color:#D92D20;font-size:13px;margin-top:10px;min-height:16px}
+
+#app{display:none;height:100vh;flex-direction:column;padding:14px}
+header{display:flex;align-items:center;gap:14px;padding-bottom:12px;flex-shrink:0}
+header h1{font-size:20px;font-weight:700;margin:0}
+.brand-mark{height:30px;display:inline-flex;align-items:center;flex-shrink:0}
+.brand-mark img{height:100%;width:auto;display:block}
+.stat{font-size:13px;color:var(--mute)}
+.stat b{color:var(--txt);font-weight:700;font-variant-numeric:tabular-nums}
+header .r{margin-left:auto;display:flex;align-items:center;gap:12px}
+#connDot{width:9px;height:9px;border-radius:99px;background:var(--ok)}
+#connDot.off{background:var(--bad)}
+header button{background:none;border:1px solid var(--line);border-radius:8px;padding:7px 14px;
+  color:var(--mute);font-size:13px}
+
+#errBanner{background:#FEECEB;color:#B3261E;padding:9px 14px;font-size:13px;border-radius:9px;
+  margin-bottom:12px;display:flex;align-items:center;gap:10px}
+#errBanner button{background:none;border:1px solid #B3261E;border-radius:7px;padding:4px 10px;
+  font-size:12px;color:#B3261E;margin-left:auto}
+.cols{flex:1;display:grid;grid-template-columns:repeat(4,1fr);gap:12px;min-height:0}
+.station{font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--mute);
+  background:var(--card);border:1px solid var(--line);border-radius:99px;padding:4px 12px}
+.ko.pri-done{border-left-color:#D0D4DA;opacity:.62}
+.kbtn.s{background:transparent;border:1px solid var(--line);color:var(--mute)}
+.kbtn.s:active{color:var(--txt);border-color:var(--mute)}
+.col{display:flex;flex-direction:column;min-height:0;gap:10px}
+.col-h{display:flex;align-items:center;gap:8px;padding:0 2px}
+.col-h b{font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
+.col-h .n{margin-left:auto;font-size:12px;color:var(--mute);background:var(--card);
+  padding:2px 9px;border-radius:99px;font-variant-numeric:tabular-nums}
+.col-l{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding-bottom:8px}
+.empty-col{border:1.5px dashed var(--line);border-radius:12px;padding:28px 14px;text-align:center;
+  color:var(--mute);font-size:13px}
+
+.ko{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;
+  border-left-width:4px;display:flex;flex-direction:column;gap:10px}
+.ko.pri-hi{border-left-color:var(--bad)} .ko.pri-md{border-left-color:var(--warn)} .ko.pri-lo{border-left-color:var(--ok)}
+.ko-h{display:flex;align-items:baseline;gap:9px}
+.ko-h .no{font-size:20px;font-weight:800;letter-spacing:-.02em}
+.ko-h .tbl{font-size:12.5px;color:var(--mute)}
+.ko-h .tm{margin-left:auto;font-family:ui-monospace,monospace;font-size:14px;font-weight:700}
+.ko-h .tm.late{color:#D92D20}
+.ko-l{display:flex;flex-direction:column;gap:6px}
+.ko-i{font-size:15px;line-height:1.35;display:flex;gap:8px}
+.ko-i .q{font-weight:800;color:var(--amber);min-width:22px}
+.ko-i .nt{font-size:12px;color:var(--mute);display:block}
+/* A refill is a real unit of preparation — a named flavour and a piece count
+   — so it gets its own card on the board rather than being something the
+   kitchen has to infer from an order note. Tinted and badged so it reads as a
+   different kind of ticket at a glance across the pass. */
+.ko.refill{border-left-color:var(--amber);background:#FFFCF4}
+.ko-badge{display:inline-block;font-size:10.5px;font-weight:800;letter-spacing:.07em;
+  background:var(--amber);color:#1F1F1F;border-radius:99px;padding:2px 9px}
+.ko-flav{font-size:19px;font-weight:800;letter-spacing:-.01em;line-height:1.2}
+.ko-pcs{font-size:14px;font-weight:700;color:var(--mute)}
+.ko-pcs b{color:var(--txt);font-size:17px}
+.ko-add{font-size:11.5px;font-weight:800;color:#B3261E;letter-spacing:.03em}
+.ko-b{display:flex;gap:8px;margin-top:2px}
+.kbtn{flex:1;height:44px;border-radius:10px;font-size:14px;font-weight:700}
+.kbtn.p{background:var(--amber);color:#1F1F1F;border:0}
+.kbtn.p:active{filter:brightness(1.08)}
+
+/* --- End-of-service reconciliation sheet -------------------------------
+   A full-screen overlay rather than a fifth column: it is not a live board,
+   it is a task the kitchen does once at close, and it needs room for the
+   numbers and their arithmetic to be legible on a wall-mounted tablet. */
+#recScrim{position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:40}
+#recSheet{position:fixed;inset:auto 0 0 0;max-height:92vh;overflow-y:auto;z-index:41;
+  background:var(--card);border-radius:16px 16px 0 0;padding:20px}
+@media (min-width:760px){ #recSheet{inset:5vh 50% auto auto;transform:translateX(50%);
+  width:min(720px,94vw);border-radius:16px;max-height:90vh} }
+#recSheet h2{margin:0 0 4px;font-size:19px}
+#recSheet .sub{color:var(--mute);font-size:13px;margin:0 0 16px}
+.rec-row{border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+.rec-row .rh{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.rec-row .rh b{font-size:16px}
+.rec-row .rh .m{color:var(--mute);font-size:13px}
+.rec-in{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.rec-in label{display:block;font-size:11.5px;color:var(--mute);margin-bottom:3px;font-weight:600}
+.rec-in .field{height:44px;font-size:16px;margin-bottom:0;text-align:right}
+.rec-calc{margin-top:10px;font-size:13.5px;line-height:1.5;background:#F7F8FA;
+  border-radius:9px;padding:10px 12px;color:var(--mute)}
+.rec-calc b{color:var(--txt)}
+.rec-calc.warn{background:#FFF4E5;color:#8A5A00} .rec-calc.warn b{color:#7A4F00}
+.rec-calc.ok{background:#E8F8EC;color:#1D6B34} .rec-calc.ok fb,.rec-calc.ok b{color:#14572A}
+.rec-calc.bad{background:#FEECEB;color:#B3261E} .rec-calc.bad b{color:#8C1D18}
+.rec-done{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13.5px}
+.rec-done span{color:var(--mute)} .rec-done b{color:var(--txt)}
+.chip{display:inline-block;font-size:11.5px;font-weight:700;border-radius:99px;padding:3px 10px}
+.chip.ok{background:#E8F8EC;color:#1D6B34} .chip.warn{background:#FFF4E5;color:#8A5A00}
+.chip.bad{background:#FEECEB;color:#B3261E} .chip.mute{background:#F0F1F3;color:var(--mute)}
+.rec-f{display:flex;gap:10px;margin-top:6px}
+.rec-f .btn{flex:1}
+.rec-f .btn.s{background:transparent;border:1px solid var(--line);color:var(--mute)}
+#recErr{color:#D92D20;font-size:13px;min-height:16px;margin-top:8px}
+#recBtn{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:7px 14px;
+  color:var(--txt);font-size:13px;font-weight:600}
+
+@media (max-width:820px){ .cols{grid-template-columns:1fr;overflow-y:auto} .col{min-height:200px} }
+@media (max-width:480px){
+  header{flex-wrap:wrap;row-gap:8px}
+  header h1{font-size:17px}
+  header .r{margin-left:0;width:100%;justify-content:space-between}
+}
+</style>
+<link rel="stylesheet" href="/assets/brand.css">
+</head>
+<body>
+
+<div id="login">
+  <div class="login-box">
+    <div class="login-mark"><img src="/img/logo.png" alt="Wings Theory"></div>
+    <h1>Wings Theory</h1>
+    <p>Kitchen display sign in</p>
+    <input class="field" id="luser" placeholder="Username" autocomplete="username">
+    <div class="pass-wrap">
+      <input class="field" id="lpass" type="password" placeholder="Password" autocomplete="current-password">
+      <button type="button" class="pass-toggle" id="passToggle" aria-label="Show password" aria-pressed="false"></button>
+    </div>
+    <button class="btn" id="loginBtn">Sign in</button>
+    <div id="loginErr"></div>
+  </div>
+</div>
+
+<div id="app">
+  <header>
+    <span id="connDot"></span>
+    <div class="brand-mark"><img src="/img/logo.png" alt="Wings Theory"></div>
+    <h1>Kitchen Display</h1>
+    <span class="station">Station 1</span>
+    <div class="stat">Queue <b id="nQueue">0</b></div>
+    <div class="stat">Cooking <b id="nCook">0</b></div>
+    <div class="r"><button id="recBtn">End-of-service reconciliation</button>
+      <span class="stat" id="whoName"></span><button id="logoutBtn">Sign out</button></div>
+  </header>
+  <div id="errBanner" class="hide"></div>
+  <div class="cols">
+    <div class="col"><div class="col-h"><b style="color:var(--warn)">Queued</b><span class="n" id="cQ">0</span></div>
+      <div class="col-l" id="colQueued"></div></div>
+    <div class="col"><div class="col-h"><b style="color:var(--amber)">Cooking</b><span class="n" id="cC">0</span></div>
+      <div class="col-l" id="colCooking"></div></div>
+    <div class="col"><div class="col-h"><b style="color:var(--ok)">Ready</b><span class="n" id="cR">0</span></div>
+      <div class="col-l" id="colReady"></div></div>
+    <div class="col"><div class="col-h"><b style="color:var(--mute)">Served</b><span class="n" id="cS">0</span></div>
+      <div class="col-l" id="colServed"></div></div>
+  </div>
+</div>
+
+<script src="/assets/brand.js"></script>
+<script>
+const API = location.origin;
+// Namespaced per app — see pos.html for why: /pos, /kds and /console used to
+// share one localStorage session, so opening one after another silently
+// carried over a role with no permission for the new page, and the page
+// just sat blank with an already-faded toast as the only clue.
+const NS = 'wt_kds_';
+const ALLOWED_ROLES = ['kitchen', 'admin'];
+let TOKEN = localStorage.getItem(NS + 'token');
+let ROLE = localStorage.getItem(NS + 'role');
+let NAME = localStorage.getItem(NS + 'name');
+let ORDERS = [];
+let REFILLS = [];
+let POLL = null;
+
+const $ = s => document.querySelector(s);
+
+/* Two error shapes come from this backend:
+     FastAPI HTTPException -> { detail: "a string" }
+     domain WTError        -> { code, message: "a string", detail: {...} }
+   `body.detail || body.message` was wrong: a WTError with no extra context
+   carries `detail: {}`, an EMPTY OBJECT, which is truthy in JavaScript — so
+   it won every time and the cashier saw "[object Object]" instead of the
+   real reason (e.g. "not enough stock"). Prefer the human message. */
+function apiErrorMessage(body, status) {
+  if (body) {
+    if (typeof body.message === 'string' && body.message) return body.message;
+    if (typeof body.detail === 'string' && body.detail) return body.detail;
+  }
+  if (status === 401) return 'Session expired — please sign in again.';
+  if (status === 403) return 'Your account does not have permission for this.';
+  return 'HTTP ' + status;
+}
+
+
+async function api(path, opts = {}) {
+  const r = await fetch(API + path, {
+    ...opts,
+    headers: { 'Content-Type': 'application/json', ...(TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}), ...(opts.headers || {}) },
+  });
+  if (r.status === 401) { doLogout(); throw new Error('session expired'); }
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(apiErrorMessage(body, r.status));
+  return body;
+}
+
+function showApp() {
+  $('#login').style.display = 'none';
+  $('#app').style.display = 'flex';
+  $('#whoName').textContent = `${NAME} · ${ROLE}`;
+  refresh();
+  POLL = setInterval(refresh, 5000);
+}
+function doLogout() {
+  if (POLL) clearInterval(POLL);
+  localStorage.removeItem(NS + 'token'); localStorage.removeItem(NS + 'role'); localStorage.removeItem(NS + 'name');
+  location.reload();
+}
+$('#logoutBtn').onclick = doLogout;
+$('#loginBtn').onclick = async () => {
+  const u = $('#luser').value.trim(), p = $('#lpass').value;
+  $('#loginErr').textContent = ''; $('#loginBtn').disabled = true;
+  try {
+    const r = await fetch(API + '/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p }),
+    });
+    const body = await r.json();
+    if (!r.ok) throw new Error(apiErrorMessage(body, r.status) || 'invalid credentials');
+    if (!ALLOWED_ROLES.includes(body.role))
+      throw new Error(`'${body.role}' accounts cannot use the kitchen display`);
+    TOKEN = body.token; ROLE = body.role; NAME = body.display_name;
+    localStorage.setItem(NS + 'token', TOKEN); localStorage.setItem(NS + 'role', ROLE); localStorage.setItem(NS + 'name', NAME);
+    showApp();
+  } catch (e) {
+    $('#loginErr').textContent = e.message || 'Could not reach the server';
+  } finally { $('#loginBtn').disabled = false; }
+};
+$('#lpass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#loginBtn').click(); });
+
+const EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a13.16 13.16 0 0 1-1.67 2.68M6.61 6.61A13.5 13.5 0 0 0 1 11s4 7 11 7a9.26 9.26 0 0 0 4.39-1.02M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>';
+$('#passToggle').innerHTML = EYE;
+$('#passToggle').addEventListener('click', () => {
+  const showing = $('#lpass').type === 'text';
+  $('#lpass').type = showing ? 'password' : 'text';
+  $('#passToggle').innerHTML = showing ? EYE : EYE_OFF;
+  $('#passToggle').setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+  $('#passToggle').setAttribute('aria-pressed', showing ? 'false' : 'true');
+});
+
+function mins(iso) {
+  const m = (Date.now() - new Date(iso + 'Z')) / 60000;
+  const mm = Math.max(0, Math.floor(m)), ss = Math.max(0, Math.floor((m % 1) * 60));
+  return { text: `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`, val: m };
+}
+
+async function refresh() {
+  try {
+    const d = await api('/kds/queue');
+    ORDERS = d.orders;
+    REFILLS = d.refills || [];
+    $('#connDot').classList.remove('off');
+    $('#errBanner').classList.add('hide');
+    paint();
+  } catch (e) {
+    $('#connDot').classList.add('off');
+    $('#errBanner').innerHTML = `<span>Could not reach the server: ${e.message}</span>
+      <button onclick="refresh()">Retry now</button>`;
+    $('#errBanner').classList.remove('hide');
+  }
+}
+
+function orderCard(o) {
+  const t = mins(o.created_at);
+  const pri = o.status === 'served' ? 'pri-done' : t.val > 15 ? 'pri-hi' : t.val > 8 ? 'pri-md' : 'pri-lo';
+  const nextAction = o.status === 'punched'
+    ? { label: 'Start cooking', path: 'start' }
+    : o.status === 'in_progress'
+    ? { label: 'Mark ready', path: 'ready' }
+    : o.status === 'ready'
+    ? { label: 'Mark served', path: 'served' }
+    : null;
+  // Voiding a queued (not-yet-started) ticket has zero inventory impact —
+  // the hold is simply released. Once cooking has started, voiding books a
+  // real compensating wastage entry and is a till-side decision, so the
+  // button only appears here for 'punched' orders.
+  const canVoid = o.status === 'punched';
+  return `<div class="ko ${pri}">
+    <div class="ko-h"><span class="no">#${o.order_no.replace('WT-', '')}</span>
+      <span class="tbl">${o.table_label || 'Walk-in'}${o.head_count ? ` · ${o.head_count} pax` : ''}</span>
+      <span class="tm ${t.val > 15 && o.status !== 'served' ? 'late' : ''}">${t.text}</span></div>
+    <div class="ko-l">${o.lines.map(l => `<div class="ko-i"><span class="q">${l.qty}×</span>
+      <span>${l.name}${l.note ? `<span class="nt">${l.note}</span>` : ''}</span></div>`).join('')}</div>
+    ${nextAction ? `<div class="ko-b">
+      <button class="kbtn p" data-adv="${o.id}:${nextAction.path}">${nextAction.label}</button>
+      ${canVoid ? `<button class="kbtn s" data-void="${o.id}">Void</button>` : ''}
+    </div>` : ''}
+  </div>`;
+}
+
+/* A refill ticket. States the flavour and the piece count outright — the
+   kitchen should never have to open an order or read a note to find out what
+   to cook. */
+function refillCard(r) {
+  const t = mins(r.created_at);
+  const done = r.status === 'served';
+  const pri = done ? 'pri-done' : t.val > 10 ? 'pri-hi' : t.val > 5 ? 'pri-md' : 'pri-lo';
+  return `<div class="ko refill ${pri}">
+    <div class="ko-h"><span class="no">#${r.order_no.replace('WT-', '')}</span>
+      <span class="ko-badge">UNLIMITED · REFILL #${r.refill_no}</span>
+      <span class="tm ${t.val > 10 && !done ? 'late' : ''}">${t.text}</span></div>
+    <div class="ko-l">
+      <div class="ko-flav">${r.flavor_name.toUpperCase()}</div>
+      <div class="ko-pcs"><b>${r.pieces}</b> pcs · ${r.head_count} head${r.head_count === 1 ? '' : 's'}
+        · ${r.table_label || 'Walk-in'}</div>
+      ${r.flavor_type === 'special'
+        ? `<div class="ko-add">SPECIAL FLAVOR · +₱${Number(r.addon_amount).toFixed(2)}</div>` : ''}
+      ${r.note ? `<div class="ko-i"><span class="nt">${r.note}</span></div>` : ''}
+    </div>
+    ${!done ? `<div class="ko-b">
+      <button class="kbtn p" data-serve-refill="${r.id}">Refill served</button>
+      <button class="kbtn s" data-void-refill="${r.id}">Void</button>
+    </div>` : ''}
+  </div>`;
+}
+
+function paint() {
+  const q = ORDERS.filter(o => o.status === 'punched');
+  const c = ORDERS.filter(o => o.status === 'in_progress');
+  const r = ORDERS.filter(o => o.status === 'ready');
+  const s = ORDERS.filter(o => o.status === 'served');
+  // A pending refill is work waiting to be cooked, so it belongs in Cooking
+  // alongside the orders already started; a served one joins the Served
+  // column for the same 30-minute "did I already do that?" window.
+  const rfPending = REFILLS.filter(x => x.status === 'pending');
+  const rfServed = REFILLS.filter(x => x.status === 'served');
+
+  $('#nQueue').textContent = q.length; $('#nCook').textContent = c.length + rfPending.length;
+  $('#cQ').textContent = q.length; $('#cC').textContent = c.length + rfPending.length;
+  $('#cR').textContent = r.length; $('#cS').textContent = s.length + rfServed.length;
+  $('#colQueued').innerHTML = q.length ? q.map(orderCard).join('') : '<div class="empty-col">No orders waiting</div>';
+  $('#colCooking').innerHTML = (rfPending.length || c.length)
+    ? rfPending.map(refillCard).join('') + c.map(orderCard).join('')
+    : '<div class="empty-col">Nothing on the pass</div>';
+  $('#colReady').innerHTML = r.length ? r.map(orderCard).join('') : '<div class="empty-col">Nothing plated</div>';
+  $('#colServed').innerHTML = (s.length || rfServed.length)
+    ? rfServed.map(refillCard).join('') + s.map(orderCard).join('')
+    : '<div class="empty-col">Nothing served yet</div>';
+}
+
+/* ===================== END-OF-SERVICE RECONCILIATION =====================
+   The kitchen is the only station that can weigh the tray, so this is where
+   the measurement is taken. It is deliberately the ONLY inventory-affecting
+   thing this client can do: the endpoints behind it are gated on
+   unli.reconcile, a capability that grants nothing else, so a kitchen tablet
+   still cannot receive stock, write anything off, or edit an ingredient.
+
+   Everything shown is either read back from the server or arithmetic the
+   operator can check by eye against the scale. The recorded numbers are the
+   ones the server returns from the submission, never these. */
+const esc2 = s => String(s == null ? '' : s).replace(/[&<>"']/g,
+  m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+const n0 = v => (Math.round(Number(v) || 0)).toLocaleString('en-PH');
+const n1 = v => (Number(v) || 0).toLocaleString('en-PH', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+
+let REC = null;
+
+function closeRec() {
+  const s = document.getElementById('recScrim'); if (s) s.remove();
+  const b = document.getElementById('recSheet'); if (b) b.remove();
+  REC = null;
+}
+
+async function openRec(dateStr) {
+  const date = dateStr || new Date().toISOString().slice(0, 10);
+  let data;
+  try { data = await api('/unli/reconciliation/pending?service_date=' + date); }
+  catch (e) { alert(e.message); return; }
+  REC = { date, data };
+  closeRec();
+  const scrim = document.createElement('div'); scrim.id = 'recScrim';
+  scrim.addEventListener('click', closeRec);
+  document.body.appendChild(scrim);
+  const sheet = document.createElement('div'); sheet.id = 'recSheet';
+  document.body.appendChild(sheet);
+  paintRec();
+}
+
+function paintRec() {
+  const { date, data } = REC;
+  const tolPct = (data.tolerance_ratio * 100).toFixed(0);
+  const active = data.streams.filter(s => s.heads > 0 || s.reconciled);
+
+  const body = active.length ? active.map(s => {
+    if (s.reconciled) {
+      const r = s.reconciled;
+      const chip = r.status === 'within_tolerance' ? 'ok'
+        : r.status === 'over_tolerance' ? 'bad' : 'warn';
+      const label = r.status === 'within_tolerance' ? 'Within tolerance'
+        : r.status === 'over_tolerance' ? 'More than expected' : 'Less than expected';
+      return `<div class="rec-row">
+        <div class="rh"><b>${esc2(s.label)}</b>
+          <span class="chip ${chip}">${label}</span>
+          <span class="chip ${r.validation_state === 'validated' ? 'ok' : 'mute'}">
+            ${r.validation_state === 'validated' ? 'Signed off' : 'Waiting for the manager'}</span></div>
+        <div class="rec-done">
+          <span>Covers <b>${s.heads}</b></span>
+          <span>Expected <b>${n0(s.theoretical_base)} ${esc2(s.base_unit)}</b></span>
+          <span>Measured <b>${n0(r.actual_base)} ${esc2(s.base_unit)}</b></span>
+          <span>Variance <b>${r.variance_base > 0 ? '+' : ''}${n0(r.variance_base)} ${esc2(s.base_unit)}
+            (${r.variance_ratio != null ? (r.variance_ratio > 0 ? '+' : '') + n1(r.variance_ratio * 100) + '%' : '—'})</b></span>
+          <span>Stock ${Math.abs(r.correction_base) > 0.001
+            ? `<b>${r.correction_base > 0 ? 'credited ' : 'reduced by '}${n0(Math.abs(r.correction_base))} ${esc2(s.base_unit)}</b>`
+            : '<b>unchanged — the estimate was right</b>'}</span>
+        </div></div>`;
+    }
+    return `<div class="rec-row" data-stream="${esc2(s.item_key)}">
+      <div class="rh"><b>${esc2(s.label)}</b>
+        <span class="m">${s.heads} cover${s.heads === 1 ? '' : 's'} ·
+          ${esc2(s.ingredient_name)} ·
+          already deducted <b>${n0(s.theoretical_base)} ${esc2(s.base_unit)}</b>
+          at ${n1(s.lambda_used)} ${esc2(s.base_unit)} a head</span></div>
+      <div class="rec-in">
+        <div><label>Weighed out (${esc2(s.base_unit)})</label>
+          <input class="field" type="number" inputmode="decimal" min="0" step="1" data-f="open"></div>
+        <div><label>Topped up (${esc2(s.base_unit)})</label>
+          <input class="field" type="number" inputmode="decimal" min="0" step="1" data-f="add" value="0"></div>
+        <div><label>Left over (${esc2(s.base_unit)})</label>
+          <input class="field" type="number" inputmode="decimal" min="0" step="1" data-f="close"></div>
+      </div>
+      <div class="rec-calc" data-calc>Enter what went out and what came back — the difference is
+        what was actually eaten.</div>
+      <div class="rec-f"><button class="btn" data-submit="${esc2(s.item_key)}" disabled>Submit ${esc2(s.label)}</button></div>
+    </div>`;
+  }).join('') : `<div class="rec-row"><div class="rec-calc">No unlimited covers were served on
+      ${esc2(date)}, so there is nothing to reconcile. Pick another date.</div></div>`;
+
+  document.getElementById('recSheet').innerHTML = `
+    <h2>End-of-service reconciliation</h2>
+    <p class="sub">The till deducted an estimate when each unlimited order was punched.
+      Weigh what actually went out and what came back, and only the difference is corrected.
+      Anything more than ${tolPct}% away from the estimate goes to the manager to confirm.</p>
+    <div class="rec-in" style="grid-template-columns:1fr auto;margin-bottom:16px">
+      <div><label>Service date</label>
+        <input class="field" id="recDate" type="date" value="${esc2(date)}" style="text-align:left"></div>
+      <div><label>&nbsp;</label><button class="btn" id="recLoad" style="height:44px;width:auto;padding:0 18px">Load</button></div>
+    </div>
+    ${body}
+    <div id="recErr"></div>
+    <div class="rec-f"><button class="btn s" id="recClose">Close</button></div>`;
+
+  document.getElementById('recClose').onclick = closeRec;
+  document.getElementById('recLoad').onclick = () => openRec(document.getElementById('recDate').value);
+  document.querySelectorAll('#recSheet [data-stream]').forEach(wireRecRow);
+}
+
+function wireRecRow(row) {
+  const key = row.dataset.stream;
+  const s = REC.data.streams.find(x => x.item_key === key);
+  const get = f => parseFloat(row.querySelector(`[data-f="${f}"]`).value);
+  const calc = row.querySelector('[data-calc]');
+  const btn = row.querySelector('[data-submit]');
+  const tolPct = (REC.data.tolerance_ratio * 100).toFixed(0);
+
+  function update() {
+    const o = get('open'), a = get('add') || 0, c = get('close');
+    if (isNaN(o) || isNaN(c)) {
+      btn.disabled = true; calc.className = 'rec-calc';
+      calc.textContent = 'Enter what went out and what came back — the difference is what was actually eaten.';
+      return;
+    }
+    if (c > o + a) {
+      btn.disabled = true; calc.className = 'rec-calc bad';
+      calc.textContent = 'The leftover is more than what went out. Check both readings.';
+      return;
+    }
+    const actual = o + a - c;
+    const variance = actual - s.theoretical_base;
+    const ratio = s.theoretical_base > 0 ? variance / s.theoretical_base : 0;
+    const within = Math.abs(ratio) <= REC.data.tolerance_ratio;
+    btn.disabled = false;
+    calc.className = 'rec-calc ' + (within ? 'ok' : 'warn');
+    calc.innerHTML = `Actually used <b>${n0(actual)} ${esc2(s.base_unit)}</b>
+      — that is <b>${n1(actual / s.heads)} ${esc2(s.base_unit)} a head</b> across ${s.heads} cover${s.heads === 1 ? '' : 's'}.<br>
+      Expected ${n0(s.theoretical_base)} ${esc2(s.base_unit)}, so the variance is
+      <b>${variance > 0 ? '+' : ''}${n0(variance)} ${esc2(s.base_unit)}
+      (${ratio > 0 ? '+' : ''}${n1(ratio * 100)}%)</b> —
+      ${within ? `inside the ${tolPct}% tolerance, so this signs off on its own.`
+               : `outside the ${tolPct}% tolerance, so the manager will be asked to confirm it.`}<br>
+      Stock will be ${Math.abs(variance) < 0.5 ? '<b>left as it is</b>'
+        : variance > 0 ? `<b>reduced by a further ${n0(Math.abs(variance))} ${esc2(s.base_unit)}</b>`
+                       : `<b>credited back ${n0(Math.abs(variance))} ${esc2(s.base_unit)}</b>`}.`;
+  }
+
+  row.querySelectorAll('input[data-f]').forEach(i => i.addEventListener('input', update));
+
+  btn.onclick = async () => {
+    btn.disabled = true;
+    document.getElementById('recErr').textContent = '';
+    try {
+      const r = await api('/unli/reconciliation', {
+        method: 'POST',
+        body: JSON.stringify({
+          service_date: REC.date, item_key: key,
+          opening_base: get('open'), added_base: get('add') || 0, closing_base: get('close'),
+        }),
+      });
+      // Reload rather than patch the row in place: the server's figures are
+      // the record, and re-reading them is how this screen proves it.
+      await openRec(REC.date);
+      const banner = document.getElementById('recErr');
+      if (banner) banner.textContent = r.inventory_corrected
+        ? `${r.label} reconciled. Stock ${r.correction_base < 0 ? 'reduced by' : 'credited'} ${Math.abs(r.correction_base).toFixed(0)} ${r.base_unit}.`
+        : `${r.label} reconciled. The estimate matched — no correction needed.`;
+      if (banner) banner.style.color = 'var(--ok)';
+    } catch (e) {
+      document.getElementById('recErr').textContent = e.message;
+      document.getElementById('recErr').style.color = '#D92D20';
+      btn.disabled = false;
+    }
+  };
+  update();
+}
+
+document.getElementById('recBtn').onclick = () => openRec();
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && REC) closeRec(); });
+
+document.addEventListener('click', async e => {
+  const b = e.target.closest('[data-adv]');
+  if (b) {
+    const [id, path] = b.dataset.adv.split(':');
+    b.disabled = true;
+    try { await api(`/kds/orders/${id}/${path}`, { method: 'POST' }); await refresh(); }
+    catch (err) { alert(err.message); b.disabled = false; }
+    return;
+  }
+  const sr = e.target.closest('[data-serve-refill]');
+  if (sr) {
+    sr.disabled = true;
+    try { await api(`/unli/refills/${sr.dataset.serveRefill}/serve`, { method: 'POST' }); await refresh(); }
+    catch (err) { alert(err.message); sr.disabled = false; }
+    return;
+  }
+  const vr = e.target.closest('[data-void-refill]');
+  if (vr) {
+    if (!confirm('Void this refill? If it has already been made, the sauce is written off as wastage and any special-flavor charge is reversed.')) return;
+    vr.disabled = true;
+    try {
+      await api(`/unli/refills/${vr.dataset.voidRefill}/void`, {
+        method: 'POST', body: JSON.stringify({ reason: 'voided from kitchen display' }),
+      });
+      await refresh();
+    } catch (err) { alert(err.message); vr.disabled = false; }
+    return;
+  }
+  const v = e.target.closest('[data-void]');
+  if (v) {
+    if (!confirm('Void this order? The customer will need to re-order if this was a mistake.')) return;
+    v.disabled = true;
+    try {
+      await api(`/pos/orders/${v.dataset.void}/void`, {
+        method: 'POST', body: JSON.stringify({ reason: 'voided from kitchen display' }),
+      });
+      await refresh();
+    } catch (err) { alert(err.message); v.disabled = false; }
+  }
+});
+
+if (TOKEN && ROLE && NAME && ALLOWED_ROLES.includes(ROLE)) showApp();
+else if (TOKEN) doLogout();
+// Arriving from the landing page's unified sign-in already ran the brand
+// intro once there; only a cold direct visit to /kds plays it here too.
+else if (new URLSearchParams(location.search).get('intro') !== 'done') WingsIntro.play();
+</script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# Deliberately short, still.
+#
+# Not here, and why:
+#   alembic      — migrations are numbered .sql files run by wt/db.py. One
+#                  deployment, one branch; Alembic's machinery earns its keep
+#                  at multi-environment scale, not here.
+#   python-jose  — wt/auth.py signs HS256 with hmac + hashlib from the stdlib.
+#   passlib      — PBKDF2 via hashlib.pbkdf2_hmac.
+#   sqlalchemy   — the write paths need exact control over emitted SQL and
+#                  rowcounts; an ORM unit-of-work would reorder them.
+#   pytest       — tests use stdlib unittest so they run on a bare install.
+fastapi>=0.111,<0.116
+uvicorn[standard]>=0.29
+pydantic>=2.9,<3
+
+# Phase 3 — forecasting, anomaly detection, product-combination analysis.
+# Named explicitly by the owner (Prophet, scikit-learn's IsolationForest,
+# mlxtend's FP-growth). wt/forecasting.py, wt/anomaly.py, and
+# wt/associations.py always still report "insufficient data" honestly below
+# their minimum sample thresholds rather than fitting noise on a thin
+# ledger — the model choice changed, that principle didn't.
+#
+# prophet needs a working CmdStan build (a compiled C++ sampler) to actually
+# run, not just a pip install — on Windows that means a real toolchain
+# (RTools64/mingw-w64, NOT an old 32-bit MinGW that may already be on PATH).
+# See wt/forecasting.py's _PROPHET_AVAILABLE fallback: if that build isn't
+# present, per-item demand forecasts quietly drop to the trailing-average
+# method and say so, rather than the console hard-failing.
+prophet>=1.1,<2
+scikit-learn>=1.4,<2
+mlxtend>=0.23,<1
+pandas>=2.0,<3

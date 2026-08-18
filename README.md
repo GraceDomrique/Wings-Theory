@@ -1,0 +1,423 @@
+# Wings Theory — Inventory & POS backend
+
+Phase 2: the data model and the deduction path. Forecasting, anomaly detection
+and association rules land in Phase 3, on top of the ledger this phase produces.
+
+```bash
+cd backend
+pip install -r requirements.txt
+
+python -m wt.raw_import            # normalise the owner's raw spreadsheet exports
+python -m wt.seed --fresh          # build the DB from the tidy CSVs
+python -m tests.run_tests          # 364 tests
+python -m tests.audit_data         # source-vs-database completeness diff
+python -m tests.demo_flow          # end-to-end walk through the HTTP layer
+                                   # (writes real orders into the DB it finds)
+uvicorn wt.api:app --host 0.0.0.0 --port 8000
+```
+
+Default logins are `owner` / `manager` / `cashier1` / `kitchen1`, password
+`wingstheory`. Change `WT_SECRET` before this leaves a developer machine.
+
+---
+
+## What is here
+
+```
+backend/
+  migrations/          numbered .sql, applied in order by wt/db.py
+  wt/
+    db.py              connections, WAL, BEGIN IMMEDIATE, migration runner
+    units.py           purchase unit -> base unit; quantity parsing
+    mapping.py         the curated alias map — the human decision, written down
+    gapfill.py         piece-weight fixes, sub-recipe construction, queue resolution
+    raw_import.py      normalises the owner's raw section-header CSV exports
+    resolver.py        recursive sub-recipe expansion, cycle detection
+    reservation.py     two-phase reserve/commit/release/void
+    availability       (view v_menu_item_availability) the POS gate
+    seed.py            imports inventory_tidy.csv + product_item_breakdown_tidy.csv
+    unli.py            three-stage unlimited reconciliation + λ recalibration
+    refills.py         unlimited sessions, refill events, flavours, add-on charges
+    reference.py       configuration from the Inventory & Recipe Reference document
+    anomaly.py         IsolationForest — reconciled consumption, and stock loss
+    auth.py            HS256 JWT + per-capability role gate
+    api.py             HTTP surface, split /pos /kds /console /unli
+    export_ui.py        dumps the seeded DB as JSON for the offline console
+  tests/
+    run_tests.py       stdlib unittest, includes a threaded race — 364 tests
+    audit_data.py       source CSVs vs. database, name-by-name diff
+    demo_flow.py         end-to-end walk through the HTTP layer
+```
+
+## The five things this phase changed
+
+**1. Stock is held in base units.** `g`, `ml`, `pc`. `pack_size` is the only
+bridge from purchase units, and `yield_factor` covers trim, drain and the
+raw→cooked weight gain. Rice is the case that matters: recipes are written in
+cooked grams, stock is bought raw, so `Rice.yield_factor = 2.5` and base units
+for rice mean *cooked* grams throughout.
+
+**2. Recipe lines are foreign keys.** `recipe_line.ingredient_id` is `NOT NULL`
+with an FK. There is no code path that writes an unmapped line because the
+database refuses one. Lines that could not be resolved during import live in
+`unmapped_recipe_line` — a queue, not production data.
+
+**3. Sub-recipes are a type.** The fourteen flavour sauces and Ranch Dip are
+`kind='sub_recipe'` with `sub_recipe_mode='exploded'`: they hold no stock and
+resolve recursively to raw goods at deduction time. Switching one to
+`'stocked'` once the kitchen logs prep batches is a data change, not a code
+change — expansion stops there automatically.
+
+**4. Two-phase reservation.**
+
+```
+punch → RESERVE (soft, no ledger) → kitchen start → COMMIT (ledger) → cook
+```
+
+The reservation is a single guarded `UPDATE`:
+
+```sql
+UPDATE ingredient SET reserved_base = reserved_base + :qty
+ WHERE id = :id AND (on_hand_base - reserved_base) >= :qty
+```
+
+Test and write are one statement, so no interleaving gets two callers past the
+guard. `rowcount == 0` is the rejection. This is deliberately not a
+SELECT-then-UPDATE in Python — that is the exact race the phase exists to close,
+and it is invisible in single-threaded testing. `TestConcurrency` runs ten
+threads at one portion and asserts exactly one wins.
+
+Voids split by state. Before commit: holds are released and **nothing** is
+written, because no stock moved — a phantom deduction here would poison the
+dataset Phase 3 trains on. After commit: a `void_credit` reverses the sale and a
+`wastage` entry immediately books the same quantity out again. Net stock is
+unchanged, because the food really was cooked, but the trail now says why.
+`restock=True` skips the wastage leg for a commit fired in error.
+
+**5. FEFO everywhere.** Batches are issued by `expires_at`, never `received_at`.
+`ix_fefo_batch_pick` encodes the ordering. A test asserts no `fifo` string
+survives anywhere in the schema.
+
+Every path that moves `on_hand_base` moves the batches with it, in the same
+transaction — `reservation.deplete_fefo` / `restore_fefo`, called from commit,
+both void legs, wastage, operational use, physical counts and the unli
+reconciliation correction. The invariant is
+
+```sql
+SUM(fefo_batch.qty_base WHERE state='open') == ingredient.on_hand_base
+```
+
+`TestFEFODepletion` asserts it after every movement type and after a long mixed
+sequence. Until that class existed, only `receive_stock` touched a batch at all:
+quantities were opened and never closed, so the expiry monitor reported stock
+that had been eaten weeks earlier and the batch total drifted permanently above
+the real balance.
+
+## Placeholder discipline
+
+Every physical constant carries a status: `verified`, `needs_verification`, or
+`unset`. Seeded values are all `needs_verification` — arithmetic works, but
+nothing pretends to be measured. `unset` blocks deduction outright.
+`v_needs_verification` unions them into one queue, and `/console/ingredients/
+{pk}/verify` is the only path from placeholder to verified; it cannot happen as
+a side effect of an ordinary edit.
+
+## What the seed actually produces
+
+Running against the 2026-08-11 spreadsheet revision, after migration 0012:
+
+| | |
+|---|---|
+| Ingredients | 111 (94 raw + 17 house sub-recipes) |
+| Recipes / lines | 45 / 269 |
+| Unmapped lines | **0** |
+| Menu items sellable | **28 of 29** |
+| Constants needing verification | **630** (`/console/queues/verification`) |
+
+The 08-11 correction resolved most of the earlier gap directly: 14 of the 18
+ingredients that previously had no stock record at all — chicken breast/thigh,
+pork chop, fresh mushrooms, olive oil, truffle oil, onion, cucumber, and more —
+are now real inventory rows with owner-counted quantities (see "Additional
+Ingredients (Recipe-Required)" in the inventory sheet), imported normally
+rather than gap-filled at zero. **Panko breadcrumbs is the one ingredient still
+genuinely unstocked**, which is why Pork Tonkatsu is the sole blocked menu
+item — `out of stock: Panko Breadcrumbs`, not an unmapped-ingredient error. The
+unmapped queue is now empty: the `Water` lines were dismissed as not inventory
+and migration 0012 supplied the last missing SKU (White Vinegar).
+
+**White Vinegar opens at zero stock** — nobody has counted any, and seeding a
+quantity would put an invented number into the balance the ledger reconciles
+against. It is required by two flavour ratios, so **Mango Habanero and Panda
+Express Orange Chicken cannot currently be served**, and `/unli/flavors` does
+not yet say so (see "Known gaps").
+
+### Bugs the spreadsheet update surfaced
+
+Reconciling against real data found three real deduction bugs, all fixed and
+covered by regression tests:
+
+- **Thousands-separator commas parsed as decimals.** `"1,000 g (12 pcs)"` — the
+  Wing Rack's wings quantity — parsed as `1.0 g` instead of `1000 g`, a 1000x
+  under-deduction. `units.parse_quantity()` now treats a comma as a thousands
+  separator only when it groups digits in proper triples, never as a decimal
+  point.
+- **Piece-counted ingredients silently deducted at the wrong scale.**
+  `"Eggs, 2 pcs (100 g)"` needs the target ingredient's own `pack_size`
+  (grams per piece) to convert — the generic `to_base()` correctly refuses to
+  guess this, so every recipe line using eggs was falling through to the
+  unmapped queue. `units.recipe_line_to_base()` now falls back to
+  `purchase_to_base()` using the ingredient's recorded pack size specifically
+  for this case, never for a genuine cross-family (g↔ml) mismatch.
+- **A resolved placeholder line with no number in its source text silently
+  deducted zero.** Wing Rack's flavour lines read "per the selected flavor's
+  ratio (see Unlimited Wings block)" — prose, no digits — so `parse_quantity`
+  returned `qty=0`, which is indistinguishable from a legitimately-optional
+  zero-quantity ingredient. Every Wing Rack sale deducted wings and nothing
+  else. `mapping.FLAVOUR_PLACEHOLDER_DEFAULT_QTY` supplies a documented
+  default (60 g, reconciled from the flavour-sauce-per-kg-wings ratios) for
+  the specific lines that need it.
+
+### Flavour sauce reconciliation
+
+The 08-11 sheet expresses the 14 wing flavours and 3 house preparations
+(Cheese Sauce, Tartar Sauce, Simple Syrup) as ratios and percentages — "~120 g
+per kg wings", "60% of total sub-recipe weight" — not literal ingredient rows.
+`raw_import.py` skips those blocks entirely; `gapfill.SUB_RECIPES` reconstructs
+each one by scaling the original fully-itemised recipe (from the manuscript)
+to the new stated total, excluding any ingredient the sheet adds back as a
+separate whole-fruit garnish ("+ zest/juice of 1 Lemon") before scaling, so it
+isn't counted twice. Every resulting quantity is `needs_verification` — the
+sheet gives a total, not the breakdown, so the itemisation is a documented
+estimate to be confirmed against the kitchen, not the owner's own figure.
+
+Clearing the queue is data entry with the owner. It is not a coding task, and
+guessing any of it would put a wrong number into the ledger permanently.
+
+## The unlimited-item loop
+
+An unlimited ticket has no bill of materials: how much a cover eats is not
+knowable when the order is punched. So it runs in three stages.
+
+```
+Stage 1   D  = H × λ                       provisional, at order time
+Stage 2   Aᵤ = opening + added − closing    actual, from the kitchen's scale
+Stage 3   variance = Aᵤ − D                compare → tolerance → correct → recalibrate
+```
+
+**Stage 1** was already live before this phase: `resolver.order_requirements`
+sizes an unli line from head count × the current *rolling* coefficient, and the
+ordinary two-phase reserve/commit path books it as a normal `sale_commit`.
+
+**Stage 2** is `migrations/0010` plus `wt/unli.py`. `unli_reconciliation` had
+existed since 0001 with the result columns and nothing saying where `actual`
+came from — no measurement in the schema at all, and no code that ever wrote a
+row. The three added columns are the two weights and any mid-service top-up, in
+the stream's own base unit. A container tare needs no column: it appears in both
+readings and cancels.
+
+**Stage 3** posts **the difference only**. The provisional quantity already left
+the ledger at commit, so the correction is `theoretical − actual`, never
+`actual`, and `UNIQUE (service_date, unli_item_id)` makes a second submission a
+database error rather than a second deduction. `theoretical` is recomputed per
+order against the coefficient that was *in force when that order was punched*
+(`effective_from <= created_at`), so recalibrating on Tuesday cannot restate what
+Monday's deduction was.
+
+A day inside the configured tolerance (`app_setting.unli_variance_tolerance`,
+10% by default) signs itself off. Anything further out is held `pending_review`:
+the stock correction is posted either way, but only a validated day may move a
+coefficient. Recalibration pools the validated window — `λ = Σ actual ÷ Σ heads`,
+a pooled ratio rather than a mean of daily rates, so a 4-cover Tuesday does not
+outvote a 60-cover Saturday — and writes a *new* `unli_coefficient` row rather
+than overwriting the old one.
+
+The kitchen does this from `/kds` (End-of-service reconciliation); managers
+review, recalibrate and read the history from the console's Unlimited
+Reconciliation page. Both are gated on `unli.reconcile` / `unli.approve` — a
+narrow pair of capabilities specifically so the kitchen never needs
+`inventory.write`.
+
+## Sessions and refills
+
+An unlimited ticket is paid once and served many times. The order records the
+purchase; the rounds are recorded separately:
+
+```
+customer_order (immutable, financial)
+  └── unli_session          one per unlimited order — the continuing context
+        └── unli_refill     one append-only row per round served
+              └── unli_refill_line   what that round held, then deducted
+        └── order_charge    a premium-flavour add-on, never folded into
+                            customer_order.total
+```
+
+**The paid order is physically unwritable.** Migration 0011 puts a trigger on
+`subtotal`, `service_charge`, `total`, `cash_received` and `change_due` that
+aborts any update once `total` has been set. `create_order`'s own
+insert-then-fill-in still works (`OLD.total IS NULL` at that moment) and status
+and timestamps are untouched, but nothing can restate a settled sale. What the
+table owes now is `order.total + SUM(order_charge.amount)`, computed when read
+and returned as a *separate* field from the original, so no client can mistake
+one for the other.
+
+**Pieces are `3 × head count`**, read off the session — never off the request.
+**Sauce is `40 g × head count`**, not a per-piece figure: the reference document
+portions 3 pieces at 35-40 g of finished sauce (Sulit Deal 99), and a round is
+that portion per head. Both are settings — `unli_pieces_per_head` and
+`unli_sauce_g_per_head` — not literals.
+
+**A refill deducts the selected flavour's sauce, and nothing else.** It does
+*not* deduct wings: the wings for the whole session already left the ledger at
+commit, sized `H × λ`, and that is the provisional figure the reconciliation
+pipeline exists to true up. Deducting them again per round would be exactly the
+double deduction `wt/unli.py` was written to prevent.
+
+Sauce is the opposite case. It was never deducted for an unlimited order at
+all — an unli line has no recipe and the four λ streams are wings, rice, fries
+and drinks, so fourteen flavour sub-recipes sat in the database with nothing
+consuming them outside the à-la-carte platters. Quantity is
+`heads × unli_sauce_g_per_head`, resolved through `expand_recipe` against the
+flavour's own 100 g master ratio: two heads is 80 g of sauce, which is 0.8 of a
+batch, and every ingredient in the ratio scales by that one number.
+
+**No second deduction engine.** Quantities come from `expand_recipe`, the hold
+is `reservation._try_hold`, the ledger write is `reservation._ledger`, the batch
+movement is `reservation.deplete_fefo`. This layer supplies policy; every
+mechanism is the existing one.
+
+**Two phases, for the reason orders have two.** Submitting holds stock and puts
+the round on the kitchen display; serving commits. That is what makes "wrong
+flavour, caught before it was cooked" a release with no ledger impact and
+"caught after" a compensating credit/wastage pair — the same split
+`release_order` and `void_after_commit` already make. A correction voids and
+records a replacement, both in one transaction, and the replacement takes a new
+round number: round three going wrong does not make round four the third thing
+that came out of the kitchen.
+
+**Flavour prices are never in client code.** `unli_flavor` carries the
+included/special classification and resolves the price as
+`COALESCE(menu_item.price, addon_price, 0)`, preferring a linked menu item so a
+flavour also sold à la carte is priced in one place. The price charged is
+snapshotted onto the refill, so re-pricing next week cannot restate what a
+customer was charged last night.
+
+**The four premium prices are system recommendations, not owner-supplied
+figures.** Migration 0012 / `reference.py` classify Snow Cheese (₱30), Cheese
+(₱30), Korean Yangnyeum (₱20) and Panda Express Orange Chicken (₱15) as
+`special`, taking the Regular/Premium split from the reference document — which
+states the classification but **no amount anywhere**. The numbers are a starting
+point for the owner and are editable from the console's Flavors card.
+
+They are, however, **stored exactly like a confirmed price**: `unli_flavor` has
+no provenance column, and `/unli/flavors` returns none, so nothing in the
+schema or the API distinguishes these four from a price the owner actually
+agreed. Until the owner confirms them, the POS is charging a real customer a
+number this system invented. See "Known gaps".
+
+Refill totals appear on the reconciliation screen as *operational context* —
+rounds, pieces, sauce, flavour mix — and are deliberately not folded into
+`theoretical_base`, which has to keep reproducing exactly what the ledger did at
+checkout.
+
+## Anomaly detection
+
+Two passes over two datasets, reported separately:
+
+- **`detect_consumption_anomalies`** — the specified model. IsolationForest
+  (200 estimators, `random_state=42`) over `v_unli_daily_consumption`: one
+  seven-feature vector per reconciled service day per stream, built from head
+  counts that came off real orders and consumption that came off a scale. Below
+  12 reconciled days it does not train, and only a rule fires (a variance more
+  than 2× the shop's own tolerance). Flags are capped at 25% of the dataset —
+  `contamination='auto'` returns −1 for an entire history when every day is
+  consistent, which is the opposite of an anomaly.
+- **`detect_anomalies`** — the older stock-loss pass over wastage / spoilage /
+  count_adjustment. Kept unchanged: a dropped tray of garlic has no head count
+  and no unlimited stream, so the consumption pass structurally cannot see it.
+
+Both are descriptive. Nothing downstream acts on a flag.
+
+## Reorder point vs. days of supply
+
+Both are in the system, and they are not two alerts for one condition:
+
+```
+days_of_supply = available ÷ avg_daily_consumption
+ROP            = avg_daily_consumption × lead_time_days
+S < ROP       ⟺  days_of_supply < lead_time_days
+```
+
+A *derived* ROP fires at exactly the moment the existing `critical` tier already
+does, so it is offered as `suggested_reorder_point_base` — advice, alerting on
+nothing. A *configured* `reorder_point_base` is a floor the owner sets from
+knowledge the ledger does not have (a supplier minimum, a Sunday with no
+deliveries), which is genuinely new information, so `below_reorder_point` is
+reported only for those and raises the risk tier to at least `warning` — it can
+never lower one. An unset reorder point is never treated as a silent zero.
+
+## Known gaps
+
+Open items from the 2026-08-16 production-readiness audit. Tests passing proves
+code behaviour; it does not make any of the numbers below true.
+
+**Nothing in the system is a verified business figure yet.** Every ingredient is
+`price_status='estimated'` or `'unset'` and `verification_status=
+'pending_supplier_confirmation'`; all 65 flavour-ratio lines, every pack size
+and every yield factor are `needs_verification`. That is the correct state — it
+is honest — but it means no cost, margin or valuation this system reports is
+defensible until the owner and the kitchen work the 630-item queue.
+
+Specifically **still unverified, and needing a human**:
+
+| value | where it lives | status |
+|---|---|---|
+| the 14 flavour master ratios | `recipe_line.qty_status` | all 65 lines `needs_verification` |
+| unlimited sauce, 40 g/head | `app_setting.unli_sauce_g_per_head` | **no status column exists** |
+| pieces per head, 3 | `app_setting.unli_pieces_per_head` | owner's stated rule, but stored identically to the estimate above |
+| rice raw→cooked yield, 2.5 | `ingredient.yield_factor_status` | `needs_verification` |
+| ingredient prices | `ingredient.price_status` | 94 `estimated`, 17 `unset`, 0 verified |
+| pack sizes | `ingredient.pack_size_status` | 94 `needs_verification`, 17 `unset` |
+| the 4 premium flavour prices | `unli_flavor.addon_price` | **no status column exists** |
+
+Two of those rows have no provenance column at all, so a manager cannot tell an
+estimate from a confirmed figure:
+
+- **`app_setting` has no status column.** `unli_pieces_per_head=3` is the shop's
+  own business rule; `unli_sauce_g_per_head=40` is read off the reference
+  document and has never been weighed. They are stored identically.
+- **`unli_flavor` has no price provenance.** The four premium prices are system
+  recommendations (see "Sessions and refills") and look exactly like owner-set
+  ones. This is the one that costs a customer money.
+
+**`/unli/flavors` has no stock gate.** `/pos/menu` carries `sellable`,
+`block_reason` and `limiting_ingredient`; the flavour list carries only
+`is_deductable`, which asks whether a recipe exists, never whether the
+ingredients are on hand. With White Vinegar at zero, Mango Habanero and Panda
+Express Orange Chicken are offered to the customer and fail at submit with a
+409. The fix is to give the flavour list the same availability projection the
+menu already has.
+
+**Is ₱399 per head or per table?** `order_requirements` sizes wings as
+`λ × head_count × line_qty`, and the cart defaults a single tap to one line at
+two heads — so one tap charges ₱399 and reserves two covers of wings. The
+ambiguous punch (`qty > 1` on an unlimited line) is now refused outright, and
+the quantity stepper is gone from that line, so the deduction can no longer be
+silently doubled. But whether ₱399 covers one cover or two is a pricing
+question only the owner can answer, and the answer changes what the cart should
+default to.
+
+**Voided-order sessions predating 2026-08-16.** Voiding now cancels the session,
+and a voided order refuses further rounds. Any session already stranded active
+on a void order needs closing by hand.
+
+## Notes for whoever picks this up
+
+- SQLite with WAL, one branch, ~5 clients. The guarded `UPDATE` is race-safe on
+  PostgreSQL too, so moving is a connection-string change. `order_requirements`
+  returns ingredients sorted by id specifically so lock acquisition order is
+  deterministic when that day comes.
+- `write_tx` refuses to nest. A partial rollback inside the reservation path
+  would leave stock double-counted, so it fails loudly instead.
+- `stock_ledger` has triggers blocking `UPDATE` and `DELETE`. It is the training
+  set for everything downstream; it should not be editable by anyone.
+
