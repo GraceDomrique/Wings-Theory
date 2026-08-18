@@ -1008,13 +1008,39 @@ async function openIngredientDrawer(pk) {
   DRAWER_ING = d;
   renderIngredientDrawer(d);
 }
+/* Section B's per-batch card. Deliberately not expiryCard() (the Expiry
+   Monitor page's own renderer) — that one repeats the ingredient's name on
+   every card and needs a window/color chosen for a cross-ingredient list,
+   neither of which fits a drawer already scoped to one ingredient showing
+   every batch it has, not just the ones inside some window. Same .batch/
+   .batch-h/.batch-m visual language, a smaller renderer built for this
+   context. "Use this one first" on the top card is FEFO made visible —
+   deplete_fefo draws these down in exactly this order, not an approximation
+   of it (see the query in api.py's ingredient_detail). */
+function drawerBatchCard(b, idx, baseUnit, avgDaily) {
+  const notTracked = b.tracking === 'not_tracked';
+  const estimated = b.tracking === 'estimated_shelf_life';
+  const color = notTracked ? 'var(--text-3)' : b.expired ? 'var(--bad-fill)'
+    : b.days_to_expiry <= 7 ? 'var(--warn-fill)' : 'var(--ok-fill)';
+  const usesUpIn = (!notTracked && avgDaily) ? b.qty_base / avgDaily : null;
+  return `<div class="batch" style="border-left-color:${color}">
+    <div class="batch-h"><b>${idx === 0 ? 'Use this one first' : 'Batch #' + (idx + 1)}</b>
+      ${estimated ? `<span class="chip fore no-dot" title="Estimated from received date + configured shelf life — this ingredient has no manufacturer expiry date">Estimated</span>` : ''}
+      <span class="lot">${esc(b.lot_no || 'lot #' + b.id)}</span>
+      <span class="d" style="color:${color}">${notTracked ? 'no date on file' : b.expired ? 'expired' : b.days_to_expiry + ' d'}</span></div>
+    <div class="batch-m">
+      <span>${num(b.qty_base, 2)} ${esc(baseUnit)}</span>
+      <span>received ${esc((b.received_at || '').slice(0, 10))}</span>
+      <span>${notTracked ? 'expiry not recorded' : estimated ? 'est. storage life to ' + esc(b.expires_at) : 'expires ' + esc(b.expires_at)}</span>
+      ${usesUpIn != null ? `<span>uses up in ~${num(usesUpIn, 0)} d</span>` : ''}
+    </div></div>`;
+}
+
 function renderIngredientDrawer(d) {
   const i = d.ingredient, dep = d.depletion;
-  const st = !i.is_deductable ? { c: 'amber', l: i.block_reason || 'No pack size' }
-    : dep ? { out: { c: 'bad', l: 'Out of stock' }, critical: { c: 'bad', l: 'Critical' },
-              warning: { c: 'warn', l: 'Running low' }, ok: { c: 'ok', l: 'Healthy' },
-              idle: { c: 'mute', l: 'Not selling' }, no_data: { c: 'mute', l: 'No sales yet' } }[dep.risk]
-      : { c: 'mute', l: '—' };
+  const statusChipHtml = !i.is_deductable
+    ? `<span class="chip amber">${esc(i.block_reason || 'No pack size')}</span>`
+    : dep ? riskChip(dep.risk) : `<span class="chip mute">—</span>`;
   const inPurchase = i.pack_size ? i.on_hand_base / (i.pack_size * (i.yield_factor || 1)) : null;
   const vchip = s => s === 'verified'
     ? `<span class="chip ok no-dot">verified</span>`
@@ -1026,15 +1052,19 @@ function renderIngredientDrawer(d) {
     : i.expiry_mode === 'none' ? `Not tracked unless a date is recorded`
     : `Fixed expiry date`;
 
+  const batches = d.batches || [];
+
   openDrawer(`
     <div class="dr-h">
-      <h2>${esc(i.name)}</h2><span class="chip ${st.c}">${esc(st.l)}</span>${tchip ? `<span class="chip ${tchip[0]} no-dot">${esc(tchip[1])}</span>` : ''}
+      <h2>${esc(i.name)}</h2>${statusChipHtml}${tchip ? `<span class="chip ${tchip[0]} no-dot">${esc(tchip[1])}</span>` : ''}
       <div class="r">
         <button class="icon-btn" data-act="drawer-edit" data-id="${i.id}" title="Edit">${ic('set')}</button>
         <button class="icon-btn" data-act="drawer-close" title="Close">${ic('x')}</button>
       </div>
     </div>
     <div class="dr-b">
+
+      <!-- A — STOCK -->
       <div class="grid g2">
         <div class="kpi"><div class="l">Available</div>
           <div class="v">${esc(i.on_hand_display)}</div>
@@ -1043,29 +1073,16 @@ function renderIngredientDrawer(d) {
           <div class="v">${dep && dep.days_remaining != null ? num(dep.days_remaining, 1) : '—'}<small>days</small></div>
           <div class="f">${dep && dep.avg_daily_consumption ? 'uses ' + num(dep.avg_daily_consumption, 2) + ' ' + esc(i.base_unit) + '/day' : 'no recent usage'}</div></div>
       </div>
-
       <div>
-        <div class="dr-t">Unit conversion</div>
+        <div class="dr-t">Stock</div>
         <dl class="dl">
-          <dt>Deducted in</dt><dd>${esc(i.base_unit)}</dd>
-          <dt>Bought as</dt><dd>${esc(i.purchase_unit)}</dd>
-          <dt>Pack size</dt><dd>${i.pack_size != null ? num(i.pack_size, 2) + ' ' + esc(i.base_unit) : '<span class="sub">not set</span>'} ${vchip(i.pack_size_status)}</dd>
-          <dt>Usable after prep</dt><dd>${num(i.yield_factor, 2)} ${vchip(i.yield_factor_status)}</dd>
-          <dt>Cost</dt><dd>${i.unit_cost != null ? money(i.unit_cost) + ' / ' + esc(i.purchase_unit) : '<span class="sub">not set</span>'} ${vchip(i.unit_cost_status)}</dd>
           <dt>On hand</dt><dd>${esc(i.on_hand_display)}</dd>
-          <dt>In purchase units</dt><dd>${inPurchase != null ? num(inPurchase, 2) + ' ' + esc(i.purchase_unit) : '—'}</dd>
-          <dt>Delivery time</dt><dd>${i.lead_time_days} day${i.lead_time_days === 1 ? '' : 's'}</dd>
-        </dl>
-      </div>
-
-      <div>
-        <div class="dr-t">Stocking</div>
-        <dl class="dl">
-          <dt>Max stock</dt><dd>${i.max_stock_base != null ? num(i.max_stock_base, 2) + ' ' + esc(i.base_unit) : '<span class="sub">no ceiling set</span>'}</dd>
+          <dt>Reserved</dt><dd>${num(i.reserved_base, 2)} ${esc(i.base_unit)}</dd>
+          <dt>Available</dt><dd>${num(i.available_base, 2)} ${esc(i.base_unit)}</dd>
           <dt>Reorder point</dt><dd>${i.reorder_point_base != null ? num(i.reorder_point_base, 2) + ' ' + esc(i.base_unit) : '<span class="sub">not set</span>'}</dd>
-          <dt>Expiry tracking</dt><dd>${expiryLine}</dd>
-          <dt>Supplier</dt><dd>${i.supplier ? esc(i.supplier) : '<span class="sub">not set</span>'}</dd>
-          <dt>Supplier contact</dt><dd>${i.supplier_contact ? esc(i.supplier_contact) : '<span class="sub">not set</span>'}</dd>
+          <dt>Suggested reorder</dt><dd>${dep && dep.suggested_order_qty != null ? `<b>${dep.suggested_order_qty} ${esc(dep.suggested_order_unit)}${dep.suggested_order_qty === 1 ? '' : 's'}</b>` : '<span class="sub">nothing suggested right now</span>'}</dd>
+          <dt>Delivery time</dt><dd>${i.lead_time_days} day${i.lead_time_days === 1 ? '' : 's'}</dd>
+          <dt>Max stock</dt><dd>${i.max_stock_base != null ? num(i.max_stock_base, 2) + ' ' + esc(i.base_unit) : '<span class="sub">no ceiling set</span>'}</dd>
         </dl>
       </div>
 
@@ -1095,6 +1112,45 @@ function renderIngredientDrawer(d) {
         <div id="drErr" style="color:var(--bad-text);font-size:12.5px;display:none;margin-top:4px"></div>
       </div>
 
+      <!-- B — EXPIRY / FEFO -->
+      <div>
+        <div class="dr-t">Stock batches (${batches.length})</div>
+        <p class="sub" style="margin:0 0 10px">Stock with the earliest expiry is used first — this is the order it will actually be drawn down in.</p>
+        ${batches.length
+          ? `<div style="display:flex;flex-direction:column;gap:9px">${batches.map((b, idx) =>
+              drawerBatchCard(b, idx, i.base_unit, dep && dep.avg_daily_consumption)).join('')}</div>`
+          : `<p class="sub" style="margin:0">No open batches — nothing has been received for this ingredient yet.</p>`}
+      </div>
+
+      <!-- D/E — USAGE & OUTLOOK -->
+      <div>
+        <div class="dr-t">Usage &amp; outlook</div>
+        ${!i.is_deductable ? `<p class="sub" style="margin:0">This ingredient can't be deducted yet (${esc(i.block_reason || 'no pack size set')}), so usage can't be measured.</p>`
+        : `<p style="margin:0 0 10px;font-size:13px;line-height:1.55">
+            ${dep && dep.avg_daily_consumption
+              ? `Over the last 30 days, this used about <b>${num(dep.avg_daily_consumption, 2)} ${esc(i.base_unit)}/day</b> on average.${dep.days_remaining != null ? ` At that pace, the current stock covers about <b>${num(dep.days_remaining, 1)} more day${dep.days_remaining === 1 ? '' : 's'}</b>.` : ''}`
+              : `No consumption has been recorded for this ingredient in the last 30 days — there's nothing yet to project a runway from.`}
+          </p>
+          ${dep && dep.suggested_order_qty != null
+            ? note(`About ${dep.suggested_order_qty} ${dep.suggested_order_unit}${dep.suggested_order_qty === 1 ? '' : 's'} — enough to cover the ${i.lead_time_days}-day delivery time plus a few days' buffer.`, 'Suggested reorder', 'info')
+            : ''}`}
+      </div>
+
+      <div>
+        <div class="dr-t">Conversion &amp; cost</div>
+        <dl class="dl">
+          <dt>Deducted in</dt><dd>${esc(i.base_unit)}</dd>
+          <dt>Bought as</dt><dd>${esc(i.purchase_unit)}</dd>
+          <dt>Pack size</dt><dd>${i.pack_size != null ? num(i.pack_size, 2) + ' ' + esc(i.base_unit) : '<span class="sub">not set</span>'} ${vchip(i.pack_size_status)}</dd>
+          <dt>Usable after prep</dt><dd>${num(i.yield_factor, 2)} ${vchip(i.yield_factor_status)}</dd>
+          <dt>Cost</dt><dd>${i.unit_cost != null ? money(i.unit_cost) + ' / ' + esc(i.purchase_unit) : '<span class="sub">not set</span>'} ${vchip(i.unit_cost_status)}</dd>
+          <dt>In purchase units</dt><dd>${inPurchase != null ? num(inPurchase, 2) + ' ' + esc(i.purchase_unit) : '—'}</dd>
+          <dt>Expiry tracking</dt><dd>${expiryLine}</dd>
+          <dt>Supplier</dt><dd>${i.supplier ? esc(i.supplier) : '<span class="sub">not set</span>'}</dd>
+          <dt>Supplier contact</dt><dd>${i.supplier_contact ? esc(i.supplier_contact) : '<span class="sub">not set</span>'}</dd>
+        </dl>
+      </div>
+
       <div>
         <div class="dr-t">Used in ${d.used_in.length} recipe${d.used_in.length === 1 ? '' : 's'}</div>
         ${d.used_in.length ? `<dl class="dl">${d.used_in.slice(0, 12).map(u =>
@@ -1104,8 +1160,9 @@ function renderIngredientDrawer(d) {
         : `<p class="sub" style="margin:0">Not used by any recipe yet.</p>`}
       </div>
 
+      <!-- C — MOVEMENT HISTORY -->
       <div>
-        <div class="dr-t">Stock movements</div>
+        <div class="dr-t">Recent stock movements</div>
         ${d.movements.length ? `<div class="tl">${d.movements.slice(0, 12).map(m => {
           const up = m.delta_base > 0;
           return `<div class="tl-i">
@@ -1613,7 +1670,7 @@ async function dismissUnmapped(id) {
 /* ===================== APP STATE ===================== */
 const STATE = {
   readiness: null,
-  inventory: { q: '', cat: '', status: '', onlyBlocked: false, data: [], dep: {} },
+  inventory: { q: '', cat: '', status: '', conf: '', exp: '', onlyBlocked: false, data: [], dep: {}, expMap: {} },
   movements: { reason: '', offset: 0, limit: 50, data: null },
   recipes: { list: [], selectedId: null, detail: null, menuByRecipe: {} },
   expiry: { within: 90, data: [] },
@@ -1808,43 +1865,63 @@ async function loadTomorrowForecast(itemName) {
 
 /* ===================== INVENTORY ===================== */
 async function loadInventory() {
-  const [d, dep] = await Promise.all([
+  const [d, dep, exp] = await Promise.all([
     api('/console/ingredients?limit=500'),
     fetchDepletion(),
+    api('/console/expiry?within_days=3650'),   // 10y — "nearest expiry, however far out", not a real window
   ]);
   STATE.inventory.data = d.ingredients;
   STATE.inventory.dep = {};
   dep.ingredients.forEach(x => { STATE.inventory.dep[x.ingredient_id] = x; });
+  // Nearest open batch per ingredient, from figures /console/expiry already
+  // computed — this only groups them down to one per ingredient, it doesn't
+  // recompute anything. No entry here is a real, distinct state (see
+  // expiry_monitor's own docstring): no batch for this ingredient carries a
+  // usable expiry signal at all, not "unknown".
+  STATE.inventory.expMap = {};
+  exp.batches.forEach(b => {
+    const cur = STATE.inventory.expMap[b.ingredient_id];
+    if (!cur || b.days_to_expiry < cur.days_to_expiry) STATE.inventory.expMap[b.ingredient_id] = b;
+  });
   renderInventory();
 }
 const CAT_LABELS = { '': 'All', wet_food: 'Wet food', dry_food: 'Dry food', packaging: 'Packaging', consumable: 'Consumable', resale: 'Resale' };
-/* One status per ingredient, combining "can it be deducted at all" with the
-   runway the Forecasts page computes — so the tab you click here means the
-   same thing it means there.
 
-   no_data is deliberately NOT healthy: it means ingredient_depletion() found
-   zero days of recorded consumption for this item, i.e. nothing has ever
-   measured whether it's running low. A lack of evidence is not evidence of
-   health — collapsing it into 'healthy' silently told a manager 86% of a
-   fresh install's stock was fine when none of it had been measured at all.
-   The two defensive fallbacks below (an unmapped risk string, or no
-   depletion row at all) carry the same reasoning: absence of a signal is
-   never treated as a good signal. */
-const INV_STATUS = { out: 'out', critical: 'critical', warning: 'low', ok: 'healthy', idle: 'healthy', no_data: 'insufficient_data' };
-function invStatus(i) {
-  if (!i.is_deductable) return 'unset';
+/* Four independent signals, four separate columns, never merged into one
+   chip: stock level (on_hand_display, shown as-is), runway (stockRisk —
+   how long that stock lasts at recent usage, via the Forecasts page's own
+   riskChip so the two never disagree on wording), expiry (expiryStatus —
+   how long before the nearest batch turns, via the Expiry page's own
+   expiryChip), and confidence (confidenceStatus — whether the numbers
+   runway and receiving depend on are actually verified). A row can be
+   well-stocked, expiring tomorrow, and built on an unconfirmed pack size
+   all at once; the old single "Status" column could only ever show one of
+   the three, which is what made an unmeasured ingredient indistinguishable
+   from a genuinely healthy one. */
+function stockRisk(i) {
+  if (!i.is_deductable) return null;   // no pack size — no runway to report at all; see confidenceStatus
   const d = STATE.inventory.dep[i.id];
-  return d ? (INV_STATUS[d.risk] || 'insufficient_data') : 'insufficient_data';
+  return d ? d.risk : 'no_data';
 }
-const INV_TABS = [
-  ['', 'All'], ['out', 'Out'], ['critical', 'Critical'], ['low', 'Low'],
-  ['healthy', 'Healthy'], ['insufficient_data', 'Not measured'],
-  ['unset', 'No pack size'], ['sub', 'Sub-recipes'],
+// riskChip distinguishes 'idle' (had activity, but the rate came out to
+// zero or less — a real, different situation) from 'no_data' (never
+// measured at all) with its own existing copy. Browsing groups the two
+// under one tab, since both mean "no reliable runway number exists", but
+// the per-row chip still shows which one it actually is.
+function riskBucket(risk) { return (risk === 'idle' || risk === 'no_data') ? 'no_data' : risk; }
+const RUNWAY_TABS = [
+  ['', 'All'], ['out', 'Out of stock'], ['critical', 'Reorder now'], ['warning', 'Reorder soon'],
+  ['ok', 'Enough stock'], ['no_data', 'Not measured'], ['sub', 'Sub-recipes'],
 ];
-const INV_CHIP = {
-  out: ['bad', 'Out of stock'], critical: ['bad', 'Critical'], low: ['warn', 'Running low'],
-  healthy: ['ok', 'Healthy'], insufficient_data: ['mute', 'Not measured'],
-  unset: ['amber', 'No pack size'],
+function expiryStatus(i) { return STATE.inventory.expMap[i.id] || null; }
+const EXP_LABELS = { '': 'All expiry states', soon: 'Expiring within 7 days', expired: 'Expired' };
+function confidenceStatus(i) {
+  if (!i.is_deductable) return 'unset';
+  return i.unverified_count ? 'unverified' : 'confirmed';
+}
+const CONF_LABELS = { '': 'All confidence levels', unset: 'No pack size', unverified: 'Unverified', confirmed: 'Confirmed' };
+const CONF_CHIP = {
+  unset: ['bad', 'No pack size'], unverified: ['amber', 'Unverified'], confirmed: ['ok', 'Confirmed'],
 };
 // food_ingredient is the common case and gets no badge — only the two
 // exceptions are worth calling out in the table.
@@ -1856,7 +1933,10 @@ function inventoryFilteredList() {
   const st = STATE.inventory;
   let list = st.data;
   if (st.status === 'sub') list = list.filter(i => i.kind === 'sub_recipe');
-  else if (st.status) list = list.filter(i => invStatus(i) === st.status);
+  else if (st.status) list = list.filter(i => riskBucket(stockRisk(i)) === st.status);
+  if (st.conf) list = list.filter(i => confidenceStatus(i) === st.conf);
+  if (st.exp === 'soon') list = list.filter(i => { const e = expiryStatus(i); return e && !e.expired && e.days_to_expiry <= 7; });
+  else if (st.exp === 'expired') list = list.filter(i => { const e = expiryStatus(i); return e && e.expired; });
   if (st.cat) list = list.filter(i => i.category === st.cat);
   if (st.q) list = list.filter(i => i.name.toLowerCase().includes(st.q.toLowerCase()));
   if (st.onlyBlocked) list = list.filter(i => !i.is_deductable);
@@ -1866,14 +1946,15 @@ function renderInventory() {
   const st = STATE.inventory;
   const list = inventoryFilteredList();
   const val = inventoryValuation();
-  const count = s => st.data.filter(i => s === 'sub' ? i.kind === 'sub_recipe' : invStatus(i) === s).length;
-  const unverified = st.data.reduce((a, i) => a + (i.unverified_count || 0), 0);
+  const count = s => st.data.filter(i => s === 'sub' ? i.kind === 'sub_recipe' : riskBucket(stockRisk(i)) === s).length;
+  const expiringSoon = st.data.filter(i => { const e = expiryStatus(i); return e && (e.expired || e.days_to_expiry <= 7); }).length;
+  const needsConfirming = st.data.filter(i => confidenceStatus(i) !== 'confirmed').length;
   setWork(`
     <div class="grid g4">
       ${kpi('Inventory value', money0(val.total), `${val.priced} of ${val.total_count} priced`, 'cash')}
       ${kpi('Out of stock', count('out'), 'blocking menu items', 'warn')}
-      ${kpi('Critical', count('critical'), 'inside delivery time', 'clock')}
-      ${kpi('Numbers unverified', unverified, 'still placeholders', 'db', 'verification')}
+      ${kpi('Expiring within 7 days', expiringSoon, 'or already expired', 'exp', 'expiry')}
+      ${kpi('Needs confirming', needsConfirming, 'pack size, cost or usable amount', 'db', 'verification')}
     </div>
     <div class="card">
       <div class="card-h">
@@ -1882,28 +1963,32 @@ function renderInventory() {
           <label class="search">${ic('srch')}<input class="field-sm" data-bind="inv-q" placeholder="Search ingredients…" value="${esc(st.q)}" style="width:200px"></label>
           <select class="field-sm" data-act="inv-cat-sel">${Object.keys(CAT_LABELS).map(c =>
             `<option value="${c}" ${st.cat === c ? 'selected' : ''}>${esc(c ? CAT_LABELS[c] : 'All categories')}</option>`).join('')}</select>
+          <select class="field-sm" data-act="inv-exp-sel">${Object.keys(EXP_LABELS).map(k =>
+            `<option value="${k}" ${st.exp === k ? 'selected' : ''}>${esc(EXP_LABELS[k])}</option>`).join('')}</select>
+          <select class="field-sm" data-act="inv-conf-sel">${Object.keys(CONF_LABELS).map(k =>
+            `<option value="${k}" ${st.conf === k ? 'selected' : ''}>${esc(CONF_LABELS[k])}</option>`).join('')}</select>
           <button class="btn btn-s btn-sm" data-act="inv-bulk">${ic('scale')}Bulk update</button>
           <button class="btn btn-p btn-sm" data-act="inv-add">${ic('inv')}Add ingredient</button>
         </div>
       </div>
-      <div class="card-b tight"><div class="tabs">${INV_TABS.map(([k, l]) =>
+      <div class="card-b tight"><div class="tabs">${RUNWAY_TABS.map(([k, l]) =>
         `<button class="tab ${st.status === k ? 'on' : ''}" data-act="inv-status" data-s="${k}">${esc(l)}${k ? ` <span class="sub">${count(k)}</span>` : ''}</button>`).join('')}</div></div>
       <div class="tw"><table>
-        <thead><tr><th>Ingredient</th><th>Category</th><th class="n">Available</th><th class="n">Reserved</th>
-          <th>Base</th><th class="n">Pack</th><th class="n">Days supply</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Ingredient</th><th>Category</th><th class="n">On hand</th>
+          <th>Runway</th><th>Expiry</th><th>Confidence</th><th></th></tr></thead>
         <tbody>${list.length ? list.map(i => {
-          const d = st.dep[i.id], s = invStatus(i), chip = INV_CHIP[s] || INV_CHIP.healthy;
+          const risk = stockRisk(i);
+          const ex = expiryStatus(i);
+          const cchip = CONF_CHIP[confidenceStatus(i)];
           const tchip = TYPE_CHIP[i.inventory_type];
           return `<tr class="row-link" data-act="ing-open" data-id="${i.id}">
-            <td><div class="nm">${esc(i.name)}${tchip ? ` <span class="chip ${tchip[0]} no-dot">${esc(tchip[1])}</span>` : ''}${i.unverified_count ? ` <span class="chip warn no-dot" title="${i.unverified_count} number(s) still unverified">?</span>` : ''}${i.kind === 'sub_recipe' ? ` <span class="chip fore no-dot">sub</span>` : ''}</div>
+            <td><div class="nm">${esc(i.name)}${tchip ? ` <span class="chip ${tchip[0]} no-dot">${esc(tchip[1])}</span>` : ''}${i.kind === 'sub_recipe' ? ` <span class="chip fore no-dot">sub</span>` : ''}</div>
               <div class="sub">${esc(i.ingredient_id)}</div></td>
             <td class="sub">${esc(CAT_LABELS[i.category] || i.category)}</td>
             <td class="n">${esc(i.on_hand_display)}</td>
-            <td class="n sub">${i.reserved_base > 0 ? num(i.reserved_base, 2) : '—'}</td>
-            <td class="sub">${esc(i.base_unit)}</td>
-            <td class="n sub">${i.pack_size != null ? num(i.pack_size, 0) + ' /' + esc(i.purchase_unit) : '<span class="chip bad no-dot">unset</span>'}</td>
-            <td class="n">${d && d.days_remaining != null ? num(d.days_remaining, 1) : '—'}</td>
-            <td><span class="chip ${chip[0]}">${esc(chip[1])}</span></td>
+            <td>${risk ? riskChip(risk) : '<span class="sub">—</span>'}</td>
+            <td>${ex ? expiryChip(ex) + (ex.tracking === 'estimated_shelf_life' ? ` <span class="sub">est.</span>` : '') : '<span class="sub">—</span>'}</td>
+            <td><span class="chip ${cchip[0]}">${esc(cchip[1])}</span></td>
             <td><div class="toolbar">
               <button class="btn btn-s btn-sm" data-act="receive" data-id="${i.id}" data-name="${esc(i.name)}" data-unit="${esc(i.purchase_unit)}">${ic('buy')}Delivery</button>
               <button class="btn btn-s btn-sm" data-act="count" data-id="${i.id}" data-name="${esc(i.name)}" data-baseunit="${esc(i.base_unit)}" data-onhand="${i.on_hand_base}">${ic('scale')}Count</button>
@@ -1911,7 +1996,7 @@ function renderInventory() {
               <button class="icon-btn btn-sm" data-act="ing-edit" data-id="${i.id}" title="Edit ${esc(i.name)}">${ic('set')}</button>
             </div></td>
           </tr>`;
-        }).join('') : `<tr><td colspan="9">${emptyState('No ingredients match', 'Try a different search, category or status filter.', 'srch')}</td></tr>`}
+        }).join('') : `<tr><td colspan="7">${emptyState('No ingredients match', 'Try a different search, category or filter.', 'srch')}</td></tr>`}
         </tbody>
       </table></div>
       ${list.length ? `<div class="tfoot"><span>Showing ${list.length} of ${st.data.length} ingredients</span></div>` : ''}
@@ -3406,6 +3491,8 @@ $('#work').addEventListener('change', async e => {
   if ((t = el2('[data-act="mv-reason"]'))) { STATE.movements.reason = t.value; STATE.movements.offset = 0; await fetchMovements(); return; }
   if ((t = el2('[data-act="inv-blocked"]'))) { STATE.inventory.onlyBlocked = t.checked; renderInventory(); return; }
   if ((t = el2('[data-act="inv-cat-sel"]'))) { STATE.inventory.cat = t.value; renderInventory(); return; }
+  if ((t = el2('[data-act="inv-exp-sel"]'))) { STATE.inventory.exp = t.value; renderInventory(); return; }
+  if ((t = el2('[data-act="inv-conf-sel"]'))) { STATE.inventory.conf = t.value; renderInventory(); return; }
 });
 $('#work').addEventListener('input', e => {
   const t = e.target.closest('[data-bind="inv-q"]');
