@@ -197,6 +197,7 @@ _WEIGHT_VOLUME_WORDS = {
 def format_base(
     qty: float, base_unit: str,
     pack_size: float | None = None, purchase_unit: str | None = None,
+    yield_factor: float = 1.0,
 ) -> str:
     """Human-readable base quantity — kg/L above 1000 so a stock figure never
     reads as '24500 g' on an operator's screen.
@@ -206,7 +207,19 @@ def format_base(
     (5.10 kg)' — because a manager thinks in sacks of rice or bottles of oil,
     not grams. Skipped when purchase_unit is itself just a weight/volume word
     (kg, L, ...): the kg/L rollup above already says that, so repeating it
-    would just be the same number twice."""
+    would just be the same number twice.
+
+    The purchase-unit figure goes through base_to_purchase() — the same
+    inverse purchase_to_base() itself defines — rather than a bare
+    qty / pack_size division. Dividing by pack_size alone silently dropped
+    yield_factor from the inverse while every forward conversion in the
+    system (receiving, recipe costing, the console's own drawer and
+    valuation figures) included it, so an ingredient with a yield_factor
+    away from 1.0 showed a different purchase-unit quantity on this display
+    than everywhere else that converted the same on_hand_base — e.g. Rice
+    (pack_size 1000, yield_factor 2.5) read as 60.9 sacks here against the
+    correct 24.4 sacks everywhere else. There is exactly one conversion rule
+    now, not two."""
     if base_unit == "g" and abs(qty) >= 1000:
         base_str = f"{qty / 1000:.2f} kg"
     elif base_unit == "ml" and abs(qty) >= 1000:
@@ -217,7 +230,7 @@ def format_base(
         base_str = f"{qty:.1f} {base_unit}"
 
     if pack_size and purchase_unit and purchase_unit.strip().lower() not in _WEIGHT_VOLUME_WORDS:
-        packs = qty / pack_size
+        packs = base_to_purchase(qty, pack_size, yield_factor)
         # Only once there is at least one whole container. Below that, state
         # the real remaining amount: "110 ml" is something a cook can pour,
         # "0.44 packs" is not a thing that exists on a shelf. The inventory

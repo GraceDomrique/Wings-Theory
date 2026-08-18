@@ -1,9 +1,9 @@
 {
   "database_path": "C:\\Users\\PLPASIG\\wings-theory\\backend\\dev\\wings_theory_dev.db",
-  "backup_path": "C:\\Users\\PLPASIG\\wings-theory\\backend\\backups\\wings_theory_dev.pre_demo_history.20260818_233500.db",
+  "backup_path": "C:\\Users\\PLPASIG\\wings-theory\\backend\\backups\\wings_theory_dev.pre_demo_history.20260819_010638.db",
   "seed": 42,
   "days": 90,
-  "generation_seconds": 33.3,
+  "generation_seconds": 15.8,
   "catalog_import": {
     "ingredients": 111,
     "recipes": 45,
@@ -24,31 +24,31 @@
     "gapfill_queue_dismissed": 3
   },
   "generation_stats": {
-    "orders": 2219,
-    "voided": 90,
-    "restocked_ingredients": 415,
+    "orders": 1972,
+    "voided": 86,
+    "restocked_ingredients": 363,
     "days": 90,
-    "unli_orders": 340,
-    "unli_voided": 15,
-    "unli_refills_served": 906,
-    "unli_refills_voided": 32,
-    "unli_refills_corrected": 40,
+    "unli_orders": 297,
+    "unli_voided": 8,
+    "unli_refills_served": 806,
+    "unli_refills_voided": 24,
+    "unli_refills_corrected": 31,
     "wastage": {
-      "routine": 66,
-      "outliers": 2
+      "routine": 73,
+      "outliers": 3
     },
-    "stock_counts": 96,
-    "receiving_events": 30,
+    "stock_counts": 94,
+    "receiving_events": 29,
     "reconciliation": {
-      "reconciled": 296,
-      "within_tolerance": 215,
-      "over_tolerance": 47,
-      "under_tolerance": 34,
+      "reconciled": 303,
+      "within_tolerance": 227,
+      "over_tolerance": 46,
+      "under_tolerance": 30,
       "skipped_already_done": 0,
       "errors": 0,
-      "candidates": 348
+      "candidates": 356
     },
-    "date_range": "2026-05-20 to 2026-08-17"
+    "date_range": "2026-05-21 to 2026-08-18"
   },
   "integrity_before": {
     "integrity_check": "ok",

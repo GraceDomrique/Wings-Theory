@@ -253,6 +253,72 @@ class TestUnits(unittest.TestCase):
         self.assertEqual(units.format_base(250, "g"), "250.0 g")
         self.assertEqual(units.format_base(3, "pc"), "3 pc")
 
+    # -----------------------------------------------------------------
+    # format_base's purchase-unit figure must be the exact inverse of
+    # purchase_to_base() — the same rule receiving, recipe costing, and
+    # the console's own drawer/valuation figures already use. It used to
+    # divide by pack_size alone (qty / pack_size), silently dropping
+    # yield_factor from the inverse while every forward conversion in the
+    # system included it: Rice (pack_size 1000, yield_factor 2.5) showed
+    # 60.9 sacks on the inventory table (on_hand_display) against the
+    # correct 24.4 sacks in the drawer and in inventory valuation — the
+    # same on_hand_base, two different purchase-unit answers depending on
+    # which screen asked. These tests cover exactly the unit types and
+    # yield-factor combinations that class of bug hides in.
+    # -----------------------------------------------------------------
+    def test_format_base_matches_base_to_purchase_with_a_yield_factor(self):
+        # Rice: pack_size 1000 g, yield_factor 2.5 (cooked weight gain).
+        # 60,880 g on hand -> 24.352 sacks, not 60.88.
+        on_hand, pack_size, yield_factor = 60880.0, 1000.0, 2.5
+        expected_packs = units.base_to_purchase(on_hand, pack_size, yield_factor)
+        self.assertAlmostEqual(expected_packs, 24.352, places=3)
+        shown = units.format_base(on_hand, "g", pack_size, "sacks", yield_factor)
+        self.assertIn(f"{expected_packs:.2f} sacks", shown)
+        self.assertNotIn("60.88 sacks", shown)
+
+    def test_format_base_kg_ingredient_shown_as_pieces_with_yield_factor(self):
+        # A kg-tracked ingredient purchased and thought of by the piece,
+        # with a trim/prep yield below 1.0 (e.g. bone-in wings trimmed).
+        on_hand, pack_size, yield_factor = 4500.0, 250.0, 0.8   # base_unit 'g', piece = 250g raw
+        expected_packs = units.base_to_purchase(on_hand, pack_size, yield_factor)
+        shown = units.format_base(on_hand, "g", pack_size, "pcs", yield_factor)
+        self.assertIn(f"{expected_packs:.2f} pcs", shown)
+        # the old, wrong formula (qty / pack_size alone) must NOT appear
+        wrong = on_hand / pack_size
+        self.assertNotAlmostEqual(expected_packs, wrong, places=2)
+        self.assertNotIn(f"{wrong:.2f} pcs", shown)
+
+    def test_format_base_ml_bottles_with_yield_factor(self):
+        # A liquid with drain/prep loss below 1.0 — bottled oil, say.
+        on_hand, pack_size, yield_factor = 9000.0, 1000.0, 0.9
+        expected_bottles = units.base_to_purchase(on_hand, pack_size, yield_factor)
+        shown = units.format_base(on_hand, "ml", pack_size, "bottles", yield_factor)
+        self.assertIn(f"{expected_bottles:.2f} bottles", shown)
+
+    def test_format_base_without_a_yield_factor_is_unchanged(self):
+        # yield_factor defaults to 1.0 and must reproduce the exact figures
+        # the pre-fix behaviour already gave for every ingredient that never
+        # had a yield factor away from 1.0 — the fix must not move numbers
+        # that were already correct.
+        self.assertEqual(units.format_base(2400, "g", 500, "Packs"), "4.80 Packs (2.40 kg)")
+        self.assertEqual(units.format_base(2400, "g", 500, "Packs", 1.0), "4.80 Packs (2.40 kg)")
+
+    def test_format_base_purchase_unit_figure_round_trips_through_purchase_to_base(self):
+        """The real end-to-end check: receive N purchase units of an
+        ingredient with a non-1.0 yield factor, then confirm format_base
+        reports back approximately those same N units from the resulting
+        on_hand_base — receiving and display must agree on what "N packs"
+        means, in both directions."""
+        for pack_size, yield_factor, purchased in (
+            (1000.0, 2.5, 10),      # kg-tracked, cooked-weight-gain yield
+            (250.0, 0.8, 18),       # piece-tracked, trim-loss yield
+            (500.0, 1.0, 6),        # no yield factor at all
+        ):
+            on_hand = units.purchase_to_base(purchased, pack_size, yield_factor)
+            shown = units.format_base(on_hand, "g", pack_size, "units", yield_factor)
+            self.assertIn(f"{purchased:.2f} units", shown,
+                          f"pack_size={pack_size} yield={yield_factor}: expected {purchased} units, got {shown!r}")
+
     def test_normalise_label_collapses_variants(self):
         self.assertEqual(units.normalise_label("Bacon (cooked, chopped)"), "bacon")
         self.assertEqual(units.normalise_label("Bacon (strips)"), "bacon")
@@ -1421,6 +1487,32 @@ class TestConsoleAPI(unittest.TestCase):
     def test_ingredient_detail_404s_on_a_missing_id(self):
         r = self.client.get("/console/ingredients/999999", headers=self.H_MGR)
         self.assertEqual(r.status_code, 404)
+
+    def test_on_hand_display_agrees_between_list_and_detail_for_a_yield_factor_ingredient(self):
+        """The regression this exists for: on_hand_display is computed by
+        format_base() in two call sites (the /console/ingredients list and
+        the /console/ingredients/{pk} detail) that must never disagree for
+        the same ingredient. Before the fix, an ingredient with a real
+        yield_factor (Rice: pack_size 1000, yield_factor 2.5, from the real
+        seeded catalog) would still have shown the same wrong figure in
+        both places, since both call sites shared the one buggy formula —
+        this test would not have caught the original bug on its own. It's
+        here as the standing guarantee that the two call sites can never
+        drift apart again, whatever format_base does internally."""
+        rows = self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+        candidate = next((i for i in rows if i["yield_factor"] and i["yield_factor"] != 1.0
+                          and i["pack_size"]), None)
+        self.assertIsNotNone(candidate, "expected at least one seeded ingredient with a real yield factor")
+
+        detail = self.client.get(f"/console/ingredients/{candidate['id']}", headers=self.H_MGR).json()
+        self.assertEqual(candidate["on_hand_display"], detail["ingredient"]["on_hand_display"])
+
+        # And it must match the real inverse of the forward conversion —
+        # not just "whatever the two endpoints happen to agree on".
+        expected_packs = units.base_to_purchase(
+            candidate["on_hand_base"], candidate["pack_size"], candidate["yield_factor"])
+        if expected_packs >= 1:
+            self.assertIn(f"{expected_packs:.2f}", candidate["on_hand_display"])
 
     def test_ingredient_detail_lists_the_recipes_that_use_it(self):
         # pick an ingredient that a recipe actually consumes, via the same

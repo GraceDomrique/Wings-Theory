@@ -624,7 +624,8 @@ def list_ingredients(
     params.append(limit)
     data = rows(c.execute(sql, params))
     for d in data:
-        d["on_hand_display"] = format_base(d["on_hand_base"], d["base_unit"], d["pack_size"], d["purchase_unit"])
+        d["on_hand_display"] = format_base(d["on_hand_base"], d["base_unit"], d["pack_size"],
+                                           d["purchase_unit"], d["yield_factor"])
     return {"ingredients": data, "count": len(data)}
 
 
@@ -868,7 +869,8 @@ def ingredient_detail(
         raise HTTPException(404, "ingredient not found")
     data = dict(row)
     data["on_hand_display"] = format_base(
-        data["on_hand_base"], data["base_unit"], data["pack_size"], data["purchase_unit"])
+        data["on_hand_base"], data["base_unit"], data["pack_size"], data["purchase_unit"],
+        data["yield_factor"])
 
     used_in = rows(c.execute(
         """
