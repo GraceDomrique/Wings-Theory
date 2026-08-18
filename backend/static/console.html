@@ -196,10 +196,11 @@ a{color:inherit}
 /* ================= PRIMITIVES ================= */
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-card);box-shadow:var(--sh-1)}
 .card-h{display:flex;align-items:flex-start;gap:var(--s2);padding:var(--s2) var(--s3);
-  border-bottom:1px solid var(--border-soft)}
+  border-bottom:1px solid var(--border-soft);flex-wrap:wrap}
+.card-h>div:first-child{min-width:0;flex:1 1 auto}
 .card-h h2{font-size:14px;font-weight:600;margin:0;letter-spacing:-.01em}
 .card-h p{font-size:12px;color:var(--text-3);margin:2px 0 0;line-height:1.45}
-.card-h .r{margin-left:auto;display:flex;gap:var(--s1);align-items:center;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}
+.card-h .r{margin-left:auto;display:flex;gap:var(--s1);align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .card-b{padding:var(--s3)}
 .card-b.tight{padding:var(--s2)}
 .card.flat{box-shadow:none}
@@ -318,8 +319,17 @@ a{color:inherit}
 .note.info{background:var(--info-wash)} .note.info svg,.note.info b{color:var(--info-text)}
 .note.bad{background:var(--bad-wash)} .note.bad svg,.note.bad b{color:var(--bad-text)}
 
-/* ================= TABLE ================= */
-.tw{overflow:auto;-webkit-overflow-scrolling:touch}
+/* ================= TABLE =================
+   max-height is what makes thead's position:sticky below mean anything —
+   without it .tw grows to fit every row and the page scrolls instead of
+   the table, so a 100+ row table just runs off the bottom with its
+   "sticky" header nowhere near the viewport edge by the time you'd need
+   it. A short table (a handful of rows) never reaches this cap, so
+   nothing here changes for those. Any one instance that genuinely needs
+   a different cap (the bulk-update modal's table uses 50vh, since a
+   modal has far less vertical room to spend) sets its own inline
+   max-height, which — being more specific — wins over this default. */
+.tw{overflow:auto;-webkit-overflow-scrolling:touch;max-height:68vh}
 table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px;min-width:640px}
 thead th{position:sticky;top:0;background:var(--card);z-index:2;text-align:left;
   font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-3);
@@ -366,12 +376,24 @@ td.wrap{white-space:normal;min-width:190px}
 .verify-group td{padding:5px 6px;font-size:12.5px;border-top:1px solid var(--border)}
 .verify-group tr:first-child td{border-top:none}
 
-/* ================= MODAL ================= */
-.scrim{position:fixed;inset:0;background:rgba(16,24,40,.32);z-index:60;opacity:0;
+/* ================= MODAL =================
+   Overlay z-tiers, made explicit rather than accidental: every overlay
+   used to share z-index 60/61 regardless of kind (drawer, modal, command
+   palette all layered at the same depth with independent scrims), so
+   opening one over another stacked two dimming layers and two
+   interactive surfaces with no way to reach whatever was underneath —
+   see the OVERLAY MANAGER section below, which is what actually
+   guarantees at most one is ever open; these tiers just keep that
+   guarantee visually correct if that invariant is ever momentarily
+   violated (e.g. mid-animation). DRAWER < SHEET (modal/command palette)
+   < TOAST, which is never modal and must never be hidden behind either. */
+.scrim{position:fixed;inset:0;background:rgba(16,24,40,.32);opacity:0;
   animation:fade var(--dur) var(--ease) forwards;backdrop-filter:blur(1px)}
+#drScrim{z-index:69}
+#scrim,#cmdScrim{z-index:79}
 @keyframes fade{to{opacity:1}}
 .modal{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--card);
-  border:1px solid var(--border);border-radius:14px;padding:var(--s3);width:min(430px,92vw);z-index:61;
+  border:1px solid var(--border);border-radius:14px;padding:var(--s3);width:min(430px,92vw);z-index:80;
   box-shadow:0 20px 60px rgba(16,24,40,.24);max-height:86vh;overflow-y:auto;
   animation:pop 200ms var(--ease) both}
 @keyframes pop{from{opacity:0;transform:translate(-50%,-50%) scale(.97)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
@@ -384,7 +406,7 @@ td.wrap{white-space:normal;min-width:190px}
 
 /* ================= DRAWER ================= */
 .drawer{position:fixed;top:0;right:0;bottom:0;width:min(460px,100vw);background:var(--card);
-  border-left:1px solid var(--border);z-index:61;display:flex;flex-direction:column;
+  border-left:1px solid var(--border);z-index:70;display:flex;flex-direction:column;
   animation:slide 240ms var(--ease) both;box-shadow:-8px 0 28px rgba(16,24,40,.14)}
 @keyframes slide{from{transform:translateX(100%)}to{transform:none}}
 .dr-h{display:flex;align-items:center;gap:10px;padding:var(--s2) var(--s3);
@@ -417,7 +439,7 @@ tbody tr.row-link{cursor:pointer}
 
 /* command palette */
 .cmd{position:fixed;top:14vh;left:50%;transform:translateX(-50%);width:min(600px,92vw);
-  background:var(--card);border:1px solid var(--border);border-radius:14px;z-index:61;
+  background:var(--card);border:1px solid var(--border);border-radius:14px;z-index:80;
   box-shadow:0 20px 60px rgba(16,24,40,.22);overflow:hidden;animation:cpop 200ms var(--ease) both}
 @keyframes cpop{from{opacity:0;transform:translateX(-50%) scale(.98) translateY(-6px)}
   to{opacity:1;transform:translateX(-50%) scale(1)}}
@@ -436,7 +458,7 @@ tbody tr.row-link{cursor:pointer}
 .cmd-r .k{margin-left:auto;font-size:11px;color:var(--text-3)}
 
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--charcoal);
-  color:#fff;padding:11px 17px;border-radius:11px;font-size:13px;z-index:80;display:flex;
+  color:#fff;padding:11px 17px;border-radius:11px;font-size:13px;z-index:90;display:flex;
   align-items:center;gap:9px;box-shadow:0 8px 26px rgba(0,0,0,.28);animation:tst 240ms var(--ease) both;
   max-width:min(520px,92vw);transition:opacity 240ms var(--ease)}
 @keyframes tst{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%)}}
@@ -889,9 +911,37 @@ function downloadCsv(filename, rowsArr, cols) {
   setTimeout(() => URL.revokeObjectURL(a.href), 2000);
 }
 
-/* ===================== MODALS ===================== */
+/* ===================== OVERLAY MANAGER =====================
+   Three things in this app cover the whole screen: the ingredient drawer,
+   a modal ("sheet" — a guided one-off workflow), and the command palette.
+   Each used to manage its own independent scrim at the same z-index as
+   the other two, so opening one while another was already showing
+   stacked two dimming layers and two interactive surfaces on screen at
+   once, with the top one's full-viewport scrim blocking every click to
+   whatever was underneath — the literal "elements overlapping or being
+   stacked on top of existing components" defect.
+
+   The fix is not "give each a bigger z-index" (see the tiers on .drawer/
+   .modal/.cmd for that, which only matters if this invariant is ever
+   momentarily violated) — it's that opening any one of the three now
+   always closes whichever of the other two was open first, so at most
+   one is ever in the DOM. The one exception: opening a modal over an
+   open ingredient drawer remembers which ingredient it was on
+   (RETURN_TO_DRAWER_PK) and reopens the same drawer once that modal
+   closes, rather than just discarding the user's place — the drawer is
+   a place you're looking at something, not a one-off action like the
+   other two, so "closes" here means "steps aside for the moment", not
+   "forgotten". goto() (page navigation) clears that memory outright,
+   since a full page change has nowhere to return to. */
+let RETURN_TO_DRAWER_PK = null;
+
 function openModal(html) {
-  closeModal();
+  _removeModalDom();
+  closeCmd();
+  if ($('#drawerBox')) {
+    if (DRAWER_ING) RETURN_TO_DRAWER_PK = DRAWER_ING.ingredient.id;
+    _removeDrawerDom();
+  }
   const scrim = el('<div class="scrim" id="scrim"></div>');
   scrim.addEventListener('click', closeModal);
   document.body.appendChild(scrim);
@@ -899,9 +949,17 @@ function openModal(html) {
   modal.innerHTML = html;
   document.body.appendChild(modal);
 }
-function closeModal() {
+function _removeModalDom() {
   const s = $('#scrim'); if (s) s.remove();
   const m = $('#modalBox'); if (m) m.remove();
+}
+function closeModal() {
+  _removeModalDom();
+  if (RETURN_TO_DRAWER_PK != null) {
+    const pk = RETURN_TO_DRAWER_PK;
+    RETURN_TO_DRAWER_PK = null;
+    openIngredientDrawer(pk);
+  }
 }
 function modalError(msg) {
   const err = $('#modalErr'); if (!err) return;
@@ -910,7 +968,9 @@ function modalError(msg) {
 
 /* ===================== DRAWER ===================== */
 function openDrawer(html) {
-  closeDrawer();
+  _removeDrawerDom();
+  closeCmd();
+  if ($('#modalBox')) { RETURN_TO_DRAWER_PK = null; _removeModalDom(); }
   const scrim = el('<div class="scrim" id="drScrim"></div>');
   scrim.addEventListener('click', closeDrawer);
   document.body.appendChild(scrim);
@@ -918,9 +978,13 @@ function openDrawer(html) {
   dr.innerHTML = html;
   document.body.appendChild(dr);
 }
-function closeDrawer() {
+function _removeDrawerDom() {
   const s = $('#drScrim'); if (s) s.remove();
   const d = $('#drawerBox'); if (d) d.remove();
+}
+function closeDrawer() {
+  RETURN_TO_DRAWER_PK = null;
+  _removeDrawerDom();
 }
 
 /* Ingredient detail — the one screen that answers "what is going on with
@@ -1102,6 +1166,7 @@ function renderIngredientDrawer(d) {
   });
 }
 async function refreshAfterDrawerAction(pk) {
+  invalidateDepletionCache();   // receive/count/waste/use all move on-hand stock
   const d = await api('/console/ingredients/' + pk);
   DRAWER_ING = d;
   renderIngredientDrawer(d);
@@ -1194,6 +1259,7 @@ function openVerifyModal(id, field, name, current) {
     $('#vfSubmit').disabled = true;
     try {
       await api(`/console/ingredients/${id}/verify`, { method: 'POST', body: JSON.stringify({ field, value: val }) });
+      invalidateDepletionCache();   // pack_size/yield can restate on-hand stock
       closeModal(); toast('Saved.'); goto('verification');
     } catch (e) { modalError(e.message); }
     finally { const b = $('#vfSubmit'); if (b) b.disabled = false; }
@@ -1314,6 +1380,7 @@ function openBulkUpdateModal() {
       const r = await api('/console/ingredients/bulk-count', {
         method: 'POST', body: JSON.stringify({ items, note: $('#bulkNote').value || null }),
       });
+      invalidateDepletionCache();
       closeModal();
       toast(r.failed ? `Updated ${r.updated}, ${r.failed} failed.` : `Updated ${r.updated} ingredient${r.updated === 1 ? '' : 's'}.`);
       if (CURRENT) goto(CURRENT);
@@ -1560,6 +1627,31 @@ const STATE = {
 };
 const MIN_DEMAND_DAYS = 7;
 
+/* Dashboard, Inventory, Forecasts and Expiry each independently fetched
+   /console/forecasts/depletion?lookback_days=30 — four requests for the
+   same data on a single page load's worth of navigation, and four
+   separate in-memory copies with no reason they couldn't drift from each
+   other. This is the one canonical fetch every one of them reads from
+   instead. A short TTL (not "forever") because the whole point of caching
+   this is to dedupe the burst of near-simultaneous loads one page
+   transition fires, not to serve minutes-old risk figures; anything that
+   actually mutates stock (receive/count/waste/use/verify) clears it
+   outright rather than waiting the TTL out, and the manual refresh button
+   always bypasses it. */
+const DEPLETION_CACHE_MS = 20000;
+let _depletionCache = null;   // { at, lookbackDays, data }
+async function fetchDepletion(lookbackDays = 30, { fresh = false } = {}) {
+  const now = Date.now();
+  if (!fresh && _depletionCache && _depletionCache.lookbackDays === lookbackDays
+      && now - _depletionCache.at < DEPLETION_CACHE_MS) {
+    return _depletionCache.data;
+  }
+  const data = await api(`/console/forecasts/depletion?lookback_days=${lookbackDays}`);
+  _depletionCache = { at: now, lookbackDays, data };
+  return data;
+}
+function invalidateDepletionCache() { _depletionCache = null; }
+
 function inventoryValuation() {
   const list = STATE.inventory.data || [];
   let total = 0, priced = 0; const missing = [];
@@ -1577,7 +1669,7 @@ async function loadDashboard() {
     api('/console/reports/sales?days=30'),
     api('/console/reports/sales?days=1'),
     api('/console/expiry?within_days=14'),
-    api('/console/forecasts/depletion?lookback_days=30'),
+    fetchDepletion(),
     api('/console/ingredients?limit=500'),
     api('/console/anomalies?lookback_days=30'),
   ]);
@@ -1718,7 +1810,7 @@ async function loadTomorrowForecast(itemName) {
 async function loadInventory() {
   const [d, dep] = await Promise.all([
     api('/console/ingredients?limit=500'),
-    api('/console/forecasts/depletion?lookback_days=30'),
+    fetchDepletion(),
   ]);
   STATE.inventory.data = d.ingredients;
   STATE.inventory.dep = {};
@@ -1945,7 +2037,7 @@ async function loadPurchases() {
 /* ===================== FORECASTS ===================== */
 async function loadForecasts() {
   const [dep, dem] = await Promise.all([
-    api('/console/forecasts/depletion?lookback_days=30'),
+    fetchDepletion(),
     api('/console/forecasts/demand?horizon_days=7&lookback_days=60'),
   ]);
   STATE.forecasts = { dep: dep.ingredients, dem: dem.items };
@@ -2596,7 +2688,7 @@ async function runUnliRecalibration(dryRun) {
 async function loadExpiry() {
   const [d, dep] = await Promise.all([
     api('/console/expiry?within_days=' + STATE.expiry.within),
-    api('/console/forecasts/depletion?lookback_days=30'),
+    fetchDepletion(),
   ]);
   const burn = {};
   dep.ingredients.forEach(i => { burn[i.ingredient_id] = i.avg_daily_consumption; });
@@ -3073,6 +3165,9 @@ async function goto(id) {
   $('#pgTitle').textContent = TITLES[id][0];
   $('#pgSub').textContent = TITLES[id][1];
   clearErr();
+  // A full page change has nowhere to return to — clear this before
+  // closeModal() below would otherwise reopen the drawer it just left.
+  RETURN_TO_DRAWER_PK = null;
   closeModal();
   closeDrawer();
   setWork(`<div class="empty">${ic('clock')}<b>Loading…</b><p></p></div>`);
@@ -3083,6 +3178,7 @@ async function goto(id) {
 $('#refreshBtn').addEventListener('click', e => {
   const b = e.currentTarget;
   b.classList.remove('spin'); void b.offsetWidth; b.classList.add('spin');
+  invalidateDepletionCache();   // a manual refresh means "now", not "whenever the cache expires"
   if (CURRENT) goto(CURRENT);
 });
 
@@ -3121,6 +3217,10 @@ $('#railToggle').addEventListener('click', () => {
 let CMD_SEL = 0, CMD_ROWS = [];
 function openCmd() {
   closeCmd();
+  // Jumping to a different section has nowhere to return to either.
+  RETURN_TO_DRAWER_PK = null;
+  _removeModalDom();
+  _removeDrawerDom();
   const scrim = el('<div class="scrim" id="cmdScrim"></div>');
   scrim.addEventListener('click', closeCmd);
   document.body.appendChild(scrim);
