@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from wt import db, refills, units, unli                             # noqa: E402
+from wt import db, refills, timeutil, units, unli                   # noqa: E402
 from wt.anomaly import consumption_model_details                    # noqa: E402
 from wt.anomaly import detect_anomalies, detect_consumption_anomalies  # noqa: E402
 from wt.anomaly import model_details as anomaly_model_details       # noqa: E402
@@ -2140,7 +2140,14 @@ def add_unli_order(conn, menu_pk, heads, iso_date=None, qty=1, commit=True):
     if commit:
         commit_order(conn, o)
     if iso_date:
-        ts = f"{iso_date} 18:00:00"
+        # 12:00 UTC = 20:00 Manila -- safely inside the same Manila business
+        # day as iso_date. 18:00 UTC (the old value here) is 02:00 Manila the
+        # *next* day, so under the Manila-aware business-date truncation the
+        # order would land one day later than iso_date says it should --
+        # exactly the class of bug wt/timeutil.py exists to prevent, just
+        # triggered by this fixture's own choice of hour rather than by app
+        # code.
+        ts = f"{iso_date} 12:00:00"
         conn.execute(
             "UPDATE customer_order SET created_at=?, committed_at=?, served_at=?, "
             "status=CASE WHEN status='in_progress' THEN 'served' ELSE status END WHERE id=?",
@@ -2175,6 +2182,109 @@ class UnliBase(Base):
         return self.conn.execute(
             "SELECT COALESCE(SUM(qty_base),0) AS q FROM fefo_batch WHERE ingredient_id=? "
             "AND state='open'", (self.wings,)).fetchone()["q"]
+
+
+# ===========================================================================
+# Phase 07 — wt/timeutil.py is now the one place a UTC-stored timestamp
+# becomes a Manila business date. These tests exercise exactly the window
+# the fix is for: UTC 16:00-23:59 on day D, which is Manila 00:00-07:59 on
+# day D+1 -- roughly a third of every real day where the two calendars
+# disagree about which day it is.
+# ===========================================================================
+class TestTimezoneHardening(UnliBase):
+    # (utc instant string, expected Manila business date)
+    BOUNDARY_CASES = [
+        ("2026-03-09 15:59:00", "2026-03-09"),  # Manila 2026-03-09 23:59 -- still the old day
+        ("2026-03-09 16:00:00", "2026-03-10"),  # Manila 2026-03-10 00:00 -- rolls over
+        ("2026-03-09 16:01:00", "2026-03-10"),  # Manila 2026-03-10 00:01
+        ("2026-03-09 23:59:00", "2026-03-10"),  # UTC's own day hasn't rolled yet; Manila 07:59
+        ("2026-03-10 00:00:00", "2026-03-10"),  # UTC rolls too now; Manila 08:00
+        ("2026-03-10 00:01:00", "2026-03-10"),  # Manila 08:01
+    ]
+
+    def test_business_today_agrees_with_manila_wall_clock_at_every_boundary(self):
+        for ts, expected in self.BOUNDARY_CASES:
+            instant = dt.datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc)
+            with self.subTest(ts=ts):
+                self.assertEqual(timeutil.business_today(instant).isoformat(), expected)
+
+    def test_sql_business_date_agrees_with_business_today_at_every_boundary(self):
+        for ts, expected in self.BOUNDARY_CASES:
+            with self.subTest(ts=ts):
+                got = self.conn.execute(
+                    f"SELECT {timeutil.sql_business_date('?')}", (ts,)
+                ).fetchone()[0]
+                self.assertEqual(got, expected)
+
+    def test_bare_date_truncation_is_the_bug_sql_business_date_fixes(self):
+        """2026-03-09 16:30 UTC is Manila 2026-03-10 00:30 -- bare date()
+        still reads 2026-03-09. This is the exact defect that made
+        reconciliation, forecasting and expiry disagree with each other for
+        part of every day before wt/timeutil.py existed."""
+        ts = "2026-03-09 16:30:00"
+        bare, business = self.conn.execute(
+            f"SELECT date(?), {timeutil.sql_business_date('?')}", (ts, ts)
+        ).fetchone()
+        self.assertEqual(bare, "2026-03-09")
+        self.assertEqual(business, "2026-03-10")
+        self.assertNotEqual(bare, business)
+
+    def test_business_date_of_converts_a_full_utc_timestamp(self):
+        self.assertEqual(timeutil.business_date_of("2026-03-09 16:30:00"), "2026-03-10")
+        self.assertEqual(timeutil.business_date_of("2026-03-09 15:30:00"), "2026-03-09")
+
+    def test_business_date_of_leaves_a_time_free_date_unchanged(self):
+        # received_at is sometimes imported with no time-of-day at all (see
+        # the Mango fixture in TestSeedImport) -- there is no instant to
+        # shift, so the date already is the business date.
+        self.assertEqual(timeutil.business_date_of("2026-03-09"), "2026-03-09")
+
+    def test_utc_bound_n_manila_days_ago_lands_exactly_on_a_manila_midnight(self):
+        now = dt.datetime(2026, 3, 10, 1, 0, 0, tzinfo=dt.timezone.utc)   # Manila 09:00
+        self.assertEqual(timeutil.utc_bound_n_manila_days_ago(1, now), "2026-03-09 16:00:00")
+        self.assertEqual(timeutil.utc_bound_n_manila_days_ago(2, now), "2026-03-08 16:00:00")
+
+    def test_a_non_positive_window_lands_in_the_future_and_matches_nothing(self):
+        now = dt.datetime(2026, 3, 10, 1, 0, 0, tzinfo=dt.timezone.utc)
+        bound = timeutil.utc_bound_n_manila_days_ago(0, now)
+        self.assertGreater(bound, now.strftime("%Y-%m-%d %H:%M:%S"))
+
+    def test_an_order_just_after_manila_midnight_belongs_to_the_new_business_day(self):
+        """The concrete scenario the owner asked to see proven: a real order,
+        committed at a real instant 1 minute after Manila midnight, must be
+        reconciled against the NEW Manila day -- not the UTC day its own
+        created_at timestamp is still on."""
+        order = add_order(self.conn, [(self.menu, 1)], head_count=6)
+        reserve_order(self.conn, order)
+        commit_order(self.conn, order)
+        crossing_ts = "2026-03-09 16:01:00"   # Manila 2026-03-10 00:01
+        self.conn.execute(
+            "UPDATE customer_order SET created_at=?, committed_at=?, served_at=?, "
+            "status='served' WHERE id=?",
+            (crossing_ts, crossing_ts, crossing_ts, order),
+        )
+
+        new_day = unli.provisional_for_date(self.conn, self.stream, "2026-03-10")
+        old_day = unli.provisional_for_date(self.conn, self.stream, "2026-03-09")
+        self.assertEqual(new_day["heads"], 6)
+        self.assertAlmostEqual(new_day["theoretical_base"], 6 * self.LAMBDA)
+        self.assertEqual(old_day["heads"], 0)
+
+        # unli.pending() -- what the reconciliation screen actually calls --
+        # must show the same split, not just the lower-level helper.
+        pend_new = unli.pending(self.conn, "2026-03-10")
+        pend_old = unli.pending(self.conn, "2026-03-09")
+        s_new = next(s for s in pend_new["streams"] if s["item_key"] == "wings")
+        s_old = next(s for s in pend_old["streams"] if s["item_key"] == "wings")
+        self.assertEqual(s_new["heads"], 6)
+        self.assertEqual(s_old["heads"], 0)
+
+        # And it can actually be reconciled against the day it truly belongs
+        # to -- not just counted correctly, but usable end to end.
+        r = unli.record_reconciliation(self.conn, "2026-03-10", "wings",
+                                       opening_base=6 * self.LAMBDA, closing_base=0)
+        self.assertEqual(r["heads"], 6)
+        self.assertEqual(r["service_date"], "2026-03-10")
 
 
 class TestUnliReconciliation(UnliBase):
@@ -4586,7 +4696,7 @@ def main() -> int:
         loader.loadTestsFromTestCase(t) for t in (
             TestUnits, TestSchemaConstraints, TestResolver, TestMenuGate,
             TestReservation, TestReceiveStock, TestRecordCount, TestRecordWastage, TestUnliOrders, TestConcurrency, TestFEFO,
-            TestFEFODepletion, TestUnliReconciliation, TestUnliRecalibration,
+            TestFEFODepletion, TestTimezoneHardening, TestUnliReconciliation, TestUnliRecalibration,
             TestConsumptionAnomaly, TestReorderPoint, TestUnliRBAC,
             TestUnliSession, TestRefillPieces, TestRefillSequence, TestRefillInventory,
             TestRefillIdempotency, TestFlavorConfiguration, TestOrderImmutability,

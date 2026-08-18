@@ -35,6 +35,7 @@ import logging
 import math
 import sqlite3
 
+from . import timeutil
 from .errors import NotFoundError
 
 MIN_DEMAND_SAMPLE_DAYS = 7      # distinct days with at least one sale before a forecast is offered
@@ -91,7 +92,7 @@ def _elapsed_days(first_day_iso: str | None) -> int:
     if not first_day_iso:
         return 0
     first = _dt.date.fromisoformat(first_day_iso)
-    return max(1, (_dt.date.today() - first).days + 1)
+    return max(1, (timeutil.business_today() - first).days + 1)
 
 
 def ingredient_depletion(conn: sqlite3.Connection, lookback_days: int = 30) -> list[dict]:
@@ -123,15 +124,15 @@ def ingredient_depletion(conn: sqlite3.Connection, lookback_days: int = 30) -> l
     for ing in ingredients:
         consumption_reason = "operational_use" if ing["inventory_type"] == "operational_supply" else "sale_commit"
         row = conn.execute(
-            """
+            f"""
             SELECT -SUM(delta_base) AS consumed,
-                   COUNT(DISTINCT date(created_at)) AS days_active,
-                   MIN(date(created_at)) AS first_day
+                   COUNT(DISTINCT {timeutil.sql_business_date("created_at")}) AS days_active,
+                   MIN({timeutil.sql_business_date("created_at")}) AS first_day
               FROM stock_ledger
              WHERE ingredient_id = ? AND reason = ?
-               AND created_at >= datetime('now', ?)
+               AND created_at >= ?
             """,
-            (ing["id"], consumption_reason, f"-{lookback_days} days"),
+            (ing["id"], consumption_reason, timeutil.utc_bound_n_manila_days_ago(lookback_days)),
         ).fetchone()
 
         consumed = row["consumed"] or 0.0
@@ -208,18 +209,19 @@ def _daily_series(conn: sqlite3.Connection, menu_item_pk: int, lookback_days: in
     """Real daily sold-qty rows plus the same series zero-filled across every
     calendar day in the window — shared by both forecasting methods below so
     they can't disagree about what "the last N days" contains."""
+    bd = timeutil.sql_business_date("o.created_at")
     rows = conn.execute(
-        """
-        SELECT date(o.created_at) AS d, SUM(ol.qty) AS qty
+        f"""
+        SELECT {bd} AS d, SUM(ol.qty) AS qty
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
          WHERE ol.menu_item_id = ? AND o.status != 'void'
-           AND o.created_at >= datetime('now', ?)
-         GROUP BY date(o.created_at)
+           AND o.created_at >= ?
+         GROUP BY {bd}
         """,
-        (menu_item_pk, f"-{lookback_days} days"),
+        (menu_item_pk, timeutil.utc_bound_n_manila_days_ago(lookback_days)),
     ).fetchall()
     by_day = {r["d"]: r["qty"] for r in rows}
-    today = _dt.date.today()
+    today = timeutil.business_today()
     series = []
     for i in range(lookback_days - 1, -1, -1):
         d = today - _dt.timedelta(days=i)
@@ -270,7 +272,7 @@ def menu_item_demand(
         for wd, vals in by_weekday.items():
             weekday_factor[wd] = (sum(vals) / len(vals)) / overall_avg
 
-    today = _dt.date.today()
+    today = timeutil.business_today()
     forecast = []
     for i in range(1, horizon_days + 1):
         d = today + _dt.timedelta(days=i)

@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, db, refills, unli
+from . import auth, db, refills, timeutil, unli
 from .anomaly import detect_anomalies, detect_consumption_anomalies
 from .anomaly import consumption_model_details
 from .anomaly import model_details as anomaly_model_details
@@ -1207,7 +1207,11 @@ def _annotate_batch_expiry(b: dict) -> dict | None:
     mode = b.pop("expiry_mode")
     if mode == "shelf_life_estimate":
         try:
-            received = _dt.date.fromisoformat(b["received_at"][:10])
+            # The Manila business date the batch was received on, not the
+            # UTC calendar date its timestamp happens to fall on -- a batch
+            # received at, say, UTC 20:00 (Manila 04:00 the next day) is
+            # "received today" to whoever signed for it.
+            received = _dt.date.fromisoformat(timeutil.business_date_of(b["received_at"]))
         except (ValueError, TypeError):
             return None
         exp = received + _dt.timedelta(days=shelf_life_days or 0)
@@ -1219,7 +1223,7 @@ def _annotate_batch_expiry(b: dict) -> dict | None:
         except (ValueError, TypeError):
             return None
         b["tracking"] = "exact_date"
-    days = (exp - _dt.date.today()).days
+    days = (exp - timeutil.business_today()).days
     b["days_to_expiry"] = days
     b["expired"] = days < 0
     b["storage_status"] = "Expired" if days < 0 else "Use Soon" if days <= 2 else "Normal"
@@ -1274,26 +1278,31 @@ def sales_summary(
     No synthetic history is generated to make the chart look busier.
 
     days may be negative (a window into the future, matching nothing) — used
-    by tests to get a deterministically-empty result. f"-{days}" would break
-    for a negative input ("-{-1}" -> the literal string "--1", not a valid
-    SQLite datetime modifier), so the sign is built explicitly instead.
+    by tests to get a deterministically-empty result. utc_bound_n_manila_days_ago
+    handles that the same way the old f"-{days} days" SQLite modifier did: a
+    negative or zero `days` pushes the bound into the future, so nothing real
+    can be >= it.
+
+    The bound is computed once in Python (Manila calendar-day aligned) rather
+    than left to SQLite's own `datetime('now', ?)`, and calendar-day grouping
+    below uses the Manila business date, not the UTC one — see wt/timeutil.py.
     """
-    window = f"{'-' if days >= 0 else '+'}{abs(days)} days"
+    bound = timeutil.utc_bound_n_manila_days_ago(days)
     totals = c.execute(
         """
         SELECT COUNT(*) AS orders, COALESCE(SUM(o.head_count), 0) AS covers
           FROM customer_order o
-         WHERE o.status != 'void' AND o.created_at >= datetime('now', ?)
+         WHERE o.status != 'void' AND o.created_at >= ?
         """,
-        (window,),
+        (bound,),
     ).fetchone()
     revenue = c.execute(
         """
         SELECT COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE o.status != 'void' AND o.created_at >= datetime('now', ?)
+         WHERE o.status != 'void' AND o.created_at >= ?
         """,
-        (window,),
+        (bound,),
     ).fetchone()["revenue"]
     by_item = rows(c.execute(
         """
@@ -1301,25 +1310,26 @@ def sales_summary(
           FROM order_line ol
           JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND o.created_at >= datetime('now', ?)
+         WHERE o.status != 'void' AND o.created_at >= ?
          GROUP BY m.id ORDER BY revenue DESC
         """,
-        (window,),
+        (bound,),
     ))
     # Revenue per calendar day, oldest first. Purely additive: the console's
     # dashboard charts this instead of deriving it from recent_orders, which
     # is capped at 50 rows and would silently undercount a busy week.
+    day_bd = timeutil.sql_business_date("o.created_at")
     by_day = rows(c.execute(
-        """
-        SELECT date(o.created_at) AS day,
+        f"""
+        SELECT {day_bd} AS day,
                COUNT(DISTINCT o.id) AS orders,
                COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue
           FROM customer_order o
           LEFT JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.created_at >= datetime('now', ?)
-         GROUP BY date(o.created_at) ORDER BY day
+         WHERE o.status != 'void' AND o.created_at >= ?
+         GROUP BY {day_bd} ORDER BY day
         """,
-        (window,),
+        (bound,),
     ))
     # Voided orders stay in this list on purpose (audit visibility — seeing
     # "this one was voided" is useful in a report) but were missing the same
@@ -1331,10 +1341,10 @@ def sales_summary(
                (SELECT COALESCE(SUM(ol2.qty*ol2.unit_price),0) FROM order_line ol2
                  WHERE ol2.order_id=o.id) AS total
           FROM customer_order o
-         WHERE o.created_at >= datetime('now', ?)
+         WHERE o.created_at >= ?
          ORDER BY o.created_at DESC LIMIT 50
         """,
-        (window,),
+        (bound,),
     ))
     return {
         "window_days": days,
@@ -1444,8 +1454,7 @@ def model_details_endpoint(
 # works without handing the kitchen inventory.write. See wt/unli.py.
 # ===========================================================================
 def _today_iso() -> str:
-    import datetime as _dt
-    return _dt.date.today().isoformat()
+    return timeutil.business_today_iso()
 
 
 @app.get("/unli/reconciliation/pending", tags=["unli"])

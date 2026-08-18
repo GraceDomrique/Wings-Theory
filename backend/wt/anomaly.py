@@ -50,6 +50,8 @@ import sqlite3
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
+from . import timeutil
+
 ANOMALY_REASONS = ("wastage", "spoilage", "count_adjustment")
 MIN_POOLED_SAMPLES = 15          # entries needed before IsolationForest is trained at all
 RULE_FRACTION_THRESHOLD = 0.25   # a single entry removing >=25% of prior on-hand stock
@@ -98,10 +100,10 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 90) -> list[
                l.note, l.user_id, l.created_at
           FROM stock_ledger l JOIN ingredient i ON i.id = l.ingredient_id
          WHERE l.reason IN ({placeholders})
-           AND l.created_at >= datetime('now', ?)
+           AND l.created_at >= ?
          ORDER BY l.ingredient_id, l.created_at
         """,
-        (*ANOMALY_REASONS, f"-{lookback_days} days"),
+        (*ANOMALY_REASONS, timeutil.utc_bound_n_manila_days_ago(lookback_days)),
     ).fetchall()
     if not rows:
         return []
@@ -217,12 +219,12 @@ def _consumption_records(conn: sqlite3.Connection, lookback_days: int) -> list[d
                    AND id = (SELECT MAX(c2.id) FROM unli_coefficient c2
                               WHERE c2.unli_item_id = c1.unli_item_id AND c2.role = 'baseline')
                ) b ON b.unli_item_id = d.unli_item_id
-         WHERE d.service_date >= date('now', ?)
+         WHERE d.service_date >= ?
            AND d.heads > 0
            AND d.validation_state <> 'rejected'
          ORDER BY d.unli_item_id, d.service_date
         """,
-        (f"-{lookback_days} days",),
+        (timeutil.business_date_n_days_ago(lookback_days),),
     ).fetchall()
     if not rows:
         return []
@@ -390,8 +392,8 @@ def model_details(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:
     placeholders = ",".join("?" * len(ANOMALY_REASONS))
     total = conn.execute(
         f"SELECT COUNT(*) AS n FROM stock_ledger WHERE reason IN ({placeholders}) "
-        "AND created_at >= datetime('now', ?)",
-        (*ANOMALY_REASONS, f"-{lookback_days} days"),
+        "AND created_at >= ?",
+        (*ANOMALY_REASONS, timeutil.utc_bound_n_manila_days_ago(lookback_days)),
     ).fetchone()["n"]
     by_method: dict[str, int] = {}
     for a in anomalies:

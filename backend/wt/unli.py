@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import sqlite3
 
+from . import timeutil
 from .db import write_tx
 from .errors import InvalidStateError, NotFoundError
 from .reservation import EPS, _ledger, restore_fefo, deplete_fefo
@@ -114,7 +115,7 @@ def provisional_for_date(conn: sqlite3.Connection, unli_item_id: int, service_da
           FROM customer_order o
           JOIN order_line ol ON ol.order_id = o.id
           JOIN menu_item  m  ON m.id = ol.menu_item_id AND m.is_unli = 1
-         WHERE date(COALESCE(o.committed_at, o.created_at)) = ?
+         WHERE {timeutil.sql_business_date("COALESCE(o.committed_at, o.created_at)")} = ?
            AND o.status IN ({",".join("?" * len(COMMITTED_STATES))})
          GROUP BY o.id
         """,
@@ -169,30 +170,32 @@ def refill_context(conn: sqlite3.Connection, service_date: str) -> dict:
     conflating the two would smuggle a second estimate into a figure whose
     whole value is that it reproduces exactly what the ledger did.
     """
+    served_bd = timeutil.sql_business_date("r.served_at")
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS refills,
                COALESCE(SUM(r.pieces), 0)     AS pieces,
                COALESCE(SUM(r.sauce_base), 0) AS sauce_base,
                COUNT(DISTINCT r.session_id)   AS sessions,
                COUNT(DISTINCT r.flavor_id)    AS flavors_used
           FROM unli_refill r
-         WHERE r.status = 'served' AND date(r.served_at) = ?
+         WHERE r.status = 'served' AND {served_bd} = ?
         """,
         (service_date,),
     ).fetchone()
     by_flavor = [dict(r) for r in conn.execute(
-        """
+        f"""
         SELECT r.flavor_name, COUNT(*) AS refills, SUM(r.pieces) AS pieces
           FROM unli_refill r
-         WHERE r.status = 'served' AND date(r.served_at) = ?
+         WHERE r.status = 'served' AND {served_bd} = ?
          GROUP BY r.flavor_id ORDER BY refills DESC, r.flavor_name
         """,
         (service_date,),
     ).fetchall()]
+    voided_bd = timeutil.sql_business_date("COALESCE(voided_at, created_at)")
     voided = conn.execute(
-        "SELECT COUNT(*) AS n FROM unli_refill WHERE status IN ('voided','cancelled') "
-        "AND date(COALESCE(voided_at, created_at)) = ?", (service_date,),
+        f"SELECT COUNT(*) AS n FROM unli_refill WHERE status IN ('voided','cancelled') "
+        f"AND {voided_bd} = ?", (service_date,),
     ).fetchone()["n"]
     return {
         "refills_served": row["refills"], "pieces_served": row["pieces"],
@@ -428,8 +431,8 @@ def history(conn: sqlite3.Connection, limit: int = 100, item_key: str | None = N
         sql += " AND item_key = ?"
         params.append(item_key)
     if days:
-        sql += " AND service_date >= date('now', ?)"
-        params.append(f"-{days} days")
+        sql += " AND service_date >= ?"
+        params.append(timeutil.business_date_n_days_ago(days))
     sql += " ORDER BY service_date DESC, unli_item_id LIMIT ?"
     params.append(limit)
     rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
@@ -475,9 +478,9 @@ def recalibrate(conn: sqlite3.Connection, item_key: str | None = None,
              WHERE unli_item_id = ?
                AND validation_state = 'validated'
                AND heads >= ?
-               AND service_date >= date('now', ?)
+               AND service_date >= ?
             """,
-            (s["id"], min_heads, f"-{s['window_days']} days"),
+            (s["id"], min_heads, timeutil.business_date_n_days_ago(s["window_days"])),
         ).fetchone()
 
         current = conn.execute(

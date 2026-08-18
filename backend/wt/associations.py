@@ -16,6 +16,8 @@ import pandas as pd
 from mlxtend.frequent_patterns import association_rules, fpgrowth
 from mlxtend.preprocessing import TransactionEncoder
 
+from . import timeutil
+
 MIN_TRANSACTIONS = 30     # orders needed before a frequent-itemset pass is trustworthy
 MIN_SUPPORT = 0.02        # a pair must appear in at least 2% of orders
 MIN_CONFIDENCE = 0.3      # given item A, item B follows at least 30% of the time
@@ -34,9 +36,9 @@ def product_combinations(conn: sqlite3.Connection, lookback_days: int = 90, top_
           FROM order_line ol
           JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND o.created_at >= datetime('now', ?)
+         WHERE o.status != 'void' AND o.created_at >= ?
         """,
-        (f"-{lookback_days} days",),
+        (timeutil.utc_bound_n_manila_days_ago(lookback_days),),
     ))
 
     baskets: dict[int, set] = {}
