@@ -535,6 +535,13 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     print(f"database: {db.db_path()}")
+    # Guarded only here, not inside run() — run(fresh=True) is also the
+    # in-process entrypoint six test classes call against their own tempfile
+    # WT_DB in setUpClass, and forcing them through an interactive
+    # confirmation would hang the suite. This CLI block is the only path an
+    # operator actually invokes by hand.
+    if args.fresh:
+        db.require_destructive_confirmation("drop and rebuild the database")
     stats = run(fresh=args.fresh)
     if stats:
         print("\nimported")

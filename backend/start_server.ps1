@@ -17,6 +17,31 @@
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
+# Production database path and environment, made explicit rather than left
+# to wt/db.py's WT_DB default — see BASELINE_SNAPSHOT.json's audit: dev,
+# test and prod previously all resolved to the same implicit path with
+# nothing distinguishing them. This launcher now names its target file
+# outright and marks itself as production, which turns on the startup
+# integrity gate and the default-secret refusal in wt/db.py
+# (validate_production_startup) — neither fires for a dev run that never
+# sets WT_ENV.
+$env:WT_DB = Join-Path $PSScriptRoot "wings_theory.db"
+$env:WT_ENV = "production"
+
+# WT_SECRET signs every login token. Generating a new one on every launch
+# would silently log everyone out on every restart (HS256 tokens signed
+# under the old secret stop verifying), so it is generated once and
+# persisted locally rather than regenerated per run. backend/.secret is
+# gitignored — this file must never be committed.
+$secretPath = Join-Path $PSScriptRoot ".secret"
+if (-not (Test-Path $secretPath)) {
+    $bytes = New-Object byte[] 48
+    [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
+    [Convert]::ToBase64String($bytes) | Set-Content -Path $secretPath -Encoding utf8 -NoNewline
+    Write-Host "Generated a new signing secret at $secretPath -- back this up; losing it logs everyone out." -ForegroundColor Yellow
+}
+$env:WT_SECRET = Get-Content -Path $secretPath -Raw
+
 function Get-LanIp {
     $defaultRoute = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($defaultRoute) {
@@ -33,7 +58,8 @@ function Show-Urls([string]$ip, [string]$color) {
 }
 
 $lanIp = Get-LanIp
-Write-Host "Wings Theory -- starting backend..." -ForegroundColor Yellow
+Write-Host "Wings Theory -- starting backend (production)..." -ForegroundColor Yellow
+Write-Host "Database: $env:WT_DB"
 Show-Urls $lanIp "White"
 Write-Host "(tablets must be on the same Wi-Fi / hotspot as this PC)"
 Write-Host ""

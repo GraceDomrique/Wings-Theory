@@ -19,6 +19,7 @@ venv/
 # Local environment / secrets
 .env
 .env.*
+backend/.secret
 
 # OS noise
 .DS_Store

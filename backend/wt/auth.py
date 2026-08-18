@@ -29,6 +29,11 @@ ALGO = "HS256"
 TOKEN_TTL = 12 * 3600          # one shift plus overtime
 ITERATIONS = 240_000
 
+# The fallback signing key when WT_SECRET isn't set. Named so a production
+# startup check (db.validate_production_startup) can refuse to run with it
+# still in effect, instead of duplicating the literal in two files.
+DEFAULT_SECRET = "dev-only-change-in-production"
+
 ROLES = ("admin", "manager", "cashier", "kitchen")
 
 # Capability -> roles allowed. Mirrors the access matrix in the build document.
@@ -75,7 +80,7 @@ CAPABILITIES = {
 
 
 def _secret() -> bytes:
-    return os.environ.get("WT_SECRET", "dev-only-change-in-production").encode()
+    return os.environ.get("WT_SECRET", DEFAULT_SECRET).encode()
 
 
 def _b64(raw: bytes) -> str:

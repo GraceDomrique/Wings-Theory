@@ -1728,20 +1728,31 @@ async function loadInventory() {
 const CAT_LABELS = { '': 'All', wet_food: 'Wet food', dry_food: 'Dry food', packaging: 'Packaging', consumable: 'Consumable', resale: 'Resale' };
 /* One status per ingredient, combining "can it be deducted at all" with the
    runway the Forecasts page computes — so the tab you click here means the
-   same thing it means there. */
-const INV_STATUS = { out: 'out', critical: 'critical', warning: 'low', ok: 'healthy', idle: 'healthy', no_data: 'healthy' };
+   same thing it means there.
+
+   no_data is deliberately NOT healthy: it means ingredient_depletion() found
+   zero days of recorded consumption for this item, i.e. nothing has ever
+   measured whether it's running low. A lack of evidence is not evidence of
+   health — collapsing it into 'healthy' silently told a manager 86% of a
+   fresh install's stock was fine when none of it had been measured at all.
+   The two defensive fallbacks below (an unmapped risk string, or no
+   depletion row at all) carry the same reasoning: absence of a signal is
+   never treated as a good signal. */
+const INV_STATUS = { out: 'out', critical: 'critical', warning: 'low', ok: 'healthy', idle: 'healthy', no_data: 'insufficient_data' };
 function invStatus(i) {
   if (!i.is_deductable) return 'unset';
   const d = STATE.inventory.dep[i.id];
-  return d ? (INV_STATUS[d.risk] || 'healthy') : 'healthy';
+  return d ? (INV_STATUS[d.risk] || 'insufficient_data') : 'insufficient_data';
 }
 const INV_TABS = [
   ['', 'All'], ['out', 'Out'], ['critical', 'Critical'], ['low', 'Low'],
-  ['healthy', 'Healthy'], ['unset', 'No pack size'], ['sub', 'Sub-recipes'],
+  ['healthy', 'Healthy'], ['insufficient_data', 'Not measured'],
+  ['unset', 'No pack size'], ['sub', 'Sub-recipes'],
 ];
 const INV_CHIP = {
   out: ['bad', 'Out of stock'], critical: ['bad', 'Critical'], low: ['warn', 'Running low'],
-  healthy: ['ok', 'Healthy'], unset: ['amber', 'No pack size'],
+  healthy: ['ok', 'Healthy'], insufficient_data: ['mute', 'Not measured'],
+  unset: ['amber', 'No pack size'],
 };
 // food_ingredient is the common case and gets no badge — only the two
 // exceptions are worth calling out in the table.

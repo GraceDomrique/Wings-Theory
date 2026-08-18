@@ -317,6 +317,10 @@ if __name__ == "__main__":
     p.add_argument("--seed", type=int, default=42)
     args = p.parse_args()
 
+    print(f"database: {db.db_path()}")
+    db.require_destructive_confirmation(
+        f"write {args.days} days of synthetic order history directly into"
+    )
     c = db.get_conn()
     result = run(c, days=args.days, seed=args.seed)
     print("done:", result)

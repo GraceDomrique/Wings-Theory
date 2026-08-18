@@ -45,7 +45,11 @@ app.add_middleware(
 
 @app.on_event("startup")
 def _startup() -> None:
-    db.migrate(db.get_conn())
+    conn = db.get_conn()
+    db.migrate(conn)
+    # No-op unless WT_ENV=production is explicitly set — see
+    # db.validate_production_startup for why that's the gate.
+    db.validate_production_startup(conn)
 
 
 @app.exception_handler(WTError)
@@ -75,6 +79,16 @@ def conn():
         yield c
     finally:
         c.close()
+
+
+@app.get("/health", tags=["ops"], include_in_schema=False)
+def health(c: sqlite3.Connection = Depends(conn)):
+    """Unauthenticated on purpose — this is what a launcher script or an
+    external monitor checks before assuming the server is actually usable,
+    not a console page, so it can't require a login token. Reports nothing
+    that isn't already visible to anyone on the LAN who can reach the
+    server at all."""
+    return db.integrity_report(c)
 
 
 def principal(authorization: str = Header(default="")) -> dict:

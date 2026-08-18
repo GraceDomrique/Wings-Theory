@@ -4281,6 +4281,174 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
         self.assertIn("voided", r.text)
 
 
+class TestMigrationSafety(unittest.TestCase):
+    """Covers the migration-runner rewrite in db.py: a failed migration must
+    roll back everything it had done so far (not just what it wrote after
+    its own internal BEGIN, since the old runner's conn.executescript()
+    committed each statement as it ran and left the rollback() with nothing
+    left to undo), an already-used database gets backed up before a pending
+    migration touches it, and re-running migrate() against an up-to-date
+    database is a safe no-op — a second deployment cannot duplicate schema
+    history or re-run work that already happened.
+
+    Builds its own tiny migration sets in a temp directory rather than
+    touching backend/migrations/, which is immutable — real migration
+    content is exercised separately by every other test in this file via
+    fresh_db().
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.mig_dir = self.tmp / "migrations"
+        self.mig_dir.mkdir()
+        self.backup_dir = self.tmp / "backups"
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(self.db_path)
+
+        self._real_mig_dir = db.MIGRATIONS_DIR
+        self._real_backup_dir = db.BACKUP_DIR
+        db.MIGRATIONS_DIR = self.mig_dir
+        db.BACKUP_DIR = self.backup_dir
+
+    def tearDown(self):
+        db.MIGRATIONS_DIR = self._real_mig_dir
+        db.BACKUP_DIR = self._real_backup_dir
+        scrub(self.db_path)
+
+    def _write_migration(self, version: int, name: str, sql: str) -> None:
+        (self.mig_dir / f"{version:04d}_{name}.sql").write_text(sql, encoding="utf-8")
+
+    def test_migration_failure_rolls_back_completely(self):
+        # 0001 exists alone first and is applied on its own — migrate()
+        # applies every pending migration it finds in one call, so 0002 is
+        # only written to disk (and therefore only becomes "pending") after
+        # 0001 has already succeeded and committed.
+        self._write_migration(1, "base", """
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT,
+                applied_at TEXT DEFAULT (datetime('now')));
+            INSERT INTO schema_version (version, name) VALUES (1, 'base');
+        """)
+        conn = db.connect(self.db_path)
+        db.migrate(conn)
+        self.assertEqual(db.applied_version(conn), 1)
+
+        # 0002 creates a table, inserts one row successfully, then fails on
+        # a second insert that collides on the primary key — the exact
+        # shape that silently partially-committed under the old
+        # executescript-based runner.
+        self._write_migration(2, "bad", """
+            CREATE TABLE t2 (id INTEGER PRIMARY KEY);
+            INSERT INTO t2 VALUES (1);
+            INSERT INTO t2 VALUES (1);
+        """)
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.migrate(conn)
+
+        # 0002 must not have left ANY trace — not the table, not a partial
+        # row, not an advanced schema_version.
+        self.assertEqual(db.applied_version(conn), 1)
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='t2'"
+        ).fetchone()
+        self.assertIsNone(exists, "a failed migration left table t2 behind")
+        conn.close()
+
+    def test_pending_migration_backs_up_an_already_used_database_first(self):
+        self._write_migration(1, "base", """
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT,
+                applied_at TEXT DEFAULT (datetime('now')));
+            INSERT INTO schema_version (version, name) VALUES (1, 'base');
+            CREATE TABLE widgets (id INTEGER PRIMARY KEY);
+        """)
+        conn = db.connect(self.db_path)
+        db.migrate(conn)
+        conn.execute("INSERT INTO widgets DEFAULT VALUES")
+        conn.commit() if conn.in_transaction else None
+
+        self.assertFalse(self.backup_dir.exists())
+
+        self._write_migration(2, "adds_column", "ALTER TABLE widgets ADD COLUMN note TEXT;")
+        db.migrate(conn)
+
+        self.assertTrue(self.backup_dir.exists())
+        backups = list(self.backup_dir.glob("*.db"))
+        self.assertEqual(len(backups), 1, "expected exactly one pre-migration backup")
+        self.assertIn("pre_migrate_to_v0002", backups[0].name)
+
+        # the backup is a real, openable snapshot of the pre-migration state
+        snap = sqlite3.connect(str(backups[0]))
+        self.assertEqual(
+            snap.execute("SELECT COUNT(*) FROM widgets").fetchone()[0], 1
+        )
+        cols = [r[1] for r in snap.execute("PRAGMA table_info(widgets)").fetchall()]
+        self.assertNotIn("note", cols, "backup should predate the column that migration 2 adds")
+        snap.close()
+        conn.close()
+
+    def test_fresh_database_is_not_backed_up_before_its_first_migration(self):
+        # Nothing existed yet, so there is nothing worth a backup of — this
+        # is the ordinary path every test in this file takes via fresh_db(),
+        # and it must not start writing backup files on every test run.
+        self._write_migration(1, "base", """
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT,
+                applied_at TEXT DEFAULT (datetime('now')));
+            INSERT INTO schema_version (version, name) VALUES (1, 'base');
+        """)
+        conn = db.connect(self.db_path)
+        db.migrate(conn)
+        self.assertFalse(self.backup_dir.exists())
+        conn.close()
+
+    def test_second_deploy_does_not_duplicate_or_rerun(self):
+        self._write_migration(1, "base", """
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT,
+                applied_at TEXT DEFAULT (datetime('now')));
+            INSERT INTO schema_version (version, name) VALUES (1, 'base');
+            CREATE TABLE widgets (id INTEGER PRIMARY KEY);
+            INSERT INTO widgets DEFAULT VALUES;
+        """)
+        conn = db.connect(self.db_path)
+        v1 = db.migrate(conn)
+        v2 = db.migrate(conn)  # second "deployment" against the same, now-current db
+        self.assertEqual(v1, v2)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM widgets").fetchone()[0], 1,
+            "re-running migrate() against an up-to-date database duplicated a row",
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM schema_version WHERE version=1").fetchone()[0], 1,
+        )
+        conn.close()
+
+    def test_restart_preserves_data_across_a_reopened_connection(self):
+        self._write_migration(1, "base", """
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY, name TEXT,
+                applied_at TEXT DEFAULT (datetime('now')));
+            INSERT INTO schema_version (version, name) VALUES (1, 'base');
+            CREATE TABLE widgets (id INTEGER PRIMARY KEY, note TEXT);
+        """)
+        conn = db.connect(self.db_path)
+        db.migrate(conn)
+        conn.execute("INSERT INTO widgets (note) VALUES ('survives restart')")
+        conn.commit() if conn.in_transaction else None
+        conn.close()
+
+        # Simulate the process restarting: a brand new connection to the
+        # same file, migrate() run again (as api.py's startup hook does).
+        conn2 = db.connect(self.db_path)
+        db.migrate(conn2)
+        row = conn2.execute("SELECT note FROM widgets").fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["note"], "survives restart")
+        conn2.close()
+
+    def test_require_destructive_confirmation_refuses_without_env_opt_in(self):
+        os.environ.pop("WT_ALLOW_DESTRUCTIVE", None)
+        with self.assertRaises(SystemExit):
+            db.require_destructive_confirmation("do something destructive")
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(
@@ -4296,6 +4464,7 @@ def main() -> int:
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
             TestSeedImport, TestConsoleAPI, TestForecasting, TestAnomaly, TestAssociations,
+            TestMigrationSafety,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
