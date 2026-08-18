@@ -267,6 +267,7 @@ a{color:inherit}
 .g2{grid-template-columns:repeat(2,minmax(0,1fr))}
 .g3{grid-template-columns:repeat(3,minmax(0,1fr))}
 .g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
 .g-side{grid-template-columns:minmax(0,1fr) 340px;align-items:start}
 .g-split{grid-template-columns:minmax(0,1.05fr) minmax(0,1.35fr);align-items:start}
 
@@ -479,7 +480,7 @@ tbody tr.row-link{cursor:pointer}
 .mob-nav{display:none}
 @media (max-width:1180px){
   .g-side,.g-split{grid-template-columns:minmax(0,1fr)}
-  .g4{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .g4,.g5{grid-template-columns:repeat(2,minmax(0,1fr))}
 }
 @media (max-width:900px){
   .app{grid-template-columns:1fr}
@@ -497,7 +498,7 @@ tbody tr.row-link{cursor:pointer}
   .mob-i svg{width:20px;height:20px}
   .mob-i.on{color:var(--amber-text)}
 }
-@media (max-width:620px){ .g4{grid-template-columns:1fr} }
+@media (max-width:620px){ .g4,.g5{grid-template-columns:1fr} }
 
 @media print{
   .rail,.head,#errBanner,.mob-nav,.btn,.tabs,.toast{display:none!important}
@@ -846,10 +847,6 @@ function kpi(label, value, foot, icon, act) {
 function emptyState(title, body, icon) {
   return `<div class="empty">${ic(icon || 'chkc')}<b>${esc(title)}</b><p>${esc(body || '')}</p></div>`;
 }
-function statusChip(s) {
-  const map = { punched: 'info', in_progress: 'warn', ready: 'warn', served: 'ok', void: 'bad' };
-  return `<span class="chip ${map[s] || 'mute'}">${esc(String(s).replace(/_/g, ' '))}</span>`;
-}
 const REASON_LABELS = {
   purchase_receipt: 'Delivery received',
   sale_commit: 'Sold',
@@ -882,12 +879,6 @@ function riskChip(risk) {
 }
 function note(text, title, kind) {
   return `<div class="note ${kind || ''}">${ic('spark')}<div><b>${esc(title || 'How this works')}</b><p>${esc(text)}</p></div></div>`;
-}
-function progressRow(label, part, total, color) {
-  const pct = total > 0 ? Math.round((part / total) * 100) : 0;
-  const c = color || (pct === 100 ? 'var(--ok-fill)' : pct >= 80 ? 'var(--warn-fill)' : 'var(--bad-fill)');
-  return `<div class="prog"><div class="prog-t"><b>${esc(label)}</b><span>${part} / ${total}</span></div>
-    <div class="prog-b"><i data-w="${pct}%" style="background:${c}"></i></div></div>`;
 }
 /* Kept for call-site compatibility — now renders the real SVG bar chart. */
 function barChart(items, opt) {
@@ -1720,139 +1711,195 @@ function inventoryValuation() {
 }
 
 /* ===================== DASHBOARD ===================== */
+/* ===================== TODAY (DASHBOARD) =====================
+   One question governs this whole page: "what does the manager need to
+   know and act on today?" Priority order, top to bottom: operational
+   problems needing action now -> today's overall position -> what's
+   actually being consumed -> what to buy / what will likely sell ->
+   what to use first before it turns -> data that still needs confirming
+   (kept last and visually quiet, since an unverified price never competes
+   with stock that will run out tomorrow — those are different kinds of
+   problem with different urgency).
+
+   Every figure here comes from an endpoint already used elsewhere in the
+   console (fetchDepletion, /console/expiry, /console/anomalies, /console/
+   forecasts/demand, /console/readiness) — nothing on this page is a second,
+   independently-computed copy of a number the backend already owns. Sales/
+   revenue reporting has been moved off this page entirely: none of it
+   answers "what does inventory need today", and Reports already covers it. */
 async function loadDashboard() {
-  const [r, s30, s1, exp, dep, ing, anom] = await Promise.all([
+  const [r, exp, dep, ing, anom, dem] = await Promise.all([
     api('/console/readiness'),
-    api('/console/reports/sales?days=30'),
-    api('/console/reports/sales?days=1'),
-    api('/console/expiry?within_days=14'),
+    api('/console/expiry?within_days=90'),
     fetchDepletion(),
     api('/console/ingredients?limit=500'),
     api('/console/anomalies?lookback_days=30'),
+    api('/console/forecasts/demand'),
   ]);
   STATE.readiness = r; renderNavBadges();
-  STATE.inventory.data = ing.ingredients;   // keeps Reports' valuation warm without refetching
+  STATE.inventory.data = ing.ingredients;
 
-  const out = dep.ingredients.filter(i => i.risk === 'out');
-  const crit = dep.ingredients.filter(i => i.risk === 'critical');
-  const warn = dep.ingredients.filter(i => i.risk === 'warning');
+  // riskBucket() is the same grouping the Stock page's Runway tabs use —
+  // 'idle' and 'no_data' both mean "no reliable runway number exists",
+  // just for different reasons, and both count as "not measured" here.
+  const bucketed = dep.ingredients.map(x => ({ x, b: riskBucket(x.risk) }));
+  const out = bucketed.filter(v => v.b === 'out').map(v => v.x);
+  const crit = bucketed.filter(v => v.b === 'critical').map(v => v.x);
+  const warn = bucketed.filter(v => v.b === 'warning').map(v => v.x);
+  const notMeasured = bucketed.filter(v => v.b === 'no_data').map(v => v.x);
+  const measured = dep.ingredients.length - notMeasured.length;
+
+  const expiringSoonBatches = (exp.batches || []).filter(b => b.days_to_expiry <= 7);
+  const expiringSoonIngredients = new Set(expiringSoonBatches.map(b => b.ingredient_id)).size;
+  // Same enrichment loadExpiry() applies on the Expiry page — not a new
+  // calculation, the same one, so expiryCard() below reads identically to
+  // how it reads there.
+  const rateByIngredient = {};
+  dep.ingredients.forEach(x => { rateByIngredient[x.ingredient_id] = x.avg_daily_consumption; });
+  const useFirst = (exp.batches || []).slice(0, 5).map(b => {
+    const rate = rateByIngredient[b.ingredient_id];
+    const usesUpIn = rate ? b.qty_base / rate : null;
+    return { ...b, uses_up_in_days: usesUpIn, at_risk: !b.expired && (usesUpIn == null || usesUpIn > b.days_to_expiry) };
+  });
+  const useFirstColor = b => (b.expired || b.days_to_expiry <= 7) ? 'var(--bad-fill)'
+    : b.days_to_expiry <= 30 ? 'var(--warn-fill)' : 'var(--info-fill)';
+
   const toBuy = dep.ingredients.filter(i => i.suggested_order_qty != null)
-    .sort((a, b) => (a.days_remaining ?? 1e9) - (b.days_remaining ?? 1e9)).slice(0, 7);
-  const val = inventoryValuation();
+    .sort((a, b) => (a.days_remaining ?? 1e9) - (b.days_remaining ?? 1e9)).slice(0, 6);
 
-  /* Attention band — every row is a real condition read from a real endpoint. */
-  const att = [];
-  out.slice(0, 4).forEach(i => att.push({ ic: 'warn', cls: 'c-bad', go: 'inventory',
+  const highAnomalies = (anom.anomalies || []).filter(a => a.severity === 'high');
+
+  /* SECTION 1 — Action required. Two groups, visually distinct: real
+     operational problems (stock, expiry, unusual loss — all read from a
+     model or a real count, never fabricated) first and separately, only
+     when it actually blocks a sale, a data problem. An unverified price
+     never appears here — see Section 6. */
+  const ops = [];
+  out.slice(0, 4).forEach(i => ops.push({ ic: 'warn', cls: 'c-bad', go: 'inventory',
     t: `${i.name} is out of stock`,
     s: `delivery normally takes ${i.lead_time_days} day${i.lead_time_days === 1 ? '' : 's'}`,
     m: '<span class="chip bad">Out</span>' }));
-  crit.slice(0, 3).forEach(i => att.push({ ic: 'warn', cls: 'c-bad', go: 'forecasts',
-    t: `${i.name} runs out in about ${num(i.days_remaining, 1)} day${i.days_remaining === 1 ? '' : 's'}`,
-    s: `${num(i.available_base, 2)} ${i.base_unit} left · delivery takes ${i.lead_time_days}d`,
+  crit.slice(0, 3).forEach(i => ops.push({ ic: 'warn', cls: 'c-bad', go: 'forecasts',
+    t: `${i.name} — estimated ${num(i.days_remaining, 1)} day${i.days_remaining === 1 ? '' : 's'} of stock left`,
+    s: `${num(i.available_base, 2)} ${i.base_unit} on hand · delivery takes ${i.lead_time_days}d`,
     m: '<span class="chip bad">Reorder now</span>' }));
-  (anom.anomalies || []).filter(a => a.severity === 'high').slice(0, 2).forEach(a => att.push({
-    ic: 'anom', cls: 'c-warn', go: 'anomaly',
+  expiringSoonBatches.slice(0, 3).forEach(b => ops.push({ ic: 'exp', cls: 'c-warn', go: 'expiry',
+    t: `${b.ingredient_name} ${b.expired ? 'has expired' : `expires in ${b.days_to_expiry} day${b.days_to_expiry === 1 ? '' : 's'}`}`,
+    s: `${num(b.qty_base, 2)} ${b.base_unit}${b.tracking === 'estimated_shelf_life' ? ' · estimated, not an exact date' : ''}`,
+    m: `<span class="chip ${b.expired || b.days_to_expiry <= 1 ? 'bad' : 'warn'}">${b.expired ? 'Expired' : b.days_to_expiry + 'd'}</span>` }));
+  highAnomalies.slice(0, 2).forEach(a => ops.push({ ic: 'anom', cls: 'c-warn', go: 'anomaly',
     t: `Unusual loss on ${a.ingredient_name}`,
     s: a.why, m: '<span class="chip warn">Check</span>' }));
-  (exp.batches || []).filter(b => b.days_to_expiry <= 7).slice(0, 2).forEach(b => att.push({
-    ic: 'exp', cls: 'c-warn', go: 'expiry',
-    t: `${b.ingredient_name} expires in ${b.days_to_expiry} day${b.days_to_expiry === 1 ? '' : 's'}`,
-    s: `${num(b.qty_base, 2)} ${b.base_unit}${b.lot_no ? ' · ref ' + b.lot_no : ''}`,
-    m: `<span class="chip ${b.days_to_expiry <= 1 ? 'bad' : 'warn'}">${b.days_to_expiry}d</span>` }));
-  if (r.unmapped_open) att.push({ ic: 'db', cls: 'c-amber', go: 'unmapped',
-    t: `${r.unmapped_open} recipe ingredient${r.unmapped_open === 1 ? '' : 's'} still unmatched`,
-    s: 'Each one blocks every menu item that uses it',
-    m: '<span class="chip amber">Data</span>' });
 
-  const dayBars = (s30.by_day || []).slice(-14).map((d, i, arr) => ({
-    l: d.day.slice(5), v: Math.round(d.revenue), t: money0(d.revenue),
-    c: i === arr.length - 1 ? CV('--amber') : CV('--info-fill'),
-  }));
+  const dataBlocking = [];
+  if (r.unmapped_open) dataBlocking.push({ ic: 'db', cls: 'c-amber', go: 'unmapped',
+    t: `${r.unmapped_open} recipe ingredient${r.unmapped_open === 1 ? '' : 's'} still unmatched`,
+    s: 'Each one blocks every menu item that uses it — not just a data gap, a sale that can\'t go through',
+    m: '<span class="chip amber">Blocks a sale</span>' });
 
   setWork(`
   <div class="att">
-    <div class="att-h"><span class="pulse"></span><h2>Needs attention now</h2><span class="n">${att.length} open</span></div>
-    <div class="att-l">${att.length ? att.map(a => `<button class="att-i" data-nav="${a.go}">
+    <div class="att-h"><span class="pulse"></span><h2>Needs attention now</h2><span class="n">${ops.length} open</span></div>
+    <div class="att-l">${ops.length ? ops.map(a => `<button class="att-i" data-nav="${a.go}">
       <span class="att-ic ${a.cls}">${ic(a.ic)}</span>
       <span class="att-x"><b>${esc(a.t)}</b><span>${esc(a.s)}</span></span>
       <span class="att-m">${a.m}${ic('chev')}</span></button>`).join('')
-      : emptyState('Nothing needs attention', 'No stock is critical, nothing unusual was flagged, and nothing expires inside a week.')}</div>
+      : emptyState('Nothing needs attention', 'No stock is critical, nothing unusual was flagged, and nothing expires within a week.')}</div>
+  </div>
+  ${dataBlocking.length ? `
+  <div class="att">
+    <div class="att-h"><h2>Data problems blocking a sale</h2><span class="n">${dataBlocking.length} open</span></div>
+    <div class="att-l">${dataBlocking.map(a => `<button class="att-i" data-nav="${a.go}">
+      <span class="att-ic ${a.cls}">${ic(a.ic)}</span>
+      <span class="att-x"><b>${esc(a.t)}</b><span>${esc(a.s)}</span></span>
+      <span class="att-m">${a.m}${ic('chev')}</span></button>`).join('')}</div>
+  </div>` : ''}
+
+  <!-- SECTION 2 — Today's position -->
+  <div class="sec-t"><h2>Today's position</h2><p>Every ingredient, sorted into one real state</p></div>
+  <div class="grid g5">
+    ${kpi('Tracked', ing.ingredients.length, 'active ingredients', 'inv', 'inventory')}
+    ${kpi('Critical', out.length + crit.length, 'out of stock or about to be', 'warn', 'inventory')}
+    ${kpi('Running low', warn.length, 'inside delivery time', 'clock', 'inventory')}
+    ${kpi('Expiring soon', expiringSoonIngredients, 'ingredient(s), within 7 days', 'exp', 'expiry')}
+    ${kpi('Not measured yet', notMeasured.length, 'no usage recorded to judge by', 'db', 'inventory')}
   </div>
 
-  <div class="grid g-side">
-    <div class="card">
-      <div class="card-h"><div><h2>Buy next</h2>
-        <p>Sized from real recent usage, covering delivery time plus a few days' buffer</p></div>
-        <div class="r"><button class="btn btn-p btn-sm" data-nav="inventory">${ic('buy')}Log a delivery</button></div></div>
-      ${toBuy.length ? `<div class="tw"><table><thead><tr>
-        <th>Ingredient</th><th class="n">On hand</th><th class="n">Days left</th>
-        <th class="n">Used / day</th><th class="n">Order</th><th>Status</th></tr></thead>
-        <tbody>${toBuy.map(i => `<tr>
-          <td class="nm">${esc(i.name)}</td>
-          <td class="n">${num(i.available_base, 2)} ${esc(i.base_unit)}</td>
-          <td class="n">${i.days_remaining != null ? num(i.days_remaining, 1) + ' d' : '—'}</td>
-          <td class="n">${i.avg_daily_consumption ? num(i.avg_daily_consumption, 2) + ' ' + esc(i.base_unit) : '—'}</td>
-          <td class="n"><b>${i.suggested_order_qty} ${esc(i.suggested_order_unit)}${i.suggested_order_qty === 1 ? '' : 's'}</b></td>
-          <td>${riskChip(i.risk)}</td></tr>`).join('')}</tbody></table></div>`
-        : emptyState('Nothing to order', 'Every ingredient has a comfortable buffer right now.')}
-    </div>
-
+  <div class="grid g-split">
     <div style="display:flex;flex-direction:column;gap:var(--s2)">
+
+      <!-- SECTION 3 — Consumption -->
+      <div class="card"><div class="card-h"><h2>What's being consumed</h2></div>
+        <div class="card-b tight">
+          <p style="margin:0;font-size:13px;line-height:1.6">
+            <b>${measured}</b> of <b>${dep.ingredients.length}</b> ingredients have real usage recorded in the last
+            30 days${measured ? ` — for those, the "used/day" figures below are a <b>calculated average</b> over that window, not a single reading` : ''}.
+            ${notMeasured.length ? ` <b>${notMeasured.length}</b> have no usage recorded yet, so there's nothing to judge them by — that's a data gap, not a sign anything's wrong.` : ''}
+          </p>
+          ${highAnomalies.length ? `<p style="margin:10px 0 0;font-size:13px;line-height:1.6">
+            <b>${highAnomalies.length}</b> unusual stock loss${highAnomalies.length === 1 ? '' : 'es'} flagged in the last 30 days — see above.</p>` : ''}
+        </div>
+      </div>
+
+      <!-- SECTION 4 — Forecast / replenishment -->
+      <div class="card">
+        <div class="card-h"><div><h2>Buy next</h2>
+          <p>Sized from calculated average usage — not a forecast, a projection from real recent history</p></div>
+          <div class="r"><button class="btn btn-p btn-sm" data-nav="inventory">${ic('buy')}Log a delivery</button></div></div>
+        ${toBuy.length ? `<div class="tw"><table><thead><tr>
+          <th>Ingredient</th><th class="n">On hand</th><th class="n">Est. days left</th>
+          <th class="n">Used / day (avg)</th><th class="n">Order</th><th>Status</th></tr></thead>
+          <tbody>${toBuy.map(i => `<tr>
+            <td class="nm">${esc(i.name)}</td>
+            <td class="n">${num(i.available_base, 2)} ${esc(i.base_unit)}</td>
+            <td class="n">${i.days_remaining != null ? num(i.days_remaining, 1) + ' d' : '—'}</td>
+            <td class="n">${i.avg_daily_consumption ? num(i.avg_daily_consumption, 2) + ' ' + esc(i.base_unit) : '—'}</td>
+            <td class="n"><b>${i.suggested_order_qty} ${esc(i.suggested_order_unit)}${i.suggested_order_qty === 1 ? '' : 's'}</b></td>
+            <td>${riskChip(i.risk)}</td></tr>`).join('')}</tbody></table></div>`
+          : emptyState('Nothing to order', 'Every ingredient has a comfortable buffer right now.')}
+      </div>
+
       <div class="card" id="tomorrowCard">
-        <div class="card-h"><h2>Tomorrow's forecast</h2></div>
+        <div class="card-h"><h2>What's likely to sell tomorrow</h2></div>
         <div class="card-b tight"><span class="sub">Working…</span></div>
       </div>
-      <div class="card"><div class="card-h"><h2>Menu availability</h2></div>
-        <div class="card-b" style="display:flex;flex-direction:column;gap:12px">
-          ${progressRow('Sellable right now', r.menu_items_sellable, r.menu_items_total, 'var(--ok-fill)')}
-          ${progressRow('Ingredients ready to deduct', ing.ingredients.length - r.ingredients_blocked, ing.ingredients.length, 'var(--info-fill)')}
-          ${r.menu_items_blocked ? `<div class="sub" style="line-height:1.5">${r.menu_items_blocked} blocked — each one is out of stock on a specific ingredient, not a broken recipe.</div>` : ''}
-        </div></div>
+    </div>
+
+    <!-- SECTION 5 — Use first (Expiry / FEFO) -->
+    <div class="card">
+      <div class="card-h"><div><h2>Use first</h2>
+        <p>Stock with the earliest expiry goes first — this is that order, soonest at top</p></div>
+        <div class="r"><button class="btn btn-s btn-sm" data-nav="expiry">${ic('exp')}Full expiry list</button></div></div>
+      ${useFirst.length ? `<div style="display:flex;flex-direction:column;gap:9px;padding:var(--s2)">${useFirst.map(b =>
+        expiryCard(b, 90, useFirstColor(b))).join('')}</div>`
+        : emptyState('Nothing expiring soon', 'No open batch carries a near-term expiry within the next 90 days.')}
     </div>
   </div>
 
-  <div class="sec-t"><h2>Today</h2><p>Live from real orders</p></div>
-  <div class="grid g4">
-    ${kpi("Today's sales", money0(s1.revenue), `${s1.orders} order${s1.orders === 1 ? '' : 's'}`, 'cash', 'reports')}
-    ${kpi('Last 30 days', money0(s30.revenue), `${s30.orders} orders · ${s30.covers} covers`, 'rep', 'reports')}
-    ${kpi('Inventory value', money0(val.total), `${val.priced} of ${val.total_count} priced`, 'pkg', 'inventory')}
-    ${kpi('Out / reorder now / soon', `${out.length} / ${crit.length} / ${warn.length}`, 'by days of supply', 'warn', 'forecasts')}
-  </div>
+  <!-- SECTION 6 — Data confidence: quiet, last, never mixed with stock health -->
+  ${r.needs_verification ? `
+  <div class="note">${ic('db')}<div><b>Setup details still need confirming</b>
+    <p><b>${r.needs_verification}</b> value${r.needs_verification === 1 ? '' : 's'} (pack sizes, costs, recipe quantities) ${r.needs_verification === 1 ? 'is' : 'are'} still placeholders from setup. This is about the data behind the numbers, not the stock itself — a healthy ingredient can still have an unconfirmed price.
+    <a href="#" data-nav="verification" style="margin-left:6px">Review →</a></p></div>
+  </div>` : ''}`);
 
-  <div class="card"><div class="card-h"><div><h2>Revenue by day</h2>
-    <p>Real completed orders, last ${dayBars.length} day${dayBars.length === 1 ? '' : 's'} with sales — today in amber</p></div></div>
-    <div class="card-b tight">${dayBars.length ? bars(dayBars, 200, CV('--info-fill'), v => '₱' + (v >= 1000 ? (v / 1000).toFixed(0) + 'k' : v.toFixed(0)))
-      : emptyState('No sales yet', 'Once orders are punched through the POS they show up here.')}</div></div>
-
-  <div class="card"><div class="card-h"><div><h2>Recent orders</h2></div>
-    <div class="r"><button class="btn btn-s btn-sm" data-nav="reports">${ic('rep')}All reports</button></div></div>
-    <div class="tw"><table><thead><tr><th>Order</th><th>Table</th><th>Status</th><th class="n">Total</th><th>When</th></tr></thead>
-    <tbody>${s30.recent_orders.slice(0, 8).map(o => `<tr><td class="nm">${esc(o.order_no)}</td>
-      <td class="sub">${esc(o.table_label || '—')}</td><td>${statusChip(o.status)}</td>
-      <td class="n">${money(o.total)}</td><td class="sub">${esc(o.created_at)}</td></tr>`).join('')
-      || `<tr><td colspan="5">${emptyState('No orders yet', '')}</td></tr>`}</tbody></table></div></div>`);
-
-  const topItem = (s30.by_item || [])[0];
-  if (topItem) loadTomorrowForecast(topItem.name);
+  const ready = (dem.items || []).filter(x => !x.insufficient_data);
+  if (ready.length) loadTomorrowForecast(ready.reduce((a, b) => (b.active_days > a.active_days ? b : a)));
   else { const c = $('#tomorrowCard'); if (c) c.style.display = 'none'; }
 }
 
-async function loadTomorrowForecast(itemName) {
+async function loadTomorrowForecast(item) {
   try {
-    const all = STATE.forecasts.dem.length ? { items: STATE.forecasts.dem } : await api('/console/forecasts/demand');
-    const item = all.items.find(d => d.name === itemName);
+    const d = await api('/console/forecasts/demand?menu_item_pk=' + item.menu_item_id + '&horizon_days=7');
     const card = $('#tomorrowCard');
     if (!card) return;                       // navigated away while loading
-    if (!item || item.insufficient_data) { card.style.display = 'none'; return; }
-    const d = await api('/console/forecasts/demand?menu_item_pk=' + item.menu_item_id + '&horizon_days=7');
-    const card2 = $('#tomorrowCard');
-    if (!card2) return;
-    if (d.insufficient_data || !d.forecast.length) { card2.style.display = 'none'; return; }
+    if (d.insufficient_data || !d.forecast.length) { card.style.display = 'none'; return; }
 
     const c = forecastChart(d, 130, 21);
     const t = d.forecast[0];
-    card2.innerHTML = `
-      <div class="card-h"><div><h2>Tomorrow's forecast</h2><p>${esc(itemName)}</p></div></div>
+    card.innerHTML = `
+      <div class="card-h"><div><h2>What's likely to sell tomorrow</h2>
+        <p>${esc(item.name)} · forecasted menu-item demand, not an ingredient figure</p></div></div>
       <div class="card-b tight">
         <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px">
           <span class="num" style="font-size:23px;font-weight:600">${num(t.qty, 1)}</span>
@@ -3185,7 +3232,7 @@ function loadSettings() {
 /* ===================== ROUTER / SHELL ===================== */
 const NAV = [
   { g: 'Overview' },
-  { k: 'dashboard', n: 'Dashboard', i: 'dash' },
+  { k: 'dashboard', n: 'Today', i: 'dash' },
   { g: 'Manage' },
   { k: 'inventory', n: 'Inventory', i: 'inv', badge: () => STATE.readiness && STATE.readiness.ingredients_blocked },
   { k: 'movements', n: 'Stock Movements', i: 'moves' },
@@ -3207,7 +3254,7 @@ const NAV = [
   { k: 'settings', n: 'Settings', i: 'set' },
 ];
 const TITLES = {
-  dashboard: ['Dashboard', "A quick look at stock health and today's sales"],
+  dashboard: ['Today', "What needs attention right now, and what to do about it"],
   inventory: ['Inventory', 'Every ingredient and how much is on hand'],
   movements: ['Stock Movements', 'Every time stock went up or down, and why'],
   recipes: ['Recipes', 'What goes into each menu item, and what it costs'],
