@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, db, refills, timeutil, unli
+from . import auth, db, refills, timeutil, unli, verification
 from .anomaly import detect_anomalies, detect_consumption_anomalies
 from .anomaly import consumption_model_details
 from .anomaly import model_details as anomaly_model_details
@@ -1124,12 +1124,41 @@ def resolve_unmapped(
 def queue_verification(
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("queue.read")),
 ):
-    """Every physical constant still carrying a seeded placeholder."""
-    items = rows(c.execute("SELECT * FROM v_needs_verification ORDER BY field, entity_name"))
-    by_field: dict[str, int] = {}
-    for i in items:
-        by_field[i["field"]] = by_field.get(i["field"], 0) + 1
-    return {"items": items, "count": len(items), "by_field": by_field}
+    """Every physical constant still carrying a seeded placeholder, translated
+    into plain operational language and grouped by what breaks if it's
+    wrong. See wt/verification.py."""
+    return verification.list_queue(c)
+
+
+@app.get("/console/queues/verification/history", tags=["queues"])
+def queue_verification_history(
+    field: str, row_id: int,
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("queue.read")),
+):
+    """Every decision ever recorded for one field/row: what it was, what it
+    became, who decided, and when — the provenance trail."""
+    return {"events": verification.history_for(c, field, row_id)}
+
+
+class VerificationResolveIn(BaseModel):
+    field: str
+    row_id: int
+    action: Literal["confirm", "change", "keep_estimate"]
+    new_value: float | str | None = None
+    note: str | None = None
+
+
+@app.post("/console/queues/verification/resolve", tags=["queues"])
+def resolve_verification(
+    body: VerificationResolveIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("queue.resolve")),
+):
+    """Confirm, change, or keep-as-estimate for one verification item. The
+    only path that can move one of these fields to 'verified' — see
+    wt/verification.py for exactly what each action does and why the
+    unlimited-rate field is never edited in place."""
+    return verification.resolve(c, body.field, body.row_id, body.action,
+                                body.new_value, body.note, p["sub"])
 
 
 @app.get("/console/readiness", tags=["console"])

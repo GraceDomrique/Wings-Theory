@@ -1286,34 +1286,6 @@ function openCountModal(id, name, baseUnit, onHand) {
   });
 }
 
-function openVerifyModal(id, field, name, current) {
-  const titles = { pack_size: 'Confirm package size', yield_factor: 'Confirm usable percentage', unit_cost: 'Confirm cost' };
-  const labels = {
-    pack_size: 'How much is in one unit you buy (one sack, one bottle, one box)?',
-    yield_factor: 'What percentage is actually usable after prep? (Enter 1 if nothing is wasted, 0.9 if 10% is trimmed off, etc.)',
-    unit_cost: 'How much do you pay for one unit you buy?',
-  };
-  openModal(`
-    <h3>${esc(titles[field] || 'Confirm this number')}</h3>
-    <p>${esc(name)} — this was a placeholder guess: ${esc(current || 'none set')}</p>
-    <label>${esc(labels[field] || field)}</label>
-    <input class="field" id="vfVal" type="number" step="0.0001" value="${esc(current || '')}">
-    <div id="modalErr"></div>
-    <div class="actions"><button class="btn btn-s" data-act="modal-cancel">Cancel</button><button class="btn btn-p" id="vfSubmit">Save the real number</button></div>
-  `);
-  $('#vfSubmit').addEventListener('click', async () => {
-    const val = parseFloat($('#vfVal').value);
-    if (isNaN(val)) { modalError('Enter a number.'); return; }
-    $('#vfSubmit').disabled = true;
-    try {
-      await api(`/console/ingredients/${id}/verify`, { method: 'POST', body: JSON.stringify({ field, value: val }) });
-      invalidateDepletionCache();   // pack_size/yield can restate on-hand stock
-      closeModal(); toast('Saved.'); goto('verification');
-    } catch (e) { modalError(e.message); }
-    finally { const b = $('#vfSubmit'); if (b) b.disabled = false; }
-  });
-}
-
 function openUsageModal(id, name, baseUnit) {
   openModal(`
     <h3>Record usage</h3>
@@ -2540,8 +2512,6 @@ function renderAnomaly() {
               never calculated in this file. The live preview below is a
               convenience for the person holding the scale; the number that
               is recorded is the one the server returns. */
-function unliDate() { return STATE.unli.date || new Date().toISOString().slice(0, 10); }
-
 function varianceChip(status) {
   const map = { within_tolerance: 'ok', over_tolerance: 'bad', under_tolerance: 'warn' };
   const label = { within_tolerance: 'Within tolerance', over_tolerance: 'Used more than expected',
@@ -2555,15 +2525,23 @@ function validationChip(state) {
 }
 
 async function loadUnli() {
-  const d = unliDate();
+  // No client-side "today" here — new Date() in a browser is local-to-the-
+  // browser (often UTC on a server-hosted device), not the shop's own
+  // Manila business day. STATE.unli.date is undefined on first load, so the
+  // request omits service_date entirely and the backend supplies its own
+  // authoritative Manila-business-date default (see wt/timeutil.py); once
+  // picked (here, or via the date input below), that exact value is reused
+  // verbatim. Either way STATE.unli.date is set FROM the response, never
+  // computed here — one source of truth for what day it is.
+  const chosen = STATE.unli.date;
   const [pending, hist, coeff, tol, flav] = await Promise.all([
-    api('/unli/reconciliation/pending?service_date=' + d),
+    api('/unli/reconciliation/pending' + (chosen ? '?service_date=' + chosen : '')),
     api('/unli/reconciliation?limit=120'),
     api('/unli/coefficients'),
     api('/unli/tolerance'),
     api('/unli/flavors?all_flavors=true'),
   ]);
-  STATE.unli = { date: d, pending, history: hist.reconciliations, coefficients: coeff.streams,
+  STATE.unli = { date: pending.service_date, pending, history: hist.reconciliations, coefficients: coeff.streams,
                  tolerance: tol.tolerance_ratio, minHeads: tol.min_heads_for_recalibration,
                  flavors: flav.flavors };
   renderUnli();
@@ -3012,89 +2990,157 @@ function expiryCard(b, withinDays, color) {
 /* ===================== NEEDS VERIFICATION ===================== */
 async function loadVerification() {
   STATE.verification.data = await api('/console/queues/verification');
+  STATE.verification.priority = 1;   // land on the most operationally urgent tab, not a flat 630-row dump
   STATE.verification.field = '';
   renderVerification();
 }
-const VERIFY_FIELD_LABELS = {
-  'ingredient.pack_size': 'Pack size',
-  'ingredient.yield_factor': 'Usable amount',
-  'ingredient.unit_cost': 'Cost',
-  'recipe_line.qty_base': 'Recipe amount',
-  'fefo_batch.expires_at': 'Expiry date',
-  'unli_coefficient.lambda': 'Unlimited wings rate',
+const VERIFY_PRIORITY_TAB = {
+  1: 'Priority 1 — stock amounts', 2: 'Priority 2 — cost', 3: 'Priority 3 — expiry dates',
 };
-function verifyFieldLabel(f) { return VERIFY_FIELD_LABELS[f] || f; }
-function verifyAction(i) {
-  if (i.field.startsWith('ingredient.')) {
-    const field = i.field.split('.')[1];
-    return `<button class="btn btn-s btn-sm" data-act="verify" data-id="${i.row_id}" data-field="${field}" data-name="${esc(i.entity_name)}" data-current="${esc(i.current_value || '')}">${ic('chk')}Confirm</button>`;
-  }
-  if (i.field === 'recipe_line.qty_base') return `<span class="sub">Fix this in Recipes</span>`;
-  if (i.field === 'fefo_batch.expires_at') return `<span class="sub">Set on next delivery</span>`;
-  if (i.field === 'unli_coefficient.lambda') return `<span class="sub">Not editable here yet</span>`;
-  return `<span class="sub">—</span>`;
-}
 const VERIFY_GROUP_CAP = 100;
-const VERIFY_SOURCE_LABELS = {
-  ingredient: 'Ingredient', recipe_line: 'Recipe line',
-  fefo_batch: 'Stock batch', unli_coefficient: 'Unlimited wings rate',
-};
+function verifyKey(i) { return i.field + '::' + i.row_id; }
+function verifyFindItem(key) {
+  return (STATE.verification.data.items || []).find(i => verifyKey(i) === key);
+}
 function renderVerification() {
   const d = STATE.verification.data, st = STATE.verification;
-  const fields = Object.keys(d.by_field).sort();
-  let list = d.items;
+  let list = st.priority ? d.items.filter(i => i.priority === st.priority) : d.items;
+  const fields = [...new Set(list.map(i => i.field))].sort();
   if (st.field) list = list.filter(i => i.field === st.field);
 
-  // One card per real-world thing (an ingredient, a recipe line, a batch, an
-  // unli rate) instead of one row per placeholder field — three unrelated
+  // Two levels: a coarse group ("Verify all sauce bottles" instead of 269
+  // scattered technical rows), then one card per real-world thing inside it
+  // (an ingredient, a recipe, a batch, an unlimited rate) — three unrelated
   // rows for the same ingredient's pack size, cost and usable amount was the
-  // "messy" part; grouping puts everything about one thing in one place, and
-  // makes clear which groups are fixable here versus fixed elsewhere.
-  const groups = {};
+  // original "messy" part; this keeps that fix and adds the coarser layer
+  // on top.
+  const bySection = {};
   list.forEach(i => {
-    const source = i.field.split('.')[0];
-    const key = source + ':' + i.entity_id;
-    if (!groups[key]) groups[key] = { source, entity_name: i.entity_name, items: [] };
-    groups[key].items.push(i);
+    if (!bySection[i.group_label]) bySection[i.group_label] = {};
+    const entityKey = i.field.split('.')[0] + ':' + i.entity_id;
+    const sec = bySection[i.group_label];
+    if (!sec[entityKey]) sec[entityKey] = { entity_name: i.entity_name, items: [] };
+    sec[entityKey].items.push(i);
   });
-  const groupList = Object.values(groups).sort((a, b) => a.entity_name.localeCompare(b.entity_name));
-  const shown = groupList.slice(0, VERIFY_GROUP_CAP);
-  const fixable = d.items.filter(i => i.field.startsWith('ingredient.')).length;
+  const sections = Object.keys(bySection).sort().map(label => ({
+    label, groups: Object.values(bySection[label]).sort((a, b) => a.entity_name.localeCompare(b.entity_name)),
+  }));
+  const totalGroups = sections.reduce((n, s) => n + s.groups.length, 0);
+  let shown = 0;
 
   setWork(`
     <div class="grid g3">
       ${kpi('Still unconfirmed', d.count, 'placeholders left from setup', 'db')}
-      ${kpi('Fixable right here', fixable, 'pack size, usable amount, cost', 'chk')}
-      ${kpi('Field types', fields.length, 'see tabs below', 'filt')}
+      ${kpi('Priority 1', d.by_priority[1] || 0, 'affects how much stock gets deducted', 'warn')}
+      ${kpi('Priority 2 + 3', (d.by_priority[2] || 0) + (d.by_priority[3] || 0), 'cost and expiry — not deduction', 'filt')}
     </div>
     <div class="card">
       <div class="card-h">
-        <div><h2>Numbers that need a real value</h2><p>${groupList.length} thing${groupList.length === 1 ? '' : 's'} with a placeholder from setup — grouped so everything about one thing is in one place</p></div>
+        <div><h2>Numbers that need a real value</h2><p>Grouped by what breaks if it's wrong — start with Priority 1, it changes how much stock a sale actually deducts</p></div>
         <div class="r"><button class="btn btn-s btn-sm" data-act="export-verification">${ic('dl')}Download</button></div>
       </div>
       <div class="card-b tight"><div class="tabs">
-        <button class="tab ${!st.field ? 'on' : ''}" data-act="verify-field" data-f="">All (${d.count})</button>
-        ${fields.map(f => `<button class="tab ${st.field === f ? 'on' : ''}" data-act="verify-field" data-f="${f}">${esc(verifyFieldLabel(f))} (${d.by_field[f]})</button>`).join('')}
+        <button class="tab ${!st.priority ? 'on' : ''}" data-act="verify-priority" data-pr="">All (${d.count})</button>
+        ${[1, 2, 3].map(p => `<button class="tab ${st.priority === p ? 'on' : ''}" data-act="verify-priority" data-pr="${p}">${esc(VERIFY_PRIORITY_TAB[p])} (${d.by_priority[p] || 0})</button>`).join('')}
       </div></div>
-      <div class="card-b" style="display:flex;flex-direction:column;gap:10px">
-        ${shown.length ? shown.map(g => `
-          <div class="verify-group">
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:2px">
-              <b style="font-size:13px">${esc(g.entity_name)}</b>
-              <span class="chip mute no-dot">${esc(VERIFY_SOURCE_LABELS[g.source] || g.source)}</span>
-              <span class="sub">${g.items.length} to confirm</span>
+      ${fields.length > 1 ? `<div class="card-b tight"><div class="tabs">
+        <button class="tab ${!st.field ? 'on' : ''}" data-act="verify-field" data-f="">All types</button>
+        ${fields.map(f => `<button class="tab ${st.field === f ? 'on' : ''}" data-act="verify-field" data-f="${f}">${esc(d.items.find(i => i.field === f).field_label)}</button>`).join('')}
+      </div></div>` : ''}
+      <div class="card-b" style="display:flex;flex-direction:column;gap:16px">
+        ${sections.length ? sections.map(sec => `
+          <div>
+            <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:6px">${esc(sec.label)}</div>
+            <div style="display:flex;flex-direction:column;gap:10px">
+              ${sec.groups.filter(() => shown++ < VERIFY_GROUP_CAP).map(g => `
+                <div class="verify-group">
+                  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+                    <b style="font-size:13px">${esc(g.entity_name)}</b>
+                    <span class="sub">${g.items.length} to confirm</span>
+                  </div>
+                  <div style="display:flex;flex-direction:column;gap:8px">
+                    ${g.items.map(i => `
+                      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--border)">
+                        <div style="flex:1;min-width:0">
+                          <div style="font-size:13px;font-weight:600">${esc(i.question)}</div>
+                          <div class="sub" style="margin-top:2px">${esc(i.why_it_matters)}</div>
+                          <div class="sub" style="margin-top:4px">Currently: <b>${esc(i.current_value === null || i.current_value === undefined ? 'not set' : i.current_value)}</b>${i.context ? ' — ' + esc(i.context) : ''}</div>
+                          <div class="sub" data-act="verify-history" data-key="${esc(verifyKey(i))}" style="margin-top:2px;cursor:pointer;text-decoration:underline">History</div>
+                        </div>
+                        <div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0">
+                          <button class="btn btn-p btn-sm" data-act="verify-open" data-key="${esc(verifyKey(i))}">${ic('chk')}Review</button>
+                        </div>
+                      </div>`).join('')}
+                  </div>
+                </div>`).join('')}
             </div>
-            <table><tbody>${g.items.map(i => `<tr>
-              <td style="white-space:nowrap"><span class="chip warn no-dot">${esc(verifyFieldLabel(i.field))}</span></td>
-              <td class="n sub" style="white-space:nowrap">${esc(i.current_value === null || i.current_value === undefined ? '—' : i.current_value)}</td>
-              <td class="sub">${esc(i.context || '—')}</td>
-              <td style="text-align:right">${verifyAction(i)}</td>
-            </tr>`).join('')}</tbody></table>
           </div>`).join('')
-        : emptyState('Nothing to verify', 'Every physical constant has a confirmed value.')}
+        : emptyState('Nothing to verify', 'Every physical constant in this priority has a confirmed value.')}
       </div>
-      ${groupList.length > VERIFY_GROUP_CAP ? `<div class="tfoot"><span>Showing the first ${VERIFY_GROUP_CAP} of ${groupList.length} — narrow it with a tab above, or download the full list.</span></div>` : ''}
+      ${totalGroups > VERIFY_GROUP_CAP ? `<div class="tfoot"><span>Showing the first ${VERIFY_GROUP_CAP} groups — narrow it with a tab above, or download the full list.</span></div>` : ''}
     </div>`);
+}
+
+function openVerifyModal(item) {
+  const isDate = item.field === 'fefo_batch.expires_at';
+  const currentDisplay = item.current_value === null || item.current_value === undefined ? 'not set' : item.current_value;
+  openModal(`
+    <h3>${esc(item.question)}</h3>
+    <p class="sub">${esc(item.entity_name)}${item.context ? ' — ' + esc(item.context) : ''}</p>
+    <p class="sub">${esc(item.why_it_matters)}</p>
+    <p class="sub"><i>${esc(item.what_to_check)}</i></p>
+    <label>Currently on file: ${esc(currentDisplay)}. If you checked and it's different, enter the real value:</label>
+    <input class="field" id="vfVal" type="${isDate ? 'date' : 'number'}" ${isDate ? '' : 'step="0.0001"'} placeholder="${isDate ? '' : esc(item.current_value ?? '')}">
+    <label>Note (optional)</label>
+    <input class="field" id="vfNote" type="text" placeholder="e.g. weighed it myself, checked the supplier receipt">
+    <div id="modalErr"></div>
+    <div class="actions" style="flex-wrap:wrap">
+      <button class="btn btn-s" data-act="modal-cancel">Cancel</button>
+      <button class="btn btn-s" id="vfKeep">Keep as estimate for now</button>
+      <button class="btn btn-s" id="vfConfirm">${esc(currentDisplay)} is correct</button>
+      <button class="btn btn-p" id="vfChange">Save the real value</button>
+    </div>
+  `);
+  const submit = async (action, newValue) => {
+    try {
+      await api('/console/queues/verification/resolve', {
+        method: 'POST',
+        body: JSON.stringify({
+          field: item.field, row_id: item.row_id, action,
+          new_value: newValue, note: $('#vfNote').value || null,
+        }),
+      });
+      if (item.field === 'ingredient.pack_size' || item.field === 'ingredient.yield_factor') invalidateDepletionCache();
+      closeModal(); toast('Saved.'); await loadVerification();
+    } catch (e) { modalError(e.message); }
+  };
+  $('#vfConfirm').addEventListener('click', () => submit('confirm', null));
+  $('#vfKeep').addEventListener('click', () => submit('keep_estimate', null));
+  $('#vfChange').addEventListener('click', () => {
+    const raw = $('#vfVal').value;
+    if (!raw) { modalError('Enter a value, or use one of the other two buttons instead.'); return; }
+    submit('change', isDate ? raw : parseFloat(raw));
+  });
+}
+
+async function openVerifyHistory(key) {
+  const item = verifyFindItem(key);
+  if (!item) return;
+  const { events } = await api(`/console/queues/verification/history?field=${encodeURIComponent(item.field)}&row_id=${item.row_id}`);
+  const ACTION_LABEL = { confirmed: 'Confirmed', changed: 'Changed', kept_estimate: 'Left as an estimate' };
+  openModal(`
+    <h3>History — ${esc(item.entity_name)}</h3>
+    <p class="sub">${esc(item.question)}</p>
+    ${events.length ? `<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
+      ${events.map(e => `
+        <div style="border-top:1px solid var(--border);padding-top:6px">
+          <div><b>${esc(ACTION_LABEL[e.action] || e.action)}</b> by ${esc(e.user_id || 'unknown')} on ${esc((e.created_at || '').replace('T', ' '))}</div>
+          ${e.action === 'changed' ? `<div class="sub">${esc(e.previous_value)} → ${esc(e.new_value)}</div>` : ''}
+          ${e.note ? `<div class="sub">${esc(e.note)}</div>` : ''}
+        </div>`).join('')}
+    </div>` : `<p class="sub">No decision recorded yet for this item.</p>`}
+    <div class="actions"><button class="btn btn-s" data-act="modal-cancel">Close</button></div>
+  `);
 }
 
 /* ===================== INGREDIENT QUEUE ===================== */
@@ -3559,7 +3605,6 @@ document.addEventListener('click', async e => {
   }
   if ((t = el2('[data-act="inv-bulk"]'))) { openBulkUpdateModal(); return; }
   if ((t = el2('[data-act="inv-add"]'))) { openAddIngredientModal(); return; }
-  if ((t = el2('[data-act="verify"]'))) { openVerifyModal(t.dataset.id, t.dataset.field, t.dataset.name, t.dataset.current); return; }
   if ((t = el2('[data-act="mv-prev"]'))) { STATE.movements.offset = Math.max(0, STATE.movements.offset - STATE.movements.limit); await fetchMovements(); return; }
   if ((t = el2('[data-act="mv-next"]'))) { STATE.movements.offset += STATE.movements.limit; await fetchMovements(); return; }
   if ((t = el2('[data-act="unli-date"]'))) { STATE.unli.date = $('#unliDate').value; await loadUnli(); return; }
@@ -3613,13 +3658,25 @@ document.addEventListener('click', async e => {
   if ((t = el2('[data-act="resolve-map"]'))) { openResolveModal(t.dataset.id, t.dataset.label); return; }
   if ((t = el2('[data-act="resolve-dismiss"]'))) { dismissUnmapped(t.dataset.id); return; }
   if ((t = el2('[data-act="verify-field"]'))) { STATE.verification.field = t.dataset.f; renderVerification(); return; }
+  if ((t = el2('[data-act="verify-priority"]'))) {
+    STATE.verification.priority = t.dataset.pr ? parseInt(t.dataset.pr, 10) : null;
+    STATE.verification.field = '';
+    renderVerification(); return;
+  }
+  if ((t = el2('[data-act="verify-open"]'))) {
+    const item = verifyFindItem(t.dataset.key);
+    if (item) openVerifyModal(item);
+    return;
+  }
+  if ((t = el2('[data-act="verify-history"]'))) { await openVerifyHistory(t.dataset.key); return; }
   if ((t = el2('[data-act="demand-chart"]'))) { openDemandChartModal(parseInt(t.dataset.id, 10)); return; }
   if ((t = el2('[data-act="theme-set"]'))) { setTheme(t.dataset.t); return; }
   if ((t = el2('[data-act="export-verification"]'))) {
     const d = STATE.verification.data;
     if (!d || !d.items.length) { toast('Nothing to export.'); return; }
     downloadCsv('needs_verification.csv', d.items, [
-      { label: 'Field', key: 'field' }, { label: 'Entity', key: 'entity_name' },
+      { label: 'Priority', key: 'priority' }, { label: 'What to check', key: 'question' },
+      { label: 'Entity', key: 'entity_name' },
       { label: 'Current value', key: 'current_value' }, { label: 'Context', key: 'context' },
     ]);
     return;

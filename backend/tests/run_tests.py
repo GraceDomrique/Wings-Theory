@@ -1132,6 +1132,238 @@ class TestSeedImport(unittest.TestCase):
 
 
 # ===========================================================================
+# Phase 08 — the owner verification workflow. Each test below targets a
+# distinct row (a different ingredient / recipe line / batch / coefficient)
+# so tests can share one real, expensively-imported catalog without one
+# test's write affecting another's assumptions.
+# ===========================================================================
+class TestVerificationWorkflow(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        cls.conn = db.get_conn()
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        scrub(cls.path)
+
+    def test_queue_translates_every_field_into_plain_language_with_a_priority(self):
+        from wt.verification import list_queue, PRIORITY
+        q = list_queue(self.conn)
+        self.assertEqual(q["count"], self.conn.execute(
+            "SELECT COUNT(*) AS n FROM v_needs_verification").fetchone()["n"])
+        for item in q["items"]:
+            self.assertIn(item["priority"], (1, 2, 3))
+            self.assertEqual(item["priority"], PRIORITY[item["field"]])
+            for key in ("question", "why_it_matters", "what_to_check", "group_label"):
+                self.assertTrue(item[key], f"{item['field']} is missing {key}")
+            # no raw column name leaking into the owner-facing text
+            for tech_word in ("pack_size", "yield_factor", "qty_base", "lambda"):
+                self.assertNotIn(tech_word, item["question"].lower())
+                self.assertNotIn(tech_word, item["why_it_matters"].lower())
+
+    def test_recipe_lines_split_into_sauce_and_menu_groups(self):
+        from wt.verification import list_queue
+        q = list_queue(self.conn)
+        rl_items = [i for i in q["items"] if i["field"] == "recipe_line.qty_base"]
+        groups = {i["group_label"] for i in rl_items}
+        self.assertEqual(groups, {"Sauce & house-prep recipes", "Menu recipes"})
+
+    def test_confirming_an_ingredient_field_moves_it_out_of_the_queue_and_logs_it(self):
+        from wt.verification import resolve, history_for, list_queue
+        before = list_queue(self.conn)["count"]
+        row = self.conn.execute(
+            "SELECT id, name, pack_size FROM ingredient WHERE name='Wings'").fetchone()
+        r = resolve(self.conn, "ingredient.pack_size", row["id"], "confirm", None, None, "owner1")
+        self.assertEqual(r["value"], row["pack_size"])
+        after = list_queue(self.conn)["count"]
+        self.assertEqual(after, before - 1)
+        events = history_for(self.conn, "ingredient.pack_size", row["id"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["action"], "confirmed")
+        self.assertEqual(events[0]["previous_value"], events[0]["new_value"])
+        self.assertEqual(events[0]["user_id"], "owner1")
+        self.assertEqual(self.conn.execute(
+            "SELECT pack_size_status FROM ingredient WHERE id=?", (row["id"],)
+        ).fetchone()["pack_size_status"], "verified")
+
+    def test_changing_an_ingredient_field_preserves_the_previous_value(self):
+        from wt.verification import resolve, history_for
+        row = self.conn.execute(
+            "SELECT id, unit_cost FROM ingredient WHERE name='Fries'").fetchone()
+        old = row["unit_cost"]
+        r = resolve(self.conn, "ingredient.unit_cost", row["id"], "change", old * 2, "checked the receipt", "owner2")
+        self.assertEqual(r["value"], old * 2)
+        events = history_for(self.conn, "ingredient.unit_cost", row["id"])
+        self.assertEqual(events[-1]["action"], "changed")
+        self.assertEqual(float(events[-1]["previous_value"]), old)
+        self.assertEqual(float(events[-1]["new_value"]), old * 2)
+        self.assertEqual(self.conn.execute(
+            "SELECT unit_cost, unit_cost_status FROM ingredient WHERE id=?", (row["id"],)
+        ).fetchone()["unit_cost_status"], "verified")
+
+    def test_keep_as_estimate_changes_no_operational_value_but_is_logged(self):
+        from wt.verification import resolve, history_for, list_queue
+        row = self.conn.execute(
+            "SELECT id, name, yield_factor FROM ingredient WHERE name='Hugarian Sausage'").fetchone()
+        before_count = list_queue(self.conn)["count"]
+        r = resolve(self.conn, "ingredient.yield_factor", row["id"], "keep_estimate",
+                    None, "not sure yet, will check next delivery", "owner3")
+        self.assertEqual(r["value"], row["yield_factor"])
+        after_count = list_queue(self.conn)["count"]
+        self.assertEqual(after_count, before_count, "keep_estimate must not remove the item from the queue")
+        self.assertEqual(self.conn.execute(
+            "SELECT yield_factor_status FROM ingredient WHERE id=?", (row["id"],)
+        ).fetchone()["yield_factor_status"], "needs_verification")
+        events = history_for(self.conn, "ingredient.yield_factor", row["id"])
+        self.assertEqual(events[-1]["action"], "kept_estimate")
+        self.assertEqual(events[-1]["new_value"], None)
+
+    def test_recipe_line_change_never_rewrites_a_historical_ledger_row(self):
+        """The concrete scenario the owner needs proven: verifying a recipe
+        amount after the fact must not silently rewrite what a past sale
+        already deducted -- only sales from this point on use the new
+        amount."""
+        from wt.verification import resolve
+        from wt.reservation import reserve_order, commit_order
+        row = self.conn.execute("""
+            SELECT rl.id AS rl_id, rl.qty_base, rl.ingredient_id, m.id AS menu_id, m.price
+              FROM recipe_line rl
+              JOIN recipe r ON r.id = rl.recipe_id AND r.kind='menu'
+              JOIN menu_item m ON m.recipe_id = r.id AND m.pos_visible = 1
+             WHERE rl.qty_status='needs_verification'
+             ORDER BY rl.id LIMIT 1
+        """).fetchone()
+        cur = self.conn.execute(
+            "INSERT INTO customer_order (order_no, table_label, head_count) VALUES ('VWF-1','T-VWF',0)")
+        oid = cur.lastrowid
+        self.conn.execute(
+            "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,1,?)",
+            (oid, row["menu_id"], row["price"]))
+        reserve_order(self.conn, oid)
+        commit_order(self.conn, oid)
+        historical_delta = self.conn.execute(
+            "SELECT delta_base FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1",
+            (row["ingredient_id"],)).fetchone()["delta_base"]
+
+        resolve(self.conn, "recipe_line.qty_base", row["rl_id"], "change",
+                row["qty_base"] * 3, "measured a real batch", "owner4")
+
+        still_there = self.conn.execute(
+            "SELECT delta_base FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1",
+            (row["ingredient_id"],)).fetchone()["delta_base"]
+        self.assertEqual(historical_delta, still_there,
+                         "a later verification must never rewrite a historical ledger row")
+
+        cur2 = self.conn.execute(
+            "INSERT INTO customer_order (order_no, table_label, head_count) VALUES ('VWF-2','T-VWF',0)")
+        oid2 = cur2.lastrowid
+        self.conn.execute(
+            "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,1,?)",
+            (oid2, row["menu_id"], row["price"]))
+        reserve_order(self.conn, oid2)
+        commit_order(self.conn, oid2)
+        new_delta = self.conn.execute(
+            "SELECT delta_base FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1",
+            (row["ingredient_id"],)).fetchone()["delta_base"]
+        self.assertAlmostEqual(new_delta, historical_delta * 3, places=4,
+                               msg="an order placed after the change must use the new amount")
+
+    def test_fefo_batch_expiry_change_is_logged_and_leaves_the_queue(self):
+        from wt.verification import resolve, list_queue
+        row = self.conn.execute(
+            "SELECT id, expires_at FROM fefo_batch WHERE expiry_status='needs_verification' "
+            "AND state='open' ORDER BY id LIMIT 1").fetchone()
+        before = list_queue(self.conn)["count"]
+        resolve(self.conn, "fefo_batch.expires_at", row["id"], "change", "2027-12-31", "checked the label", "owner5")
+        after = list_queue(self.conn)["count"]
+        self.assertEqual(after, before - 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT expires_at, expiry_status FROM fefo_batch WHERE id=?", (row["id"],)
+        ).fetchone()["expires_at"], "2027-12-31")
+
+    def test_unli_coefficient_change_versions_instead_of_overwriting(self):
+        """provisional_for_date() re-reads lambda_value live per historical
+        order via effective_from -- an in-place UPDATE would retroactively
+        change what an already-reconciled day is judged against. A 'change'
+        here must insert a new row, exactly like recalibrate() does, and
+        leave the superseded row's own lambda_value untouched."""
+        from wt.verification import resolve
+        coeff = self.conn.execute(
+            "SELECT c.id, c.lambda_value, c.unli_item_id, c.role FROM unli_coefficient c "
+            "JOIN unli_item u ON u.id=c.unli_item_id WHERE u.item_key='rice' AND c.role='rolling'"
+        ).fetchone()
+        n_before = self.conn.execute("SELECT COUNT(*) AS n FROM unli_coefficient").fetchone()["n"]
+        resolve(self.conn, "unli_coefficient.lambda", coeff["id"], "change", 4321.0, "measured", "owner6")
+        n_after = self.conn.execute("SELECT COUNT(*) AS n FROM unli_coefficient").fetchone()["n"]
+        self.assertEqual(n_after, n_before + 1)
+        old_row = self.conn.execute(
+            "SELECT lambda_value, status FROM unli_coefficient WHERE id=?", (coeff["id"],)).fetchone()
+        self.assertEqual(old_row["lambda_value"], coeff["lambda_value"],
+                         "the superseded row's own historical value must never change")
+        self.assertEqual(old_row["status"], "verified")
+        new_row = self.conn.execute(
+            "SELECT lambda_value, role, unli_item_id, status FROM unli_coefficient "
+            "WHERE id != ? AND unli_item_id=? AND role=? ORDER BY id DESC LIMIT 1",
+            (coeff["id"], coeff["unli_item_id"], coeff["role"])).fetchone()
+        self.assertEqual(new_row["lambda_value"], 4321.0)
+        self.assertEqual(new_row["status"], "verified")
+
+    def test_unli_coefficient_change_does_not_alter_an_already_committed_historical_order(self):
+        """The same guarantee as the recipe-line test above, but for the
+        unlimited stream: an order committed before a coefficient is
+        verified must keep resolving to the coefficient that was actually in
+        force when it was punched, not whatever is current now."""
+        import time
+        from wt.verification import resolve
+        from wt import unli, timeutil
+        from wt.reservation import reserve_order, commit_order
+        stream = self.conn.execute(
+            "SELECT id FROM unli_item WHERE item_key='drinks'").fetchone()["id"]
+        coeff = self.conn.execute(
+            "SELECT id, lambda_value FROM unli_coefficient WHERE unli_item_id=? AND role='rolling'",
+            (stream,)).fetchone()
+        # There is one billable "Unlimited" product covering every stream
+        # (wings/rice/fries/drinks all come with it) -- not a separate menu
+        # item per stream, so head-count for the drinks stream is driven by
+        # the same order line as every other stream.
+        menu = self.conn.execute(
+            "SELECT id, price FROM menu_item WHERE is_unli=1 LIMIT 1").fetchone()
+        cur = self.conn.execute(
+            "INSERT INTO customer_order (order_no, table_label, head_count) VALUES ('VWF-U1','T-VWF',3)")
+        oid = cur.lastrowid
+        self.conn.execute(
+            "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,1,?)",
+            (oid, menu["id"], menu["price"]))
+        reserve_order(self.conn, oid)
+        commit_order(self.conn, oid)
+        order_ts = self.conn.execute(
+            "SELECT created_at FROM customer_order WHERE id=?", (oid,)).fetchone()["created_at"]
+        business_date = timeutil.business_date_of(order_ts)
+        before = unli.provisional_for_date(self.conn, stream, business_date)
+        self.assertEqual(before["heads"], 3)
+        self.assertAlmostEqual(before["theoretical_base"], 3 * coeff["lambda_value"])
+
+        time.sleep(1.1)   # clear SQLite's 1-second datetime('now') resolution
+        resolve(self.conn, "unli_coefficient.lambda", coeff["id"], "change", 777.0, "measured", "owner7")
+
+        after = unli.provisional_for_date(self.conn, stream, business_date)
+        self.assertEqual(before, after,
+                         "verifying a rate later must not change what an already-committed order is judged against")
+
+
+# ===========================================================================
 class TestConsoleAPI(unittest.TestCase):
     """The three read endpoints the connected console needs beyond what
     Phase 2 originally shipped: ledger, expiry monitor, sales summary. Built
@@ -2838,6 +3070,14 @@ class TestUnliRBAC(unittest.TestCase):
         r = self.client.get("/unli/reconciliation/pending", headers=self.H_KIT)
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()["streams"])
+
+    def test_the_default_service_date_is_the_backends_manila_business_date(self):
+        """The live HTTP default, not just the Python function underneath it
+        — this is exactly what the frontend now trusts instead of computing
+        its own (browser-UTC) date. See console.html's loadUnli()."""
+        from wt import timeutil
+        r = self.client.get("/unli/reconciliation/pending", headers=self.H_KIT)
+        self.assertEqual(r.json()["service_date"], timeutil.business_today_iso())
 
     def test_a_cashier_may_not(self):
         self.assertEqual(
@@ -4704,7 +4944,7 @@ def main() -> int:
             TestRefillReconciliationLink, TestRefillAPI,
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
-            TestSeedImport, TestConsoleAPI, TestForecasting, TestAnomaly, TestAssociations,
+            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestForecasting, TestAnomaly, TestAssociations,
             TestMigrationSafety,
         )
     )
