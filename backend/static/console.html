@@ -2167,6 +2167,28 @@ async function loadPurchases() {
 }
 
 /* ===================== FORECASTS ===================== */
+/* ===================== FORECASTS / REPLENISHMENT =====================
+   One question governs this page: "what am I likely to need, when will I
+   run short, and what should I prepare to restock?" — not "here are some
+   ML graphs". Priority order, top to bottom:
+
+     1 Replenishment actions  — what to prepare to restock, first
+     2 Forecast status        — is a real prediction even available right now
+     3 Demand forecast        — what's likely to sell (Prophet, menu items)
+     4 Stock vs expected demand — how one recommendation was actually reached
+     6 Forecast details       — MAE/RMSE/MAPE, collapsed, technical evidence
+
+   (Section 5, reorder point vs days of supply, isn't a separate container —
+   it's the Replenishment table's own "Reorder point" column plus one
+   explanatory note, since the backend already treats the two as one signal,
+   not two competing ones; giving it a whole section would just be an
+   explanation looking for something to explain.)
+
+   Two pipelines feed this page and they never merge: ingredient_depletion()
+   (calculated averages over the real ledger — stdlib arithmetic, not ML) is
+   what actually drives days-remaining, risk, and suggested order quantity.
+   Prophet forecasts MENU-ITEM demand only, and feeds nothing else
+   automatically — it's decision support, not the replenishment engine. */
 async function loadForecasts() {
   const [dep, dem] = await Promise.all([
     fetchDepletion(),
@@ -2178,43 +2200,72 @@ async function loadForecasts() {
 }
 function renderForecasts() {
   const dep = STATE.forecasts.dep, dem = STATE.forecasts.dem;
-  const atRisk = dep.filter(i => i.risk === 'out' || i.risk === 'critical');
+  const out = dep.filter(i => i.risk === 'out');
+  const crit = dep.filter(i => i.risk === 'critical');
   const warn = dep.filter(i => i.risk === 'warning');
   const noData = dep.filter(i => i.risk === 'no_data');
   const ready = dem.filter(d => !d.insufficient_data);
+  const urgent = dep.filter(i => i.risk === 'out' || i.risk === 'critical').slice(0, 5);
   const shown = dep.slice(0, 30);
+
+  // Section 4 candidate: the most urgent ingredient that actually has a
+  // computable rate — urgency first, falling back to any ingredient with
+  // real usage so the mechanism can still be shown honestly when nothing is
+  // currently at risk (today's real data: 0 at risk, 15 with a real rate).
+  const flowItem = dep.find(i => (i.risk === 'out' || i.risk === 'critical' || i.risk === 'warning') && i.avg_daily_consumption > 0)
+    || dep.find(i => i.avg_daily_consumption > 0);
+
   setWork(`
-    ${note('Looks at how fast each ingredient has actually been used recently, then works out how many days of stock are left at that pace — measured against how long a delivery normally takes, so it warns you in time. The table below uses a quick daily average for every item at once; press "View chart" on any item for its real forecast (a model called Prophet, fit on that item alone) with a predicted range, not just one number. Nothing is guessed — anything without enough real sales is labelled as such instead of being shown a made-up number.')}
-    <div class="grid g4">
-      ${kpi('Reorder now', atRisk.length, 'out of stock or nearly there', 'warn')}
-      ${kpi('Reorder soon', warn.length, 'inside delivery time + buffer', 'clock')}
-      ${kpi('No sales data yet', noData.length, `of ${dep.length} ingredients`, 'db')}
-      ${kpi('Items forecastable', `${ready.length} / ${dem.length}`, `need ${MIN_DEMAND_DAYS}+ days of sales`, 'fore')}
+    <!-- SECTION 1 — Replenishment actions -->
+    <div class="att">
+      <div class="att-h"><span class="pulse"></span><h2>Needs restocking</h2><span class="n">${urgent.length} open</span></div>
+      <div class="att-l">${urgent.length ? urgent.map(i => `<button class="att-i" data-nav="inventory" data-open-ing="${i.ingredient_id}">
+        <span class="att-ic ${i.risk === 'out' ? 'c-bad' : 'c-bad'}">${ic('warn')}</span>
+        <span class="att-x"><b>${esc(i.name)}</b><span>${i.risk === 'out'
+          ? `Out of stock — delivery normally takes ${i.lead_time_days} day${i.lead_time_days === 1 ? '' : 's'}.`
+          : `Estimated to run out in about ${num(i.days_remaining, 1)} day${i.days_remaining === 1 ? '' : 's'} — delivery takes ${i.lead_time_days} day${i.lead_time_days === 1 ? '' : 's'}.`
+        }${i.suggested_order_qty != null ? ` Suggested: ${i.suggested_order_qty} ${esc(i.suggested_order_unit)}${i.suggested_order_qty === 1 ? '' : 's'}.` : ''}</span></span>
+        <span class="att-m"><span class="chip bad">${i.risk === 'out' ? 'Out' : 'Reorder now'}</span>${ic('chev')}</span></button>`).join('')
+        : emptyState('Nothing needs restocking right now', 'Every ingredient with a measured usage rate has a comfortable buffer.')}</div>
     </div>
-    ${ready.length ? `<div class="card" id="foreChartCard">
-      <div class="card-h"><div><h2>Demand forecast</h2><p>Loading the model for the item with the most sales history…</p></div></div>
-      <div class="card-b tight" style="height:230px;display:grid;place-items:center"><span class="sub">Working…</span></div>
-    </div>` : ''}
+
     <div class="card">
-      <div class="card-h"><div><h2>How long will stock last</h2><p>Soonest to run out shown first</p></div>
+      <div class="card-h"><div><h2>Full replenishment list</h2><p>Soonest to run out shown first — every figure below is a calculated average from real sales/usage history, not a forecast</p></div>
         <div class="r">
           <button class="btn btn-s btn-sm" data-act="export-depletion">${ic('dl')}Download</button>
           <button class="btn btn-s btn-sm" data-act="print-section">${ic('prn')}Print</button>
         </div></div>
-      <div class="tw"><table><thead><tr><th>Ingredient</th><th class="n">On hand</th><th class="n">Used / day</th><th class="n">Days left</th><th class="n">Delivery time</th><th class="n">Order</th><th>Status</th></tr></thead>
+      <div class="card-b tight">${note('Days left is how long the current stock is expected to last at its recent usage rate. Delivery time is how long a supplier normally takes once an order goes out. Reorder point is a floor: either one you set yourself, or — when none is set — the amount usage suggests as a starting point, shown as a suggestion only. An item needs attention once its days left gets close to its delivery time, before the two actually collide.')}</div>
+      <div class="tw"><table><thead><tr><th>Ingredient</th><th class="n">On hand</th><th class="n">Used / day</th><th class="n">Days left</th><th class="n">Delivery time</th><th class="n">Reorder point</th><th class="n">Order</th><th>Status</th></tr></thead>
       <tbody>${shown.length ? shown.map(i => `<tr>
         <td class="nm">${esc(i.name)}</td>
         <td class="n">${num(i.available_base, 2)} ${esc(i.base_unit)}</td>
         <td class="n">${i.avg_daily_consumption ? num(i.avg_daily_consumption, 3) + ' ' + esc(i.base_unit) : '—'}</td>
         <td class="n">${i.days_remaining != null ? num(i.days_remaining, 1) + ' d' : '—'}</td>
         <td class="n">${i.lead_time_days} d</td>
+        <td class="n">${i.reorder_point_base != null
+          ? num(i.reorder_point_base, 2) + ' ' + esc(i.base_unit) + (i.below_reorder_point ? ' <span class="chip bad no-dot">below</span>' : '')
+          : i.suggested_reorder_point_base != null
+            ? `<span class="sub">not set · ~${num(i.suggested_reorder_point_base, 2)} ${esc(i.base_unit)} suggested</span>`
+            : '<span class="sub">not set</span>'}</td>
         <td class="n">${i.suggested_order_qty != null ? `<b>${i.suggested_order_qty} ${esc(i.suggested_order_unit)}${i.suggested_order_qty === 1 ? '' : 's'}</b>` : '—'}</td>
         <td>${riskChip(i.risk)}</td>
-      </tr>`).join('') : `<tr><td colspan="7">${emptyState('No ingredients to show', '')}</td></tr>`}</tbody></table></div>
+      </tr>`).join('') : `<tr><td colspan="8">${emptyState('No ingredients to show', '')}</td></tr>`}</tbody></table></div>
       ${dep.length > 30 ? `<div class="tfoot"><span>Showing the 30 most urgent of ${dep.length} ingredients — download for the full list.</span></div>` : ''}
     </div>
+
+    <!-- SECTION 2 — Forecast status -->
+    ${ready.length === 0
+      ? note(`Not enough sales history to generate a reliable demand forecast yet — needs ${MIN_DEMAND_DAYS}+ days with at least one sale for a menu item (the closest so far has ${dem.length ? Math.max(...dem.map(d => d.active_days)) : 0}). Continue recording POS sales through the till to build the required history — this is a data gap, not a sign anything is wrong.`, 'Forecast status: insufficient data')
+      : `<div class="note" id="foreStatusNote">${ic('spark')}<div><b>Forecast status: checking…</b><p>Working…</p></div></div>`}
+
+    <!-- SECTION 3 — Demand forecast -->
+    ${ready.length ? `<div class="card" id="foreChartCard">
+      <div class="card-h"><div><h2>Demand forecast</h2><p>Loading the model for the item with the most sales history…</p></div></div>
+      <div class="card-b tight" style="height:230px;display:grid;place-items:center"><span class="sub">Working…</span></div>
+    </div>` : ''}
     <div class="card">
-      <div class="card-h"><div><h2>What's likely to sell</h2><p>${ready.length} of ${dem.length} menu items have ${MIN_DEMAND_DAYS}+ days of real sales to predict from</p></div></div>
+      <div class="card-h"><div><h2>What's likely to sell</h2><p>${ready.length} of ${dem.length} menu items have ${MIN_DEMAND_DAYS}+ days of real sales to predict from — this forecasts menu-item demand, not ingredient consumption; see below for how one connects to the other</p></div></div>
       <div class="tw"><table><thead><tr><th>Item</th><th class="n">Days it sold</th><th class="n">Average / day</th><th class="n">Next 7 days</th><th></th></tr></thead>
       <tbody>${dem.length ? dem.map(d => `<tr>
         <td class="nm">${esc(d.name)}</td>
@@ -2223,7 +2274,56 @@ function renderForecasts() {
         <td class="n">${d.insufficient_data ? `<span class="sub">needs ${d.required_days}+ days (has ${d.active_days})</span>` : '<b>' + num(d.forecast.reduce((s, f) => s + f.qty, 0), 1) + '</b>'}</td>
         <td>${d.insufficient_data ? '' : `<button class="btn btn-s btn-sm" data-act="demand-chart" data-id="${d.menu_item_id}">${ic('fore')}View chart</button>`}</td>
       </tr>`).join('') : `<tr><td colspan="5">${emptyState('No menu items', '')}</td></tr>`}</tbody></table></div>
-    </div>`);
+    </div>
+
+    <!-- SECTION 4 — Stock vs expected demand -->
+    <div class="card">
+      <div class="card-h"><div><h2>How a recommendation is reached</h2>
+        <p>${flowItem
+          ? (flowItem.risk === 'out' || flowItem.risk === 'critical' || flowItem.risk === 'warning'
+              ? `${esc(flowItem.name)} — the connection behind its recommendation above`
+              : `${esc(flowItem.name)} — nothing is urgent right now, so this shows the same calculation on a currently-healthy ingredient instead`)
+          : 'Not enough measured usage yet to show this'}</p></div></div>
+      <div class="card-b tight">
+        ${flowItem ? `<div style="display:flex;align-items:center;gap:10px;overflow-x:auto;padding:4px 2px">
+          <div class="kpi" style="flex:1;min-width:130px"><div class="l">On hand</div><div class="v">${num(flowItem.available_base, 1)}<small>${esc(flowItem.base_unit)}</small></div><div class="f">actual, right now</div></div>
+          <span style="color:var(--text-3);flex-shrink:0">${ic('chev')}</span>
+          <div class="kpi" style="flex:1;min-width:130px"><div class="l">Used per day</div><div class="v">${num(flowItem.avg_daily_consumption, 2)}<small>${esc(flowItem.base_unit)}</small></div><div class="f">calculated average, last 30 days</div></div>
+          <span style="color:var(--text-3);flex-shrink:0">${ic('chev')}</span>
+          <div class="kpi" style="flex:1;min-width:130px"><div class="l">Delivery time</div><div class="v">${flowItem.lead_time_days}<small>day${flowItem.lead_time_days === 1 ? '' : 's'}</small></div><div class="f">supplier lead time on file</div></div>
+          <span style="color:var(--text-3);flex-shrink:0">${ic('chev')}</span>
+          <div class="kpi" style="flex:1;min-width:130px"><div class="l">Recommended</div><div class="v">${flowItem.suggested_order_qty != null ? flowItem.suggested_order_qty : '—'}<small>${flowItem.suggested_order_qty != null ? esc(flowItem.suggested_order_unit) + (flowItem.suggested_order_qty === 1 ? '' : 's') : 'not needed yet'}</small></div><div class="f">covers delivery time + a few days' buffer</div></div>
+        </div>`
+        : emptyState('Not enough data to show this yet', 'Once an ingredient has real sales or recorded usage, this shows exactly how its stock, usage rate, delivery time and reorder timing connect.')}
+      </div>
+    </div>
+
+    <!-- SECTION 6 — Forecast details (technical, collapsed) -->
+    <details class="card" style="padding:0">
+      <summary style="cursor:pointer;padding:var(--s2) var(--s3);font-size:13px;font-weight:600;color:var(--text-2)">Forecast details — model accuracy, technical evidence</summary>
+      <div id="foreDetailsBody" style="padding:0 var(--s3) var(--s3)"><span class="sub">Not loaded yet — expand to load.</span></div>
+    </details>`);
+
+  const details = document.querySelector('#work details.card');
+  if (details) details.addEventListener('toggle', loadForecastDetailsOnce, { once: true });
+}
+
+async function loadForecastDetailsOnce() {
+  // Bound with {once:true} on this specific details element (see above),
+  // not a module-level flag — a module-level "already loaded" guard would
+  // permanently block reloading this on a second visit to the page, since
+  // renderForecasts() creates a brand new details/#foreDetailsBody pair every
+  // time it runs but a flag set once would never reset.
+  const body = $('#foreDetailsBody');
+  if (!body) return;
+  try {
+    const md = await api('/console/model-details');
+    if (!$('#foreDetailsBody')) return;   // navigated away while loading
+    $('#foreDetailsBody').innerHTML = `<div class="grid g3">${demandModelDetailCard(md.demand_forecast)}</div>
+      <div class="sub" style="margin-top:10px">Anomaly detection and product-combination model details are on <a href="#" data-nav="syscheck">System Check</a>.</div>`;
+  } catch (e) {
+    if ($('#foreDetailsBody')) $('#foreDetailsBody').innerHTML = `<span class="sub">Couldn't load: ${esc(e.message)}</span>`;
+  }
 }
 
 /* Builds the shared "actual then forecast" line chart from one item's
@@ -2267,20 +2367,40 @@ function forecastChart(d, h, histDays) {
   };
 }
 
+/* Sets #foreStatusNote (Section 2) — always with an honest reason, never
+   silently left on its "checking…" placeholder. */
+function paintForecastStatus(kind, title, text) {
+  const el2 = $('#foreStatusNote');
+  if (!el2) return;
+  el2.className = `note ${kind || ''}`;
+  el2.innerHTML = `${ic('spark')}<div><b>${esc(title)}</b><p>${esc(text)}</p></div>`;
+}
+
 async function loadForecastChart() {
   const ready = STATE.forecasts.dem.filter(d => !d.insufficient_data);
-  if (!ready.length) return;
+  if (!ready.length) return;   // renderForecasts() already rendered the definitive "insufficient data" status
   const best = ready.reduce((a, b) => (b.active_days > a.active_days ? b : a));
   try {
     const d = await api('/console/forecasts/demand?menu_item_pk=' + best.menu_item_id + '&horizon_days=14');
     const card = $('#foreChartCard');
+    if (d.insufficient_data || !d.forecast.length) {
+      if (card) card.style.display = 'none';
+      paintForecastStatus('bad', 'Forecast status: unavailable', "The item with the most sales history still didn't produce a usable forecast — this shouldn't normally happen; try refreshing.");
+      return;
+    }
+    if (d.prophet_unavailable) {
+      paintForecastStatus('bad', 'Forecast status: currently unavailable',
+        'The full forecasting model (Prophet) is not available on this server right now, so a simpler daily-average estimate is shown instead of a real prediction.');
+    } else {
+      paintForecastStatus(null, 'Forecast status: available',
+        `Successfully generated for ${d.name}, using ${d.active_days} days of real sales history.`);
+    }
     if (!card) return;                       // navigated away while loading
-    if (d.insufficient_data || !d.forecast.length) { card.style.display = 'none'; return; }
     const c = forecastChart(d, 240, 45);
     const total = d.forecast.reduce((s, f) => s + f.qty, 0);
     card.innerHTML = `
       <div class="card-h"><div><h2>${esc(d.name)} — demand forecast</h2>
-        <p>${d.method === 'prophet' ? 'Prophet' : 'Quick estimate'} · next 14 days${c.hasRange ? ' · shaded band is the likely range' : ''}${d.seasonality_applied ? ' · adjusted for day of the week' : ''}</p></div>
+        <p>${d.method === 'prophet' ? 'Prophet' : 'Quick estimate'} · menu-item demand, not ingredient consumption · next 14 days${c.hasRange ? ' · shaded band is the likely range' : ''}${d.seasonality_applied ? ' · adjusted for day of the week' : ''}</p></div>
         <div class="r"><button class="btn btn-s btn-sm" data-act="demand-chart" data-id="${d.menu_item_id}">${ic('fore')}Open larger</button></div></div>
       <div class="card-b tight">
         <div style="display:flex;gap:var(--s3);flex-wrap:wrap;margin-bottom:6px">
@@ -2290,7 +2410,10 @@ async function loadForecastChart() {
         </div>
         ${c.svg}${c.legend}
       </div>`;
-  } catch (e) { const card = $('#foreChartCard'); if (card) card.style.display = 'none'; }
+  } catch (e) {
+    const card = $('#foreChartCard'); if (card) card.style.display = 'none';
+    paintForecastStatus('bad', 'Forecast status: couldn\'t check', e.message);
+  }
 }
 
 async function openDemandChartModal(menuItemId) {
@@ -3137,12 +3260,12 @@ async function loadSyscheck() {
     </div>
     ${modelDetailsCard(md)}`);
 }
-function modelDetailsCard(md) {
-  const f = md.demand_forecast, a = md.anomaly_detection, c = md.product_combinations;
+/* Extracted so the Forecasts page's own "Forecast details" section can show
+   the same real backtest numbers without a second query — both this and
+   modelDetailsCard() below read the same /console/model-details response,
+   nothing here is refetched or recomputed. */
+function demandModelDetailCard(f) {
   return `
-    <div class="card">
-      <div class="card-h"><div><h2>Model details</h2><p>Technical evidence for the three prediction models — for review or defence, not day-to-day use</p></div></div>
-      <div class="card-b"><div class="grid g3">
         <div class="card flat">
           <div class="card-h"><div><h2 style="font-size:12.5px">Demand forecasting</h2><p>Prophet</p></div></div>
           <div class="card-b tight" style="display:flex;flex-direction:column;gap:10px">
@@ -3155,7 +3278,15 @@ function modelDetailsCard(md) {
                 ${kpi('Trend', num(f.trend_per_week, 3), 'units / week')}
               </div>` : `<div class="sub">Not available — ${esc(f.reason || 'unknown')}.</div>`}
           </div>
-        </div>
+        </div>`;
+}
+function modelDetailsCard(md) {
+  const f = md.demand_forecast, a = md.anomaly_detection, c = md.product_combinations;
+  return `
+    <div class="card">
+      <div class="card-h"><div><h2>Model details</h2><p>Technical evidence for the three prediction models — for review or defence, not day-to-day use</p></div></div>
+      <div class="card-b"><div class="grid g3">
+        ${demandModelDetailCard(f)}
         <div class="card flat">
           <div class="card-h"><div><h2 style="font-size:12.5px">Anomaly detection</h2><p>Isolation Forest</p></div></div>
           <div class="card-b tight" style="display:flex;flex-direction:column;gap:10px">
@@ -3315,10 +3446,17 @@ $('#refreshBtn').addEventListener('click', e => {
 });
 
 /* Global nav delegation — covers the rail, the mobile bar, and any
-   [data-nav] button rendered inside a view (KPI cards, attention rows). */
+   [data-nav] button rendered inside a view (KPI cards, attention rows).
+   data-open-ing is optional: when present, the ingredient drawer opens
+   automatically once the target page has finished loading — "review this
+   recommendation" should land you looking at the actual ingredient, not
+   just the list it lives in. */
 document.addEventListener('click', e => {
   const b = e.target.closest('[data-nav]');
-  if (b && !b.closest('#modalBox')) { goto(b.dataset.nav); }
+  if (b && !b.closest('#modalBox')) {
+    const openIng = b.dataset.openIng;
+    goto(b.dataset.nav).then(() => { if (openIng) openIngredientDrawer(parseInt(openIng, 10)); });
+  }
 });
 
 /* ===================== THEME ===================== */
