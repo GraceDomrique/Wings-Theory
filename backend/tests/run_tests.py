@@ -1432,6 +1432,45 @@ class TestConsoleAPI(unittest.TestCase):
         self.assertIn("name", d["used_in"][0])
         self.assertIn("qty_base", d["used_in"][0])
 
+    def test_ingredient_detail_lists_every_open_batch_in_real_fefo_order(self):
+        # Unlike /console/expiry (which only monitors batches carrying a
+        # usable expiry signal), the drawer's batch list must include every
+        # open batch for this ingredient — a batch doesn't stop being real
+        # stock just because nobody has confirmed when it turns.
+        #
+        # Receive three batches out of chronological order — a far date, an
+        # undated one, then a near date — through the real HTTP receiving
+        # path, so passing this proves actual FEFO sort order rather than
+        # just insertion order, and proves an undated batch sorts last.
+        ing = next(i for i in self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+                   if i["pack_size"])
+        pk = ing["id"]
+        before_ids = {b["id"] for b in self.client.get(f"/console/ingredients/{pk}", headers=self.H_MGR).json()["batches"]}
+        for expires in ("2030-06-01", None, "2027-01-01"):
+            body = {"purchase_qty": 1, "lot_no": f"FEFO-TEST-{expires or 'none'}"}
+            if expires:
+                body["expires_at"] = expires
+            r = self.client.post(f"/console/ingredients/{pk}/receive", headers=self.H_MGR, json=body)
+            self.assertEqual(r.status_code, 200, r.text)
+
+        d = self.client.get(f"/console/ingredients/{pk}", headers=self.H_MGR).json()
+        new_batches = [b for b in d["batches"] if b["id"] not in before_ids]
+        self.assertEqual(len(new_batches), 3)
+        # near date, then far date, then undated last — real FEFO pick order.
+        self.assertEqual(
+            [b["lot_no"] for b in new_batches],
+            ["FEFO-TEST-2027-01-01", "FEFO-TEST-2030-06-01", "FEFO-TEST-none"],
+        )
+        self.assertEqual(new_batches[0]["tracking"], "exact_date")
+        self.assertEqual(new_batches[1]["tracking"], "exact_date")
+        self.assertLess(new_batches[0]["days_to_expiry"], new_batches[1]["days_to_expiry"])
+        # The undated batch is still present, still real stock — just
+        # honestly labelled as having nothing to compute a date from,
+        # never silently dropped the way /console/expiry drops it.
+        self.assertEqual(new_batches[2]["tracking"], "not_tracked")
+        self.assertIsNone(new_batches[2]["days_to_expiry"])
+        self.assertIsNone(new_batches[2]["storage_status"])
+
     def test_waste_endpoint_requires_inventory_write_and_moves_stock(self):
         ing = next(i for i in self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
                    if i["on_hand_base"] > 50)

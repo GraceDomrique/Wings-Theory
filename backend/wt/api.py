@@ -853,7 +853,8 @@ def ingredient_detail(
     """Everything the console's ingredient drawer shows, in one call: the
     ingredient with its readiness flags, which recipes consume it (walking
     the same v_recipe_leaf view the deduction path uses, so a sub-recipe's
-    parent shows up too), and its recent stock movements."""
+    parent shows up too), its open FEFO batches in real pick order, and its
+    recent stock movements."""
     row = c.execute(
         """
         SELECT i.*, r.is_deductable, r.block_reason, r.unverified_count,
@@ -879,6 +880,29 @@ def ingredient_detail(
         """,
         (pk,),
     ))
+    # Same order deplete_fefo actually draws down in — expiry ascending,
+    # undated batches last, id breaking ties — so "next to be used" here
+    # means exactly what it means to the deduction engine, not a UI-only
+    # approximation of it. Unlike /console/expiry, nothing is excluded for
+    # lacking a usable date: a batch this ingredient actually holds doesn't
+    # stop being real stock just because nobody has confirmed when it turns.
+    batches = rows(c.execute(
+        """
+        SELECT b.id, b.lot_no, b.qty_base, b.received_at, b.expires_at, b.expiry_status,
+               i.expiry_mode, i.shelf_life_days
+          FROM fefo_batch b JOIN ingredient i ON i.id = b.ingredient_id
+         WHERE b.ingredient_id = ? AND b.state = 'open' AND b.qty_base > 0
+         ORDER BY (b.expires_at IS NULL), b.expires_at, b.id
+        """,
+        (pk,),
+    ))
+    for b in batches:
+        if _annotate_batch_expiry(b) is None:
+            b["tracking"] = "not_tracked"
+            b["days_to_expiry"] = None
+            b["expired"] = False
+            b["storage_status"] = None
+
     movements = rows(c.execute(
         """
         SELECT id, delta_base, balance_after_base, reason, wastage_reason,
@@ -889,7 +913,8 @@ def ingredient_detail(
     ))
     # Same rate/runway maths the Forecasts page uses, for this one ingredient.
     dep = next((d for d in ingredient_depletion(c, 30) if d["ingredient_id"] == pk), None)
-    return {"ingredient": data, "used_in": used_in, "movements": movements, "depletion": dep}
+    return {"ingredient": data, "used_in": used_in, "batches": batches,
+            "movements": movements, "depletion": dep}
 
 
 # ===========================================================================
@@ -1160,6 +1185,45 @@ def list_ledger(
     return {"entries": rows(c.execute(sql, params)), "total": total}
 
 
+def _annotate_batch_expiry(b: dict) -> dict | None:
+    """Shared with ingredient_detail's batch list below, so there is exactly
+    one place that turns a batch's raw expiry_mode/expires_at/received_at
+    into a usable date — not two independently-maintained copies of the
+    same arithmetic. Mutates and returns `b` with tracking/days_to_expiry/
+    expired/storage_status added, or returns None when this batch has no
+    computable expiry at all (not on a shelf-life estimate, and either
+    missing or an unparseable expires_at) — the caller decides what that
+    means for it: expiry_monitor drops it (it isn't an expiry signal to
+    monitor), the drawer keeps it (it's still real stock the owner should
+    see, just with nothing to say about when it turns).
+
+    Pops shelf_life_days/expiry_mode off `b` — they're inputs to this
+    calculation, not part of what either caller wants back.
+    """
+    import datetime as _dt
+    shelf_life_days = b.pop("shelf_life_days")
+    mode = b.pop("expiry_mode")
+    if mode == "shelf_life_estimate":
+        try:
+            received = _dt.date.fromisoformat(b["received_at"][:10])
+        except (ValueError, TypeError):
+            return None
+        exp = received + _dt.timedelta(days=shelf_life_days or 0)
+        b["expires_at"] = exp.isoformat()
+        b["tracking"] = "estimated_shelf_life"
+    else:
+        try:
+            exp = _dt.date.fromisoformat(b["expires_at"])
+        except (ValueError, TypeError):
+            return None
+        b["tracking"] = "exact_date"
+    days = (exp - _dt.date.today()).days
+    b["days_to_expiry"] = days
+    b["expired"] = days < 0
+    b["storage_status"] = "Expired" if days < 0 else "Use Soon" if days <= 2 else "Normal"
+    return b
+
+
 @app.get("/console/expiry", tags=["console"])
 def expiry_monitor(
     within_days: int = Query(90, description="only batches expiring/estimated within this many days"),
@@ -1188,33 +1252,12 @@ def expiry_monitor(
            AND (b.expires_at IS NOT NULL OR i.expiry_mode = 'shelf_life_estimate')
         """
     ))
-    import datetime as _dt
-    today = _dt.date.today()
     out = []
     for b in batches:
-        shelf_life_days = b.pop("shelf_life_days")
-        mode = b.pop("expiry_mode")
-        if mode == "shelf_life_estimate":
-            try:
-                received = _dt.date.fromisoformat(b["received_at"][:10])
-            except (ValueError, TypeError):
-                continue
-            exp = received + _dt.timedelta(days=shelf_life_days or 0)
-            b["expires_at"] = exp.isoformat()
-            b["tracking"] = "estimated_shelf_life"
-        else:
-            try:
-                exp = _dt.date.fromisoformat(b["expires_at"])
-            except (ValueError, TypeError):
-                continue
-            b["tracking"] = "exact_date"
-        days = (exp - today).days
-        if days > within_days:
+        annotated = _annotate_batch_expiry(b)
+        if annotated is None or annotated["days_to_expiry"] > within_days:
             continue
-        b["days_to_expiry"] = days
-        b["expired"] = days < 0
-        b["storage_status"] = "Expired" if days < 0 else "Use Soon" if days <= 2 else "Normal"
-        out.append(b)
+        out.append(annotated)
     out.sort(key=lambda x: x["days_to_expiry"])
     return {"batches": out, "count": len(out)}
 
