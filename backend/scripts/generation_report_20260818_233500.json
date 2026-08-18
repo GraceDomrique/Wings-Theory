@@ -1,0 +1,77 @@
+{
+  "database_path": "C:\\Users\\PLPASIG\\wings-theory\\backend\\dev\\wings_theory_dev.db",
+  "backup_path": "C:\\Users\\PLPASIG\\wings-theory\\backend\\backups\\wings_theory_dev.pre_demo_history.20260818_233500.db",
+  "seed": 42,
+  "days": 90,
+  "generation_seconds": 33.3,
+  "catalog_import": {
+    "ingredients": 111,
+    "recipes": 45,
+    "recipe_lines": 196,
+    "unmapped_lines": 4,
+    "menu_items": 29,
+    "unli_streams": 4,
+    "unli_flavors": 14,
+    "reference_flavors_configured": 14,
+    "reference_skus_repriced": 5,
+    "reference_recipe_fixes": 2,
+    "sellable_menu_items": 28,
+    "needs_verification": 630,
+    "gapfill_ingredients_added": 2,
+    "gapfill_piece_weights_set": 6,
+    "gapfill_subrecipes_created": 17,
+    "gapfill_queue_resolved": 1,
+    "gapfill_queue_dismissed": 3
+  },
+  "generation_stats": {
+    "orders": 2219,
+    "voided": 90,
+    "restocked_ingredients": 415,
+    "days": 90,
+    "unli_orders": 340,
+    "unli_voided": 15,
+    "unli_refills_served": 906,
+    "unli_refills_voided": 32,
+    "unli_refills_corrected": 40,
+    "wastage": {
+      "routine": 66,
+      "outliers": 2
+    },
+    "stock_counts": 96,
+    "receiving_events": 30,
+    "reconciliation": {
+      "reconciled": 296,
+      "within_tolerance": 215,
+      "over_tolerance": 47,
+      "under_tolerance": 34,
+      "skipped_already_done": 0,
+      "errors": 0,
+      "candidates": 348
+    },
+    "date_range": "2026-05-20 to 2026-08-17"
+  },
+  "integrity_before": {
+    "integrity_check": "ok",
+    "foreign_key_violations": 0,
+    "fefo_reconciliation_drift": 0,
+    "ledger_reconciliation_drift": 0,
+    "stale_reservations": 0,
+    "ingredients_with_reserved_stock": 0,
+    "orphan_recipe_lines": 0,
+    "orphan_fefo_batches": 0,
+    "duplicate_skus": 0,
+    "refill_line_state_mismatch": 0
+  },
+  "integrity_after": {
+    "integrity_check": "ok",
+    "foreign_key_violations": 0,
+    "fefo_reconciliation_drift": 0,
+    "ledger_reconciliation_drift": 0,
+    "stale_reservations": 0,
+    "ingredients_with_reserved_stock": 0,
+    "orphan_recipe_lines": 0,
+    "orphan_fefo_batches": 0,
+    "duplicate_skus": 0,
+    "refill_line_state_mismatch": 0
+  }
+}

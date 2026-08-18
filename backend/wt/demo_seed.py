@@ -1,22 +1,37 @@
-"""Synthetic historical order generator.
+"""Synthetic historical operating-history generator — development/demo only.
 
-Explicitly authorized, one-time, owner-requested: the console's Forecasts,
-Anomaly Detection, and Reports sections need real order history to show
-anything, and this database started at zero. The owner was warned this
-writes directly into the live database (not a separate demo copy) and will
-reduce real on-hand stock the same way real sales would, and chose to
-proceed anyway so the live system shows populated data immediately.
+Explicitly authorized, for system testing, demonstration and thesis
+evaluation against an isolated development database
+(backend/dev/wings_theory_dev.db), never against production
+(backend/wings_theory.db). The orchestration script that calls this
+(scripts/generate_demo_history.py) is what enforces that separation by
+setting WT_DB before this module ever touches a connection — this module
+itself just writes through whatever connection it is given or that
+db.get_conn() resolves to, so getting WT_DB right before calling it is the
+caller's responsibility, not this file's.
 
-Every order this writes goes through the real reservation pipeline
-(reserve_order / commit_order) — the same code path a real POS punch uses —
-so the resulting ledger, on-hand stock, and reservations are internally
-consistent with a real system, not hand-waved numbers. Timestamps are
-backdated after the fact so the history lands in the past, ending the day
-before this is run (never on "today", so live testing afterward stays
-clean).
+Every write here goes through the real service-layer functions a real POS
+punch, a real receiving screen, a real physical count, and a real kitchen
+scale would use — reserve_order/commit_order/release_order, receive_stock,
+record_count, record_wastage, open_session/record_refill/serve_refill/
+void_refill/correct_refill, record_reconciliation. Nothing computes a
+forecast, an anomaly, or a replenishment figure directly; those come out of
+running the real pipelines against this history afterward. The one thing
+this module does that no ordinary API caller can: backdate the timestamps
+those functions stamp with datetime('now'), so the history lands in the
+past instead of piling up on today. That requires briefly dropping the two
+append-only triggers (stock_ledger, order_charge) that would otherwise
+reject the UPDATE — see run() for exactly how narrowly that's scoped, and
+why it's always restored even if generation fails partway through.
 
-Not imported by wt/api.py and never runs automatically — invoke deliberately:
-    python -m wt.demo_seed [--days N] [--seed N]
+Every row this writes carries user_id='demo_seed' (orders, ledger entries,
+receiving, counts, refills, reconciliation) — the one marker convention,
+applied consistently, that makes every synthetic row identifiable and
+queryable as such after the fact.
+
+Not imported by wt/api.py and never runs automatically — invoke
+deliberately via scripts/generate_demo_history.py, not this module's CLI
+directly, unless you have already independently verified WT_DB.
 """
 from __future__ import annotations
 
@@ -25,8 +40,16 @@ import random
 import sqlite3
 
 from . import db
-from .errors import InsufficientStockError
-from .reservation import commit_order, receive_stock, release_order, reserve_order
+from .errors import InsufficientStockError, InvalidStateError
+from .reservation import (
+    commit_order, receive_stock, record_count, record_wastage, release_order,
+    reserve_order,
+)
+from .refills import (
+    correct_refill, list_flavors, open_session, record_refill, serve_refill,
+    void_refill,
+)
+from .unli import provisional_for_date, record_reconciliation
 
 USER_ID = "demo_seed"
 
@@ -60,6 +83,32 @@ COMBOS: dict[str, list[tuple[str, float]]] = {
     "Sulit Deal – 3 pcs Wings + Rice": [("Ranch Dip", 0.4)],
     "Cheesy Bacon Fries": [("Coke in Can", 0.35)],
     "Wing Rack 12 pcs (2 Flavors)": [("1 Cup Rice", 0.4)],
+}
+
+# Category -> (healthy_min, healthy_max, approaching_min, approaching_max),
+# in days from the receiving date, for ingredients on a real fixed expiry
+# date. Rough, generic shelf-life bands by kind of good — a real owner would
+# know these per-supplier; a synthetic dataset just needs them plausible.
+# shelf_life_estimate ingredients never use this (see _pick_expires_at).
+SHELF_LIFE_WINDOWS: dict[str, tuple[int, int, int, int]] = {
+    "wet_food": (10, 25, 3, 9),
+    "dry_food": (120, 365, 14, 30),
+    "packaging": (365, 730, 60, 120),
+    "consumable": (180, 400, 30, 60),
+    "resale": (90, 365, 20, 45),
+}
+
+# How often (in days, roughly) a category's stock actually gets checked for
+# restocking, before the on-hand-vs-target gate below even asks whether a
+# delivery is warranted. Perishables get looked at often; packaging rarely.
+RESTOCK_CHECK_CADENCE: dict[str, int] = {
+    "wet_food": 4, "dry_food": 10, "packaging": 18, "consumable": 12, "resale": 8,
+}
+# How many packs "well stocked" means, by category — the reference level
+# _seed_periodic_receiving tops an ingredient back up toward once it has
+# actually run low from real consumption, not a level received on a clock.
+RESTOCK_TARGET_PACKS: dict[str, float] = {
+    "wet_food": 4.0, "dry_food": 2.0, "packaging": 1.5, "consumable": 2.0, "resale": 2.0,
 }
 
 
@@ -136,55 +185,182 @@ def _backdate_ledger_range(conn: sqlite3.Connection, lo_id: int, hi_id: int, ts:
         conn.execute("UPDATE stock_ledger SET created_at=? WHERE id > ? AND id <= ?", (ts, lo_id, hi_id))
 
 
-def _restock_shortfalls(conn: sqlite3.Connection, shortfalls: list[dict], ts: str) -> int:
-    """Reactive restocking — exactly what a real shop does: something ran
-    low, so it gets replenished. Sized generously (25x the immediate need)
-    so the same ingredient isn't triggering a restock every other order."""
+# ---------------------------------------------------------------------------
+# receiving, with realistic expiry
+# ---------------------------------------------------------------------------
+def _pick_expires_at(rng: random.Random, category: str, expiry_mode: str,
+                     received_date: _dt.date) -> str | None:
+    """A believable expiry date for one receiving event — mixed healthy/
+    approaching/at-risk so the resulting batches read like a real shop's
+    stock, not a uniform wall of one color. None for anything not on a real
+    fixed date: a shelf_life_estimate ingredient (fresh produce, herbs) is
+    tracked from received_at + its own configured shelf_life_days by FEFO
+    itself, and supplying a date here would just be a second, competing
+    number nobody asked for; 'none'-mode ingredients have nothing to invent
+    a date for at all.
+    """
+    if expiry_mode != "fixed_date":
+        return None
+    healthy_lo, healthy_hi, near_lo, near_hi = SHELF_LIFE_WINDOWS.get(category, (90, 200, 14, 30))
+    roll = rng.random()
+    if roll < 0.75:
+        days_out = rng.randint(healthy_lo, healthy_hi)
+    elif roll < 0.93:
+        days_out = rng.randint(near_lo, near_hi)
+    else:
+        days_out = rng.randint(-5, 3)   # a small number land already-expired or expiring imminently
+    return (received_date + _dt.timedelta(days=days_out)).isoformat()
+
+
+def _receive_realistic(conn: sqlite3.Connection, ingredient_id: int, category: str,
+                       expiry_mode: str, purchase_qty: float, ts: str, day: _dt.date,
+                       rng: random.Random, lot_prefix: str = "DEMO") -> dict:
+    expires_at = _pick_expires_at(rng, category, expiry_mode, day)
+    before = _last_ledger_id(conn)
+    result = receive_stock(conn, ingredient_id, purchase_qty, lot_no=f"{lot_prefix}-{day.isoformat()}",
+                           expires_at=expires_at, user_id=USER_ID)
+    after = _last_ledger_id(conn)
+    _backdate_ledger_range(conn, before, after, ts)
+    conn.execute(
+        "UPDATE fefo_batch SET received_at=? "
+        "WHERE id = (SELECT MAX(id) FROM fefo_batch WHERE ingredient_id=?)",
+        (ts, ingredient_id),
+    )
+    return result
+
+
+def _restock_shortfalls(conn: sqlite3.Connection, shortfalls: list[dict], ts: str,
+                        day: _dt.date, rng: random.Random) -> int:
+    """Reactive restocking — exactly what a real shop does when something
+    runs low mid-service: sized generously (25x the immediate need) so the
+    same ingredient isn't triggering a restock every other order."""
     for s in shortfalls:
-        row = conn.execute("SELECT pack_size FROM ingredient WHERE id=?",
+        row = conn.execute("SELECT pack_size, category, expiry_mode FROM ingredient WHERE id=?",
                            (s["ingredient_id"],)).fetchone()
         pack_size = row["pack_size"] or 1.0
         shortfall_base = max(0.0, s["needed"] - s["available"])
         top_up_base = shortfall_base + s["needed"] * 25
         purchase_qty = max(1.0, top_up_base / pack_size)
-        before = _last_ledger_id(conn)
-        receive_stock(conn, s["ingredient_id"], purchase_qty, lot_no=f"DEMO-{ts[:10]}", user_id=USER_ID)
-        after = _last_ledger_id(conn)
-        _backdate_ledger_range(conn, before, after, ts)
-        conn.execute(
-            "UPDATE fefo_batch SET received_at=? "
-            "WHERE id = (SELECT MAX(id) FROM fefo_batch WHERE ingredient_id=?)",
-            (ts, s["ingredient_id"]),
-        )
+        _receive_realistic(conn, s["ingredient_id"], row["category"], row["expiry_mode"],
+                           purchase_qty, ts, day, rng, lot_prefix="DEMO")
     return len(shortfalls)
 
 
-def _record_direct_ledger(conn: sqlite3.Connection, ingredient_id: int, delta: float,
-                          reason: str, wastage_reason: str | None, ts: str, note: str | None = None) -> None:
-    """Wastage/spoilage has no dedicated write path in the API yet (a real
-    gap — see the console feature audit) so this writes the ledger row the
-    same way reservation._ledger does, directly. ref_type is left NULL, not
-    tagged with this script's name — a real wastage-recording feature
-    wouldn't stamp an internal label onto a row the owner reads in plain
-    English in Stock Movements, so this shouldn't either."""
-    bal = conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?", (ingredient_id,)).fetchone()["on_hand_base"]
-    new_bal = max(0.0, bal + delta)
-    conn.execute("UPDATE ingredient SET on_hand_base=?, updated_at=? WHERE id=?", (new_bal, ts, ingredient_id))
-    conn.execute(
-        "INSERT INTO stock_ledger (ingredient_id, delta_base, balance_after_base, reason, "
-        "wastage_reason, ref_type, ref_id, user_id, note, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (ingredient_id, delta, new_bal, reason, wastage_reason, None, None, USER_ID, note, ts),
-    )
+def _seed_periodic_receiving(conn: sqlite3.Connection, start: _dt.date, end: _dt.date,
+                             rng: random.Random) -> int:
+    """Proactive receiving, driven by actual on-hand level, not a calendar.
+
+    Every RESTOCK_CHECK_CADENCE[category] days, per ingredient, check
+    whether it has actually run low relative to a plausible "well stocked"
+    reference level for its category — and only then receive. A fast-
+    depleting ingredient (real recipe usage most days) gets topped up on
+    most checks; a slow mover can go the entire window without ever
+    triggering one. That is what makes receiving frequency track actual
+    consumption instead of an arbitrary schedule — the "correlation between
+    operations, not independent random events" requirement, applied to
+    receiving specifically.
+    """
+    ings = _rows(conn.execute(
+        """
+        SELECT i.id, i.category, i.expiry_mode, i.pack_size, i.purchase_unit
+          FROM ingredient i JOIN v_ingredient_readiness r ON r.id = i.id
+         WHERE i.is_active = 1 AND r.is_deductable = 1
+           AND i.kind = 'raw' AND i.pack_size IS NOT NULL
+        """
+    ))
+    total_days = (end - start).days + 1
+    events = 0
+    for ing in ings:
+        cadence = RESTOCK_CHECK_CADENCE.get(ing["category"], 10)
+        target_packs = RESTOCK_TARGET_PACKS.get(ing["category"], 2.0)
+        pack_size = ing["pack_size"] or 1.0
+        target_base = target_packs * pack_size
+        day_idx = rng.randint(0, cadence - 1)   # stagger so every ingredient isn't checked the same day
+        while day_idx < total_days:
+            day = start + _dt.timedelta(days=day_idx)
+            on_hand = conn.execute(
+                "SELECT on_hand_base FROM ingredient WHERE id=?", (ing["id"],)
+            ).fetchone()["on_hand_base"]
+            if on_hand < 0.4 * target_base:
+                hour = rng.randint(8, 11)   # deliveries arrive in the morning
+                ts = f"{day.isoformat()} {hour:02d}:{rng.randint(0, 59):02d}:00"
+                top_up_base = (target_base - on_hand) * rng.uniform(0.9, 1.2)
+                purchase_qty = max(1.0, round(top_up_base / pack_size))
+                _receive_realistic(conn, ing["id"], ing["category"], ing["expiry_mode"],
+                                   purchase_qty, ts, day, rng, lot_prefix="RECV")
+                events += 1
+            day_idx += cadence + rng.randint(-1, 2)   # jitter — deliveries aren't clockwork
+    return events
 
 
-def _seed_wastage_history(conn: sqlite3.Connection, start: _dt.date, end: _dt.date, rng: random.Random) -> dict:
+# ---------------------------------------------------------------------------
+# stock counts
+# ---------------------------------------------------------------------------
+def _seed_stock_counts(conn: sqlite3.Connection, start: _dt.date, end: _dt.date,
+                       rng: random.Random) -> int:
+    """Periodic physical counts through the real record_count() path.
+    Mostly small variance, occasionally moderate, rarely significant —
+    matching a real closing-shift count, not a stress test."""
+    ings = _rows(conn.execute(
+        """
+        SELECT i.id FROM ingredient i JOIN v_ingredient_readiness r ON r.id = i.id
+         WHERE i.is_active = 1 AND r.is_deductable = 1 AND i.kind = 'raw'
+        """
+    ))
+    if not ings:
+        return 0
+    total_days = (end - start).days + 1
+    events = 0
+    day_idx = rng.randint(2, 6)
+    while day_idx < total_days:
+        day = start + _dt.timedelta(days=day_idx)
+        sample = rng.sample(ings, k=min(rng.randint(6, 10), len(ings)))
+        hour = rng.randint(21, 23)   # counted at close
+        for ing in sample:
+            ts = f"{day.isoformat()} {hour:02d}:{rng.randint(0, 59):02d}:00"
+            on_hand = conn.execute(
+                "SELECT on_hand_base FROM ingredient WHERE id=?", (ing["id"],)
+            ).fetchone()["on_hand_base"]
+            if on_hand <= 0:
+                continue
+            roll = rng.random()
+            if roll < 0.70:
+                pct = rng.uniform(-0.02, 0.02)
+            elif roll < 0.92:
+                pct = rng.choice([-1, 1]) * rng.uniform(0.03, 0.06)
+            else:
+                pct = rng.choice([-1, 1]) * rng.uniform(0.10, 0.20)
+            actual = max(0.0, round(on_hand * (1 + pct), 2))
+            before = _last_ledger_id(conn)
+            record_count(conn, ing["id"], actual, note="periodic physical count", user_id=USER_ID)
+            after = _last_ledger_id(conn)
+            _backdate_ledger_range(conn, before, after, ts)
+            events += 1
+        day_idx += 7 + rng.randint(-1, 2)
+    return events
+
+
+# ---------------------------------------------------------------------------
+# wastage
+# ---------------------------------------------------------------------------
+_ROUTINE_NOTES = ["prep trim", "over-portioned", "dropped during prep", "spillage during service"]
+_OUTLIER_NOTES = ["cooler outage — batch discarded", "delivery arrived damaged and unusable",
+                  "expired before use — discarded"]
+
+
+def _seed_wastage_history(conn: sqlite3.Connection, start: _dt.date, end: _dt.date,
+                          rng: random.Random) -> dict:
     """A believable baseline of small routine losses per ingredient (so the
-    z-score check in wt/anomaly.py has enough same-ingredient history to be
-    meaningful), plus a handful of deliberate outliers for it to actually
-    catch."""
+    anomaly check has enough same-ingredient history to be meaningful),
+    plus a handful of deliberate outliers for it to actually catch. Through
+    the real record_wastage() path — the routine/outlier design is
+    unchanged from the original version of this generator, only the write
+    path is: record_wastage() already existed and is what the console's own
+    waste button calls, so there was no real reason for this to hand-roll
+    the ledger math a second time."""
     raw_ings = _rows(conn.execute(
         """
-        SELECT i.id, i.name, i.on_hand_base FROM ingredient i
+        SELECT i.id, i.name FROM ingredient i
           JOIN v_ingredient_readiness r ON r.id = i.id
          WHERE i.is_active = 1 AND r.is_deductable = 1 AND i.kind = 'raw'
          ORDER BY i.name
@@ -201,9 +377,15 @@ def _seed_wastage_history(conn: sqlite3.Connection, start: _dt.date, end: _dt.da
         for _ in range(n_events):
             day = start + _dt.timedelta(days=rng.randint(0, total_days - 1))
             ts = f"{day.isoformat()} {rng.randint(9, 21):02d}:{rng.randint(0, 59):02d}:00"
-            row = conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
-            magnitude = max(0.01, row["on_hand_base"] * rng.uniform(0.005, 0.02))
-            _record_direct_ledger(conn, ing["id"], -magnitude, "wastage", "routine trim/prep loss", ts)
+            on_hand = conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?", (ing["id"],)).fetchone()["on_hand_base"]
+            if on_hand <= 0:
+                continue
+            magnitude = min(on_hand * 0.999, max(0.01, on_hand * rng.uniform(0.005, 0.02)))
+            before = _last_ledger_id(conn)
+            record_wastage(conn, ing["id"], round(magnitude, 3), reason="wastage",
+                           note=rng.choice(_ROUTINE_NOTES), user_id=USER_ID)
+            after = _last_ledger_id(conn)
+            _backdate_ledger_range(conn, before, after, ts)
             routine += 1
 
     outlier_targets = rng.sample(raw_ings, k=min(3, len(raw_ings)))
@@ -211,38 +393,250 @@ def _seed_wastage_history(conn: sqlite3.Connection, start: _dt.date, end: _dt.da
     for ing in outlier_targets:
         day = start + _dt.timedelta(days=rng.randint(int(total_days * 0.4), total_days - 1))
         ts = f"{day.isoformat()} {rng.randint(9, 21):02d}:{rng.randint(0, 59):02d}:00"
-        row = conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
-        magnitude = row["on_hand_base"] * rng.uniform(0.3, 0.5)
+        on_hand = conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?", (ing["id"],)).fetchone()["on_hand_base"]
+        if on_hand <= 0:
+            continue
+        magnitude = min(on_hand * 0.999, on_hand * rng.uniform(0.3, 0.5))
         if magnitude <= 0:
             continue
-        _record_direct_ledger(conn, ing["id"], -magnitude, "spoilage",
-                              "cooler outage — batch discarded", ts)
+        before = _last_ledger_id(conn)
+        record_wastage(conn, ing["id"], round(magnitude, 3), reason="spoilage",
+                       note=rng.choice(_OUTLIER_NOTES), user_id=USER_ID)
+        after = _last_ledger_id(conn)
+        _backdate_ledger_range(conn, before, after, ts)
         outliers += 1
 
     return {"routine": routine, "outliers": outliers}
+
+
+# ---------------------------------------------------------------------------
+# unlimited orders, refills, reconciliation
+# ---------------------------------------------------------------------------
+def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rng: random.Random,
+                          flavors_included: list[dict], flavors_premium: list[dict],
+                          unli_menu_id: int, price: float) -> dict | None:
+    """One unlimited table, start to close: order -> session -> 1-5 refill
+    rounds, each individually held-then-served through the real two-phase
+    refill path -> occasionally a round voided or corrected along the way.
+    Returns None for a table that voided before the kitchen ever started
+    (no ledger impact, matching release_order's own contract) or stats
+    otherwise."""
+    minute = rng.randint(0, 59)
+    ts = f"{day.isoformat()} {hour:02d}:{minute:02d}:00"
+    head_count = rng.choices([1, 2, 3, 4, 5, 6], weights=[10, 30, 25, 18, 10, 7])[0]
+
+    order_pk, order_no = _new_order(conn, f"T-{rng.randint(1, 14):02d}", head_count)
+    conn.execute(
+        "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,?,?)",
+        (order_pk, unli_menu_id, 1, price),
+    )
+
+    try:
+        reserve_order(conn, order_pk, user_id=USER_ID)
+    except InsufficientStockError as e:
+        _restock_shortfalls(conn, e.shortfalls, ts, day, rng)
+        reserve_order(conn, order_pk, user_id=USER_ID)
+
+    if rng.random() < 0.03:
+        release_order(conn, order_pk, "demo: table left before kitchen started", user_id=USER_ID)
+        conn.execute("UPDATE customer_order SET created_at=?, voided_at=? WHERE id=?", (ts, ts, order_pk))
+        return None
+
+    ledger_before = _last_ledger_id(conn)
+    commit_order(conn, order_pk, user_id=USER_ID)
+    ledger_after = _last_ledger_id(conn)
+    _backdate_ledger_range(conn, ledger_before, ledger_after, ts)
+    conn.execute(
+        "UPDATE customer_order SET created_at=?, committed_at=? WHERE id=?",
+        (ts, ts, order_pk),
+    )
+
+    session = open_session(conn, order_pk, user_id=USER_ID)
+    session_pk = session["session_id"]
+    conn.execute("UPDATE unli_session SET started_at=? WHERE id=?", (ts, session_pk))
+
+    n_rounds = rng.choices([1, 2, 3, 4, 5], weights=[15, 35, 30, 15, 5])[0]
+    served, voided, corrected = 0, 0, 0
+    minute_cursor = minute
+    round_hour = hour
+    for _ in range(n_rounds):
+        minute_cursor += rng.randint(8, 22)
+        if minute_cursor >= 60:
+            round_hour = min(round_hour + minute_cursor // 60, 23)
+            minute_cursor %= 60
+        round_ts = f"{day.isoformat()} {round_hour:02d}:{minute_cursor:02d}:00"
+
+        use_premium = flavors_premium and rng.random() < 0.12
+        flavor = rng.choice(flavors_premium) if use_premium else rng.choice(flavors_included)
+        try:
+            refill = record_refill(conn, session_pk, flavor["id"], user_id=USER_ID)
+        except InsufficientStockError as e:
+            _restock_shortfalls(conn, e.shortfalls, round_ts, day, rng)
+            refill = record_refill(conn, session_pk, flavor["id"], user_id=USER_ID)
+        refill_pk = refill["id"]
+        conn.execute("UPDATE unli_refill SET created_at=? WHERE id=?", (round_ts, refill_pk))
+        conn.execute("UPDATE unli_refill_line SET created_at=? WHERE refill_id=?", (round_ts, refill_pk))
+
+        roll = rng.random()
+        if roll < 0.03:
+            # caught before it was cooked — no ledger impact, matching a
+            # pending-round void exactly.
+            void_refill(conn, refill_pk, reason="demo: wrong flavour caught before cooking", user_id=USER_ID)
+            conn.execute("UPDATE unli_refill SET voided_at=? WHERE id=?", (round_ts, refill_pk))
+            voided += 1
+            continue
+
+        ledger_before = _last_ledger_id(conn)
+        serve_refill(conn, refill_pk, user_id=USER_ID)
+        ledger_after = _last_ledger_id(conn)
+        _backdate_ledger_range(conn, ledger_before, ledger_after, round_ts)
+        conn.execute("UPDATE unli_refill SET served_at=? WHERE id=?", (round_ts, refill_pk))
+        conn.execute("UPDATE unli_refill_line SET resolved_at=? WHERE refill_id=?", (round_ts, refill_pk))
+        conn.execute("UPDATE order_charge SET created_at=? WHERE refill_id=?", (round_ts, refill_pk))
+        served += 1
+
+        if roll < 0.07 and served:
+            # wrong flavour, caught after serving — void the served round and
+            # send out a real replacement, exactly what a floor correction is.
+            replacement_flavor = rng.choice(flavors_included)
+            try:
+                correction = correct_refill(conn, refill_pk, replacement_flavor["id"],
+                                            reason="demo: wrong flavour served", user_id=USER_ID)
+            except (InsufficientStockError, InvalidStateError):
+                correction = None
+            if correction:
+                repl_pk = correction["id"]
+                conn.execute("UPDATE unli_refill SET created_at=? WHERE id=?", (round_ts, repl_pk))
+                conn.execute("UPDATE unli_refill_line SET created_at=? WHERE refill_id=?", (round_ts, repl_pk))
+                ledger_before = _last_ledger_id(conn)
+                serve_refill(conn, repl_pk, user_id=USER_ID)
+                ledger_after = _last_ledger_id(conn)
+                _backdate_ledger_range(conn, ledger_before, ledger_after, round_ts)
+                conn.execute("UPDATE unli_refill SET served_at=? WHERE id=?", (round_ts, repl_pk))
+                conn.execute("UPDATE unli_refill_line SET resolved_at=? WHERE refill_id=?", (round_ts, repl_pk))
+                conn.execute("UPDATE order_charge SET created_at=? WHERE refill_id=?", (round_ts, repl_pk))
+                corrected += 1
+                served += 1
+
+    end_ts = f"{day.isoformat()} {min(round_hour + 1, 23):02d}:{minute_cursor:02d}:00"
+    conn.execute(
+        "UPDATE unli_session SET status='completed', ended_at=?, completed_by=? WHERE id=?",
+        (end_ts, USER_ID, session_pk),
+    )
+    conn.execute(
+        "UPDATE customer_order SET status='served', served_at=? WHERE id=?",
+        (end_ts, order_pk),
+    )
+    return {"order_pk": order_pk, "session_pk": session_pk, "rounds_served": served,
+            "rounds_voided": voided, "rounds_corrected": corrected, "head_count": head_count}
+
+
+def _seed_unlimited_reconciliation(conn: sqlite3.Connection, start: _dt.date, end: _dt.date,
+                                   rng: random.Random, coverage: float = 0.85) -> dict:
+    """Reconcile a realistic majority (not all) of the service-date/stream
+    pairs that actually had committed unlimited orders — a real kitchen
+    does not weigh every tray every single day. Distribution: mostly close
+    to the provisional estimate (validated), a real minority meaningfully
+    off (over-tolerance, held for review), and a rare few materially off —
+    enough for IsolationForest to have genuine signal without every day
+    being manufactured as an outlier.
+
+    opening/closing/added readings are constructed backward from a target
+    actual/theoretical ratio rather than invented independently, so
+    actual = opening + added - closing always holds exactly, the same
+    arithmetic record_reconciliation() itself uses.
+    """
+    streams = _rows(conn.execute("SELECT id, item_key, label FROM unli_item WHERE is_active=1"))
+    total_days = (end - start).days + 1
+    candidates = []
+    for day_idx in range(total_days):
+        day = start + _dt.timedelta(days=day_idx)
+        service_date = day.isoformat()
+        for s in streams:
+            prov = provisional_for_date(conn, s["id"], service_date)
+            if prov["heads"] > 0:
+                candidates.append((service_date, s, prov))
+
+    rng.shuffle(candidates)
+    n_target = round(len(candidates) * coverage)
+    chosen = candidates[:n_target]
+
+    results = {"reconciled": 0, "within_tolerance": 0, "over_tolerance": 0,
+               "under_tolerance": 0, "skipped_already_done": 0, "errors": 0}
+    for service_date, s, prov in chosen:
+        theoretical = prov["theoretical_base"]
+        if theoretical <= 0:
+            continue
+        roll = rng.random()
+        if roll < 0.75:
+            ratio = rng.uniform(0.95, 1.10)              # normal — within or just at tolerance
+        elif roll < 0.95:
+            magnitude = rng.uniform(0.10, 0.30)           # over-tolerance — real operational variance
+            ratio = (1 + magnitude) if rng.random() < 0.65 else (1 - magnitude)
+        else:
+            ratio = rng.choice([rng.uniform(0.35, 0.65), rng.uniform(1.5, 1.9)])   # rare genuine outlier
+        actual = theoretical * ratio
+        leftover_ratio = rng.uniform(0.03, 0.08)
+        opening = actual / max(0.01, (1 - leftover_ratio))
+        closing = max(0.0, opening - actual)
+        added = 0.0 if rng.random() < 0.8 else opening * rng.uniform(0.05, 0.15)
+        # re-derive opening so actual = opening + added - closing holds exactly
+        opening = actual + closing - added
+
+        try:
+            r = record_reconciliation(
+                conn, service_date, s["item_key"],
+                opening_base=round(max(0.0, opening), 2),
+                closing_base=round(max(0.0, closing), 2),
+                added_base=round(max(0.0, added), 2),
+                note="demo: synthetic reconciliation", user_id=USER_ID,
+            )
+        except InvalidStateError:
+            results["skipped_already_done"] += 1
+            continue
+        except Exception:
+            results["errors"] += 1
+            continue
+
+        end_of_day_ts = f"{service_date} 22:{rng.randint(0, 59):02d}:00"
+        conn.execute("UPDATE unli_reconciliation SET created_at=? WHERE id=?", (end_of_day_ts, r["id"]))
+        if r["ledger_id"]:
+            conn.execute("UPDATE stock_ledger SET created_at=? WHERE id=?", (end_of_day_ts, r["ledger_id"]))
+        results["reconciled"] += 1
+        results[r["status"]] = results.get(r["status"], 0) + 1
+
+    results["candidates"] = len(candidates)
+    return results
 
 
 _LEDGER_NO_UPDATE_TRIGGER = (
     "CREATE TRIGGER trg_ledger_no_update BEFORE UPDATE ON stock_ledger\n"
     "BEGIN SELECT RAISE(ABORT, 'stock_ledger is append-only'); END"
 )
+_ORDER_CHARGE_NO_UPDATE_TRIGGER = (
+    "CREATE TRIGGER trg_order_charge_no_update BEFORE UPDATE ON order_charge\n"
+    "BEGIN SELECT RAISE(ABORT, 'order_charge is append-only'); END"
+)
 
 
 def run(conn: sqlite3.Connection | None = None, days: int = 90, seed: int = 42,
        void_rate: float = 0.04, verbose: bool = True) -> dict:
-    """Backdating a ledger row's created_at is an UPDATE, and stock_ledger is
-    deliberately append-only (trg_ledger_no_update) everywhere else in this
-    system — that guarantee matters for a real audit trail. This is the one
-    intentional, explicitly-authorized exception: the trigger is dropped for
-    the duration of this call and always recreated afterward, success or
-    failure, so the append-only guarantee is back in force for every real
-    write that follows."""
+    """Backdating a row's created_at is an UPDATE, and stock_ledger and
+    order_charge are both deliberately append-only everywhere else in this
+    system — that guarantee matters for a real audit trail. This is the
+    one intentional, explicitly-authorized exception: both no-update
+    triggers are dropped for the duration of this call and always
+    recreated afterward, success or failure, so the append-only guarantee
+    is back in force for every real write that follows, including if this
+    function raises partway through."""
     conn = conn or db.get_conn()
     conn.execute("DROP TRIGGER IF EXISTS trg_ledger_no_update")
+    conn.execute("DROP TRIGGER IF EXISTS trg_order_charge_no_update")
     try:
         return _run(conn, days, seed, void_rate, verbose)
     finally:
         conn.execute(_LEDGER_NO_UPDATE_TRIGGER)
+        conn.execute(_ORDER_CHARGE_NO_UPDATE_TRIGGER)
 
 
 def _run(conn: sqlite3.Connection, days: int, seed: int, void_rate: float, verbose: bool) -> dict:
@@ -256,14 +650,30 @@ def _run(conn: sqlite3.Connection, days: int, seed: int, void_rate: float, verbo
     if not items:
         raise RuntimeError("no sellable menu items — seed the real inventory first")
 
-    stats = {"orders": 0, "voided": 0, "restocked_ingredients": 0, "days": days}
+    unli_menu = conn.execute("SELECT id, price FROM menu_item WHERE is_unli=1 AND pos_visible=1 LIMIT 1").fetchone()
+    flavors = list_flavors(conn, active_only=True)
+    flavors_included = [f for f in flavors if f["flavor_type"] == "included"]
+    flavors_premium = [f for f in flavors if f["flavor_type"] == "special"]
+    can_seed_unli = bool(unli_menu and flavors_included)
+
+    stats = {"orders": 0, "voided": 0, "restocked_ingredients": 0, "days": days,
+             "unli_orders": 0, "unli_voided": 0, "unli_refills_served": 0,
+             "unli_refills_voided": 0, "unli_refills_corrected": 0}
 
     for day_idx in range(days):
         day = start + _dt.timedelta(days=day_idx)
         weekend_boost = 1.6 if day.weekday() in (4, 5, 6) else 1.0
         trend = 1.0 + 0.4 * (day_idx / max(1, days - 1))
-        base_mean = 16 * weekend_boost * trend
-        n_orders = max(4, round(rng.gauss(base_mean, base_mean * 0.2)))
+        # occasional unusually busy or unusually slow day — a real shop has
+        # both, not just a smooth seasonal curve.
+        day_mood = 1.0
+        mood_roll = rng.random()
+        if mood_roll < 0.06:
+            day_mood = rng.uniform(1.4, 1.8)     # unusually busy
+        elif mood_roll < 0.14:
+            day_mood = rng.uniform(0.5, 0.7)     # unusually slow
+        base_mean = 16 * weekend_boost * trend * day_mood
+        n_orders = max(3, round(rng.gauss(base_mean, base_mean * 0.2)))
 
         for _ in range(n_orders):
             hour = rng.choices([11, 12, 13, 17, 18, 19, 20], weights=[8, 14, 8, 10, 16, 14, 6])[0]
@@ -280,7 +690,7 @@ def _run(conn: sqlite3.Connection, days: int, seed: int, void_rate: float, verbo
             try:
                 reserve_order(conn, order_pk, user_id=USER_ID)
             except InsufficientStockError as e:
-                stats["restocked_ingredients"] += _restock_shortfalls(conn, e.shortfalls, ts)
+                stats["restocked_ingredients"] += _restock_shortfalls(conn, e.shortfalls, ts, day, rng)
                 reserve_order(conn, order_pk, user_id=USER_ID)
 
             if rng.random() < void_rate:
@@ -302,10 +712,34 @@ def _run(conn: sqlite3.Connection, days: int, seed: int, void_rate: float, verbo
             )
             stats["orders"] += 1
 
+        # unlimited tables — a realistic minority of the day's covers, same
+        # weekday/weekend/mood scaling as everything else so consumption
+        # actually correlates with how busy the day was.
+        if can_seed_unli:
+            n_unli = max(0, round(rng.gauss(n_orders * 0.15, 1.2)))
+            for _ in range(n_unli):
+                hour = rng.choices([11, 12, 13, 17, 18, 19, 20], weights=[6, 12, 8, 10, 18, 16, 6])[0]
+                result = _seed_unlimited_order(conn, day, hour, rng, flavors_included, flavors_premium,
+                                               unli_menu["id"], unli_menu["price"])
+                if result is None:
+                    stats["unli_voided"] += 1
+                else:
+                    stats["unli_orders"] += 1
+                    stats["unli_refills_served"] += result["rounds_served"]
+                    stats["unli_refills_voided"] += result["rounds_voided"]
+                    stats["unli_refills_corrected"] += result["rounds_corrected"]
+
         if verbose and (day_idx + 1) % 10 == 0:
-            print(f"  ...{day_idx + 1}/{days} days, {stats['orders']} orders so far")
+            print(f"  ...{day_idx + 1}/{days} days, {stats['orders']} orders, "
+                  f"{stats['unli_orders']} unlimited so far")
 
     stats["wastage"] = _seed_wastage_history(conn, start, end, rng)
+    stats["stock_counts"] = _seed_stock_counts(conn, start, end, rng)
+    stats["receiving_events"] = _seed_periodic_receiving(conn, start, end, rng)
+    if can_seed_unli:
+        stats["reconciliation"] = _seed_unlimited_reconciliation(conn, start, end, rng)
+    else:
+        stats["reconciliation"] = {"reconciled": 0, "candidates": 0}
     stats["date_range"] = f"{start.isoformat()} to {end.isoformat()}"
     return stats
 
