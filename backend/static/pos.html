@@ -4,68 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Wings Theory — POS</title>
+<link rel="stylesheet" href="/assets/design-system.css">
+<link rel="stylesheet" href="/assets/brand.css">
 <style>
-:root{
-  --amber:#FFA000; --amber-deep:#FF6D00; --gold:#FFD54F;
-  --ink:#0D0D0D; --charcoal:#1A1A1A;
-  --bg:#F6F5F2; --card:#FFFFFF; --sunken:#F1EFEA;
-  --text:#211E1A; --text-2:#6E675F; --text-3:#A39C92; --border:#E7E2DA;
-  --ok-fill:#2E8B57; --ok-text:#1B6E3C; --ok-wash:#E7F5EC;
-  --bad-fill:#C0392B; --bad-text:#B3261E; --bad-wash:#FBEAE8;
-  --sh:0 1px 2px rgba(20,16,10,.07);
-}
+/* POS-specific layout only — every color/type/spacing token, and every
+   reusable primitive (.card/.btn/.chip/.field/.modal/.toast/etc.), lives
+   in /assets/design-system.css, shared with console.html and kds.html.
+   This file only lays out the till's own three-pane shell (rail / menu
+   stage / order panel) and the screens the other two apps don't have. */
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-  font-size:15px;-webkit-tap-highlight-color:transparent;overscroll-behavior:none}
-button{font:inherit;cursor:pointer;-webkit-tap-highlight-color:transparent}
-input{font:inherit}
+body{margin:0;font-family:var(--font-sans);font-size:14px;-webkit-tap-highlight-color:transparent;
+  overscroll-behavior:none;-webkit-font-smoothing:antialiased}
+button{-webkit-tap-highlight-color:transparent}
 svg{width:18px;height:18px}
 .hide{display:none!important}
-.field{width:100%;height:46px;border:1px solid var(--border);border-radius:10px;padding:0 14px;
-  font-size:16px;background:var(--card);color:var(--text)}
-.field:focus{outline:none;border-color:var(--amber)}
-.btn{display:flex;align-items:center;justify-content:center;gap:8px;height:46px;border-radius:10px;
-  border:0;font-weight:700;font-size:15px}
-.btn-p{background:linear-gradient(135deg,var(--amber),var(--amber-deep));color:#1A1200}
-.btn-p:active{filter:brightness(.94)}
-.btn-p:disabled{opacity:.45}
-.btn-s{background:var(--sunken);color:var(--text)}
-.chip{font-size:10.5px;font-weight:700;padding:3px 8px;border-radius:99px;letter-spacing:.02em}
-.chip.ok{background:var(--ok-wash);color:var(--ok-text)}
-.chip.bad{background:var(--bad-wash);color:var(--bad-text)}
-.chip.warn{background:#FFF3DC;color:#8A5A00}
-.chip.mute{background:var(--sunken);color:var(--text-2)}
 
-/* ---------- login ----------
-   Fixed dark values, not theme tokens: this app has no dark mode for its
-   own working screens (unlike the console, which does), but the sign-in
-   gate is the one screen every client shares and should look identical
-   across POS/KDS/Console regardless. Scoped under #login so none of this
-   touches the light-themed till UI underneath. */
+/* ---------- login ---------- */
 #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-  background:#1F1F1F;padding:20px}
-#login .login-box{background:#191B1E;border-radius:16px;padding:32px 28px;width:100%;max-width:360px;
-  box-shadow:0 20px 50px rgba(0,0,0,.34)}
-#login .login-mark{height:44px;display:inline-flex;align-items:center;margin-bottom:14px}
-#login .login-mark img{height:100%;width:auto;display:block}
-#login .login-box h1{font-size:20px;margin:0 0 4px;letter-spacing:-.01em;color:#E8EAED}
-#login .login-box p{color:#9BA1AA;font-size:13px;margin:0 0 22px}
-#login .field{margin-bottom:12px;background:#191B1E;color:#E8EAED;border-color:#2A2E34}
-#login .field::placeholder{color:#6E747D}
-#login .pass-wrap{position:relative}
-#login .pass-wrap{margin-bottom:12px}
-#login .pass-wrap .field{margin-bottom:0;padding-right:42px}
-#login .pass-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;
-  padding:8px;border-radius:8px;display:flex;color:#6E747D;cursor:pointer}
-#login .pass-toggle:hover{color:#E8EAED}
-#login .pass-toggle svg{width:17px;height:17px;display:block}
-/* The till's own amber/orange gradient stays for everything else in this
-   app -- the login button specifically matches the shared sign-in amber
-   (#F4B400) so it reads the same across all three clients. */
-#login .btn-p{background:#F4B400;color:#1F1F1F}
-#login .btn-p:active{filter:brightness(.94)}
-#loginErr{color:#FF8177;font-size:13px;margin:10px 0 0;min-height:16px}
+  background:var(--ink-0);padding:20px;z-index:90}
+.login-box{background:var(--ink-1);border:1px solid var(--line);border-radius:16px;
+  padding:32px 28px;width:100%;max-width:360px;box-shadow:var(--sh-3)}
+.login-mark{height:44px;display:inline-flex;align-items:center;margin-bottom:14px}
+.login-mark img{height:100%;width:auto;display:block}
+.login-box h1{font-family:var(--font-display);font-size:20px;font-weight:600;margin:0 0 4px;
+  letter-spacing:-.01em;color:var(--text-0)}
+.login-box p{color:var(--text-2);font-size:13px;margin:0 0 22px}
+.login-box .field{margin-bottom:12px;height:46px;font-size:16px}
+.pass-wrap{position:relative;margin-bottom:12px}
+.pass-wrap .field{margin-bottom:0;padding-right:42px}
+.pass-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;
+  padding:8px;border-radius:8px;display:flex;color:var(--text-3);cursor:pointer}
+.pass-toggle:hover{color:var(--text-0)}
+.pass-toggle svg{width:17px;height:17px;display:block}
+#loginErr{color:var(--bad-text);font-size:13px;margin:10px 0 0;min-height:16px}
 
 /* ================= APP SHELL — three panes ================= */
 #app{display:none;height:100vh}
@@ -73,113 +44,103 @@ svg{width:18px;height:18px}
 
 /* ---------- 1. left rail ----------
    Sized to the artwork, not guessed: logo.png is 4.13:1, so a 30px-tall
-   lockup is 124px wide. The rail used to be 84px — the logo hung 40px past
-   its own background, which is the overlap that was visible on screen.
-   The rail is now wide enough to contain it, and collapses to the wing
-   mark (near-square, 0.88:1) when there isn't room for the full lockup. */
-.rail{background:var(--ink);display:flex;flex-direction:column;
+   lockup is 124px wide. The rail collapses to the wing mark (near-square,
+   0.88:1) when there isn't room for the full lockup. */
+.rail{background:var(--ink-1);border-right:1px solid var(--line);display:flex;flex-direction:column;
   padding:16px 12px;gap:4px;overflow:hidden;min-width:0}
 .rail-logo{padding:4px 2px 18px;display:flex;align-items:center;min-width:0}
 .rail-logo img{display:block;max-width:100%;height:auto}
 .rail-logo .full{width:158px}
 .rail-logo .mark{display:none;height:34px;width:auto;margin:0 auto}
 .rail-nav{display:flex;flex-direction:column;gap:4px;min-width:0}
-.rail-btn{width:100%;background:none;border:0;color:rgba(255,255,255,.6);border-radius:10px;
+.rail-btn{width:100%;color:var(--text-2);border-radius:10px;
   padding:11px 12px;display:flex;align-items:center;gap:11px;
-  font-size:13px;font-weight:600;letter-spacing:.01em;text-align:left;min-width:0}
+  font-size:13px;font-weight:600;letter-spacing:.01em;text-align:left;min-width:0;
+  transition:background var(--dur) var(--ease),color var(--dur) var(--ease)}
 .rail-btn svg{width:19px;height:19px;flex-shrink:0}
 .rail-btn span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rail-btn:hover{background:rgba(255,255,255,.05);color:rgba(255,255,255,.85)}
-.rail-btn.on{background:rgba(255,160,0,.15);color:var(--gold)}
+.rail-btn:hover{background:var(--ink-2);color:var(--text-0)}
+.rail-btn.on{background:var(--amber-wash);color:var(--amber-text)}
 .rail-spacer{flex:1}
-.rail-btn.rail-logout{color:rgba(255,255,255,.42)}
+.rail-btn.rail-logout{color:var(--text-3)}
 
 /* ---------- 2. center stage ---------- */
 .stage{min-width:0;display:flex;flex-direction:column;height:100vh;overflow:hidden}
 .topbar{display:flex;align-items:center;gap:10px;padding:14px 18px 10px;flex-shrink:0}
 .search-wrap{flex:1;position:relative;max-width:460px}
-.search-wrap svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--text-3)}
+.search-wrap svg{position:absolute;left:13px;top:50%;transform:translateY(-50%);color:var(--text-3);width:16px;height:16px}
 .search-wrap input{padding-left:38px}
 .who-badge{margin-left:auto;display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--text-2)}
-#connDot{width:8px;height:8px;border-radius:99px;background:var(--ok-fill);flex-shrink:0}
-#connDot.off{background:var(--bad-fill)}
-
-#errBanner{background:var(--bad-wash);color:var(--bad-text);padding:10px 18px;font-size:13px;
-  display:flex;align-items:center;gap:10px;flex-shrink:0;margin:0 18px 10px;border-radius:9px}
-#errBanner button{background:none;border:1px solid var(--bad-text);border-radius:7px;
-  padding:4px 10px;font-size:12px;color:var(--bad-text);margin-left:auto}
+#connDot{width:8px;height:8px;border-radius:99px;background:var(--ok);flex-shrink:0}
+#connDot.off{background:var(--bad)}
 
 .cats{display:flex;gap:7px;overflow-x:auto;padding:0 18px 12px;flex-shrink:0}
-.cat{flex-shrink:0;padding:8px 16px;border-radius:99px;border:1px solid var(--border);
-  background:var(--card);font-size:13px;font-weight:600;color:var(--text-2)}
-.cat.on{background:var(--charcoal);border-color:var(--charcoal);color:#fff}
+.cat{flex-shrink:0;padding:8px 16px;border-radius:99px;border:1px solid var(--line);
+  background:var(--ink-1);font-size:13px;font-weight:600;color:var(--text-2)}
+.cat.on{background:var(--amber);border-color:var(--amber);color:var(--amber-ink)}
 
 #grid{flex:1;overflow-y:auto;padding:2px 18px 24px;display:grid;
   grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:12px;align-content:start}
-.card{border:1px solid var(--border);border-radius:14px;background:var(--card);overflow:hidden;
-  text-align:left;box-shadow:var(--sh);display:flex;flex-direction:column;transition:transform .1s ease}
-.card:active{transform:scale(.97)}
-.card.blocked{opacity:.5}
-.tile{height:84px;display:flex;align-items:center;justify-content:center;flex-shrink:0;position:relative}
-.tile b{font-size:26px;font-weight:800;color:rgba(255,255,255,.92);letter-spacing:-.02em}
-.tile .flav{position:absolute;top:7px;right:7px;background:rgba(0,0,0,.28);color:#fff;
+.mcard{border:1px solid var(--line);border-radius:var(--r-card);background:var(--ink-1);overflow:hidden;
+  text-align:left;box-shadow:var(--sh-1);display:flex;flex-direction:column;transition:transform .1s ease}
+.mcard:active{transform:scale(.97)}
+.mcard.blocked{opacity:.55}
+.tile{height:78px;display:flex;align-items:center;justify-content:center;flex-shrink:0;position:relative}
+.tile b{font-family:var(--font-display);font-size:26px;font-weight:600;color:rgba(255,255,255,.92);letter-spacing:-.01em}
+.tile .flav{position:absolute;top:7px;right:7px;background:rgba(0,0,0,.32);color:#fff;
   font-size:9px;font-weight:700;padding:2px 6px;border-radius:99px;letter-spacing:.03em}
-.card .body{padding:10px 11px 11px;display:flex;flex-direction:column;gap:7px;flex:1}
-.card .nm{font-size:13px;font-weight:700;line-height:1.28;min-height:2.5em}
-.card .row{display:flex;align-items:center;gap:6px;margin-top:auto}
-.card .price{font-size:14.5px;font-weight:800;color:var(--amber-deep)}
-.card .why{font-size:10px;color:var(--bad-text);line-height:1.3;min-height:2.2em}
-.addbtn{margin-left:auto;background:var(--charcoal);color:#fff;border:0;border-radius:8px;
+.mcard .body{padding:10px 11px 11px;display:flex;flex-direction:column;gap:7px;flex:1}
+.mcard .nm{font-size:13px;font-weight:600;line-height:1.28;min-height:2.5em;color:var(--text-0)}
+.mcard .row{display:flex;align-items:center;gap:6px;margin-top:auto}
+.mcard .price{font-family:var(--font-mono);font-size:14.5px;font-weight:600;color:var(--text-0);
+  font-variant-numeric:tabular-nums}
+.mcard .why{font-size:10px;color:var(--bad-text);line-height:1.3;min-height:2.2em}
+.addbtn{margin-left:auto;background:var(--amber);color:var(--amber-ink);border-radius:8px;
   padding:6px 12px;font-size:11.5px;font-weight:700;letter-spacing:.02em;display:flex;align-items:center;gap:4px}
 .addbtn svg{width:13px;height:13px}
-.addbtn:active{background:var(--amber-deep)}
+.addbtn:active{background:var(--amber-press)}
 
-.empty{grid-column:1/-1;text-align:center;color:var(--text-3);padding:70px 20px;font-size:14px}
+.empty{grid-column:1/-1}
 
 /* ---------- orders / history view ---------- */
 .list-topbar{display:flex;align-items:center;gap:10px;padding:16px 18px 10px;flex-shrink:0}
-.list-topbar h2{font-size:17px;margin:0}
-.list-topbar button{margin-left:auto;background:var(--sunken);border:0;border-radius:9px;
-  padding:7px 14px;font-size:12.5px;font-weight:600;color:var(--text-2)}
+.list-topbar h2{font-family:var(--font-display);font-size:17px;font-weight:600;margin:0;color:var(--text-0)}
+.list-topbar button{margin-left:auto}
 #ordersList{flex:1;overflow-y:auto;padding:2px 18px 24px;display:flex;flex-direction:column;gap:8px}
-.order-row{border:1px solid var(--border);border-radius:12px;background:var(--card);padding:12px 14px;
+.order-row{border:1px solid var(--line);border-radius:var(--r-card);background:var(--ink-1);padding:12px 14px;
   display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .order-row .or-main{display:flex;align-items:center;gap:9px;min-width:160px}
-.order-row .or-main b{font-size:13.5px}
+.order-row .or-main b{font-size:13.5px;color:var(--text-0)}
 .order-row .or-meta{display:flex;gap:14px;font-size:12px;color:var(--text-2);flex:1;flex-wrap:wrap}
-.order-row .or-meta .amt{font-weight:800;color:var(--text);font-variant-numeric:tabular-nums;margin-left:auto}
+.order-row .or-meta .amt{font-family:var(--font-mono);font-weight:600;color:var(--text-0);
+  font-variant-numeric:tabular-nums;margin-left:auto}
 .order-row .or-actions{display:flex;gap:8px}
-.order-row .or-actions button{background:var(--sunken);border:0;border-radius:8px;padding:6px 12px;
-  font-size:12px;font-weight:600;color:var(--text)}
-.order-row .or-actions button.danger{background:var(--bad-wash);color:var(--bad-text)}
 
 /* ---------- 3. right order panel ---------- */
-.cartp{background:var(--card);border-left:1px solid var(--border);display:flex;flex-direction:column;height:100vh}
+.cartp{background:var(--ink-1);border-left:1px solid var(--line);display:flex;flex-direction:column;height:100vh}
 .cart-h{padding:16px 16px 0;flex-shrink:0}
 .cart-title{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px}
-.cart-title h2{font-size:16px;margin:0;letter-spacing:-.01em}
+.cart-title h2{font-family:var(--font-display);font-size:16px;font-weight:600;margin:0;letter-spacing:-.01em;color:var(--text-0)}
 .cart-title .sub{display:block;font-size:11.5px;font-weight:500;color:var(--text-3);margin-top:3px}
-.clear-link{margin-left:auto;background:none;border:0;padding:4px 2px;font-size:11.5px;
-  font-weight:700;color:var(--text-3);flex-shrink:0}
+.clear-link{margin-left:auto;padding:4px 2px;font-size:11.5px;font-weight:700;color:var(--text-3);flex-shrink:0}
 .clear-link:hover{color:var(--bad-text)}
 .type-badge{margin-left:8px;display:inline-flex;align-items:center;gap:6px;flex-shrink:0;
-  background:#FFF3DC;color:#8A5A00;border-radius:9px;padding:7px 11px;font-size:11px;
+  background:var(--amber-wash);color:var(--amber-text);border-radius:9px;padding:7px 11px;font-size:11px;
   font-weight:800;letter-spacing:.06em;text-transform:uppercase}
 .type-badge svg{width:14px;height:14px}
 .order-type{display:flex;gap:6px;margin-bottom:14px}
-.order-type button{flex:1;padding:9px 4px;border-radius:9px;border:1px solid var(--border);
-  background:var(--sunken);font-size:12.5px;font-weight:700;color:var(--text-2);transition:.12s}
-.order-type button.on{background:linear-gradient(135deg,var(--amber),var(--amber-deep));
-  border-color:transparent;color:#1A1200}
+.order-type button{flex:1;padding:9px 4px;border-radius:9px;border:1px solid var(--line);
+  background:var(--ink-2);font-size:12.5px;font-weight:700;color:var(--text-2);transition:.12s}
+.order-type button.on{background:var(--amber);border-color:var(--amber);color:var(--amber-ink)}
 
 /* column header row, matching the reference's Order / Qty / Amount grid */
 .cart-cols{display:grid;grid-template-columns:1fr 92px 78px;gap:8px;align-items:center;
-  padding:9px 16px;background:var(--sunken);flex-shrink:0;
+  padding:9px 16px;background:var(--ink-2);flex-shrink:0;
   font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;color:var(--text-2)}
 .cart-cols .c2{text-align:center}
 .cart-cols .c3{text-align:right}
 .cart-cols .cart-count{display:inline-flex;align-items:center;justify-content:center;
-  background:var(--charcoal);color:#fff;border-radius:99px;min-width:19px;height:19px;padding:0 6px;
+  background:var(--amber);color:var(--amber-ink);border-radius:99px;min-width:19px;height:19px;padding:0 6px;
   font-size:10.5px;margin-left:5px}
 .cart-cols .cart-count.bump{animation:bump .28s ease}
 @keyframes bump{50%{transform:scale(1.32)}}
@@ -187,46 +148,41 @@ svg{width:18px;height:18px}
 #cartItems{flex:1;overflow-y:auto;padding:2px 0}
 .empty-cart{text-align:center;color:var(--text-3);padding:50px 16px;font-size:13px}
 .ci{display:grid;grid-template-columns:1fr 92px 78px;gap:8px;align-items:start;
-  padding:12px 16px;border-bottom:1px solid var(--sunken)}
-.ci-nm{font-size:13px;font-weight:700;line-height:1.32;min-width:0}
-.ci-note{display:block;font-size:11px;font-weight:600;color:var(--amber-deep);margin-top:3px;line-height:1.35}
+  padding:12px 16px;border-bottom:1px solid var(--line-soft)}
+.ci-nm{font-size:13px;font-weight:600;line-height:1.32;min-width:0;color:var(--text-0)}
+.ci-note{display:block;font-size:11px;font-weight:600;color:var(--amber-text);margin-top:3px;line-height:1.35}
 .ci-mid{display:flex;flex-direction:column;align-items:center;gap:6px}
-.ci-amt{text-align:right;font-size:13px;font-weight:800;font-variant-numeric:tabular-nums;white-space:nowrap}
-.ci-unit{display:block;font-size:10.5px;font-weight:500;color:var(--text-3);margin-top:2px}
+.ci-amt{text-align:right;font-family:var(--font-mono);font-size:13px;font-weight:600;
+  font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--text-0)}
+.ci-unit{display:block;font-size:10.5px;font-weight:500;color:var(--text-3);margin-top:2px;font-family:var(--font-sans)}
 .qty{display:flex;align-items:center;gap:6px}
-.qty button{width:25px;height:25px;border-radius:7px;border:1px solid var(--border);
-  background:var(--sunken);font-size:15px;line-height:1;color:var(--text)}
-.qty button:active{background:var(--amber);border-color:var(--amber)}
-.qty b{font-size:13px;min-width:15px;text-align:center;font-variant-numeric:tabular-nums}
+.qty button{width:25px;height:25px;border-radius:7px;border:1px solid var(--line);
+  background:var(--ink-2);font-size:15px;line-height:1;color:var(--text-0)}
+.qty button:active{background:var(--amber);border-color:var(--amber);color:var(--amber-ink)}
+.qty b{font-size:13px;min-width:15px;text-align:center;font-variant-numeric:tabular-nums;color:var(--text-0)}
 /* Stands in for the quantity stepper on an unlimited line, which is sized by
    its Heads control alone. */
 .qty-fixed{font-size:10.5px;font-weight:600;color:var(--text-3);white-space:nowrap}
 .ci-acts{display:flex;gap:8px;justify-content:center}
-.ci-link{background:none;border:0;padding:0;font-size:11px;font-weight:700;color:var(--text-3)}
-.ci-link:hover{color:var(--text)}
+.ci-link{font-size:11px;font-weight:700;color:var(--text-3)}
+.ci-link:hover{color:var(--text-0)}
 .ci-link.rm:hover{color:var(--bad-text)}
 .heads{grid-column:1/-1;display:flex;align-items:center;gap:8px;margin-top:8px;
   font-size:11.5px;color:var(--text-2)}
 .heads .qty button{width:22px;height:22px;font-size:13px}
 
-.cart-f{border-top:1px solid var(--border);flex-shrink:0}
-.tot-block{background:var(--sunken);padding:13px 16px}
+.cart-f{border-top:1px solid var(--line);flex-shrink:0}
+.tot-block{background:var(--ink-2);padding:13px 16px}
 .tot-row{display:flex;justify-content:space-between;font-size:12.5px;color:var(--text-2);margin-bottom:5px}
-.tot-row span:last-child{font-variant-numeric:tabular-nums;font-weight:600;color:var(--text)}
-.tot-row.grand{font-size:17px;font-weight:800;color:var(--text);margin:9px 0 0;padding-top:10px;
-  border-top:1px solid var(--border)}
+.tot-row span:last-child{font-family:var(--font-mono);font-variant-numeric:tabular-nums;font-weight:600;color:var(--text-0)}
+.tot-row.grand{font-size:17px;font-weight:800;color:var(--text-0);margin:9px 0 0;padding-top:10px;
+  border-top:1px solid var(--line)}
 .tot-row.grand span:last-child{font-weight:800}
 .cart-actions{padding:12px 16px 14px}
 #punchBtn{width:100%;font-size:16px;height:52px}
 .cart-foot{display:flex;align-items:center;justify-content:center;gap:8px;padding:0 16px 14px;
   font-size:10px;font-weight:700;letter-spacing:.08em;color:var(--text-3);text-transform:uppercase}
-.cart-foot img{height:13px;width:auto;opacity:.75}
-
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--charcoal);
-  color:#fff;padding:12px 20px;border-radius:11px;font-size:14px;z-index:80;
-  box-shadow:0 8px 26px rgba(0,0,0,.3);animation:up .2s ease both;
-  white-space:pre-line;text-align:left;max-width:340px}
-@keyframes up{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
+.cart-foot img{height:13px;width:auto;opacity:.6}
 
 /* Below ~1180px the full lockup no longer fits a comfortable rail, so the
    rail narrows and swaps to the wing mark. Labels go with it — an icon rail
@@ -249,7 +205,7 @@ svg{width:18px;height:18px}
   .rail-btn{flex-direction:row;gap:7px;padding:8px 12px;font-size:12px;width:auto}
   .rail-spacer{flex:1}
   .stage{height:auto;min-height:0}
-  .cartp{border-left:0;border-top:1px solid var(--border);height:auto;max-height:52vh}
+  .cartp{border-left:0;border-top:1px solid var(--line);height:auto;max-height:52vh}
   #grid{padding-bottom:16px}
 }
 /* Below ~480px even icon+label buttons don't fit four-across next to the
@@ -264,20 +220,20 @@ svg{width:18px;height:18px}
 }
 
 /* ---------- customization ---------- */
-.scrim2{position:fixed;inset:0;background:rgba(16,14,10,.42);z-index:150;display:flex;
+.scrim2{position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:150;display:flex;
   align-items:center;justify-content:center;padding:20px}
-.cust-box{background:var(--card);border-radius:16px;padding:22px 22px 18px;width:100%;max-width:420px;
-  box-shadow:0 20px 50px rgba(0,0,0,.3);max-height:86vh;display:flex;flex-direction:column}
-.cust-box h3{margin:0 0 2px;font-size:17px}
+.cust-box{background:var(--ink-1);border:1px solid var(--line);border-radius:16px;padding:22px 22px 18px;
+  width:100%;max-width:420px;box-shadow:var(--sh-3);max-height:86vh;display:flex;flex-direction:column}
+.cust-box h3{font-family:var(--font-display);margin:0 0 2px;font-size:17px;font-weight:600;color:var(--text-0)}
 .cust-box .cust-sub{color:var(--text-3);font-size:12.5px;margin:0 0 14px}
 .cust-slot{margin-bottom:14px}
 .cust-slot .lbl{font-size:12px;font-weight:700;color:var(--text-2);margin-bottom:8px;
   display:flex;align-items:center;gap:6px}
 .cust-slot .lbl .req{color:var(--bad-text);font-weight:800}
 .chipgrid{display:flex;flex-wrap:wrap;gap:7px;max-height:150px;overflow-y:auto;padding:2px}
-.chipgrid button{padding:8px 13px;border-radius:99px;border:1px solid var(--border);
-  background:var(--sunken);font-size:12.5px;font-weight:600;color:var(--text)}
-.chipgrid button.on{background:var(--amber);border-color:var(--amber-deep);color:#1A1200}
+.chipgrid button{padding:8px 13px;border-radius:99px;border:1px solid var(--line);
+  background:var(--ink-2);font-size:12.5px;font-weight:600;color:var(--text-0)}
+.chipgrid button.on{background:var(--amber);border-color:var(--amber-press);color:var(--amber-ink)}
 .cust-actions{display:flex;gap:10px;margin-top:6px;flex-shrink:0}
 .cust-actions .btn-s{flex:1}
 .cust-actions .btn-p{flex:2}
@@ -287,61 +243,57 @@ svg{width:18px;height:18px}
    piece count and the arithmetic behind it are stated before anything is
    pressed, and an included flavour is visually a different thing from one
    that will add to the bill. */
-.rf-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;
+.rf-card{background:var(--ink-1);border:1px solid var(--line);border-radius:var(--r-card);padding:16px;
   margin-bottom:12px;display:flex;flex-wrap:wrap;align-items:center;gap:12px}
-.rf-card .no{font-size:17px;font-weight:800}
-.rf-card .meta{color:var(--muted);font-size:13px;display:flex;gap:14px;flex-wrap:wrap}
-.rf-card .meta b{color:var(--text);font-weight:700}
+.rf-card .no{font-size:17px;font-weight:800;color:var(--text-0)}
+.rf-card .meta{color:var(--text-2);font-size:13px;display:flex;gap:14px;flex-wrap:wrap}
+.rf-card .meta b{color:var(--text-0);font-weight:700}
 .rf-card .go{margin-left:auto}
 
-.refill-box{background:var(--card);border-radius:16px;width:100%;max-width:520px;
+.refill-box{background:var(--ink-1);border:1px solid var(--line);border-radius:16px;width:100%;max-width:520px;
   max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
 .refill-scroll{overflow-y:auto;padding:20px}
-.refill-actions{display:flex;gap:10px;padding:14px 20px;border-top:1px solid var(--border);flex-shrink:0}
+.refill-actions{display:flex;gap:10px;padding:14px 20px;border-top:1px solid var(--line);flex-shrink:0}
 .refill-actions .btn-s{flex:1}
 .refill-actions .btn-p{flex:2}
 .rf-head{display:flex;align-items:flex-start;gap:12px;margin-bottom:16px}
-.rf-head h3{margin:0;font-size:19px}
-.rf-sub{margin:3px 0 0;color:var(--muted);font-size:13px}
+.rf-head h3{font-family:var(--font-display);margin:0;font-size:19px;font-weight:600;color:var(--text-0)}
+.rf-sub{margin:3px 0 0;color:var(--text-2);font-size:13px}
 .rf-head .chip{margin-left:auto}
-.chip{font-size:11px;font-weight:800;letter-spacing:.04em;border-radius:99px;padding:4px 11px;
-  text-transform:uppercase}
-.chip.ok{background:#E8F8EC;color:#1D6B34} .chip.warn{background:#FFF4E5;color:#8A5A00}
-.chip.bad{background:#FEECEB;color:#B3261E} .chip.mute{background:#F0F1F3;color:var(--muted)}
 
-.rf-now{background:#FFF8E7;border:1px solid #F3DFAE;border-radius:12px;padding:14px 16px;
+.rf-now{background:var(--amber-wash);border:1px solid var(--line);border-radius:12px;padding:14px 16px;
   margin-bottom:18px}
-.rf-now-l{font-size:11px;font-weight:800;letter-spacing:.08em;color:#8A5A00}
+.rf-now-l{font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--amber-text)}
 .rf-now-v{display:flex;align-items:baseline;gap:12px;margin-top:4px}
-.rf-now-v b{font-size:26px;font-weight:800;letter-spacing:-.02em}
-.rf-now-v span{font-size:17px;font-weight:700;color:#8A5A00}
-.rf-now-f{font-size:12.5px;color:#8A5A00;margin-top:4px}
+.rf-now-v b{font-family:var(--font-mono);font-size:26px;font-weight:600;letter-spacing:-.02em;color:var(--text-0)}
+.rf-now-v span{font-size:17px;font-weight:700;color:var(--amber-text)}
+.rf-now-f{font-size:12.5px;color:var(--amber-text);margin-top:4px}
 
-.rf-sect{font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--muted);margin:0 0 8px}
+.rf-sect{font-size:11px;font-weight:800;letter-spacing:.08em;color:var(--text-3);margin:0 0 8px}
 .rf-flavors{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:18px}
-.rf-fl{text-align:left;border:1.5px solid var(--border);background:var(--card);border-radius:11px;
+.rf-fl{text-align:left;border:1.5px solid var(--line);background:var(--ink-1);border-radius:11px;
   padding:11px 12px;display:flex;flex-direction:column;gap:2px;min-height:56px;justify-content:center}
 .rf-fl:disabled{opacity:.45}
-.rf-fl.on{border-color:var(--amber);background:#FFF8E7}
-.rf-fl .n{font-size:13.5px;font-weight:700;line-height:1.25}
-.rf-fl .p{font-size:11.5px;font-weight:700;color:var(--ok-text)}
-.rf-fl .p.add{color:#B3261E}
+.rf-fl.on{border-color:var(--amber);background:var(--amber-wash)}
+.rf-fl .n{font-size:13.5px;font-weight:700;line-height:1.25;color:var(--text-0)}
+.rf-fl .p{font-family:var(--font-mono);font-size:11.5px;font-weight:700;color:var(--ok-text)}
+.rf-fl .p.add{color:var(--bad-text)}
 
 .rf-prev{display:flex;flex-direction:column;gap:6px;margin-bottom:18px}
 .rf-r{display:flex;align-items:center;gap:10px;font-size:13.5px;padding:8px 11px;
-  border:1px solid var(--border);border-radius:9px}
-.rf-r .n{font-weight:800;min-width:26px}
+  border:1px solid var(--line);border-radius:9px;color:var(--text-1)}
+.rf-r .n{font-weight:800;min-width:26px;color:var(--text-0)}
 .rf-r .f{flex:1}
-.rf-r .a{color:#B3261E;font-weight:700;font-size:12.5px}
+.rf-r .a{color:var(--bad-text);font-weight:700;font-size:12.5px}
 .rf-r.gone{opacity:.5;text-decoration:line-through}
-.rf-r button{background:none;border:1px solid var(--border);border-radius:7px;padding:3px 9px;
-  font-size:11.5px;color:var(--muted)}
-.rf-empty{color:var(--muted);font-size:13px;padding:10px 0}
+.rf-r button{background:none;border:1px solid var(--line);border-radius:7px;padding:3px 9px;
+  font-size:11.5px;color:var(--text-2)}
+.rf-empty{color:var(--text-2);font-size:13px;padding:10px 0}
 
-.rf-tot{border-top:1px solid var(--border);padding-top:12px;font-size:13.5px}
-.rf-tot .row{display:flex;justify-content:space-between;padding:3px 0}
-.rf-tot .row.grand{font-weight:800;font-size:15px;border-top:1px solid var(--border);
-  margin-top:6px;padding-top:8px}
+.rf-tot{border-top:1px solid var(--line);padding-top:12px;font-size:13.5px}
+.rf-tot .row{display:flex;justify-content:space-between;padding:3px 0;color:var(--text-1)}
+.rf-tot .row.grand{font-weight:800;font-size:15px;border-top:1px solid var(--line);
+  margin-top:6px;padding-top:8px;color:var(--text-0)}
 #rfErr{color:var(--bad-text);font-size:12.5px;margin-top:10px;min-height:15px}
 
 /* Refill history on the printed receipt. Deliberately below the totals rule:
@@ -353,31 +305,42 @@ svg{width:18px;height:18px}
 .rc-rf .r span:last-child{white-space:nowrap}
 .rc-rf .v{opacity:.55;text-decoration:line-through}
 
-/* ---------- payment + receipt ---------- */
-.pay-box{background:var(--card);border-radius:16px;padding:26px 24px;width:100%;max-width:360px;
-  box-shadow:0 20px 50px rgba(0,0,0,.3)}
-.pay-box h3{margin:0 0 4px;font-size:18px}
+/* ---------- payment ----------
+   Amount received and change are the two numbers a cashier is handing
+   money against, so they read at arm's length instead of blending into
+   the rest of the form. */
+.pay-box{background:var(--ink-1);border:1px solid var(--line);border-radius:16px;padding:26px 24px;
+  width:100%;max-width:360px;box-shadow:var(--sh-3)}
+.pay-box h3{font-family:var(--font-display);margin:0 0 4px;font-size:18px;font-weight:600;color:var(--text-0)}
 .pay-box .due-lbl{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--text-3)}
-.pay-box .amt-due{font-size:30px;font-weight:800;margin:2px 0 16px;font-variant-numeric:tabular-nums}
-.pay-box .method{display:inline-flex;align-items:center;gap:6px;background:var(--sunken);
+.pay-box .amt-due{font-family:var(--font-mono);font-size:32px;font-weight:600;margin:2px 0 16px;
+  font-variant-numeric:tabular-nums;color:var(--text-0)}
+.pay-box .method{display:inline-flex;align-items:center;gap:6px;background:var(--ink-2);
   border-radius:9px;padding:6px 12px;font-size:12.5px;font-weight:700;color:var(--text-2);margin-bottom:14px}
 .pay-box label{display:block;font-size:12.5px;font-weight:600;color:var(--text-2);margin-bottom:6px}
+.pay-box .field{height:50px;font-size:20px;font-family:var(--font-mono);font-variant-numeric:tabular-nums;text-align:right}
 .quick-cash{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0 4px}
-.quick-cash button{flex:1;min-width:64px;height:38px;border-radius:9px;border:1px solid var(--border);
-  background:var(--sunken);font-size:13px;font-weight:600;color:var(--text)}
-.quick-cash button:active{background:var(--amber);color:var(--charcoal)}
-.change-line{display:flex;justify-content:space-between;margin-top:14px;padding-top:12px;
-  border-top:1px solid var(--sunken);font-size:14px;font-weight:700}
+.quick-cash button{flex:1;min-width:64px;height:38px;border-radius:9px;border:1px solid var(--line);
+  background:var(--ink-2);font-size:13px;font-weight:600;color:var(--text-0)}
+.quick-cash button:active{background:var(--amber);color:var(--amber-ink);border-color:var(--amber)}
+.change-line{display:flex;justify-content:space-between;align-items:baseline;margin-top:16px;
+  padding:14px;border-radius:10px;background:var(--ok-wash)}
+.change-line span:first-child{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--ok-text)}
+.change-line span:last-child{font-family:var(--font-mono);font-size:24px;font-weight:600;color:var(--ok-text);
+  font-variant-numeric:tabular-nums}
+.change-line.short{background:var(--bad-wash)}
+.change-line.short span{color:var(--bad-text)}
 .pay-actions{display:flex;gap:10px;margin-top:18px}
 .pay-actions .btn-s{flex:1}
 .pay-actions .btn-p{flex:2}
 
-/* Thermal-roll proportions and a monospace body, so what is on screen is
-   what comes out of an 80mm printer rather than a web card that reflows. */
+/* ---------- receipt ----------
+   The one screen deliberately outside the dark working palette: an 80mm
+   thermal printer prints on white paper, so what's on screen here is what
+   a monospace body on a paper roll actually looks like, not a themed card. */
 .receipt-box{background:#FDFCF9;border-radius:14px;padding:0;width:100%;max-width:330px;
-  box-shadow:0 20px 50px rgba(0,0,0,.3);overflow:hidden;display:flex;flex-direction:column;max-height:88vh}
-.receipt-scroll{overflow-y:auto;padding:20px 20px 8px;
-  font-family:ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;color:#1A1713}
+  box-shadow:0 20px 50px rgba(0,0,0,.4);overflow:hidden;display:flex;flex-direction:column;max-height:88vh}
+.receipt-scroll{overflow-y:auto;padding:20px 20px 8px;font-family:var(--font-mono);color:#1A1713}
 #rcLogo{display:block;height:44px;width:auto;margin:0 auto 8px}
 .rc-head{text-align:center;margin-bottom:12px}
 .rc-head h2{font-size:13px;margin:0 0 3px;letter-spacing:.06em;font-weight:800}
@@ -403,7 +366,7 @@ svg{width:18px;height:18px}
   border-top:1px solid #1A1713}
 .rc-foot{text-align:center;font-size:10.5px;color:#5C554D;margin:14px 0 2px;line-height:1.7;font-weight:700}
 .rc-social{text-align:center;font-size:9.5px;color:#8A8178;margin:6px 0 2px;letter-spacing:.05em}
-.receipt-actions{display:flex;gap:10px;padding:14px 20px;border-top:1px solid var(--border);flex-shrink:0}
+.receipt-actions{display:flex;gap:10px;padding:14px 20px;border-top:1px solid var(--line);flex-shrink:0}
 .receipt-actions .btn-s{flex:1}
 .receipt-actions .btn-p{flex:2}
 
@@ -417,7 +380,6 @@ svg{width:18px;height:18px}
   @page{margin:6mm}
 }
 </style>
-<link rel="stylesheet" href="/assets/brand.css">
 </head>
 <body>
 
@@ -526,7 +488,7 @@ svg{width:18px;height:18px}
       <div class="cart-f">
         <div class="tot-block">
           <div class="tot-row"><span>Subtotal</span><span id="subT">₱0</span></div>
-          <div class="tot-row"><span>Service charge (10%)</span><span id="svcT">₱0</span></div>
+          <div class="tot-row"><span id="svcLabel">Service charge</span><span id="svcT">₱0</span></div>
           <div class="tot-row grand"><span>Total</span><span id="grandT">₱0</span></div>
         </div>
         <div class="cart-actions">
@@ -562,7 +524,7 @@ svg{width:18px;height:18px}
     <label for="payCash">Amount received</label>
     <input class="field" id="payCash" type="number" min="0" step="1" inputmode="decimal">
     <div class="quick-cash" id="quickCash"></div>
-    <div class="change-line"><span>Change</span><span id="payChange">₱0</span></div>
+    <div class="change-line" id="changeLine"><span>Change</span><span id="payChange">₱0</span></div>
     <div id="payErr" style="color:var(--bad-text);font-size:12.5px;margin-top:8px;display:none"></div>
     <div class="pay-actions">
       <button class="btn btn-s" id="payCancel">Cancel</button>
@@ -662,6 +624,11 @@ let ROLE = localStorage.getItem(NS + 'role');
 let NAME = localStorage.getItem(NS + 'name');
 let MENU = [];
 let FLAVORS = [];
+// Read from /pos/menu, never hardcoded: the till's pre-checkout total
+// preview must use the same rate checkout actually charges, not a second
+// copy in JavaScript that could silently drift from it. 0.10 is only a
+// display fallback for the instant before the first menu load resolves.
+let SERVICE_CHARGE_RATE = 0.10;
 let CART = [];      // [{menuId, name, price, qty, unli, heads, note}]
 let CAT = 'All';
 let Q = '';
@@ -793,6 +760,7 @@ async function loadMenu() {
   try {
     const d = await api('/pos/menu');
     MENU = d.items;
+    if (d.service_charge_rate != null) SERVICE_CHARGE_RATE = d.service_charge_rate;
     clearError();
     paintCats(); paintGrid();
   } catch (e) {
@@ -832,7 +800,7 @@ function paintGrid() {
   const list = MENU.filter(m => (CAT === 'All' || m.category === CAT) &&
     m.name.toLowerCase().includes(Q.toLowerCase()));
   $('#grid').innerHTML = list.length ? list.map(m => `
-    <button class="card ${m.sellable ? '' : 'blocked'}" data-add="${m.menu_item_pk}">
+    <button class="mcard ${m.sellable ? '' : 'blocked'}" data-add="${m.menu_item_pk}">
       <div class="tile" style="background:${tileColor(m.category)}">
         <b>${m.name.charAt(0)}</b>
         ${m.flavor_slots ? `<span class="flav">${m.flavor_slots > 1 ? m.flavor_slots + ' flavors' : 'pick flavor'}</span>` : ''}
@@ -846,7 +814,7 @@ function paintGrid() {
              <div class="row"><span class="price">₱${m.price}</span><span class="chip bad">Out of stock</span></div>`}
       </div>
     </button>`).join('')
-    : `<div class="empty">No items match "${Q}"</div>`;
+    : `<div class="empty"><b>No items match "${Q}"</b></div>`;
 }
 $('#search').oninput = e => { Q = e.target.value; paintGrid(); };
 $('#cats').onclick = e => { const b = e.target.closest('[data-cat]'); if (b) { CAT = b.dataset.cat; paintCats(); paintGrid(); } };
@@ -988,6 +956,7 @@ function paintCart() {
   $('#cartCount').textContent = CART.reduce((s, l) => s + l.qty, 0);
   const { sub, svc, total } = cartTotals();
   $('#subT').textContent = peso(sub);
+  $('#svcLabel').textContent = `Service charge (${Math.round(SERVICE_CHARGE_RATE * 100)}%)`;
   $('#svcT').textContent = peso(svc);
   $('#grandT').textContent = peso(total);
   $('#punchBtn').textContent = `Charge ${peso(total)}`;
@@ -1026,7 +995,7 @@ setInterval(paintOrderMeta, 60000);
 
 function cartTotals() {
   const sub = CART.reduce((s, l) => s + l.price * l.qty, 0);
-  const svc = Math.round(sub * 0.10 * 100) / 100;
+  const svc = Math.round(sub * SERVICE_CHARGE_RATE * 100) / 100;
   return { sub, svc, total: sub + svc };
 }
 
@@ -1067,7 +1036,7 @@ function updateChange() {
   const cash = parseFloat($('#payCash').value) || 0;
   const change = cash - total;
   $('#payChange').textContent = peso(Math.max(0, change));
-  $('#payChange').style.color = change < 0 ? 'var(--bad-text)' : '';
+  $('#changeLine').classList.toggle('short', change < 0);
 }
 $('#payCash').addEventListener('input', updateChange);
 $('#payCancel').onclick = () => $('#payModal').classList.add('hide');

@@ -286,6 +286,14 @@ def pos_menu(
         "items": data,
         "sellable": sum(1 for d in data if d["sellable"]),
         "blocked": sum(1 for d in data if not d["sellable"]),
+        # The POS shows a running total before checkout (subtotal, service
+        # charge, change preview) — it needs this rate to do that, and it
+        # must be this one, not a second copy hardcoded in JavaScript that
+        # could silently drift from what checkout actually charges. Menu
+        # load is the one call every POS session makes before any of that
+        # math happens, so it rides along here rather than needing its own
+        # endpoint.
+        "service_charge_rate": SERVICE_CHARGE_RATE,
     }
 
 

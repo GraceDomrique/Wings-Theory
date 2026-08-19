@@ -1605,6 +1605,18 @@ class TestConsoleAPI(unittest.TestCase):
         self.assertEqual(sulit["flavor_slots"], 1)
         self.assertEqual(no_flavor["flavor_slots"], 0)
 
+    def test_pos_menu_carries_the_real_service_charge_rate(self):
+        """Phase 10: the POS's pre-checkout total preview must read this
+        rate from the server, not keep its own hardcoded copy that could
+        silently drift from what checkout actually charges."""
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        self.assertIn("service_charge_rate", menu)
+        item = next(m for m in menu["items"] if m["sellable"] and not m["is_unli"])
+        order = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-SC", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]}).json()
+        expected_charge = round(item["price"] * menu["service_charge_rate"], 2)
+        self.assertAlmostEqual(order["service_charge"], expected_charge, places=2)
+
     def test_pos_flavors_lists_real_sauces_and_excludes_house_preps(self):
         r = self.client.get("/pos/flavors", headers=self.H_CASH)
         self.assertEqual(r.status_code, 200)
