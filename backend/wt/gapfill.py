@@ -59,7 +59,11 @@ ADDITIONS = [
 # ---------------------------------------------------------------------------
 PIECE_WEIGHTS = {
     "Mango":       180,   # flesh only, stone and skin discarded
-    "Banana":      100,   # peeled
+    # Banana is deliberately absent here — see reference.py's BANANA_UNIT_FIX
+    # docstring: the 2026-08 reference document states outright "Banana stays
+    # in whole pieces end-to-end (purchase, stock, recipe, deduction)... it
+    # never overrides the piece count," so it is seeded piece-based via
+    # seed.py's PACK_SIZES (pack_size=1) instead of converted to grams here.
     "Lemon":        15,   # juice yield per fruit
     "Orange":        40,  # juice + zest
     "Salted Eggs":  20,   # mashed yolk only (see Salted Egg flavour sauce below

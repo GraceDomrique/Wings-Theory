@@ -4758,6 +4758,94 @@ class TestReferenceAlignment(unittest.TestCase):
         self.assertIsNotNone(row, "Taiwanese Porkchop still has no cabbage line")
         self.assertEqual(row["qty_base"], 30.0)
 
+    # -- main-dish recipe corrections (2026-08 revision) --------------------
+    def _line(self, recipe_like, ingredient_name):
+        return self.conn.execute(
+            """SELECT rl.qty_base, rl.display_label FROM recipe_line rl
+                 JOIN recipe r ON r.id = rl.recipe_id
+                 JOIN ingredient i ON i.id = rl.ingredient_id
+                WHERE r.name LIKE ? AND i.name = ?""",
+            (recipe_like, ingredient_name)).fetchone()
+
+    def test_documented_quantity_corrections_applied(self):
+        cases = [
+            ("Spicy Tuna Linguine Pesto%", "Pesto Jar", 40.0),
+            ("Creamy Sausage Pasta%", "Hugarian Sausage", 80.0),
+            ("Spicy Korean Wing Bowl%", "Wings", 300.0),
+            ("Spicy Korean Wing Bowl%", "Kimchi", 50.0),
+            ("Spicy Korean Wing Bowl%", "Cucumber", 30.0),
+            ("Chicken Salpicao%", "Chicken Breast/Thigh (raw, boneless)", 180.0),
+            ("Bacon & Egg%", "Bacon", 60.0),
+            ("Onion Rings%", "White Eggs", 0.25),
+            ("1 Cup Rice%", "Rice", 180.0),
+            ("Ranch Dip%", "Mayonaise", 25.0),
+        ]
+        for recipe_like, ing, qty in cases:
+            row = self._line(recipe_like, ing)
+            self.assertIsNotNone(row, f"{recipe_like} / {ing} missing")
+            self.assertEqual(row["qty_base"], qty, f"{recipe_like} / {ing}")
+
+    def test_wrong_ingredients_were_redirected_not_left_in_place(self):
+        """Creamy Sausage Pasta named the generic Pasta SKU where the
+        document names Balducci Penne Pasta by name; Alfredo — a pasta dish —
+        deducted Rice and carried no pasta line at all."""
+        self.assertIsNone(self._line("Creamy Sausage Pasta%", "Pasta"))
+        self.assertEqual(self._line("Creamy Sausage Pasta%", "Balducci Penne Pasta")["qty_base"], 120.0)
+
+        self.assertIsNone(self._line("Creamy Chicken & Mushroom Alfredo%", "Rice"))
+        self.assertEqual(self._line("Creamy Chicken & Mushroom Alfredo%", "Pasta")["qty_base"], 120.0)
+
+    def test_missing_lines_were_added(self):
+        cases = [
+            ("Onion Rings%", "Cornstarch", 10.0),
+            ("Fish & Chips%", "White Eggs", 0.5),
+            ("Wing Rack%", "Cornstarch", 60.0),
+            ("Wing Rack%", "Butter", 30.0),
+            ("Hungarian Sausage (Breakfast)%", "Iodized Salt", 1.0),
+            ("Ranch Dip%", "Ground Pepper", 1.0),
+        ]
+        for recipe_like, ing, qty in cases:
+            row = self._line(recipe_like, ing)
+            self.assertIsNotNone(row, f"{recipe_like} / {ing} still missing")
+            self.assertEqual(row["qty_base"], qty, f"{recipe_like} / {ing}")
+
+    def test_undocumented_lines_were_removed(self):
+        """Chicken Salpicao and Ranch Dip both carried lines the document
+        does not list at all."""
+        self.assertIsNone(self._line("Chicken Salpicao%", "Mama Sitas Oyster Sauce Big"))
+        self.assertIsNone(self._line("Chicken Salpicao%", "Iodized Salt"))
+        self.assertIsNone(self._line("Ranch Dip%", "All purpose Cream"))
+        self.assertIsNone(self._line("Ranch Dip%", "Iodized Salt"))
+
+    def test_banana_is_piece_based_not_gram_based(self):
+        """'Banana stays in whole pieces end-to-end (purchase, stock, recipe,
+        deduction) ... it never overrides the piece count.'"""
+        row = self.conn.execute(
+            "SELECT base_unit, pack_size, on_hand_base FROM ingredient WHERE name='Banana'"
+        ).fetchone()
+        self.assertEqual(row["base_unit"], "pc")
+        self.assertEqual(row["pack_size"], 1.0)
+        self.assertEqual(row["on_hand_base"], 15.0, "15 bananas were counted on the sheet")
+
+        line = self._line("Banana MilkShake%", "Banana")
+        self.assertIsNotNone(line)
+        self.assertEqual(line["qty_base"], 1.0, "must deduct exactly 1 whole banana, not a weight")
+
+    def test_recipe_corrections_do_not_touch_the_fourteen_flavours(self):
+        """The main-dish corrections are additive to 0012's flavour alignment,
+        never a second pass over it."""
+        from wt.gapfill import SUB_RECIPES
+        for name, (_, yield_qty, components) in SUB_RECIPES.items():
+            if "(house)" in name:
+                continue
+            rid = self.conn.execute(
+                "SELECT r.id FROM recipe r JOIN ingredient i ON i.id=r.produces_ingredient_id "
+                "WHERE i.name=?", (name,)).fetchone()["id"]
+            total = self.conn.execute(
+                "SELECT SUM(qty_base) AS s FROM recipe_line WHERE recipe_id=?",
+                (rid,)).fetchone()["s"]
+            self.assertAlmostEqual(total, yield_qty, places=3, msg=name)
+
     # -- full validation pass ----------------------------------------------
     def test_no_active_recipe_line_is_structurally_broken(self):
         problems = self.conn.execute(

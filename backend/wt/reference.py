@@ -103,6 +103,126 @@ KOREAN_BOWL_FIX = ("Spicy Korean Wing Bowl", "Korean BBQ Sauce",
 # SKU is stocked, but the recipe carried no line for it.
 CABBAGE_FIX = ("Taiwanese Porkchop", "Shredded Cabbage", 30.0)
 
+# ---------------------------------------------------------------------------
+# Main-dish recipe corrections — the remaining Section 4 divergences.
+#
+# Migration 0012 found these and deliberately left them unapplied: "the
+# remaining divergences between the document and the seeded main dishes are
+# reported, not silently applied, because several of them are
+# recipe-composition decisions the kitchen owns." The owner has since
+# reviewed the specific list and asked for it to be applied, so it lands
+# here rather than as a second silent transcription pass.
+#
+#   RECIPE_QTY_FIXES      (recipe LIKE-pattern, ingredient name, new qty_base)
+#                          the ingredient is already on the recipe; only the
+#                          quantity was wrong.
+#   RECIPE_INGREDIENT_SWAPS  (recipe LIKE-pattern, wrong ingredient name,
+#                          correct ingredient name, new qty_base, new label)
+#                          the line named the wrong stock item outright —
+#                          redirected in place, same technique as the Korean
+#                          Bowl fix, so the correction is visible on the row.
+#   RECIPE_LINE_ADDITIONS (recipe LIKE-pattern, ingredient name, qty_base,
+#                          display label) — the line was missing entirely.
+#   RECIPE_LINE_REMOVALS  (recipe LIKE-pattern, ingredient name) — the line
+#                          does not appear in the document at all.
+# ---------------------------------------------------------------------------
+RECIPE_QTY_FIXES: list[tuple[str, str, float]] = [
+    ("Spicy Tuna Linguine Pesto%", "Pesto Jar", 40.0),
+    ("Creamy Sausage Pasta%", "Hugarian Sausage", 80.0),
+    ("Creamy Chicken & Mushroom Alfredo%", "Chicken Breast/Thigh (raw, boneless)", 100.0),
+    ("Spicy Korean Wing Bowl%", "Wings", 300.0),
+    ("Spicy Korean Wing Bowl%", "Kimchi", 50.0),
+    ("Spicy Korean Wing Bowl%", "Cucumber", 30.0),
+    ("Chicken Salpicao%", "Chicken Breast/Thigh (raw, boneless)", 180.0),
+    ("Chicken Salpicao%", "Butter", 15.0),
+    ("Chicken Salpicao%", "Soy Sauce", 10.0),
+    ("Chicken Salpicao%", "Worchestershire", 5.0),
+    ("Chicken Salpicao%", "Ground Pepper", 2.0),
+    ("Hungarian Sausage (Breakfast)%", "Palm Oil", 5.0),
+    ("Pork Tocino (Breakfast)%", "Palm Oil", 5.0),
+    ("Spam & Egg%", "Spam", 100.0),
+    ("Spam & Egg%", "Palm Oil", 5.0),
+    ("Bacon & Egg%", "Bacon", 60.0),
+    ("Bacon & Egg%", "Palm Oil", 5.0),
+    ("Onion Rings%", "Flour", 20.0),
+    ("Onion Rings%", "White Eggs", 0.25),
+    ("Fish & Chips%", "Flour", 20.0),
+    ("Banana MilkShake%", "Fresh Milk", 100.0),
+    ("Banana MilkShake%", "Tube Ice", 150.0),
+    ("Banana MilkShake%", "Simple Syrup (house)", 15.0),
+    ("Blueberry Yogurt%", "Plain Yogurt", 150.0),
+    ("Blueberry Yogurt%", "Tube Ice", 100.0),
+    ("1 Pitcher Iced Tea%", "Red Tea Powder", 25.0),
+    ("1 Pitcher Iced Tea%", "Refined Sugar", 40.0),
+    ("1 Cup Rice%", "Rice", 180.0),
+    ("Ranch Dip%", "Mayonaise", 25.0),
+]
+
+RECIPE_INGREDIENT_SWAPS: list[tuple[str, str, str, float, str]] = [
+    # Named "Balducci Penne Pasta" in the document, not the generic Pasta SKU.
+    ("Creamy Sausage Pasta%", "Pasta", "Balducci Penne Pasta", 120.0, "Balducci Penne Pasta"),
+    # A pasta dish with no pasta line — it deducted Rice instead.
+    ("Creamy Chicken & Mushroom Alfredo%", "Rice", "Pasta", 120.0, "Pasta (generic dry)"),
+]
+
+RECIPE_LINE_ADDITIONS: list[tuple[str, str, float, str]] = [
+    ("Hungarian Sausage (Breakfast)%", "Iodized Salt", 1.0, "Iodized Salt"),
+    ("Hungarian Sausage (Breakfast)%", "Ground Pepper", 1.0, "Ground Pepper"),
+    ("Pork Tocino (Breakfast)%", "Iodized Salt", 1.0, "Iodized Salt"),
+    ("Pork Tocino (Breakfast)%", "Ground Pepper", 1.0, "Ground Pepper"),
+    ("Onion Rings%", "Cornstarch", 10.0, "Cornstarch"),
+    ("Onion Rings%", "Parchment Paper", 1.0, "Parchment Paper"),
+    ("Fish & Chips%", "Cornstarch", 15.0, "Cornstarch"),
+    ("Fish & Chips%", "White Eggs", 0.5, "Egg (beaten)"),
+    ("Fish & Chips%", "Parchment Paper", 1.0, "Parchment Paper"),
+    ("Wing Rack%", "Cornstarch", 60.0, "Cornstarch"),
+    ("Wing Rack%", "Flour", 40.0, "All-Purpose Flour"),
+    ("Wing Rack%", "Iodized Salt", 6.0, "Iodized Salt"),
+    ("Wing Rack%", "Ground Pepper", 4.0, "Ground Pepper"),
+    ("Wing Rack%", "Garlic powder", 4.0, "Garlic Powder"),
+    ("Wing Rack%", "Butter", 30.0, "Butter"),
+    ("Wing Rack%", "Parsley", 2.0, "Parsley (optional garnish)"),
+    ("Wing Rack%", "Tissue Interfold", 3.0, "Tissue"),
+    ("Wing Rack%", "Parchment Paper", 2.0, "Parchment Paper"),
+    ("Ranch Dip%", "Ground Pepper", 1.0, "Ground Pepper"),
+    # Banana Milkshake — see BANANA_UNIT_FIX below. On a fresh install the
+    # CSV's "120 g" quantity fails to resolve against the now piece-based
+    # Banana ingredient (by design — see units.recipe_line_to_base) and lands
+    # in the unmapped queue instead of a wrong recipe_line, so the correct
+    # line is added here rather than corrected in place.
+    ("Banana MilkShake%", "Banana", 1.0, "Banana (peeled)"),
+]
+
+RECIPE_LINE_REMOVALS: list[tuple[str, str]] = [
+    ("Chicken Salpicao%", "Mama Sitas Oyster Sauce Big"),
+    ("Chicken Salpicao%", "Iodized Salt"),
+    ("Ranch Dip%", "All purpose Cream"),
+    ("Ranch Dip%", "Iodized Salt"),
+]
+
+# ---------------------------------------------------------------------------
+# Banana — the one ingredient the document insists stays piece-counted.
+#
+# "Banana stays in whole pieces end-to-end (purchase, stock, recipe,
+# deduction). Average weight (120 g, estimated) is stored only as optional
+# metadata for forecasting — it never overrides the piece count." The seeded
+# ingredient instead converted every purchased piece into 100 g via
+# gapfill.PIECE_WEIGHTS, and Banana Milkshake deducted 120 g per order — a
+# converted weight, exactly what the document forbids.
+#
+# A fresh install never has this problem: seed.py now seeds Banana as
+# base_unit='pc' from the start (see PACK_SIZES). This fix is for a database
+# that was already seeded under the old gram-based scheme, and it is the one
+# correction here that touches a unit of measure rather than a quantity —
+# every already-open reservation and FEFO batch is rescaled by the same
+# 100 g-per-piece factor the ingredient was seeded with, so "how many
+# bananas" reads the same before and after; only the unit changes. Stock
+# ledger history is left exactly as it was written (it is append-only by
+# design) — entries before this fix are in grams, same as any other
+# unit-of-measure change to a live ledger.
+# ---------------------------------------------------------------------------
+BANANA_UNIT_FIX_GRAMS_PER_PIECE = 100.0
+
 
 def _pk(conn: sqlite3.Connection, table: str, name: str) -> int | None:
     row = conn.execute(f"SELECT id FROM {table} WHERE name = ?", (name,)).fetchone()
@@ -198,6 +318,85 @@ def apply_configuration(conn: sqlite3.Connection, user_id: str = "reference") ->
                                     WHERE rl.recipe_id = r.id AND rl.ingredient_id = ?)
                 """,
                 (ing_pk, ing_name, qty, recipe_like + "%", ing_pk))
+            out["recipe_fixes"] += cur.rowcount
+
+        # --- main-dish recipe corrections ------------------------------------
+        for recipe_like, ing_name, new_qty in RECIPE_QTY_FIXES:
+            ing_pk = _pk(conn, "ingredient", ing_name)
+            if ing_pk is None:
+                continue
+            cur = conn.execute(
+                """
+                UPDATE recipe_line
+                   SET qty_base=?, qty_status='needs_verification',
+                       note='corrected from the reference document (2026-08)'
+                 WHERE ingredient_id=?
+                   AND recipe_id IN (SELECT id FROM recipe WHERE name LIKE ?)
+                """,
+                (new_qty, ing_pk, recipe_like))
+            out["recipe_fixes"] += cur.rowcount
+
+        for recipe_like, from_name, to_name, new_qty, label in RECIPE_INGREDIENT_SWAPS:
+            from_pk = _pk(conn, "ingredient", from_name)
+            to_pk = _pk(conn, "ingredient", to_name)
+            if from_pk is None or to_pk is None:
+                continue
+            cur = conn.execute(
+                """
+                UPDATE recipe_line
+                   SET ingredient_id=?, qty_base=?, display_label=?,
+                       qty_status='needs_verification',
+                       note=? || ' — corrected from the reference document (2026-08): was ' || ?
+                 WHERE ingredient_id=?
+                   AND recipe_id IN (SELECT id FROM recipe WHERE name LIKE ?)
+                """,
+                (to_pk, new_qty, label, label, from_name, from_pk, recipe_like))
+            out["recipe_fixes"] += cur.rowcount
+
+        for recipe_like, ing_name, qty, label in RECIPE_LINE_ADDITIONS:
+            ing_pk = _pk(conn, "ingredient", ing_name)
+            if ing_pk is None:
+                continue
+            cur = conn.execute(
+                """
+                INSERT OR IGNORE INTO recipe_line
+                  (recipe_id, ingredient_id, display_label, qty_base, qty_status,
+                   is_optional, sort_order, note)
+                SELECT r.id, ?, ?, ?, 'needs_verification', 0, 91,
+                       'added from the reference document (2026-08)'
+                  FROM recipe r
+                 WHERE r.name LIKE ?
+                   AND NOT EXISTS (SELECT 1 FROM recipe_line rl
+                                    WHERE rl.recipe_id = r.id AND rl.ingredient_id = ?)
+                """,
+                (ing_pk, label, qty, recipe_like, ing_pk))
+            out["recipe_fixes"] += cur.rowcount
+            # Fresh-install Banana Milkshake: the unmapped queue entry this
+            # insert supersedes would otherwise sit open forever, looking
+            # like it still needs a decision when it does not.
+            if ing_name == "Banana" and cur.rowcount:
+                conn.execute(
+                    """
+                    UPDATE unmapped_recipe_line
+                       SET state='resolved', resolved_ingredient_id=?, resolved_by='reference',
+                           resolved_at=datetime('now'),
+                           note='resolved by reference.py — see BANANA_UNIT_FIX'
+                     WHERE state='open' AND source_recipe_name LIKE ?
+                       AND source_ingredient_label LIKE 'Banana%'
+                    """,
+                    (ing_pk, recipe_like))
+
+        for recipe_like, ing_name in RECIPE_LINE_REMOVALS:
+            ing_pk = _pk(conn, "ingredient", ing_name)
+            if ing_pk is None:
+                continue
+            cur = conn.execute(
+                """
+                DELETE FROM recipe_line
+                 WHERE ingredient_id=?
+                   AND recipe_id IN (SELECT id FROM recipe WHERE name LIKE ?)
+                """,
+                (ing_pk, recipe_like))
             out["recipe_fixes"] += cur.rowcount
 
         # --- unlimited portion settings -------------------------------------

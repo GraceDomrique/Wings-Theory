@@ -34,7 +34,10 @@ BASE_UNIT_OVERRIDE = {
     "Toothpicks": "pc", "Tissue Interfold": "pc", "Tissue Rolls": "pc",
     "Plastic Gloves": "pc", "Coke in Can": "pc", "Coke Zero in Can": "pc",
     "Sprite in Can": "pc", "Royal in Can": "pc",
-    "Mango": "g", "Banana": "g", "Lemon": "g", "Orange": "g", "Fish Fillet": "g",
+    "Mango": "g", "Lemon": "g", "Orange": "g", "Fish Fillet": "g",
+    # Banana is piece-based, not gram-based — see PACK_SIZES below and
+    # reference.py's BANANA_UNIT_FIX. Left out of this override entirely so
+    # _infer_base_unit() falls through to its normal "pcs." -> "pc" inference.
     # Bought by the sack, consumed by weight in every shake recipe.
     "Tube Ice": "g",
     # "Additional Ingredients (Recipe-Required)" — real stock rows added in
@@ -86,8 +89,13 @@ PACK_SIZES = {
     "Pork Chop (Taiwanese cut, boneless)": 1000,
     "Shredded Cabbage": 1000, "Pickled Papaya (Atchara)": 300,
     "Tonkatsu Sauce": 300, "Spring Onion": 1000,
-    # Deliberately absent: Mango, Banana, Lemon, Orange. Recipes consume these
-    # by weight of usable flesh, and grams-per-piece varies enough that a guess
+    # Banana is the one produce item that stays piece-counted end-to-end —
+    # the reference document is explicit that it is never converted to a
+    # weight, unlike Mango/Lemon/Orange below. pack_size=1 means exactly what
+    # it says for a 'pc' base unit: one purchased piece is one base unit.
+    "Banana": 1,
+    # Deliberately absent: Mango, Lemon, Orange. Recipes consume these by
+    # weight of usable flesh, and grams-per-piece varies enough that a guess
     # would be a real error. They stay unset until gapfill.PIECE_WEIGHTS runs
     # (before recipe import — see gapfill.apply_pre).
 }
