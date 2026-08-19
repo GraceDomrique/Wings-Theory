@@ -452,7 +452,14 @@ def seed_users(conn) -> None:
     ('wingstheory') and is flagged must_change_password=1 for exactly that
     reason -- see migration 0014's docstring for why the same flag is set
     there too (that UPDATE only reaches rows that already exist, so a fresh
-    install needs it set here at INSERT time instead)."""
+    install needs it set here at INSERT time instead).
+
+    password_changed_at is set explicitly here rather than left to a
+    column default -- the column has none (see migration 0014's docstring
+    for why a NOT NULL DEFAULT CURRENT_TIMESTAMP column is not safe to add
+    via ALTER TABLE against a populated table), so every INSERT path,
+    including this one, is responsible for supplying a real value itself.
+    """
     from .auth import hash_password
     for username, display, role in [
         ("owner", "R. Alonzo", "admin"),
@@ -463,8 +470,9 @@ def seed_users(conn) -> None:
         h, s = hash_password("wingstheory")
         conn.execute(
             "INSERT OR IGNORE INTO app_user "
-            "(username, display_name, role, password_hash, password_salt, must_change_password) "
-            "VALUES (?,?,?,?,?,1)",
+            "(username, display_name, role, password_hash, password_salt, "
+            "password_changed_at, must_change_password) "
+            "VALUES (?,?,?,?,?, datetime('now', 'subsec'), 1)",
             (username, display, role, h, s),
         )
 

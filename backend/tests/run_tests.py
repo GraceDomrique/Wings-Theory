@@ -1877,7 +1877,8 @@ class TestPasswordSecurity(unittest.TestCase):
             h, s = hash_password("wingstheory")
             cls.conn.execute(
                 "INSERT INTO app_user (username, display_name, role, password_hash, "
-                "password_salt, must_change_password) VALUES (?,?, 'manager', ?,?, 1)",
+                "password_salt, password_changed_at, must_change_password) "
+                "VALUES (?,?, 'manager', ?,?, datetime('now'), 1)",
                 (username, username, h, s),
             )
 
@@ -5324,6 +5325,189 @@ class TestEnvironmentSafety(unittest.TestCase):
             scrub(path)
 
 
+class TestBackupRestore(unittest.TestCase):
+    """P1-1: verify()'s independent checks, and restore()'s guard ordering
+    -- ambiguous target, production requires an explicit second flag on
+    top of WT_ENV/target agreement, a broken backup is refused outright,
+    and the current database is always recoverable (emergency_backup)
+    because nothing is ever deleted, only overwritten after its
+    replacement is already in place. Every restore exercised here targets
+    WT_ENV=test against disposable tempfiles; production is only ever
+    exercised far enough to prove it refuses, per Phase 09A's instruction
+    never to run a destructive restore against the real database."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(self.path)
+        os.environ["WT_DB"] = self.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+
+        # Isolate this class's backups from backend/backups/ -- same
+        # technique TestMigrationSafety uses.
+        self._real_backup_dir = db.BACKUP_DIR
+        self.backup_dir = Path(tempfile.mkdtemp())
+        db.BACKUP_DIR = self.backup_dir
+
+        conn = db.get_conn()
+        db.migrate(conn)
+        self.ing = add_ingredient(conn, "Test Wings", on_hand=1000.0)
+        conn.execute(
+            "INSERT INTO fefo_batch (ingredient_id, lot_no, qty_base, received_at, state) "
+            "VALUES (?, 'LOT-1', 1000.0, '2026-08-01', 'open')", (self.ing,),
+        )
+        conn.execute(
+            "INSERT INTO stock_ledger (ingredient_id, delta_base, balance_after_base, reason) "
+            "VALUES (?, 1000.0, 1000.0, 'purchase_receipt')", (self.ing,),
+        )
+
+    def tearDown(self):
+        db.close_conn()
+        db.BACKUP_DIR = self._real_backup_dir
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(self.path)
+
+    def test_verify_reports_ok_for_a_healthy_database(self):
+        from wt import backup_restore as br
+        report = br.verify(self.path)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["integrity_check"], "ok")
+        self.assertEqual(report["foreign_key_violations"], 0)
+        self.assertEqual(report["fefo_drift"], [])
+        self.assertEqual(report["ledger_drift"], [])
+
+    def test_verify_refuses_a_missing_file(self):
+        from wt import backup_restore as br
+        with self.assertRaises(br.RestoreError):
+            br.verify(str(Path(self.path).parent / "does-not-exist.db"))
+
+    def test_verify_detects_fefo_drift(self):
+        from wt import backup_restore as br
+        conn = db.get_conn()
+        conn.execute("UPDATE ingredient SET on_hand_base = on_hand_base + 500 WHERE id=?", (self.ing,))
+        db.close_conn()
+        report = br.verify(self.path)
+        self.assertFalse(report["ok"])
+        self.assertIn("Test Wings", report["fefo_drift"])
+
+    def test_verify_detects_ledger_drift(self):
+        from wt import backup_restore as br
+        conn = db.get_conn()
+        conn.execute(
+            "INSERT INTO stock_ledger (ingredient_id, delta_base, balance_after_base, reason) "
+            "VALUES (?, -1, 5000, 'purchase_receipt')", (self.ing,),
+        )
+        db.close_conn()
+        report = br.verify(self.path)
+        self.assertFalse(report["ok"])
+        self.assertIn("Test Wings", report["ledger_drift"])
+
+    def test_verify_detects_foreign_key_violations(self):
+        from wt import backup_restore as br
+        db.close_conn()
+        raw = sqlite3.connect(self.path)  # no FK pragma -- allows the bad insert
+        raw.execute(
+            "INSERT INTO fefo_batch (ingredient_id, lot_no, qty_base, received_at, state) "
+            "VALUES (99999, 'ORPHAN', 1, '2026-08-01', 'open')"
+        )
+        raw.commit()
+        raw.close()
+        report = br.verify(self.path)
+        self.assertFalse(report["ok"])
+        self.assertGreater(report["foreign_key_violations"], 0)
+        self.assertGreater(report["orphan_records"], 0)
+
+    def test_backup_writes_a_verified_file(self):
+        from wt import backup_restore as br
+        result = br.backup("test_reason")
+        self.assertTrue(Path(result["backup_path"]).exists())
+        self.assertTrue(result["verify"]["ok"])
+
+    def test_restore_round_trip_recovers_the_backed_up_state(self):
+        from wt import backup_restore as br
+        result = br.backup("before_change")
+        backup_path = result["backup_path"]
+
+        # mutate the live database after the backup
+        conn = db.get_conn()
+        conn.execute("UPDATE ingredient SET on_hand_base = 1 WHERE id=?", (self.ing,))
+        conn.execute("UPDATE fefo_batch SET qty_base = 1 WHERE ingredient_id=?", (self.ing,))
+        conn.execute(
+            "INSERT INTO stock_ledger (ingredient_id, delta_base, balance_after_base, reason) "
+            "VALUES (?, -999, 1, 'wastage')", (self.ing,),
+        )
+
+        result = br.restore(backup_path, target="test")
+        self.assertTrue(result["ok"], result)
+        self.assertIsNotNone(result["emergency_backup"])
+        self.assertTrue(result["post_restore_verify"]["ok"])
+
+        restored_conn = db.get_conn()
+        row = restored_conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)
+        ).fetchone()
+        self.assertEqual(row["on_hand_base"], 1000.0)
+
+        # the emergency backup itself really does hold the pre-restore
+        # (mutated) state -- nothing was deleted, only superseded
+        emergency_conn = sqlite3.connect(result["emergency_backup"])
+        emergency_row = emergency_conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)
+        ).fetchone()
+        emergency_conn.close()
+        self.assertEqual(emergency_row[0], 1)
+
+    def test_restore_refuses_ambiguous_target(self):
+        from wt import backup_restore as br
+        result = br.backup("for_ambiguous_target_test")
+        with self.assertRaises(br.RestoreError):
+            br.restore(result["backup_path"], target="development")  # WT_ENV is "test"
+
+    def test_restore_refuses_a_backup_that_fails_its_own_verification(self):
+        import shutil as _shutil
+        from wt import backup_restore as br
+        broken = self.backup_dir / "broken.db"
+        # Checkpoint first -- self.path is a live WAL-mode connection, and a
+        # raw file copy taken without checkpointing can miss everything
+        # sitting only in the -wal sidecar (including, for a small test
+        # database, the schema itself).
+        db.get_conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        _shutil.copy2(self.path, broken)
+        raw = sqlite3.connect(str(broken))
+        raw.execute(
+            "INSERT INTO fefo_batch (ingredient_id, lot_no, qty_base, received_at, state) "
+            "VALUES (99999, 'ORPHAN', 1, '2026-08-01', 'open')"
+        )
+        raw.commit()
+        raw.close()
+        with self.assertRaises(br.RestoreError):
+            br.restore(str(broken), target="test")
+
+    def test_restore_into_production_requires_explicit_confirm_flag(self):
+        # Never touches a real file -- this guard fires before db.db_path()
+        # is even called, using a production-labeled environment purely to
+        # prove the refusal, per Phase 09A's instruction not to exercise a
+        # destructive restore against the real database.
+        from wt import backup_restore as br
+        os.environ["WT_ENV"] = "production"
+        try:
+            with self.assertRaises(br.RestoreError):
+                br.restore("irrelevant.db", target="production", confirm_production=False)
+        finally:
+            os.environ["WT_ENV"] = "test"
+
+    def test_restore_into_production_refuses_target_mismatch_even_with_confirm(self):
+        from wt import backup_restore as br
+        os.environ["WT_ENV"] = "development"
+        try:
+            with self.assertRaises(br.RestoreError):
+                br.restore("irrelevant.db", target="production", confirm_production=True)
+        finally:
+            os.environ["WT_ENV"] = "test"
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(
@@ -5340,7 +5524,7 @@ def main() -> int:
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
             TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestPasswordSecurity,
             TestForecasting, TestAnomaly, TestAssociations,
-            TestMigrationSafety, TestEnvironmentSafety,
+            TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

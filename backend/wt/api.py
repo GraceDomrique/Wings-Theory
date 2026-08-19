@@ -188,7 +188,7 @@ def change_password(
     with db.write_tx(c):
         c.execute(
             "UPDATE app_user SET password_hash=?, password_salt=?, "
-            "password_changed_at=datetime('now'), must_change_password=0 WHERE id=?",
+            "password_changed_at=datetime('now','subsec'), must_change_password=0 WHERE id=?",
             (h, s, row["id"]),
         )
     new_changed_at = c.execute(
@@ -219,7 +219,7 @@ def reset_password(
     with db.write_tx(c):
         c.execute(
             "UPDATE app_user SET password_hash=?, password_salt=?, "
-            "password_changed_at=datetime('now'), must_change_password=1 WHERE id=?",
+            "password_changed_at=datetime('now','subsec'), must_change_password=1 WHERE id=?",
             (h, s, row["id"]),
         )
     return {

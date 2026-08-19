@@ -412,6 +412,26 @@ def require_destructive_confirmation(action: str) -> None:
         raise SystemExit(1)
 
 
+def open_and_register(path: str | Path) -> sqlite3.Connection:
+    """Closes this thread's current connection (if any), opens a fresh one
+    against `path`, and registers it as this thread's connection -- the
+    same registration reset() does, for the same reason: an unregistered
+    connection would leave a later get_conn() opening a *second* handle on
+    the same file, which on Windows keeps a lock the caller thinks it has
+    already released.
+
+    Used by wt.backup_restore.restore() after copying a backup into place.
+    Deliberately does NOT call migrate() -- a restored backup already
+    carries whatever schema version it was backed up at, and silently
+    migrating it here would make the restore change what it just put
+    back instead of returning exactly that snapshot.
+    """
+    close_conn()
+    conn = connect(path)
+    _local.conn = conn
+    return conn
+
+
 def reset(path: str | Path | None = None) -> sqlite3.Connection:
     """Drop and rebuild. Test helper — never call this against a live database.
 
