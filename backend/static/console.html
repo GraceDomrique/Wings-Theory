@@ -205,91 +205,6 @@ a{color:inherit}
 .card-b.tight{padding:var(--s2)}
 .card.flat{box-shadow:none}
 
-/* ================= TYPE SCALE (Phase 10) =================
-   A deliberate scale instead of ad-hoc per-component font-size values.
-   Numeric/data values get tight tracking + tabular-nums so they carry the
-   same weight a dashboard usually reserves for headlines -- the actual
-   content of this app is numbers (on-hand, runway, variance), not
-   headline copy. No webfont added: this project has never taken an
-   external network dependency anywhere (console/POS/KDS all ship zero
-   @font-face, zero CDN links), and a back-office tool that has to keep
-   working when the internet doesn't is the wrong place to start now. */
-:root{
-  --fs-micro:10.5px; --fs-cap:11.5px; --fs-sm:12.5px; --fs-body:13.5px;
-  --fs-md:15px; --fs-lg:18px; --fs-xl:24px; --fs-num:30px; --fs-hero:40px;
-}
-.num-lg{font-variant-numeric:tabular-nums;letter-spacing:-.02em;font-weight:650}
-
-/* ================= STATUS BAND =================
-   Replaces a KPI-tile wall for "is my inventory okay?" with one connected,
-   segmented bar (not four disconnected tiles) -- each segment sized to its
-   real share of ingredients and clickable straight into the matching table
-   filter. How many segments there are, and how big each is, IS the
-   information; a wall of same-size tiles can't show that at all. */
-.status-band{display:flex;flex-direction:column;gap:12px}
-.status-band .sb-track{display:flex;height:10px;border-radius:6px;overflow:hidden;
-  background:var(--sunken)}
-.status-band .sb-seg{transition:flex-grow var(--dur) var(--ease);cursor:pointer;min-width:3px}
-.status-band .sb-seg:hover{filter:brightness(1.12)}
-.status-band .sb-legend{display:flex;flex-wrap:wrap;gap:20px 26px}
-.sb-item{display:flex;align-items:baseline;gap:8px;cursor:pointer;border:0;background:none;
-  padding:0;text-align:left}
-.sb-item .sb-dot{width:8px;height:8px;border-radius:99px;flex-shrink:0;margin-top:3px}
-.sb-item .sb-n{font-size:var(--fs-xl);font-weight:650;letter-spacing:-.02em;
-  font-variant-numeric:tabular-nums;line-height:1}
-.sb-item .sb-l{font-size:var(--fs-sm);color:var(--text-2);line-height:1.3}
-.sb-item.on .sb-l{color:var(--text);font-weight:600}
-
-/* ================= ACTION STRIP =================
-   Not a table row, not a card -- a flagged, urgent inline list. The whole
-   section disappears when there's nothing to act on, rather than showing
-   an empty "0 actions" state -- no action needed is communicated by the
-   section's absence, not a reassuring zero. */
-.action-strip{display:flex;flex-direction:column;gap:1px;background:var(--border-soft);
-  border:1px solid var(--border-soft);border-radius:var(--r-card);overflow:hidden}
-.action-row{display:flex;align-items:center;gap:12px;background:var(--card);
-  padding:11px var(--s3);font-size:var(--fs-body)}
-.action-row .dot{width:7px;height:7px;border-radius:99px;flex-shrink:0;background:var(--bad-fill)}
-.action-row .nm{font-weight:600;flex-shrink:0}
-.action-row .why{color:var(--text-2);flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.action-row .go{flex-shrink:0}
-
-/* ================= USE-FIRST STRIP =================
-   Horizontal and compact -- FEFO priority as a quick-glance rail here, not
-   a second full card grid competing with the Expiry Monitor page, which
-   stays the place for the complete picture. */
-.uf-strip{display:flex;gap:10px;overflow-x:auto;padding-bottom:2px;scrollbar-width:thin}
-.uf-chip{flex:0 0 auto;display:flex;flex-direction:column;gap:3px;padding:9px 13px;
-  border-radius:10px;border:1px solid var(--border);background:var(--card);min-width:130px;cursor:pointer}
-.uf-chip:hover{border-color:var(--text-3)}
-.uf-chip .nm{font-size:var(--fs-body);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px}
-.uf-chip .d{font-size:var(--fs-sm);font-variant-numeric:tabular-nums}
-
-/* ================= RUNWAY CELL =================
-   Number first, label second, stacked on two lines -- "8.4 days" then
-   "Low runway", never a bare colored word standing in for the number a
-   non-technical reader actually needs to make a decision. */
-.runway-cell{display:flex;flex-direction:column;gap:1px;line-height:1.3}
-.runway-cell .rn{font-size:var(--fs-body);font-weight:600;font-variant-numeric:tabular-nums}
-.runway-cell .rl{font-size:var(--fs-micro);text-transform:uppercase;letter-spacing:.04em}
-.runway-cell .rl.bad{color:var(--bad-text)} .runway-cell .rl.warn{color:var(--warn-text)}
-.runway-cell .rl.ok{color:var(--ok-text)} .runway-cell .rl.mute{color:var(--text-3)}
-
-/* ================= PROGRESSIVE DISCLOSURE =================
-   Native <details>/<summary> for anything technical (base-unit
-   conversions, raw ledger figures) -- free keyboard support and no
-   hand-rolled open/closed state to keep in sync with anything else. */
-details.tech{border:1px solid var(--border-soft);border-radius:10px}
-details.tech>summary{list-style:none;cursor:pointer;padding:10px 14px;display:flex;
-  align-items:center;gap:8px;font-size:var(--fs-sm);font-weight:600;color:var(--text-2)}
-details.tech>summary::-webkit-details-marker{display:none}
-details.tech>summary::before{content:"";width:0;height:0;border-style:solid;
-  border-width:4px 0 4px 6px;border-color:transparent transparent transparent var(--text-3);
-  transition:transform var(--dur) var(--ease)}
-details.tech[open]>summary::before{transform:rotate(90deg)}
-details.tech[open]>summary{border-bottom:1px solid var(--border-soft)}
-details.tech>.dl,details.tech>.tl,details.tech>p{padding:12px 14px;margin:0}
-
 .sec-t{display:flex;align-items:baseline;gap:10px;margin-bottom:-8px;flex-wrap:wrap}
 .sec-t h2{font-size:13px;font-weight:600;letter-spacing:.02em;margin:0;text-transform:uppercase;color:var(--text-2)}
 .sec-t p{font-size:12.5px;color:var(--text-3);margin:0}
@@ -431,8 +346,6 @@ td.n{font-variant-numeric:tabular-nums;text-align:right;color:var(--text)}
 th.n{text-align:right}
 td.wrap{white-space:normal;min-width:190px}
 .sub{font-size:11.5px;color:var(--text-3);font-weight:400}
-.linklike{color:var(--amber-text);font-weight:600;text-decoration:underline;text-underline-offset:2px}
-.linklike:hover{color:var(--amber)}
 .tfoot{display:flex;align-items:center;gap:var(--s2);padding:10px var(--s2);
   border-top:1px solid var(--border-soft);font-size:12.5px;color:var(--text-3)}
 .tfoot .r{margin-left:auto;display:flex;gap:6px;align-items:center}
@@ -959,74 +872,10 @@ function expiryChip(b) {
   if (b.days_to_expiry <= 7) return `<span class="chip warn">${b.days_to_expiry}d left</span>`;
   return `<span class="chip ok">${b.days_to_expiry}d left</span>`;
 }
-// Single source of truth for risk -> class/label, shared by riskChip
-// (used on Forecasts, the drawer) and runwayCell/statusBand (Phase 10,
-// Inventory) -- the two must never be able to disagree on wording.
-const RISK_CLASS = { out: 'bad', critical: 'bad', warning: 'warn', idle: 'mute', ok: 'ok', no_data: 'mute' };
-const RISK_LABEL = { out: 'Out of stock', critical: 'Reorder now', warning: 'Reorder soon', idle: 'Not selling lately', ok: 'Enough stock', no_data: 'No sales yet' };
-const RISK_COLOR_VAR = { out: '--bad-fill', critical: '--bad-fill', warning: '--warn-fill', idle: '--text-3', ok: '--ok-fill', no_data: '--text-3' };
 function riskChip(risk) {
-  return `<span class="chip ${RISK_CLASS[risk]}">${esc(RISK_LABEL[risk])}</span>`;
-}
-// Number first, label second -- "8.4 days" then "Low runway", never a bare
-// colored word standing in for the number a manager actually needs.
-function runwayCell(i) {
-  if (!i.is_deductable) return '<span class="sub">—</span>';
-  const d = STATE.inventory.dep[i.id];
-  const risk = d ? d.risk : 'no_data';
-  const days = d && d.days_remaining != null ? num(d.days_remaining, 1) : null;
-  return `<div class="runway-cell">
-    ${days != null ? `<div class="rn">${days}<small style="font-weight:500;font-size:10.5px"> days</small></div>` : ''}
-    <div class="rl ${RISK_CLASS[risk]}">${esc(RISK_LABEL[risk])}</div>
-  </div>`;
-}
-// segments: [{key,label,count}]. Reuses the existing data-act="inv-status"
-// delegated handler (see the ROUTER click dispatcher) -- a segment or a
-// legend entry IS an inv-status tab, just laid out as one connected bar
-// instead of four disconnected KPI tiles, so how big each slice is (not
-// just its count) is visible at a glance.
-function statusBand(segments, activeKey) {
-  const shown = segments.filter(s => s.count > 0);
-  return `<div class="status-band">
-    <div class="sb-track">${(shown.length ? shown : segments).map(s =>
-      `<div class="sb-seg" style="flex-grow:${Math.max(s.count, 0.4)};background:var(${RISK_COLOR_VAR[s.key] || '--text-3'})"
-            data-act="inv-status" data-s="${s.key}" title="${esc(s.label)}: ${s.count}"></div>`).join('')}
-    </div>
-    <div class="sb-legend">${segments.map(s => `
-      <button class="sb-item ${activeKey === s.key ? 'on' : ''}" data-act="inv-status" data-s="${s.key}">
-        <span class="sb-dot" style="background:var(${RISK_COLOR_VAR[s.key] || '--text-3'})"></span>
-        <span><div class="sb-n">${s.count}</div><div class="sb-l">${esc(s.label)}</div></span>
-      </button>`).join('')}
-    </div>
-  </div>`;
-}
-// Compact, urgent, and absent entirely when there's nothing to act on --
-// "what's actually blocking a sale right now", not a general-purpose list.
-function actionStrip(list) {
-  if (!list.length) return '';
-  return `<div class="sec-t"><h2>Action required</h2><p>${list.length} item${list.length === 1 ? '' : 's'} blocking a sale right now</p></div>
-    <div class="action-strip">${list.map(i => `
-      <div class="action-row row-link" data-act="ing-open" data-id="${i.id}">
-        <span class="dot"></span>
-        <span class="nm">${esc(i.name)}</span>
-        <span class="why">${esc(i.is_deductable ? 'Out of stock' : (i.block_reason || 'Cannot be sold yet'))}</span>
-        <button class="btn btn-s btn-sm go" data-act="receive" data-id="${i.id}" data-name="${esc(i.name)}"
-                data-unit="${esc(i.purchase_unit)}">${ic('buy')}Log delivery</button>
-      </div>`).join('')}
-    </div>`;
-}
-// Horizontal quick-glance rail -- FEFO priority, not a second full grid
-// competing with the Expiry Monitor page (which stays the complete view).
-function useFirstStrip(list) {
-  if (!list.length) return '';
-  return `<div class="sec-t"><h2>Use first</h2><p>Nearest to expiring, across all stock</p></div>
-    <div class="uf-strip">${list.map(x => `
-      <div class="uf-chip row-link" data-act="ing-open" data-id="${x.ingredient_id}">
-        <span class="nm">${esc(x.ingredient_name)}</span>
-        <span class="d" style="color:var(${x.expired ? '--bad-fill' : x.days_to_expiry <= 3 ? '--bad-fill' : '--warn-fill'})">
-          ${x.expired ? 'Expired' : x.days_to_expiry + 'd left'}</span>
-      </div>`).join('')}
-    </div>`;
+  const map = { out: 'bad', critical: 'bad', warning: 'warn', idle: 'mute', ok: 'ok', no_data: 'mute' };
+  const label = { out: 'Out of stock', critical: 'Reorder now', warning: 'Reorder soon', idle: 'Not selling lately', ok: 'Enough stock', no_data: 'No sales yet' };
+  return `<span class="chip ${map[risk]}">${esc(label[risk])}</span>`;
 }
 function note(text, title, kind) {
   return `<div class="note ${kind || ''}">${ic('spark')}<div><b>${esc(title || 'How this works')}</b><p>${esc(text)}</p></div></div>`;
@@ -1279,20 +1128,7 @@ function renderIngredientDrawer(d) {
       </div>
 
       <div>
-        <div class="dr-t">Used in ${d.used_in.length} recipe${d.used_in.length === 1 ? '' : 's'}</div>
-        ${d.used_in.length ? `<dl class="dl">${d.used_in.slice(0, 12).map(u =>
-          `<dt>${esc(u.name)}${u.kind === 'sub_recipe' ? ' <span class="sub">(house-made)</span>' : ''}</dt>
-           <dd>${num(u.qty_base, 3)} ${esc(i.base_unit)}</dd>`).join('')}</dl>
-          ${d.used_in.length > 12 ? `<div class="sub" style="margin-top:8px">+ ${d.used_in.length - 12} more</div>` : ''}`
-        : `<p class="sub" style="margin:0">Not used by any recipe yet.</p>`}
-      </div>
-
-      <!-- Progressive disclosure: base-unit conversions and raw ledger
-           history are real data a manager might need, but not what a
-           first read of "how is this ingredient doing" requires. Closed
-           by default; a click away, not hidden behind a second screen. -->
-      <details class="tech">
-        <summary>Technical details — conversion &amp; cost</summary>
+        <div class="dr-t">Conversion &amp; cost</div>
         <dl class="dl">
           <dt>Deducted in</dt><dd>${esc(i.base_unit)}</dd>
           <dt>Bought as</dt><dd>${esc(i.purchase_unit)}</dd>
@@ -1304,11 +1140,20 @@ function renderIngredientDrawer(d) {
           <dt>Supplier</dt><dd>${i.supplier ? esc(i.supplier) : '<span class="sub">not set</span>'}</dd>
           <dt>Supplier contact</dt><dd>${i.supplier_contact ? esc(i.supplier_contact) : '<span class="sub">not set</span>'}</dd>
         </dl>
-      </details>
+      </div>
+
+      <div>
+        <div class="dr-t">Used in ${d.used_in.length} recipe${d.used_in.length === 1 ? '' : 's'}</div>
+        ${d.used_in.length ? `<dl class="dl">${d.used_in.slice(0, 12).map(u =>
+          `<dt>${esc(u.name)}${u.kind === 'sub_recipe' ? ' <span class="sub">(house-made)</span>' : ''}</dt>
+           <dd>${num(u.qty_base, 3)} ${esc(i.base_unit)}</dd>`).join('')}</dl>
+          ${d.used_in.length > 12 ? `<div class="sub" style="margin-top:8px">+ ${d.used_in.length - 12} more</div>` : ''}`
+        : `<p class="sub" style="margin:0">Not used by any recipe yet.</p>`}
+      </div>
 
       <!-- C — MOVEMENT HISTORY -->
-      <details class="tech">
-        <summary>Technical details — full ledger history</summary>
+      <div>
+        <div class="dr-t">Recent stock movements</div>
         ${d.movements.length ? `<div class="tl">${d.movements.slice(0, 12).map(m => {
           const up = m.delta_base > 0;
           return `<div class="tl-i">
@@ -1319,7 +1164,7 @@ function renderIngredientDrawer(d) {
               <span style="display:block">${esc(m.created_at)}${m.note ? ' · ' + esc(m.note) : ''}</span></div>
           </div>`;
         }).join('')}</div>` : `<p class="sub" style="margin:0">No movements yet.</p>`}
-      </details>
+      </div>
     </div>
     <div class="dr-f"><button class="btn btn-s" style="flex:1" data-act="drawer-close">Close</button></div>`);
 
@@ -1376,99 +1221,37 @@ async function refreshAfterDrawerAction(pk) {
   if (CURRENT === 'inventory') loadInventory();   // keep the table behind in sync
 }
 
-/* Receiving, as a guided flow rather than a one-shot form (Phase 10
-   section F): enter the delivery -> review exactly what it will do,
-   computed by the server (GET .../receive/preview, the same
-   units.purchase_to_base conversion the real POST uses, never
-   re-derived here) -> post -> show exactly what changed. "Cost" is
-   deliberately not a field in this flow: receive_stock() has no cost
-   parameter at all -- unit cost lives on the ingredient record itself,
-   set separately (Edit / verification), not captured per delivery by
-   this schema -- so a cost input here would be UI with nothing behind
-   it. "New FEFO position" is genuinely advisory, worded as such: it's a
-   client-side comparison of the already-fetched batch expiry dates, not
-   a second copy of the database's own pick order (ix_fefo_batch_pick),
-   which can have tie-break rules this preview doesn't need to reproduce
-   to be useful. */
 function openReceiveModal(id, name, purchaseUnit) {
-  const renderForm = () => {
-    openModal(`
-      <h3>Log a delivery</h3>
-      <p>${esc(name)}</p>
-      <label>How much arrived (in ${esc(purchaseUnit)})</label>
-      <input class="field" id="rcQty" type="number" min="0.01" step="0.01" placeholder="e.g. 5">
-      <label>Reference number (optional)</label>
-      <input class="field" id="rcLot" placeholder="e.g. supplier receipt number">
-      <label>Expiry date, if it has one (optional)</label>
-      <input class="field" id="rcExp" type="date">
-      <div id="modalErr"></div>
-      <div class="actions"><button class="btn btn-s" data-act="modal-cancel">Cancel</button><button class="btn btn-p" id="rcNext">Review</button></div>
-    `);
-    $('#rcNext').addEventListener('click', async () => {
-      const qty = parseFloat($('#rcQty').value);
-      if (!qty || qty <= 0) { modalError('Enter a quantity greater than zero.'); return; }
-      const lot = $('#rcLot').value || null, exp = $('#rcExp').value || null;
-      $('#rcNext').disabled = true;
-      try {
-        const [preview, detail] = await Promise.all([
-          api(`/console/ingredients/${id}/receive/preview?purchase_qty=${qty}`),
-          api(`/console/ingredients/${id}`),
-        ]);
-        renderReview(qty, lot, exp, preview, detail);
-      } catch (e) { modalError(e.message); }
-      finally { const b = $('#rcNext'); if (b) b.disabled = false; }
-    });
-  };
-
-  const renderReview = (qty, lot, exp, preview, detail) => {
-    const openBatches = detail.batches || [];
-    let fefoLine;
-    if (!exp) {
-      fefoLine = 'No expiry entered — this batch is used only after every dated batch already on hand.';
-    } else {
-      const earlier = openBatches.filter(b => b.expires_at && !b.expired && b.expires_at < exp).length;
-      fefoLine = earlier === 0
-        ? 'Used first — expires before every batch currently on hand.'
-        : `Used after ${earlier} earlier-expiring batch${earlier === 1 ? '' : 'es'} already on hand.`;
-    }
-    openModal(`
-      <h3>Review delivery</h3>
-      <p>Confirm before posting — this will update on-hand stock immediately.</p>
-      <dl class="dl">
-        <dt>Item</dt><dd>${esc(name)}</dd>
-        <dt>Purchase quantity</dt><dd>${num(qty, 2)} ${esc(purchaseUnit)}</dd>
-        <dt>In stock units</dt><dd>${num(preview.base_qty, 2)} ${esc(preview.base_unit)}</dd>
-        ${exp ? `<dt>Expiry</dt><dd>${esc(exp)}</dd>` : ''}
-        ${lot ? `<dt>Reference</dt><dd>${esc(lot)}</dd>` : ''}
-        <dt>On hand now</dt><dd>${num(preview.current_on_hand_base, 2)} ${esc(preview.base_unit)}</dd>
-        <dt>On hand after</dt><dd><b>${num(preview.new_on_hand_base, 2)} ${esc(preview.base_unit)}</b></dd>
-        <dt>FEFO position <span class="sub" title="Based on expiry date -- the database decides the exact draw-down order at the moment stock is actually used">(advisory)</span></dt><dd>${esc(fefoLine)}</dd>
-      </dl>
-      <div id="modalErr"></div>
-      <div class="actions">
-        <button class="btn btn-s" id="rcBack">Back</button>
-        <button class="btn btn-p" id="rcPost">Post delivery</button>
-      </div>
-    `);
-    $('#rcBack').addEventListener('click', renderForm);
-    $('#rcPost').addEventListener('click', async () => {
-      $('#rcPost').disabled = true;
-      try {
-        const r = await api(`/console/ingredients/${id}/receive`, {
-          method: 'POST', body: JSON.stringify({ purchase_qty: qty, lot_no: lot, expires_at: exp }),
-        });
-        closeModal();
-        toast(`Received ${num(r.received_base, 2)} ${r.base_unit} of ${r.name}. On hand: ${num(r.on_hand_base, 2)} ${r.base_unit}.`);
-        invalidateDepletionCache();
-        if (CURRENT === 'inventory') loadInventory();
-        else if (CURRENT === 'purchases') loadPurchases();
-        else if (CURRENT) goto(CURRENT);
-      } catch (e) { modalError(e.message); }
-      finally { const b = $('#rcPost'); if (b) b.disabled = false; }
-    });
-  };
-
-  renderForm();
+  openModal(`
+    <h3>Log a delivery</h3>
+    <p>${esc(name)}</p>
+    <label>How much arrived (in ${esc(purchaseUnit)})</label>
+    <input class="field" id="rcQty" type="number" min="0.01" step="0.01" placeholder="e.g. 5">
+    <label>Reference number (optional)</label>
+    <input class="field" id="rcLot" placeholder="e.g. supplier receipt number">
+    <label>Expiry date, if it has one (optional)</label>
+    <input class="field" id="rcExp" type="date">
+    <div id="modalErr"></div>
+    <div class="actions"><button class="btn btn-s" data-act="modal-cancel">Cancel</button><button class="btn btn-p" id="rcSubmit">Save delivery</button></div>
+  `);
+  $('#rcSubmit').addEventListener('click', async () => {
+    const qty = parseFloat($('#rcQty').value);
+    if (!qty || qty <= 0) { modalError('Enter a quantity greater than zero.'); return; }
+    $('#rcSubmit').disabled = true;
+    try {
+      const r = await api(`/console/ingredients/${id}/receive`, {
+        method: 'POST', body: JSON.stringify({
+          purchase_qty: qty, lot_no: $('#rcLot').value || null, expires_at: $('#rcExp').value || null,
+        })
+      });
+      closeModal();
+      toast(`Received ${r.received_base} ${r.base_unit} of ${r.name}. On hand: ${r.on_hand_base} ${r.base_unit}.`);
+      if (CURRENT === 'inventory') loadInventory();
+      else if (CURRENT === 'purchases') loadPurchases();
+      else if (CURRENT) goto(CURRENT);
+    } catch (e) { modalError(e.message); }
+    finally { const b = $('#rcSubmit'); if (b) b.disabled = false; }
+  });
 }
 
 function openCountModal(id, name, baseUnit, onHand) {
@@ -2182,42 +1965,19 @@ function renderInventory() {
   const st = STATE.inventory;
   const list = inventoryFilteredList();
   const val = inventoryValuation();
-  const count = s => st.data.filter(i => riskBucket(stockRisk(i)) === s).length;
-  const subCount = st.data.filter(i => i.kind === 'sub_recipe').length;
+  const count = s => st.data.filter(i => s === 'sub' ? i.kind === 'sub_recipe' : riskBucket(stockRisk(i)) === s).length;
+  const expiringSoon = st.data.filter(i => { const e = expiryStatus(i); return e && (e.expired || e.days_to_expiry <= 7); }).length;
   const needsConfirming = st.data.filter(i => confidenceStatus(i) !== 'confirmed').length;
-
-  // -- 1. Status band: is my inventory okay, at a glance -----------------
-  const segments = [
-    { key: 'out', label: 'Out of stock', count: count('out') },
-    { key: 'critical', label: 'Reorder now', count: count('critical') },
-    { key: 'warning', label: 'Reorder soon', count: count('warning') },
-    { key: 'ok', label: 'Enough stock', count: count('ok') },
-    { key: 'no_data', label: 'Not enough activity to assess', count: count('no_data') },
-  ];
-
-  // -- 2. Action strip: what's blocking a sale right now ------------------
-  const actionable = st.data.filter(i => !i.is_deductable || stockRisk(i) === 'out');
-
-  // -- 3. Use first: nearest to expiring, across all stock -----------------
-  const ufList = Object.values(st.expMap)
-    .filter(x => x.tracking !== 'not_tracked' && (x.expired || x.days_to_expiry <= 14))
-    .sort((a, b) => (a.expired ? -1e9 : a.days_to_expiry) - (b.expired ? -1e9 : b.days_to_expiry))
-    .slice(0, 10);
-
   setWork(`
-    <div class="sec-t"><h2>Stock health</h2><p>${st.data.length} ingredients tracked ·
-      ${money0(val.total)} on hand (${val.priced} of ${val.total_count} priced) ·
-      <button class="linklike" data-nav="verification">${needsConfirming} need${needsConfirming === 1 ? 's' : ''} confirming</button></p></div>
-    <div class="card"><div class="card-b">${statusBand(segments, st.status)}</div></div>
-
-    ${actionable.length ? `<div class="view">${actionStrip(actionable.slice(0, 12))}
-      ${actionable.length > 12 ? `<p class="sub" style="margin:6px 2px 0">+ ${actionable.length - 12} more below</p>` : ''}</div>` : ''}
-
-    ${ufList.length ? `<div class="view">${useFirstStrip(ufList)}</div>` : ''}
-
+    <div class="grid g4">
+      ${kpi('Inventory value', money0(val.total), `${val.priced} of ${val.total_count} priced`, 'cash')}
+      ${kpi('Out of stock', count('out'), 'blocking menu items', 'warn')}
+      ${kpi('Expiring within 7 days', expiringSoon, 'or already expired', 'exp', 'expiry')}
+      ${kpi('Needs confirming', needsConfirming, 'pack size, cost or usable amount', 'db', 'verification')}
+    </div>
     <div class="card">
       <div class="card-h">
-        <div><h2>All ingredients</h2><p>Click any row for its full detail, conversions and history</p></div>
+        <div><h2>Ingredients</h2><p>${st.data.length} tracked · click any row for its full detail, conversions and history</p></div>
         <div class="r">
           <label class="search">${ic('srch')}<input class="field-sm" data-bind="inv-q" placeholder="Search ingredients…" value="${esc(st.q)}" style="width:200px"></label>
           <select class="field-sm" data-act="inv-cat-sel">${Object.keys(CAT_LABELS).map(c =>
@@ -2226,16 +1986,17 @@ function renderInventory() {
             `<option value="${k}" ${st.exp === k ? 'selected' : ''}>${esc(EXP_LABELS[k])}</option>`).join('')}</select>
           <select class="field-sm" data-act="inv-conf-sel">${Object.keys(CONF_LABELS).map(k =>
             `<option value="${k}" ${st.conf === k ? 'selected' : ''}>${esc(CONF_LABELS[k])}</option>`).join('')}</select>
-          <button class="btn btn-s btn-sm ${st.status === '' ? 'on' : ''}" data-act="inv-status" data-s="">All</button>
-          <button class="btn btn-s btn-sm ${st.status === 'sub' ? 'on' : ''}" data-act="inv-status" data-s="sub">Sub-recipes <span class="sub">${subCount}</span></button>
           <button class="btn btn-s btn-sm" data-act="inv-bulk">${ic('scale')}Bulk update</button>
           <button class="btn btn-p btn-sm" data-act="inv-add">${ic('inv')}Add ingredient</button>
         </div>
       </div>
+      <div class="card-b tight"><div class="tabs">${RUNWAY_TABS.map(([k, l]) =>
+        `<button class="tab ${st.status === k ? 'on' : ''}" data-act="inv-status" data-s="${k}">${esc(l)}${k ? ` <span class="sub">${count(k)}</span>` : ''}</button>`).join('')}</div></div>
       <div class="tw"><table>
         <thead><tr><th>Ingredient</th><th>Category</th><th class="n">On hand</th>
           <th>Runway</th><th>Expiry</th><th>Confidence</th><th></th></tr></thead>
         <tbody>${list.length ? list.map(i => {
+          const risk = stockRisk(i);
           const ex = expiryStatus(i);
           const cchip = CONF_CHIP[confidenceStatus(i)];
           const tchip = TYPE_CHIP[i.inventory_type];
@@ -2244,7 +2005,7 @@ function renderInventory() {
               <div class="sub">${esc(i.ingredient_id)}</div></td>
             <td class="sub">${esc(CAT_LABELS[i.category] || i.category)}</td>
             <td class="n">${esc(i.on_hand_display)}</td>
-            <td>${runwayCell(i)}</td>
+            <td>${risk ? riskChip(risk) : '<span class="sub">—</span>'}</td>
             <td>${ex ? expiryChip(ex) + (ex.tracking === 'estimated_shelf_life' ? ` <span class="sub">est.</span>` : '') : '<span class="sub">—</span>'}</td>
             <td><span class="chip ${cchip[0]}">${esc(cchip[1])}</span></td>
             <td><div class="toolbar">
