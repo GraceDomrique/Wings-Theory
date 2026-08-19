@@ -3,7 +3,11 @@
 Run:  python -m tests.demo_flow
 
 Exercises the HTTP layer, not the domain functions, so route wiring, auth and
-the completeness gate are all in the path.
+the completeness gate are all in the path. Writes real orders into whatever
+database WT_DB/WT_ENV currently resolve to -- refuses to run at all under
+WT_ENV=production, the same way wt/demo_seed.py and scripts/generate_demo_
+history.py refuse, since this is exactly the kind of synthetic write that
+must never land in the shop's real data.
 """
 from __future__ import annotations
 
@@ -12,10 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi.testclient import TestClient          # noqa: E402
-
 from wt import db                                   # noqa: E402
-from wt.api import app                              # noqa: E402
 
 
 def line(ch="-", n=74):
@@ -23,6 +24,13 @@ def line(ch="-", n=74):
 
 
 def main() -> int:
+    if db.environment() == "production":
+        print("REFUSING TO PROCEED: this writes real orders and must never run "
+              "under WT_ENV=production.", file=sys.stderr)
+        return 1
+
+    from fastapi.testclient import TestClient
+    from wt.api import app
     client = TestClient(app)
     conn = db.get_conn()
 

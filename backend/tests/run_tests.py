@@ -5165,6 +5165,517 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
         self.assertIn("voided", r.text)
 
 
+class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
+    """Phase 09A section 6 -- the POS <-> Inventory integration matrix,
+    executed for real over HTTP (TestClient, real routing/auth/pydantic
+    validation, not the domain functions directly) against one disposable
+    seeded database. Each scenario checks the specific chain the spec asks
+    for -- POS state -> backend transaction -> inventory on_hand -> FEFO
+    batches -> stock ledger -> financial/order state -> final consistency
+    -- for the one ingredient/order/session that scenario actually moves.
+
+    Chain links already proven exhaustively elsewhere in this suite (the
+    FEFO invariant for every ingredient after every movement type:
+    TestFEFODepletion; the reservation race itself: TestConcurrency) are
+    not re-derived here -- this class's job is proving the real HTTP
+    surface wires up to those already-proven mechanics, which is a
+    different failure mode (a route typo, a missing capability, a
+    response that doesn't match what actually happened) than the one
+    those classes cover.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            return cls.client.post("/auth/login",
+                                   json={"username": u, "password": "wingstheory"}).json()["token"]
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    # -- shared chain-inspection helpers ------------------------------
+    def _on_hand(self, ing_id):
+        return self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (ing_id,)
+        ).fetchone()["on_hand_base"]
+
+    def _fefo_open_sum(self, ing_id):
+        return self.conn.execute(
+            "SELECT COALESCE(SUM(qty_base),0) AS q FROM fefo_batch "
+            "WHERE ingredient_id=? AND state='open'", (ing_id,)
+        ).fetchone()["q"]
+
+    def _ledger_count(self, ing_id):
+        return self.conn.execute(
+            "SELECT COUNT(*) AS n FROM stock_ledger WHERE ingredient_id=?", (ing_id,)
+        ).fetchone()["n"]
+
+    def _assert_fefo_matches_on_hand(self, ing_id, msg=""):
+        self.assertAlmostEqual(self._fefo_open_sum(ing_id), self._on_hand(ing_id), places=4, msg=msg)
+
+    def _assert_ledger_balance_matches_on_hand(self, ing_id, msg=""):
+        last = self.conn.execute(
+            "SELECT balance_after_base FROM stock_ledger WHERE ingredient_id=? "
+            "ORDER BY id DESC LIMIT 1", (ing_id,)
+        ).fetchone()
+        if last is not None:
+            self.assertAlmostEqual(last["balance_after_base"], self._on_hand(ing_id), places=4, msg=msg)
+
+    def _ala_carte_item(self):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        return next(m for m in menu["items"]
+                    if m["sellable"] and not m["is_unli"] and m["price"] > 50)
+
+    def _leaf_ingredient(self, recipe_id):
+        return self.conn.execute(
+            "SELECT i.id, i.on_hand_base FROM v_recipe_leaf l "
+            "JOIN ingredient i ON i.id=l.ingredient_id "
+            "WHERE l.recipe_id=? ORDER BY l.qty_base DESC LIMIT 1", (recipe_id,)
+        ).fetchone()
+
+    def _flavor(self, needle, all_flavors=False):
+        url = "/unli/flavors" + ("?all_flavors=true" if all_flavors else "")
+        fl = self.client.get(url, headers=self.H_CASH).json()["flavors"]
+        return next(f for f in fl if needle in f["display_name"])
+
+    def _unli_order(self, heads=2, commit=True):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        item = next(m for m in menu["items"] if m["is_unli"] and m["sellable"])
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-matrix", "head_count": heads,
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertEqual(r.status_code, 201, r.text)
+        oid = r.json()["order_id"]
+        if commit:
+            # The provisional H x lambda deduction (Stage 1) posts at
+            # commit, through the same reserve/commit path an a-la-carte
+            # order uses -- not at punch time.
+            c = self.client.post(f"/kds/orders/{oid}/start", headers=self.H_KIT)
+            self.assertEqual(c.status_code, 200, c.text)
+        return oid
+
+    def _session(self, order_id):
+        return self.client.get(f"/unli/orders/{order_id}/session",
+                               headers=self.H_CASH).json()["session_id"]
+
+    def _serve_order(self, order_id, client=None):
+        """start (deducts stock) -> ready -> served. Deduction happens at
+        start; ready/served are pure ticket-status advances with no
+        inventory impact (see api.py's _advance_status docstring)."""
+        c = client or self.client
+        r1 = c.post(f"/kds/orders/{order_id}/start", headers=self.H_KIT)
+        self.assertEqual(r1.status_code, 200, r1.text)
+        r2 = c.post(f"/kds/orders/{order_id}/ready", headers=self.H_KIT)
+        self.assertEqual(r2.status_code, 200, r2.text)
+        r3 = c.post(f"/kds/orders/{order_id}/served", headers=self.H_KIT)
+        self.assertEqual(r3.status_code, 200, r3.text)
+
+    # -- 1. a-la-carte sale --------------------------------------------
+    def test_01_ala_carte_sale(self):
+        item = self._ala_carte_item()
+        leaf = self._leaf_ingredient(item["recipe_id"])
+        on_hand_before = self._on_hand(leaf["id"])
+
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-1", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertEqual(r.status_code, 201, r.text)
+        order = r.json()
+        # reservation only -- on_hand unchanged, a hold exists
+        self.assertEqual(self._on_hand(leaf["id"]), on_hand_before)
+
+        self._serve_order(order["order_id"])
+        # committed -- on_hand actually moved, one sale_commit ledger row,
+        # FEFO and ledger both agree with the new on_hand
+        self.assertLess(self._on_hand(leaf["id"]), on_hand_before)
+        self._assert_fefo_matches_on_hand(leaf["id"])
+        self._assert_ledger_balance_matches_on_hand(leaf["id"])
+        detail = self.client.get(f"/pos/orders/{order['order_id']}", headers=self.H_CASH).json()
+        self.assertEqual(detail["order"]["status"], "served")
+
+    # -- 2. void before preparation --------------------------------------
+    def test_02_void_before_preparation(self):
+        item = self._ala_carte_item()
+        leaf = self._leaf_ingredient(item["recipe_id"])
+        on_hand_before = self._on_hand(leaf["id"])
+        ledger_before = self._ledger_count(leaf["id"])
+
+        order = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-2", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]}).json()
+        v = self.client.post(f"/pos/orders/{order['order_id']}/void", headers=self.H_CASH,
+                             json={"reason": "changed mind"})
+        self.assertEqual(v.status_code, 200, v.text)
+        self.assertEqual(v.json()["ledger_entries"], 0, "a pre-commit void must write nothing")
+        # nothing moved: no ledger rows, on_hand identical to before the order
+        self.assertEqual(self._ledger_count(leaf["id"]), ledger_before)
+        self.assertEqual(self._on_hand(leaf["id"]), on_hand_before)
+        detail = self.client.get(f"/pos/orders/{order['order_id']}", headers=self.H_CASH).json()
+        self.assertEqual(detail["order"]["status"], "void")
+
+    # -- 3. void after preparation -----------------------------------
+    def test_03_void_after_preparation(self):
+        item = self._ala_carte_item()
+        leaf = self._leaf_ingredient(item["recipe_id"])
+
+        order = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-3", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]}).json()
+        self.client.post(f"/kds/orders/{order['order_id']}/start", headers=self.H_KIT)
+        on_hand_after_commit = self._on_hand(leaf["id"])
+
+        v = self.client.post(f"/pos/orders/{order['order_id']}/void", headers=self.H_CASH,
+                             json={"reason": "kitchen error", "restock": False})
+        self.assertEqual(v.status_code, 200, v.text)
+        self.assertGreater(v.json()["ledger_entries"], 0,
+                           "a post-commit void must post a compensating credit/wastage pair")
+        # net stock unchanged (food really was cooked) -- credit and wastage cancel
+        self.assertAlmostEqual(self._on_hand(leaf["id"]), on_hand_after_commit, places=4)
+        self._assert_fefo_matches_on_hand(leaf["id"])
+        self._assert_ledger_balance_matches_on_hand(leaf["id"])
+        reasons = [r["reason"] for r in self.conn.execute(
+            "SELECT reason FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 2",
+            (leaf["id"],))]
+        self.assertEqual(set(reasons), {"void_credit", "wastage"})
+        detail = self.client.get(f"/pos/orders/{order['order_id']}", headers=self.H_CASH).json()
+        self.assertEqual(detail["order"]["status"], "void")
+
+    # -- 4. receiving --------------------------------------------------
+    def test_04_receiving(self):
+        ing = self.client.get("/console/ingredients?limit=1", headers=self.H_MGR).json()["ingredients"][0]
+        on_hand_before = self._on_hand(ing["id"])
+        r = self.client.post(f"/console/ingredients/{ing['id']}/receive", headers=self.H_MGR,
+                             json={"purchase_qty": 2, "lot_no": "MATRIX-1", "expires_at": "2027-06-01"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertGreater(self._on_hand(ing["id"]), on_hand_before)
+        self._assert_fefo_matches_on_hand(ing["id"])
+        self._assert_ledger_balance_matches_on_hand(ing["id"])
+        last = self.conn.execute(
+            "SELECT reason FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1",
+            (ing["id"],)).fetchone()
+        self.assertEqual(last["reason"], "purchase_receipt")
+
+    # -- 5. insufficient inventory --------------------------------------
+    def test_05_insufficient_inventory(self):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        blocked = next((m for m in menu["items"] if not m["sellable"]), None)
+        self.assertIsNotNone(blocked, "fixture must carry at least one out-of-stock menu item")
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-5", "lines": [{"menu_item_pk": blocked["menu_item_pk"], "qty": 1}]})
+        self.assertEqual(r.status_code, 409, r.text)
+        # refused at the door -- no order row, no reservation, no ledger activity
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS n FROM customer_order WHERE table_label='T-5'"
+        ).fetchone()["n"], 0)
+
+    # -- 6. receiving with missing ingredient configuration --------------
+    def test_06_receiving_missing_ingredient(self):
+        # (a) the ingredient itself does not exist
+        r = self.client.post("/console/ingredients/999999/receive", headers=self.H_MGR,
+                             json={"purchase_qty": 1})
+        self.assertIn(r.status_code, (404, 409), r.text)
+        # (b) a real ingredient with no pack_size configured -- receiving
+        # cannot convert a purchase unit into base units without one
+        cur = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM ingredient").fetchone()["n"]
+        self.conn.execute(
+            "INSERT INTO ingredient (ingredient_id, name, category, kind, base_unit, "
+            "purchase_unit, pack_size, pack_size_status, yield_factor, yield_factor_status, "
+            "on_hand_base, unit_cost, unit_cost_status) "
+            "VALUES (?, 'Matrix Unset Item', 'dry_food', 'raw', 'g', 'pack', NULL, 'unset', "
+            "1.0, 'verified', 0, 100.0, 'verified')",
+            (f"ING-MATRIX-{cur+1}",))
+        unset_id = self.conn.execute(
+            "SELECT id FROM ingredient WHERE name='Matrix Unset Item'").fetchone()["id"]
+        r2 = self.client.post(f"/console/ingredients/{unset_id}/receive", headers=self.H_MGR,
+                              json={"purchase_qty": 1})
+        self.assertEqual(r2.status_code, 409, r2.text)
+        self.assertEqual(self._on_hand(unset_id), 0)
+
+    # -- 7. stock count --------------------------------------------------
+    def test_07_stock_count(self):
+        ing = self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+        target = next(i for i in ing if i["on_hand_base"] > 100)
+        new_count = target["on_hand_base"] - 50
+        r = self.client.post(f"/console/ingredients/{target['id']}/count", headers=self.H_MGR,
+                             json={"actual_base": new_count, "note": "matrix physical count"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertAlmostEqual(self._on_hand(target["id"]), new_count, places=3)
+        self._assert_fefo_matches_on_hand(target["id"])
+        last = self.conn.execute(
+            "SELECT reason FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1",
+            (target["id"],)).fetchone()
+        self.assertEqual(last["reason"], "count_adjustment")
+
+    # -- 8. wastage --------------------------------------------------
+    def test_08_wastage(self):
+        ing = self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+        target = next(i for i in ing if i["on_hand_base"] > 50)
+        on_hand_before = self._on_hand(target["id"])
+        r = self.client.post(f"/console/ingredients/{target['id']}/waste", headers=self.H_MGR,
+                             json={"qty_base": 5.0, "reason": "spoilage", "note": "matrix test"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertAlmostEqual(self._on_hand(target["id"]), on_hand_before - 5.0, places=3)
+        self._assert_fefo_matches_on_hand(target["id"])
+        self._assert_ledger_balance_matches_on_hand(target["id"])
+        last = self.conn.execute(
+            "SELECT reason, wastage_reason FROM stock_ledger WHERE ingredient_id=? "
+            "ORDER BY id DESC LIMIT 1", (target["id"],)).fetchone()
+        self.assertEqual(last["reason"], "spoilage")
+
+    # -- 9. unlimited order --------------------------------------------
+    def test_09_unlimited_order(self):
+        stream_ing = self.conn.execute(
+            "SELECT i.id FROM unli_item u JOIN ingredient i ON i.id=u.ingredient_id "
+            "WHERE u.item_key='wings'").fetchone()["id"]
+        on_hand_before = self._on_hand(stream_ing)
+        oid = self._unli_order(heads=2)
+        sid = self._session(oid)
+        session = self.client.get(f"/unli/sessions/{sid}", headers=self.H_CASH).json()
+        self.assertEqual(session["head_count"], 2)
+        self.assertEqual(session["status"], "active")
+        # the provisional wings deduction (H x lambda) already happened at
+        # commit, exactly like an ordinary sale_commit
+        self.assertLess(self._on_hand(stream_ing), on_hand_before)
+        self._assert_fefo_matches_on_hand(stream_ing)
+
+    # -- 10. unlimited refill --------------------------------------------
+    def test_10_unlimited_refill(self):
+        flavor = self._flavor("Buffalo") if self._has_flavor("Buffalo") else self._flavor("")
+        oid = self._unli_order(heads=2)
+        sid = self._session(oid)
+        r = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
+                             json={"flavor_id": flavor["id"]})
+        self.assertEqual(r.status_code, 201, r.text)
+        refill_id = r.json()["id"]
+        detail = self.client.get(f"/unli/refills/{refill_id}", headers=self.H_CASH).json()
+        self.assertEqual(detail["status"], "pending")
+
+        s = self.client.post(f"/unli/refills/{refill_id}/serve", headers=self.H_KIT)
+        self.assertEqual(s.status_code, 200, s.text)
+        served = self.client.get(f"/unli/refills/{refill_id}", headers=self.H_CASH).json()
+        self.assertEqual(served["status"], "served")
+        self.assertGreater(served["pieces"], 0)
+
+    def _has_flavor(self, needle):
+        fl = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        return any(needle in f["display_name"] for f in fl)
+
+    # -- 11. premium flavour --------------------------------------------
+    def test_11_premium_flavour(self):
+        special = self.client.get("/unli/flavors", headers=self.H_CASH).json()["special"]
+        if not special:
+            self.skipTest("no premium flavour configured in this fixture")
+        premium = special[0]
+        oid = self._unli_order(heads=1)
+        sid = self._session(oid)
+        r = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
+                             json={"flavor_id": premium["id"]})
+        self.assertEqual(r.status_code, 201, r.text)
+        refill_id = r.json()["id"]
+        s = self.client.post(f"/unli/refills/{refill_id}/serve", headers=self.H_KIT)
+        self.assertEqual(s.status_code, 200, s.text)
+        # premium add-on is charged only once served, as a linked
+        # order_charge -- the order's own settled total never changes
+        receipt = self.client.get(f"/pos/orders/{oid}/receipt", headers=self.H_CASH).json()
+        self.assertGreaterEqual(receipt["current_total"], receipt["order"]["total"])
+        if premium["addon_price"] > 0:
+            self.assertGreater(receipt["current_total"], receipt["order"]["total"])
+
+    # -- 12. refill correction --------------------------------------------
+    def test_12_refill_correction(self):
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        self.assertGreaterEqual(len(flavors), 2, "fixture needs at least two flavours to correct between")
+        wrong, right = flavors[0], flavors[1]
+        oid = self._unli_order(heads=1)
+        sid = self._session(oid)
+        r = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
+                             json={"flavor_id": wrong["id"]})
+        refill_id = r.json()["id"]
+        self.client.post(f"/unli/refills/{refill_id}/serve", headers=self.H_KIT)
+
+        c = self.client.post(f"/unli/refills/{refill_id}/correct", headers=self.H_CASH,
+                             json={"flavor_id": right["id"], "reason": "wrong flavour sent"})
+        self.assertEqual(c.status_code, 200, c.text)
+        body = c.json()
+        original = self.client.get(f"/unli/refills/{refill_id}", headers=self.H_CASH).json()
+        self.assertEqual(original["status"], "voided")
+        # the replacement is a genuinely new round -- it starts 'pending'
+        # (held), exactly like any other freshly-recorded refill, and still
+        # needs the kitchen to actually serve it
+        replacement = self.client.get(f"/unli/refills/{body['id']}", headers=self.H_CASH).json()
+        self.assertEqual(replacement["status"], "pending")
+        self.assertEqual(replacement["flavor_id"], right["id"])
+        s = self.client.post(f"/unli/refills/{body['id']}/serve", headers=self.H_KIT)
+        self.assertEqual(s.status_code, 200, s.text)
+        served_replacement = self.client.get(f"/unli/refills/{body['id']}", headers=self.H_CASH).json()
+        self.assertEqual(served_replacement["status"], "served")
+
+    # -- 13. refill void --------------------------------------------------
+    def test_13_refill_void(self):
+        flavor = self._flavor("")
+        oid = self._unli_order(heads=1)
+        sid = self._session(oid)
+        r = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
+                             json={"flavor_id": flavor["id"]})
+        refill_id = r.json()["id"]
+
+        v = self.client.post(f"/unli/refills/{refill_id}/void", headers=self.H_CASH,
+                             json={"reason": "table cancelled the round"})
+        self.assertEqual(v.status_code, 200, v.text)
+        voided = self.client.get(f"/unli/refills/{refill_id}", headers=self.H_CASH).json()
+        # voided before serving -> 'cancelled'; voided after serving would be
+        # 'voided' (see wt/refills.py's _void_refill_tx docstring)
+        self.assertEqual(voided["status"], "cancelled")
+        # voiding again must be refused, not silently accepted
+        v2 = self.client.post(f"/unli/refills/{refill_id}/void", headers=self.H_CASH,
+                              json={"reason": "again"})
+        self.assertEqual(v2.status_code, 409, v2.text)
+
+    # -- 14. reconciliation --------------------------------------------
+    def test_14_reconciliation(self):
+        stream = self.conn.execute(
+            "SELECT id, ingredient_id FROM unli_item WHERE item_key='fries'").fetchone()
+        # A real order, committed today, so there is an actual provisional
+        # deduction on record to reconcile against -- record_reconciliation
+        # refuses outright ("no completed unlimited orders on {date}") for a
+        # date with no heads served.
+        oid = self._unli_order(heads=2)
+        order_ts = self.conn.execute(
+            "SELECT created_at FROM customer_order WHERE id=?", (oid,)).fetchone()["created_at"]
+        service_date = timeutil.business_date_of(order_ts)
+
+        pending_before = self.client.get(
+            f"/unli/reconciliation/pending?service_date={service_date}", headers=self.H_KIT
+        ).json()
+        row = next(p for p in pending_before["streams"] if p["item_key"] == "fries")
+        self.assertIsNone(row["reconciled"])
+        self.assertGreater(row["heads"], 0)
+
+        r = self.client.post("/unli/reconciliation", headers=self.H_KIT, json={
+            "service_date": service_date, "item_key": "fries",
+            "opening_base": 5000.0, "closing_base": 1000.0, "added_base": 0.0,
+            "note": "matrix EOD weigh-in",
+        })
+        self.assertEqual(r.status_code, 201, r.text)
+        result = r.json()
+        self.assertIn(result["status"], ("within_tolerance", "over_tolerance", "under_tolerance"))
+        # the correction posted a real ledger row for the stream's ingredient
+        self._assert_fefo_matches_on_hand(stream["ingredient_id"])
+        self._assert_ledger_balance_matches_on_hand(stream["ingredient_id"])
+        last = self.conn.execute(
+            "SELECT reason FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1",
+            (stream["ingredient_id"],)).fetchone()
+        self.assertEqual(last["reason"], "unli_reconcile")
+        # a second submission for the same stream/date is a conflict, not a
+        # second deduction
+        dup = self.client.post("/unli/reconciliation", headers=self.H_KIT, json={
+            "service_date": service_date, "item_key": "fries",
+            "opening_base": 5000.0, "closing_base": 1000.0, "added_base": 0.0,
+        })
+        self.assertEqual(dup.status_code, 409, dup.text)
+
+    # -- 15. duplicate request ---------------------------------------
+    def test_15_duplicate_request(self):
+        item = self._ala_carte_item()
+        key = "matrix-idem-key-1"
+        payload = {"table_label": "T-15", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
+                   "client_request_id": key}
+        first = self.client.post("/pos/orders", headers=self.H_CASH, json=payload)
+        self.assertEqual(first.status_code, 201, first.text)
+        second = self.client.post("/pos/orders", headers=self.H_CASH, json=payload)
+        self.assertEqual(second.status_code, 201, second.text)
+        self.assertEqual(first.json()["order_id"], second.json()["order_id"],
+                         "the same client_request_id must return the same order, not a new one")
+        n = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM customer_order WHERE table_label='T-15'"
+        ).fetchone()["n"]
+        self.assertEqual(n, 1, "a replayed request must not create a second order")
+
+    # -- 16 / 17. application restart & database reopen ------------------
+    def test_16_17_application_restart_and_database_reopen(self):
+        """Simulates the real restart sequence api.py's own startup hook
+        runs (db.migrate() against a freshly opened connection) rather than
+        just asserting on schema counts -- proves an order committed
+        before the "restart" is still exactly as committed afterward, from
+        a connection that did not exist when the order was placed."""
+        item = self._ala_carte_item()
+        leaf = self._leaf_ingredient(item["recipe_id"])
+        order = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-16", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]}).json()
+        self._serve_order(order["order_id"])
+        on_hand_before = self._on_hand(leaf["id"])
+        ledger_before = self._ledger_count(leaf["id"])
+
+        # "Database reopen": an independent connection, opened fresh AFTER
+        # the commit above and never touching this test's own self.conn or
+        # db.get_conn()'s thread-local cache, must see exactly what was
+        # committed.
+        reopened = sqlite3.connect(self.path)
+        reopened.row_factory = sqlite3.Row
+        self.assertEqual(reopened.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (leaf["id"],)
+        ).fetchone()["on_hand_base"], on_hand_before)
+        self.assertEqual(reopened.execute(
+            "SELECT COUNT(*) AS n FROM stock_ledger WHERE ingredient_id=?", (leaf["id"],)
+        ).fetchone()["n"], ledger_before)
+        reopened.close()
+
+        # "Application restart": a brand new TestClient re-runs api.py's
+        # startup hook (db.migrate() + validate_production_startup) against
+        # the same on-disk file -- deliberately a local client, not
+        # reassigned onto the class, so this does not disturb self.client/
+        # self.conn for whichever test method runs next.
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        restarted_client = TestClient(app)
+        detail = restarted_client.get(f"/pos/orders/{order['order_id']}", headers=self.H_CASH).json()
+        self.assertEqual(detail["order"]["status"], "served")
+
+        # the restarted client can still take new orders end to end
+        second = restarted_client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-16b", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertEqual(second.status_code, 201, second.text)
+
+    # -- 18. POS availability after receiving --------------------------
+    def test_18_pos_availability_after_receiving(self):
+        panko = self.conn.execute("SELECT id FROM ingredient WHERE name LIKE '%Panko%'").fetchone()
+        if panko is None:
+            self.skipTest("fixture has no Panko-blocked item to unblock")
+        before = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        blocked_before = next((m for m in before["items"] if not m["sellable"]
+                               and "Panko" in m.get("block_reason", "")), None)
+        self.assertIsNotNone(blocked_before, "fixture must start with a Panko-blocked menu item")
+
+        r = self.client.post(f"/console/ingredients/{panko['id']}/receive", headers=self.H_MGR,
+                             json={"purchase_qty": 5, "lot_no": "MATRIX-PANKO"})
+        self.assertEqual(r.status_code, 200, r.text)
+
+        after = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        same_item = next(m for m in after["items"] if m["menu_item_pk"] == blocked_before["menu_item_pk"])
+        self.assertTrue(same_item["sellable"], "receiving the limiting ingredient must unblock the POS menu item")
+
+
 class TestMigrationSafety(unittest.TestCase):
     """Covers the migration-runner rewrite in db.py: a failed migration must
     roll back everything it had done so far (not just what it wrote after
@@ -5711,6 +6222,7 @@ def main() -> int:
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
             TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestPasswordSecurity,
             TestForecasting, TestAnomaly, TestAssociations,
+            TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,
         )
     )

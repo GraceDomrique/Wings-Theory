@@ -7,17 +7,30 @@ and association rules land in Phase 3, on top of the ledger this phase produces.
 cd backend
 pip install -r requirements.txt
 
+# WT_ENV and WT_DB are both required now -- there is no default, and
+# db.db_path() refuses to start without them (see wt/db.py's environment()
+# and Phase 09A's go-live checklist, docs/GO_LIVE_CHECKLIST.md). Use
+# start_server_dev.ps1 for an actual dev server; the lines below are for
+# running the one-off scripts directly.
+export WT_ENV=development
+export WT_DB=dev/wings_theory_dev.db
+
 python -m wt.raw_import            # normalise the owner's raw spreadsheet exports
-python -m wt.seed --fresh          # build the DB from the tidy CSVs
-python -m tests.run_tests          # 364 tests
+python -m wt.seed --fresh          # build the DB from the tidy CSVs (requires WT_ALLOW_DESTRUCTIVE=1)
+python -m tests.run_tests          # 452 tests -- this suite sets its own WT_ENV=test internally
 python -m tests.audit_data         # source-vs-database completeness diff
 python -m tests.demo_flow          # end-to-end walk through the HTTP layer
-                                   # (writes real orders into the DB it finds)
+                                   # (writes real orders into the DB it finds;
+                                   # refuses to run under WT_ENV=production)
 uvicorn wt.api:app --host 0.0.0.0 --port 8000
 ```
 
 Default logins are `owner` / `manager` / `cashier1` / `kitchen1`, password
-`wingstheory`. Change `WT_SECRET` before this leaves a developer machine.
+`wingstheory` -- **not safe for production**. See
+`docs/GO_LIVE_CHECKLIST.md` for the required credential rotation
+(`POST /auth/change_password`) before this leaves a developer machine, and
+for the required `WT_SECRET` / `WT_ENV=production` setup
+(`start_server.ps1` already does this correctly for a real launch).
 
 ---
 
