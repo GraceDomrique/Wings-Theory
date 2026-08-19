@@ -18,13 +18,14 @@ $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
 # Production database path and environment, made explicit rather than left
-# to wt/db.py's WT_DB default — see BASELINE_SNAPSHOT.json's audit: dev,
-# test and prod previously all resolved to the same implicit path with
-# nothing distinguishing them. This launcher now names its target file
-# outright and marks itself as production, which turns on the startup
-# integrity gate and the default-secret refusal in wt/db.py
-# (validate_production_startup) — neither fires for a dev run that never
-# sets WT_ENV.
+# to any default — wt/db.py's db_path() has no fallback at all any more:
+# WT_ENV and WT_DB must both be set, and must agree (WT_ENV=production
+# requires WT_DB to be exactly this file; anything else is refused at
+# startup). This launcher names its target file outright and marks itself
+# as production, which turns on the startup integrity gate and the
+# default-secret refusal in wt/db.py (validate_production_startup) — the
+# dev launcher sets WT_ENV=development instead, which keeps it out of both
+# checks while still being refused if it were ever pointed at this file.
 $env:WT_DB = Join-Path $PSScriptRoot "wings_theory.db"
 $env:WT_ENV = "production"
 

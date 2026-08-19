@@ -30,13 +30,87 @@ from pathlib import Path
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 MIGRATIONS_DIR = BACKEND_DIR / "migrations"
 BACKUP_DIR = BACKEND_DIR / "backups"
-DEFAULT_DB = BACKEND_DIR / "wings_theory.db"
+# The one production database file that exists. Not a "default" any more --
+# see ConfigurationError below for why nothing ever falls back to this
+# silently. Kept under the old name too (DEFAULT_DB) only where an external
+# caller might import it; nothing outside this module does.
+PRODUCTION_DB = BACKEND_DIR / "wings_theory.db"
+DEFAULT_DB = PRODUCTION_DB  # noqa: same path, kept as an alias for clarity at call sites
+
+VALID_ENVIRONMENTS = ("production", "development", "test")
 
 _local = threading.local()
 
 
+class ConfigurationError(RuntimeError):
+    """Fail-closed startup/config error: the deployment environment or the
+    database target is missing, unrecognized, or inconsistent.
+
+    Deliberately a plain RuntimeError subclass, not a WTError -- this fires
+    before there is an HTTP request to attach a status code to (typically at
+    process startup, from a CLI script, or from the very first connection a
+    thread opens), and it must never be caught by the API layer's WTError
+    handler and turned into a JSON 4xx. It should crash the process."""
+
+
+def environment() -> str:
+    """The explicit, required deployment environment. There is no default:
+    an unset or unrecognized WT_ENV must refuse to start rather than
+    silently behaving as any one of production/development/test. Callers
+    that need to know "am I in production" must compare against this, never
+    against whether WT_DB happens to look like a particular path."""
+    env = os.environ.get("WT_ENV")
+    if not env:
+        raise ConfigurationError(
+            "WT_ENV is not set. Refusing to start. Set WT_ENV to one of "
+            f"{', '.join(VALID_ENVIRONMENTS)} before starting the application."
+        )
+    if env not in VALID_ENVIRONMENTS:
+        raise ConfigurationError(
+            f"WT_ENV={env!r} is not a recognized environment. "
+            f"Use one of {', '.join(VALID_ENVIRONMENTS)}."
+        )
+    return env
+
+
 def db_path() -> Path:
-    return Path(os.environ.get("WT_DB", str(DEFAULT_DB)))
+    """The database this process may open -- fail-closed on every axis.
+
+    WT_ENV and WT_DB must both be set explicitly; there is no fallback to
+    PRODUCTION_DB. A developer running `python -m uvicorn wt.api:app` with
+    nothing configured gets a clear refusal here instead of a working
+    connection to the shop's real database, which is what happened before
+    this function had any opinion about the pairing.
+
+    The pairing itself is validated, not just presence: WT_ENV=production
+    must point at PRODUCTION_DB and nothing else, and WT_ENV=development or
+    WT_ENV=test must point anywhere BUT PRODUCTION_DB. This is what makes
+    "production database opened by a non-production process" structurally
+    impossible rather than a matter of remembering to set WT_DB correctly --
+    the two variables cross-check each other.
+    """
+    env = environment()
+    raw = os.environ.get("WT_DB")
+    if not raw:
+        raise ConfigurationError(
+            "WT_DB is not set. Refusing to fall back to the production "
+            f"database ({PRODUCTION_DB}). Set WT_DB explicitly."
+        )
+    path = Path(raw)
+    is_memory = str(path) == ":memory:"
+    is_prod_path = (not is_memory) and path.resolve() == PRODUCTION_DB.resolve()
+    if env == "production" and not is_prod_path:
+        raise ConfigurationError(
+            f"WT_ENV=production but WT_DB={path} is not the production "
+            f"database ({PRODUCTION_DB}). Refusing to start."
+        )
+    if env != "production" and is_prod_path:
+        raise ConfigurationError(
+            f"WT_ENV={env} but WT_DB points at the production database "
+            f"({PRODUCTION_DB}). Refusing to open the production database "
+            "outside WT_ENV=production."
+        )
+    return path
 
 
 def connect(path: str | Path | None = None, *, check_same_thread: bool = True) -> sqlite3.Connection:
@@ -279,12 +353,17 @@ def integrity_report(conn: sqlite3.Connection | None = None) -> dict:
 
 def validate_production_startup(conn: sqlite3.Connection | None = None) -> None:
     """Refuses to start when WT_ENV=production is set but the deployment is
-    unsafe. A no-op in every other environment, so ordinary development and
-    test runs — which never set WT_ENV — are completely unaffected; this
-    only fires for a launcher that has explicitly opted into being treated
-    as production.
+    unsafe. A no-op in every other environment (development, test), so
+    those runs are unaffected by the checks below; this only fires for a
+    launcher that has explicitly opted into being treated as production.
+
+    db_path() (called earlier, via get_conn()/migrate() in api.py's startup
+    hook) has already refused to run at all if WT_ENV is unset/unrecognized
+    or if WT_DB doesn't match the environment. What's checked here is
+    additional and production-only: a real signing secret, and a database
+    that is actually in a healthy, migrated state.
     """
-    if os.environ.get("WT_ENV") != "production":
+    if environment() != "production":
         return
     from . import auth  # local import: auth does not import db, so this is
                          # one-directional, but importing it at module scope
@@ -294,19 +373,19 @@ def validate_production_startup(conn: sqlite3.Connection | None = None) -> None:
 
     secret = os.environ.get("WT_SECRET")
     if not secret or secret == auth.DEFAULT_SECRET:
-        raise RuntimeError(
+        raise ConfigurationError(
             "WT_ENV=production but WT_SECRET is unset or still the default — "
             "refusing to start with a forgeable signing key"
         )
     report = integrity_report(conn or get_conn())
     if report["integrity_check"] != "ok":
-        raise RuntimeError(f"database integrity check failed: {report['integrity_check']}")
+        raise ConfigurationError(f"database integrity check failed: {report['integrity_check']}")
     if report["foreign_key_violations"]:
-        raise RuntimeError(
+        raise ConfigurationError(
             f"{report['foreign_key_violations']} foreign key violation(s) found at startup"
         )
     if not report["schema_up_to_date"]:
-        raise RuntimeError(
+        raise ConfigurationError(
             f"database is at schema v{report['schema_version']}, "
             f"expected v{report['schema_head']} — migration did not complete"
         )
@@ -336,12 +415,45 @@ def require_destructive_confirmation(action: str) -> None:
 def reset(path: str | Path | None = None) -> sqlite3.Connection:
     """Drop and rebuild. Test helper — never call this against a live database.
 
+    Self-protecting, not just CLI-wrapper-protected: seed.py's operator CLI
+    additionally requires an interactive filename confirmation before it
+    ever calls this (require_destructive_confirmation), but that guard lives
+    one layer up and would not stop a future script that imports db.reset()
+    directly. So the checks below run inside this function itself, on every
+    call, regardless of caller or whether an explicit path was passed:
+
+      production  -> always refused, unconditionally. Neither WT_ALLOW_
+                     DESTRUCTIVE nor an explicit path override this.
+      development -> refused unless WT_ALLOW_DESTRUCTIVE=1 is set.
+      test        -> proceeds freely; this is what the test suite needs on
+                     every run and must not be made to require an opt-in.
+
+    The production check is duplicated deliberately: once via WT_ENV
+    (environment() == "production" refuses outright) and once via the
+    resolved target path actually being PRODUCTION_DB, even if a caller
+    passed that path explicitly while WT_ENV was something else. Either
+    condition alone is enough to refuse.
+
     The rebuilt connection is registered as this thread's connection. Returning
     an unregistered one would leave a later get_conn() opening a *second*
     handle on the same file, which on Windows keeps the file locked after the
     caller thinks it has closed everything.
     """
     target = Path(path or db_path())
+    env = environment()
+    is_prod_path = str(target) != ":memory:" and target.resolve() == PRODUCTION_DB.resolve()
+    if env == "production" or is_prod_path:
+        raise ConfigurationError(
+            f"refusing to reset {target}: this is the production database "
+            "and/or WT_ENV=production. db.reset() can never run against "
+            "production, regardless of how it was called."
+        )
+    if env == "development" and os.environ.get("WT_ALLOW_DESTRUCTIVE") != "1":
+        raise ConfigurationError(
+            f"refusing to reset {target}: WT_ENV=development requires "
+            "WT_ALLOW_DESTRUCTIVE=1 in the environment to authorize a "
+            "destructive reset."
+        )
     close_conn()
     if str(target) != ":memory:":
         for suffix in ("", "-wal", "-shm"):

@@ -934,6 +934,7 @@ class TestSeedImport(unittest.TestCase):
         except FileNotFoundError:
             pass
         os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
         db.close_conn()
         from wt import seed
         cls.stats = seed.run(fresh=True)
@@ -943,6 +944,7 @@ class TestSeedImport(unittest.TestCase):
     def tearDownClass(cls):
         db.close_conn()
         os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
     def test_every_source_stock_item_is_present(self):
@@ -1147,6 +1149,7 @@ class TestVerificationWorkflow(unittest.TestCase):
         except FileNotFoundError:
             pass
         os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
@@ -1156,6 +1159,7 @@ class TestVerificationWorkflow(unittest.TestCase):
     def tearDownClass(cls):
         db.close_conn()
         os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
     def test_queue_translates_every_field_into_plain_language_with_a_priority(self):
@@ -1380,6 +1384,7 @@ class TestConsoleAPI(unittest.TestCase):
         except FileNotFoundError:
             pass
         os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
@@ -1400,6 +1405,7 @@ class TestConsoleAPI(unittest.TestCase):
     def tearDownClass(cls):
         db.close_conn()
         os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
     def _punch_and_commit_one(self):
@@ -3045,6 +3051,7 @@ class TestUnliRBAC(unittest.TestCase):
         except FileNotFoundError:
             pass
         os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
@@ -3064,6 +3071,7 @@ class TestUnliRBAC(unittest.TestCase):
     def tearDownClass(cls):
         db.close_conn()
         os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
     def test_kitchen_may_read_the_reconciliation_worksheet(self):
@@ -3874,6 +3882,7 @@ class TestRefillAPI(unittest.TestCase):
         except FileNotFoundError:
             pass
         os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
@@ -3893,6 +3902,7 @@ class TestRefillAPI(unittest.TestCase):
     def tearDownClass(cls):
         db.close_conn()
         os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
     def _flavor(self, needle):
@@ -4071,6 +4081,7 @@ class TestReferenceAlignment(unittest.TestCase):
         except FileNotFoundError:
             pass
         os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
         db.close_conn()
         from wt import seed
         cls.stats = seed.run(fresh=True)
@@ -4080,6 +4091,7 @@ class TestReferenceAlignment(unittest.TestCase):
     def tearDownClass(cls):
         db.close_conn()
         os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
     def _flavor_recipes(self):
@@ -4569,6 +4581,7 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
         except FileNotFoundError:
             pass
         os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
@@ -4587,6 +4600,7 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
     def tearDownClass(cls):
         db.close_conn()
         os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
     def _unli_item(self):
@@ -4926,8 +4940,187 @@ class TestMigrationSafety(unittest.TestCase):
 
     def test_require_destructive_confirmation_refuses_without_env_opt_in(self):
         os.environ.pop("WT_ALLOW_DESTRUCTIVE", None)
-        with self.assertRaises(SystemExit):
-            db.require_destructive_confirmation("do something destructive")
+        os.environ["WT_ENV"] = "test"
+        os.environ["WT_DB"] = self.db_path
+        try:
+            with self.assertRaises(SystemExit):
+                db.require_destructive_confirmation("do something destructive")
+        finally:
+            os.environ.pop("WT_ENV", None)
+            os.environ.pop("WT_DB", None)
+
+
+class TestEnvironmentSafety(unittest.TestCase):
+    """P0-1: db_path() must never fall back to the production database, and
+    the WT_ENV/WT_DB pairing is validated on every call rather than trusted.
+    Covers every combination the go-live checklist calls out: unconfigured,
+    each environment against the wrong database, and reset()'s own
+    self-protection (which must hold even when a caller bypasses db_path()
+    by passing an explicit path)."""
+
+    ENV_KEYS = ("WT_ENV", "WT_DB", "WT_SECRET", "WT_ALLOW_DESTRUCTIVE")
+    DEV_DB_PATH = str(db.BACKEND_DIR / "dev" / "wings_theory_dev.db")
+
+    def setUp(self):
+        self._saved = {k: os.environ.get(k) for k in self.ENV_KEYS}
+        for k in self.ENV_KEYS:
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        db.close_conn()
+
+    # -- unconfigured / malformed -----------------------------------------
+    def test_unconfigured_refuses_to_start(self):
+        with self.assertRaises(db.ConfigurationError):
+            db.db_path()
+
+    def test_env_set_but_db_missing_refuses(self):
+        os.environ["WT_ENV"] = "development"
+        with self.assertRaises(db.ConfigurationError):
+            db.db_path()
+
+    def test_db_set_but_env_missing_refuses(self):
+        os.environ["WT_DB"] = "somewhere.db"
+        with self.assertRaises(db.ConfigurationError):
+            db.db_path()
+
+    def test_unrecognized_env_refuses(self):
+        os.environ["WT_ENV"] = "staging"
+        os.environ["WT_DB"] = "somewhere.db"
+        with self.assertRaises(db.ConfigurationError):
+            db.db_path()
+
+    # -- WT_ENV / WT_DB pairing --------------------------------------------
+    def test_production_env_requires_production_path(self):
+        os.environ["WT_ENV"] = "production"
+        os.environ["WT_DB"] = self.DEV_DB_PATH
+        with self.assertRaises(db.ConfigurationError):
+            db.db_path()
+
+    def test_production_env_with_production_path_succeeds(self):
+        os.environ["WT_ENV"] = "production"
+        os.environ["WT_DB"] = str(db.PRODUCTION_DB)
+        self.assertEqual(db.db_path().resolve(), db.PRODUCTION_DB.resolve())
+
+    def test_development_env_refuses_production_path(self):
+        os.environ["WT_ENV"] = "development"
+        os.environ["WT_DB"] = str(db.PRODUCTION_DB)
+        with self.assertRaises(db.ConfigurationError):
+            db.db_path()
+
+    def test_development_env_with_dev_path_succeeds(self):
+        os.environ["WT_ENV"] = "development"
+        os.environ["WT_DB"] = self.DEV_DB_PATH
+        self.assertTrue(str(db.db_path()).endswith("wings_theory_dev.db"))
+
+    def test_test_env_refuses_production_path(self):
+        os.environ["WT_ENV"] = "test"
+        os.environ["WT_DB"] = str(db.PRODUCTION_DB)
+        with self.assertRaises(db.ConfigurationError):
+            db.db_path()
+
+    def test_test_env_with_tempfile_succeeds(self):
+        os.environ["WT_ENV"] = "test"
+        os.environ["WT_DB"] = str(Path(tempfile.gettempdir()) / "wt_env_safety_test.db")
+        self.assertTrue(str(db.db_path()).endswith("wt_env_safety_test.db"))
+
+    # -- reset() self-protection -------------------------------------------
+    def test_reset_refuses_in_production_regardless_of_path(self):
+        os.environ["WT_ENV"] = "production"
+        os.environ["WT_DB"] = str(db.PRODUCTION_DB)
+        with self.assertRaises(db.ConfigurationError):
+            db.reset()
+
+    def test_reset_refuses_explicit_production_path_even_under_other_env(self):
+        # The exact gap this hardening closes: a caller that bypasses
+        # db_path() entirely by passing an explicit path.
+        os.environ["WT_ENV"] = "development"
+        os.environ["WT_DB"] = self.DEV_DB_PATH
+        with self.assertRaises(db.ConfigurationError):
+            db.reset(path=db.PRODUCTION_DB)
+
+    def test_reset_refuses_in_development_without_explicit_authorization(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(path)
+        os.environ["WT_ENV"] = "development"
+        os.environ["WT_DB"] = path
+        try:
+            with self.assertRaises(db.ConfigurationError):
+                db.reset()
+        finally:
+            scrub(path)
+
+    def test_reset_allowed_in_development_with_explicit_authorization(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(path)
+        os.environ["WT_ENV"] = "development"
+        os.environ["WT_DB"] = path
+        os.environ["WT_ALLOW_DESTRUCTIVE"] = "1"
+        try:
+            conn = db.reset()
+            head = max(v for v, _, _ in db._discover())
+            self.assertEqual(db.applied_version(conn), head)
+        finally:
+            db.close_conn()
+            scrub(path)
+
+    def test_reset_allowed_in_test_without_authorization(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        os.unlink(path)
+        os.environ["WT_ENV"] = "test"
+        os.environ["WT_DB"] = path
+        try:
+            conn = db.reset()
+            head = max(v for v, _, _ in db._discover())
+            self.assertEqual(db.applied_version(conn), head)
+        finally:
+            db.close_conn()
+            scrub(path)
+
+    # -- validate_production_startup: secret checks -------------------------
+    def test_production_startup_refuses_missing_secret(self):
+        os.environ["WT_ENV"] = "production"
+        with self.assertRaises(db.ConfigurationError):
+            db.validate_production_startup()
+
+    def test_production_startup_refuses_default_secret(self):
+        from wt.auth import DEFAULT_SECRET
+        os.environ["WT_ENV"] = "production"
+        os.environ["WT_SECRET"] = DEFAULT_SECRET
+        with self.assertRaises(db.ConfigurationError):
+            db.validate_production_startup()
+
+    def test_production_startup_passes_with_real_secret_and_healthy_db(self):
+        os.environ["WT_ENV"] = "production"
+        os.environ["WT_SECRET"] = "a-real-random-secret-value-not-the-default"
+        # integrity_report() reads db_path() for its informational
+        # "database_path" field even when given an explicit conn, so WT_DB
+        # must resolve for WT_ENV=production here too -- exactly the
+        # pairing a real production launch always has set together.
+        os.environ["WT_DB"] = str(db.PRODUCTION_DB)
+        conn, path = fresh_db()
+        try:
+            db.validate_production_startup(conn)  # must not raise
+        finally:
+            conn.close()
+            scrub(path)
+
+    def test_non_production_env_skips_secret_checks(self):
+        os.environ["WT_ENV"] = "development"
+        conn, path = fresh_db()
+        try:
+            db.validate_production_startup(conn)  # no-op, must not raise
+        finally:
+            conn.close()
+            scrub(path)
 
 
 def main() -> int:
@@ -4945,7 +5138,7 @@ def main() -> int:
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
             TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestForecasting, TestAnomaly, TestAssociations,
-            TestMigrationSafety,
+            TestMigrationSafety, TestEnvironmentSafety,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

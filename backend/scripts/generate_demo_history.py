@@ -42,6 +42,7 @@ def main() -> int:
     # ---- 1. Target verification, before importing anything that could
     # touch a database ------------------------------------------------
     os.environ["WT_DB"] = str(DEV_DB)
+    os.environ["WT_ENV"] = "development"
     resolved = DEV_DB.resolve()
     print(f"Target database (explicit): {resolved}")
     if resolved == PROD_DB.resolve():

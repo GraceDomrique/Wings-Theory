@@ -20,6 +20,7 @@ venv/
 .env
 .env.*
 backend/.secret
+backend/dev/.secret
 
 # OS noise
 .DS_Store
