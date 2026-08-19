@@ -38,8 +38,29 @@ from .units import format_base, normalise_label, to_base
 
 app = FastAPI(title="Wings Theory", version="0.2.0",
               description="Inventory & POS backend — Phase 2 (data model & deduction)")
+# Phase 09A section 9 audit: this app serves its own frontend (see the
+# FileResponse routes for /pos, /kds, /console near the bottom of this file)
+# on the exact same host:port every API call goes to, so the real POS/KDS/
+# console clients never make a cross-origin request in the first place --
+# CORS is not what stands between them and the API. allow_origins=["*"] is
+# left as-is rather than narrowed to a guessed value: start_server.ps1's own
+# comments explain why there is no one fixed production origin to restrict
+# to yet (the LAN IP a tablet reaches this on changes with the network, e.g.
+# a phone hotspot reassigning it) -- inventing one here would be exactly the
+# "blind change" this audit was told not to make. See
+# docs/GO_LIVE_CHECKLIST.md for this as an open deployment-configuration
+# item: if this ever moves behind a fixed domain or reverse proxy,
+# allow_origins should be narrowed to it then, not guessed now.
+#
+# allow_methods/allow_headers ARE narrowed here, to what the API actually
+# uses (GET/POST/PATCH; Authorization + Content-Type) -- unlike the origin,
+# this is not a guess, it's what grepping every @app.get/post/patch/put/
+# delete in this file actually shows, and narrowing it costs nothing any
+# real caller currently uses.
 app.add_middleware(
-    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"],
+    allow_methods=["GET", "POST", "PATCH"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 

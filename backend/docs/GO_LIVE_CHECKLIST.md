@@ -103,3 +103,23 @@ proven against disposable copies only (see BACKUP_RESTORE.md's own test
 log). The owner or an admin should run one real restore drill against a
 copy of the production database before relying on this procedure during
 an actual incident.
+
+---
+
+## 4. CORS origin (section 9 — open deployment-configuration item)
+
+`wt/api.py` still sets `allow_origins=["*"]`. This was reviewed, not left
+by default: the app serves its own frontend (`/pos`, `/kds`, `/console`
+are FastAPI routes returning the static HTML directly), so every real
+client request is same-origin already and CORS is not what stands between
+a tablet and the API. `allow_methods`/`allow_headers` were narrowed to
+what the API actually uses (`GET`/`POST`/`PATCH`, `Authorization` +
+`Content-Type`); `allow_origins` was deliberately **not** narrowed to a
+guessed value, because there isn't a fixed one yet — `start_server.ps1`
+reprints a new LAN address whenever a phone hotspot reassigns one, so a
+hardcoded origin would break on the next network change.
+
+**If this deployment ever moves behind a fixed domain or reverse proxy**
+(a static LAN hostname, a real domain, a router with a DHCP reservation),
+`allow_origins` should be narrowed to that one value at that point. Until
+then, this is an accepted, documented tradeoff — not an oversight.
