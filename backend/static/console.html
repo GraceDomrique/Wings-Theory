@@ -4,117 +4,39 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wings Theory — Operations Console</title>
+<link rel="stylesheet" href="/assets/design-system.css">
+<link rel="stylesheet" href="/assets/brand.css">
 <style>
-/* ============================================================
-   TOKENS
-   Semantic colours carry TWO ramps: --x-fill for fills/dots/bars,
-   --x-text for type on a wash (the raw fills fail contrast as text).
-   ============================================================ */
-:root{
-  --amber:#F4B400; --amber-press:#DCA200; --amber-wash:#FEF6E0; --amber-text:#8A6100;
-  --charcoal:#1F1F1F;
-  --bg:#F7F8FA; --card:#FFFFFF; --sunken:#F2F4F7;
-  --text:#2D2D2D; --text-2:#6B7280; --text-3:#9AA1AC;
-  --border:#E5E7EB; --border-soft:#EFF1F4;
-
-  --ok-fill:#34C759;   --ok-text:#1B6E3C;   --ok-wash:#EAF7EE;
-  --warn-fill:#FF9500; --warn-text:#8A5000; --warn-wash:#FFF4E5;
-  --bad-fill:#FF3B30;  --bad-text:#B3261E;  --bad-wash:#FEECEB;
-  --info-fill:#3B82F6; --info-text:#1D4ED8; --info-wash:#EAF1FE;
-  --fore-fill:#8B5CF6; --fore-text:#6D28D9; --fore-wash:#F1ECFE;
-
-  --sh-1:0 1px 2px rgba(16,24,40,.05);
-  --sh-2:0 1px 3px rgba(16,24,40,.07),0 1px 2px rgba(16,24,40,.04);
-  --sh-3:0 4px 12px rgba(16,24,40,.07),0 1px 3px rgba(16,24,40,.04);
-
-  --r-card:12px; --r-btn:16px; --r-input:10px; --r-chip:6px;
-  --s1:8px; --s2:16px; --s3:24px; --s4:32px; --s5:40px; --s6:48px;
-
-  --sans:"Inter","SF Pro Text",-apple-system,BlinkMacSystemFont,"Segoe UI Variable Text","Segoe UI",Roboto,"Manrope",sans-serif;
-  --mono:ui-monospace,"SF Mono","Cascadia Mono",Consolas,monospace;
-
-  --rail:248px; --head:60px; --dur:200ms; --ease:cubic-bezier(.32,.72,0,1);
-  color-scheme:light;
-}
-/* Dark ramp. Washes become deep tints and the *-text colours lighten —
-   a dark chip using the light theme's dark-green label is unreadable. */
-@media (prefers-color-scheme:dark){
-  :root:not([data-theme="light"]){
-    --bg:#111214; --card:#191B1E; --sunken:#212429;
-    --text:#E8EAED; --text-2:#9BA1AA; --text-3:#6E747D;
-    --border:#2A2E34; --border-soft:#232629;
-    --amber-wash:#2A2210; --amber-text:#F4B400;
-    --ok-text:#5FD37F; --ok-wash:#14261A;
-    --warn-text:#FFB24D; --warn-wash:#2A1F10;
-    --bad-text:#FF8177; --bad-wash:#2B1614;
-    --info-text:#7FAEFF; --info-wash:#141D2E;
-    --fore-text:#B79BFB; --fore-wash:#1E1830;
-    --sh-1:0 1px 2px rgba(0,0,0,.4);
-    --sh-2:0 1px 3px rgba(0,0,0,.45);
-    --sh-3:0 4px 14px rgba(0,0,0,.5);
-    color-scheme:dark;
-  }
-}
-:root[data-theme="dark"]{
-  --bg:#111214; --card:#191B1E; --sunken:#212429;
-  --text:#E8EAED; --text-2:#9BA1AA; --text-3:#6E747D;
-  --border:#2A2E34; --border-soft:#232629;
-  --amber-wash:#2A2210; --amber-text:#F4B400;
-  --ok-text:#5FD37F; --ok-wash:#14261A;
-  --warn-text:#FFB24D; --warn-wash:#2A1F10;
-  --bad-text:#FF8177; --bad-wash:#2B1614;
-  --info-text:#7FAEFF; --info-wash:#141D2E;
-  --fore-text:#B79BFB; --fore-wash:#1E1830;
-  --sh-1:0 1px 2px rgba(0,0,0,.4);
-  --sh-2:0 1px 3px rgba(0,0,0,.45);
-  --sh-3:0 4px 14px rgba(0,0,0,.5);
-  color-scheme:dark;
-}
-:root[data-theme="light"]{
-  --bg:#F7F8FA; --card:#FFFFFF; --sunken:#F2F4F7;
-  --text:#2D2D2D; --text-2:#6B7280; --text-3:#9AA1AC;
-  --border:#E5E7EB; --border-soft:#EFF1F4;
-  --amber-wash:#FEF6E0; --amber-text:#8A6100;
-  --ok-text:#1B6E3C; --ok-wash:#EAF7EE;
-  --warn-text:#8A5000; --warn-wash:#FFF4E5;
-  --bad-text:#B3261E; --bad-wash:#FEECEB;
-  --info-text:#1D4ED8; --info-wash:#EAF1FE;
-  --fore-text:#6D28D9; --fore-wash:#F1ECFE;
-  --sh-1:0 1px 2px rgba(16,24,40,.05);
-  --sh-2:0 1px 3px rgba(16,24,40,.07),0 1px 2px rgba(16,24,40,.04);
-  --sh-3:0 4px 12px rgba(16,24,40,.07),0 1px 3px rgba(16,24,40,.04);
-  color-scheme:light;
-}
+/* Console-specific layout only — every color/type/spacing token, and every
+   reusable primitive (.card/.btn/.chip/.field/table/.kpi/.status-band/
+   .action-strip/modal/drawer/toast/chart/etc.), lives in
+   /assets/design-system.css, shared with pos.html and kds.html. Nothing
+   below redefines a token; this file only lays out the console's own
+   shell (rail, header, work area) and page furniture the other two apps
+   don't have. */
+:root{ --rail:252px; --head:64px; }
 
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);
-  font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
-button,input,select{font:inherit;color:inherit}
-button{cursor:pointer;background:none;border:0;padding:0}
-:focus-visible{outline:2px solid var(--amber);outline-offset:2px;border-radius:4px}
-.num{font-variant-numeric:tabular-nums}
-.mono{font-family:var(--mono)}
-.hide{display:none!important}
-a{color:inherit}
-@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+body{margin:0;font-family:var(--font-sans);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+a{color:var(--amber-text)}
 
 /* ================= LOGIN ================= */
 #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-  background:var(--charcoal);padding:20px;z-index:90}
-.login-box{background:var(--card);border-radius:16px;padding:var(--s4) var(--s3);width:100%;max-width:370px;
-  box-shadow:0 20px 50px rgba(0,0,0,.34)}
+  background:var(--ink-0);padding:20px;z-index:90}
+.login-box{background:var(--ink-1);border:1px solid var(--line);border-radius:16px;
+  padding:var(--s4) var(--s3);width:100%;max-width:380px;box-shadow:var(--sh-3)}
 .login-mark{height:44px;display:inline-flex;align-items:center;margin-bottom:var(--s2)}
 .login-mark img{height:100%;width:auto;display:block}
-.login-box h1{font-size:20px;font-weight:600;margin:0 0 3px;letter-spacing:-.02em}
-.login-box .lead{color:var(--text-3);font-size:13px;margin:0 0 var(--s3)}
-.login-box label{display:block;font-size:12px;font-weight:500;color:var(--text-2);margin-bottom:5px}
-.login-box .field{margin-bottom:var(--s2);height:42px;font-size:15px}
+.login-box h1{font-family:var(--font-display);font-size:22px;font-weight:600;margin:0 0 4px;letter-spacing:-.01em;color:var(--text-0)}
+.login-box .lead{color:var(--text-2);font-size:13px;margin:0 0 var(--s3)}
+.login-box label{display:block;font-size:12px;font-weight:500;color:var(--text-1);margin-bottom:5px}
+.login-box .field{margin-bottom:var(--s2);height:44px;font-size:15px}
 .pass-wrap{position:relative}
 .login-box .pass-wrap{margin-bottom:var(--s2)}
 .login-box .pass-wrap .field{margin-bottom:0;padding-right:40px}
 .pass-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;
   padding:8px;border-radius:8px;display:flex;color:var(--text-3);cursor:pointer}
-.pass-toggle:hover{color:var(--text)}
+.pass-toggle:hover{color:var(--text-0)}
 .pass-toggle svg{width:16px;height:16px;display:block}
 #loginErr{color:var(--bad-text);font-size:12.5px;margin-top:10px;min-height:16px}
 
@@ -122,11 +44,11 @@ a{color:inherit}
 .app{display:grid;grid-template-columns:var(--rail) 1fr;min-height:100vh}
 .app.rail-sm{--rail:64px}
 
-.rail{background:var(--card);border-right:1px solid var(--border);
+.rail{background:var(--ink-1);border-right:1px solid var(--line);
   display:flex;flex-direction:column;position:sticky;top:0;height:100vh;z-index:40}
 .brand{height:var(--head);display:flex;align-items:center;gap:10px;
-  padding:0 var(--s2);border-bottom:1px solid var(--border-soft);flex-shrink:0}
-.brand-mark{height:30px;display:inline-flex;align-items:center;flex-shrink:0}
+  padding:0 var(--s2);border-bottom:1px solid var(--line-soft);flex-shrink:0}
+.brand-mark{height:32px;display:inline-flex;align-items:center;flex-shrink:0}
 .brand-mark img{height:100%;width:auto;display:block}
 .brand-txt{display:flex;flex-direction:column;line-height:1.15;overflow:hidden;white-space:nowrap}
 .brand-txt span{font-size:10px;color:var(--text-3);letter-spacing:.06em;text-transform:uppercase}
@@ -143,338 +65,57 @@ a{color:inherit}
 .nav-i span.lbl{white-space:nowrap;overflow:hidden}
 .rail-sm .nav-i span.lbl{display:none}
 .rail-sm .nav-i{justify-content:center;padding:9px}
-.nav-i:hover{background:var(--sunken);color:var(--text)}
+.nav-i:hover{background:var(--ink-2);color:var(--text-0)}
 .nav-i.on{background:var(--amber-wash);color:var(--amber-text);font-weight:600}
 .nav-i.on::before{content:"";position:absolute;left:-10px;top:7px;bottom:7px;width:3px;
   background:var(--amber);border-radius:0 3px 3px 0}
-.nav-i .badge{margin-left:auto;background:var(--bad-fill);color:#fff;font-size:10.5px;
+.nav-i .badge{margin-left:auto;background:var(--bad);color:#fff;font-size:10.5px;
   font-weight:600;padding:1px 6px;border-radius:99px;line-height:1.5}
 .rail-sm .nav-i .badge{display:none}
 
-.rail-foot{border-top:1px solid var(--border-soft);padding:10px;display:flex;
+.rail-foot{border-top:1px solid var(--line-soft);padding:10px;display:flex;
   align-items:center;gap:10px}
-.avatar{width:30px;height:30px;border-radius:99px;background:var(--charcoal);color:var(--amber);
+.avatar{width:30px;height:30px;border-radius:99px;background:var(--ink-4);color:var(--amber);
   display:grid;place-items:center;font-size:11.5px;font-weight:600;flex-shrink:0}
 .who{display:flex;flex-direction:column;line-height:1.25;overflow:hidden;flex:1}
-.who b{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.who b{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text-0)}
 .who span{font-size:11px;color:var(--text-3)}
 .rail-sm .who,.rail-sm .rail-foot .icon-btn{display:none}
 
 /* ================= HEADER ================= */
 .main{display:flex;flex-direction:column;min-width:0}
-.head{height:var(--head);border-bottom:1px solid var(--border);background:var(--card);
+.head{height:var(--head);border-bottom:1px solid var(--line);background:var(--ink-1);
   display:flex;align-items:center;gap:var(--s2);padding:0 var(--s3);position:sticky;top:0;z-index:30}
-.head h1{font-size:16px;font-weight:600;letter-spacing:-.015em;margin:0;white-space:nowrap}
-.head-sub{font-size:12px;color:var(--text-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw}
+.head h1{font-family:var(--font-display);font-size:20px;font-weight:600;letter-spacing:-.01em;margin:0;white-space:nowrap;color:var(--text-0)}
+.head-sub{font-size:12px;color:var(--text-2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw}
 .head-r{margin-left:auto;display:flex;align-items:center;gap:var(--s1)}
 
-.kbar{display:flex;align-items:center;gap:8px;background:var(--sunken);
+.kbar{display:flex;align-items:center;gap:8px;background:var(--ink-2);
   border:1px solid transparent;border-radius:var(--r-input);padding:6px 10px;
   color:var(--text-3);font-size:12.5px;min-width:230px;
   transition:border-color var(--dur) var(--ease),background var(--dur) var(--ease)}
-.kbar:hover{border-color:var(--border);background:var(--card)}
+.kbar:hover{border-color:var(--line);background:var(--ink-1)}
 .kbar svg{width:15px;height:15px}
-.kbar kbd{margin-left:auto;font-family:var(--mono);font-size:10.5px;border:1px solid var(--border);
-  border-radius:4px;padding:1px 5px;background:var(--card);color:var(--text-3)}
+.kbar kbd{margin-left:auto;font-family:var(--font-mono);font-size:10.5px;border:1px solid var(--line);
+  border-radius:4px;padding:1px 5px;background:var(--ink-1);color:var(--text-3)}
 
 .icon-btn{width:34px;height:34px;border-radius:9px;display:grid;place-items:center;
   color:var(--text-2);position:relative;transition:background var(--dur) var(--ease)}
-.icon-btn:hover{background:var(--sunken);color:var(--text)}
+.icon-btn:hover{background:var(--ink-2);color:var(--text-0)}
 .icon-btn svg{width:17px;height:17px}
 .icon-btn.spin svg{animation:spin 700ms linear}
 @keyframes spin{to{transform:rotate(360deg)}}
 
 #errBanner{background:var(--bad-wash);color:var(--bad-text);padding:10px var(--s3);font-size:12.5px;
-  display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border-soft)}
+  display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--line-soft)}
 #errBanner button{border:1px solid var(--bad-text);border-radius:7px;padding:4px 10px;
   font-size:11.5px;color:var(--bad-text);margin-left:auto}
 
-.work{padding:var(--s3);display:flex;flex-direction:column;gap:var(--s3);flex:1;min-width:0}
+.work{padding:var(--s3);display:flex;flex-direction:column;gap:var(--s3);flex:1;min-width:0;max-width:1400px;margin:0 auto;width:100%}
 .view{animation:enter var(--dur) var(--ease) both}
 @keyframes enter{from{opacity:0;transform:scale(.985) translateY(4px)}to{opacity:1;transform:none}}
 
-/* ================= PRIMITIVES ================= */
-.card{background:var(--card);border:1px solid var(--border);border-radius:var(--r-card);box-shadow:var(--sh-1)}
-.card-h{display:flex;align-items:flex-start;gap:var(--s2);padding:var(--s2) var(--s3);
-  border-bottom:1px solid var(--border-soft);flex-wrap:wrap}
-.card-h>div:first-child{min-width:0;flex:1 1 auto}
-.card-h h2{font-size:14px;font-weight:600;margin:0;letter-spacing:-.01em}
-.card-h p{font-size:12px;color:var(--text-3);margin:2px 0 0;line-height:1.45}
-.card-h .r{margin-left:auto;display:flex;gap:var(--s1);align-items:center;flex-wrap:wrap;justify-content:flex-end}
-.card-b{padding:var(--s3)}
-.card-b.tight{padding:var(--s2)}
-.card.flat{box-shadow:none}
-
-.sec-t{display:flex;align-items:baseline;gap:10px;margin-bottom:-8px;flex-wrap:wrap}
-.sec-t h2{font-size:13px;font-weight:600;letter-spacing:.02em;margin:0;text-transform:uppercase;color:var(--text-2)}
-.sec-t p{font-size:12.5px;color:var(--text-3);margin:0}
-.sec-t .r{margin-left:auto}
-
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:36px;padding:0 14px;
-  border-radius:var(--r-btn);font-size:13px;font-weight:500;white-space:nowrap;position:relative;overflow:hidden;
-  transition:background var(--dur) var(--ease),border-color var(--dur) var(--ease),
-             box-shadow var(--dur) var(--ease),transform var(--dur) var(--ease)}
-.btn svg{width:15px;height:15px}
-.btn-p{background:var(--amber);color:#1F1F1F;font-weight:600;box-shadow:var(--sh-1)}
-.btn-p:hover{background:var(--amber-press);box-shadow:var(--sh-2)}
-.btn-s{background:var(--card);color:var(--text);border:1px solid var(--border)}
-.btn-s:hover{background:var(--sunken);border-color:var(--text-3)}
-.btn-d{background:var(--bad-fill);color:#fff;font-weight:600}
-.btn-d:hover{filter:brightness(.93)}
-.btn-g{color:var(--text-2)}
-.btn-g:hover{background:var(--sunken);color:var(--text)}
-.btn:active{transform:scale(.98)}
-.btn-sm{height:30px;padding:0 10px;font-size:12.5px;border-radius:9px}
-.btn-lg{height:44px;padding:0 20px;font-size:15px;width:100%}
-.btn[disabled]{opacity:.45;pointer-events:none}
-.ripple{position:absolute;border-radius:99px;transform:scale(0);background:rgba(0,0,0,.13);
-  animation:rip 450ms var(--ease) forwards;pointer-events:none}
-@keyframes rip{to{transform:scale(2.6);opacity:0}}
-.toolbar{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-
-.chip{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;font-weight:600;
-  padding:2px 8px;border-radius:var(--r-chip);white-space:nowrap;line-height:1.6}
-.chip::before{content:"";width:6px;height:6px;border-radius:99px;background:currentColor;flex-shrink:0}
-.chip.no-dot::before{display:none}
-.chip.ok,.chip.c-ok{background:var(--ok-wash);color:var(--ok-text)}
-.chip.warn,.chip.c-warn{background:var(--warn-wash);color:var(--warn-text)}
-.chip.bad,.chip.c-bad{background:var(--bad-wash);color:var(--bad-text)}
-.chip.info,.chip.c-info{background:var(--info-wash);color:var(--info-text)}
-.chip.fore,.chip.c-fore{background:var(--fore-wash);color:var(--fore-text)}
-.chip.mute,.chip.c-mute{background:var(--sunken);color:var(--text-2)}
-.chip.amber,.chip.c-amber{background:var(--amber-wash);color:var(--amber-text)}
-
-.tabs{display:flex;gap:2px;background:var(--sunken);padding:3px;border-radius:10px;width:fit-content;flex-wrap:wrap}
-.tab{padding:6px 13px;border-radius:7px;font-size:12.5px;font-weight:500;color:var(--text-2);
-  transition:background var(--dur) var(--ease),color var(--dur) var(--ease)}
-.tab.on{background:var(--card);color:var(--text);font-weight:600;box-shadow:var(--sh-1)}
-
-.field{height:36px;border:1px solid var(--border);border-radius:var(--r-input);background:var(--card);
-  padding:0 11px;font-size:13px;width:100%;transition:border-color var(--dur) var(--ease)}
-.field:focus{outline:none;border-color:var(--amber);box-shadow:0 0 0 3px var(--amber-wash)}
-.field::placeholder{color:var(--text-3)}
-.field-sm{height:32px;border:1px solid var(--border);border-radius:9px;background:var(--card);
-  padding:0 10px;font-size:12.5px;color:var(--text)}
-.field-sm:focus{outline:none;border-color:var(--amber)}
-.search{position:relative;display:inline-block}
-.search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);
-  width:14px;height:14px;color:var(--text-3);pointer-events:none}
-.search .field-sm{padding-left:31px}
-.check{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--text-2);white-space:nowrap}
-
-/* ================= METRICS ================= */
-.grid{display:grid;gap:var(--s2)}
-.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
-.g3{grid-template-columns:repeat(3,minmax(0,1fr))}
-.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
-.g5{grid-template-columns:repeat(5,minmax(0,1fr))}
-.g-side{grid-template-columns:minmax(0,1fr) 340px;align-items:start}
-.g-split{grid-template-columns:minmax(0,1.05fr) minmax(0,1.35fr);align-items:start}
-
-.kpi{background:var(--card);border:1px solid var(--border);border-radius:var(--r-card);
-  padding:var(--s2);display:flex;flex-direction:column;gap:10px;box-shadow:var(--sh-1);
-  transition:box-shadow var(--dur) var(--ease),transform var(--dur) var(--ease)}
-.kpi.act{cursor:pointer}
-.kpi.act:hover{box-shadow:var(--sh-3);transform:translateY(-1px)}
-.kpi .l,.kpi-t{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text-2);font-weight:500}
-.kpi .l svg,.kpi-t svg{width:14px;height:14px;color:var(--text-3);flex-shrink:0}
-.kpi .v,.kpi-v{font-size:26px;font-weight:600;letter-spacing:-.025em;line-height:1.1;
-  font-variant-numeric:tabular-nums;display:flex;align-items:baseline;gap:6px;overflow-wrap:anywhere}
-.kpi .v small,.kpi-v small{font-size:13px;font-weight:500;color:var(--text-3);letter-spacing:0}
-.kpi .f,.kpi-f{display:flex;align-items:center;gap:6px;font-size:11.5px;color:var(--text-3);margin-top:auto;
-  overflow-wrap:anywhere;line-height:1.4}
-
-/* attention band — deliberately dominant, and empty on a good day */
-.att{border:1px solid var(--border);border-radius:var(--r-card);background:var(--card);overflow:hidden;box-shadow:var(--sh-1)}
-.att-h{display:flex;align-items:center;gap:10px;padding:13px var(--s3);border-bottom:1px solid var(--border-soft)}
-.att-h .pulse{width:8px;height:8px;border-radius:99px;background:var(--bad-fill);flex-shrink:0;
-  box-shadow:0 0 0 0 rgba(255,59,48,.5);animation:pl 2.4s ease-out infinite}
-@keyframes pl{70%{box-shadow:0 0 0 7px rgba(255,59,48,0)}100%{box-shadow:0 0 0 0 rgba(255,59,48,0)}}
-.att-h h2{font-size:14px;font-weight:600;margin:0}
-.att-h .n{font-size:12px;color:var(--text-3);margin-left:auto}
-.att-l{display:flex;flex-direction:column}
-.att-i{display:grid;grid-template-columns:34px 1fr auto;gap:var(--s2);align-items:center;
-  padding:13px var(--s3);border-bottom:1px solid var(--border-soft);text-align:left;width:100%;
-  transition:background var(--dur) var(--ease)}
-.att-i:last-child{border-bottom:0}
-.att-i:hover{background:var(--sunken)}
-.att-ic{width:34px;height:34px;border-radius:9px;display:grid;place-items:center}
-.att-ic svg{width:16px;height:16px}
-.att-x b{display:block;font-size:13.5px;font-weight:600;letter-spacing:-.005em}
-.att-x span{font-size:12.5px;color:var(--text-2)}
-.att-m{display:flex;align-items:center;gap:10px;flex-shrink:0;color:var(--text-3)}
-.att-m svg{width:15px;height:15px}
-
-.empty{padding:var(--s5) var(--s3);text-align:center;display:flex;flex-direction:column;
-  align-items:center;gap:12px}
-.empty svg{width:38px;height:38px;color:var(--ok-text);opacity:.85}
-.empty b{font-size:14px;font-weight:600}
-.empty p{font-size:12.5px;color:var(--text-3);margin:0;max-width:320px;line-height:1.5}
-
-/* note / callout */
-.note{border-radius:10px;padding:13px var(--s2);display:flex;gap:11px;align-items:flex-start;
-  background:var(--fore-wash)}
-.note svg{width:16px;height:16px;flex-shrink:0;margin-top:2px;color:var(--fore-text)}
-.note b{font-size:12.5px;font-weight:600;display:block;color:var(--fore-text)}
-.note p{font-size:12.5px;color:var(--text-2);margin:3px 0 0;line-height:1.5}
-.note.info{background:var(--info-wash)} .note.info svg,.note.info b{color:var(--info-text)}
-.note.bad{background:var(--bad-wash)} .note.bad svg,.note.bad b{color:var(--bad-text)}
-
-/* ================= TABLE =================
-   max-height is what makes thead's position:sticky below mean anything —
-   without it .tw grows to fit every row and the page scrolls instead of
-   the table, so a 100+ row table just runs off the bottom with its
-   "sticky" header nowhere near the viewport edge by the time you'd need
-   it. A short table (a handful of rows) never reaches this cap, so
-   nothing here changes for those. Any one instance that genuinely needs
-   a different cap (the bulk-update modal's table uses 50vh, since a
-   modal has far less vertical room to spend) sets its own inline
-   max-height, which — being more specific — wins over this default. */
-.tw{overflow:auto;-webkit-overflow-scrolling:touch;max-height:68vh}
-table{border-collapse:separate;border-spacing:0;width:100%;font-size:13px;min-width:640px}
-thead th{position:sticky;top:0;background:var(--card);z-index:2;text-align:left;
-  font-size:10.5px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:var(--text-3);
-  padding:9px var(--s2);border-bottom:1px solid var(--border);white-space:nowrap;user-select:none}
-tbody td{padding:10px var(--s2);border-bottom:1px solid var(--border-soft);vertical-align:middle;
-  color:var(--text-2);white-space:nowrap}
-tbody tr{transition:background 120ms var(--ease)}
-tbody tr:hover{background:var(--sunken)}
-tbody tr.sel{background:var(--amber-wash)}
-tbody tr:last-child td{border-bottom:0}
-td.nm,.nm{color:var(--text);font-weight:500}
-td.n{font-variant-numeric:tabular-nums;text-align:right;color:var(--text)}
-th.n{text-align:right}
-td.wrap{white-space:normal;min-width:190px}
-.sub{font-size:11.5px;color:var(--text-3);font-weight:400}
-.tfoot{display:flex;align-items:center;gap:var(--s2);padding:10px var(--s2);
-  border-top:1px solid var(--border-soft);font-size:12.5px;color:var(--text-3)}
-.tfoot .r{margin-left:auto;display:flex;gap:6px;align-items:center}
-
-/* ================= PROGRESS ================= */
-.prog{display:flex;flex-direction:column;gap:6px}
-.prog-t{display:flex;align-items:baseline;gap:8px;font-size:12.5px}
-.prog-t b{font-weight:500;color:var(--text)}
-.prog-t span{margin-left:auto;font-variant-numeric:tabular-nums;color:var(--text-2);font-size:12px}
-.prog-b{height:6px;border-radius:99px;background:var(--sunken);overflow:hidden}
-.prog-b i{display:block;height:100%;border-radius:99px;width:0;transition:width 700ms var(--ease)}
-
-/* ================= FEFO BATCH CARD ================= */
-.batch{border:1px solid var(--border);border-radius:10px;padding:12px;display:flex;
-  flex-direction:column;gap:9px;background:var(--card);border-left-width:3px;
-  transition:box-shadow var(--dur) var(--ease)}
-.batch:hover{box-shadow:var(--sh-2)}
-.batch-h{display:flex;align-items:baseline;gap:8px}
-.batch-h b{font-size:13px;font-weight:600}
-.batch-h .lot{font-family:var(--mono);font-size:10.5px;color:var(--text-3)}
-.batch-h .d{margin-left:auto;font-size:12px;font-weight:600;font-variant-numeric:tabular-nums}
-.shelf{height:5px;border-radius:99px;background:var(--sunken);overflow:hidden}
-.shelf i{display:block;height:100%;border-radius:99px}
-.batch-m{display:flex;gap:12px;font-size:11.5px;color:var(--text-3);flex-wrap:wrap;align-items:center}
-.batch-m span{font-variant-numeric:tabular-nums}
-
-.verify-group{border:1px solid var(--border);border-radius:10px;padding:12px}
-.verify-group table{width:100%;border-collapse:collapse}
-.verify-group td{padding:5px 6px;font-size:12.5px;border-top:1px solid var(--border)}
-.verify-group tr:first-child td{border-top:none}
-
-/* ================= MODAL =================
-   Overlay z-tiers, made explicit rather than accidental: every overlay
-   used to share z-index 60/61 regardless of kind (drawer, modal, command
-   palette all layered at the same depth with independent scrims), so
-   opening one over another stacked two dimming layers and two
-   interactive surfaces with no way to reach whatever was underneath —
-   see the OVERLAY MANAGER section below, which is what actually
-   guarantees at most one is ever open; these tiers just keep that
-   guarantee visually correct if that invariant is ever momentarily
-   violated (e.g. mid-animation). DRAWER < SHEET (modal/command palette)
-   < TOAST, which is never modal and must never be hidden behind either. */
-.scrim{position:fixed;inset:0;background:rgba(16,24,40,.32);opacity:0;
-  animation:fade var(--dur) var(--ease) forwards;backdrop-filter:blur(1px)}
-#drScrim{z-index:69}
-#scrim,#cmdScrim{z-index:79}
-@keyframes fade{to{opacity:1}}
-.modal{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);background:var(--card);
-  border:1px solid var(--border);border-radius:14px;padding:var(--s3);width:min(430px,92vw);z-index:80;
-  box-shadow:0 20px 60px rgba(16,24,40,.24);max-height:86vh;overflow-y:auto;
-  animation:pop 200ms var(--ease) both}
-@keyframes pop{from{opacity:0;transform:translate(-50%,-50%) scale(.97)}to{opacity:1;transform:translate(-50%,-50%) scale(1)}}
-.modal h3{margin:0 0 4px;font-size:16px;font-weight:600;letter-spacing:-.015em}
-.modal>p{margin:0 0 var(--s2);font-size:12.5px;color:var(--text-3);line-height:1.5}
-.modal label{display:block;font-size:12px;font-weight:500;color:var(--text-2);margin:var(--s2) 0 5px}
-.modal .actions{display:flex;gap:var(--s1);margin-top:var(--s3)}
-.modal .actions .btn{flex:1}
-#modalErr{color:var(--bad-text);font-size:12.5px;margin-top:10px;display:none}
-
-/* ================= DRAWER ================= */
-.drawer{position:fixed;top:0;right:0;bottom:0;width:min(460px,100vw);background:var(--card);
-  border-left:1px solid var(--border);z-index:70;display:flex;flex-direction:column;
-  animation:slide 240ms var(--ease) both;box-shadow:-8px 0 28px rgba(16,24,40,.14)}
-@keyframes slide{from{transform:translateX(100%)}to{transform:none}}
-.dr-h{display:flex;align-items:center;gap:10px;padding:var(--s2) var(--s3);
-  border-bottom:1px solid var(--border-soft);flex-shrink:0}
-.dr-h h2{font-size:15px;font-weight:600;margin:0;letter-spacing:-.01em}
-.dr-h .r{margin-left:auto;display:flex;gap:6px}
-.dr-b{flex:1;overflow-y:auto;padding:var(--s3);display:flex;flex-direction:column;gap:var(--s3)}
-.dr-f{padding:var(--s2) var(--s3);border-top:1px solid var(--border-soft);display:flex;gap:var(--s1);flex-shrink:0}
-.dr-t{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;
-  color:var(--text-3);margin-bottom:10px}
-.dl{display:grid;grid-template-columns:auto 1fr;gap:9px var(--s2);font-size:12.5px;align-items:center}
-.dl dt{color:var(--text-3)}
-.dl dd{margin:0;color:var(--text);text-align:right;font-variant-numeric:tabular-nums;
-  display:flex;align-items:center;gap:7px;justify-content:flex-end;flex-wrap:wrap}
-.act-row{display:flex;align-items:center;gap:9px;margin-bottom:9px}
-.act-row .field{width:96px;flex-shrink:0;text-align:right}
-.act-row .lbl{font-size:12px;color:var(--text-2);flex:1;line-height:1.35}
-.act-row .btn{flex-shrink:0;min-width:112px}
-.tl{display:flex;flex-direction:column;position:relative}
-.tl-i{display:grid;grid-template-columns:24px 1fr;gap:11px;padding-bottom:15px;position:relative}
-.tl-i:not(:last-child)::before{content:"";position:absolute;left:11px;top:22px;bottom:0;
-  width:1.5px;background:var(--border)}
-.tl-d{width:24px;height:24px;border-radius:99px;display:grid;place-items:center;
-  background:var(--sunken);z-index:1;border:2px solid var(--card)}
-.tl-d svg{width:12px;height:12px}
-.tl-x b{display:block;font-size:12.5px;font-weight:600}
-.tl-x span{font-size:11.5px;color:var(--text-3)}
-.tl-x .amt{font-family:var(--mono);font-size:11.5px}
 tbody tr.row-link{cursor:pointer}
-
-/* command palette */
-.cmd{position:fixed;top:14vh;left:50%;transform:translateX(-50%);width:min(600px,92vw);
-  background:var(--card);border:1px solid var(--border);border-radius:14px;z-index:80;
-  box-shadow:0 20px 60px rgba(16,24,40,.22);overflow:hidden;animation:cpop 200ms var(--ease) both}
-@keyframes cpop{from{opacity:0;transform:translateX(-50%) scale(.98) translateY(-6px)}
-  to{opacity:1;transform:translateX(-50%) scale(1)}}
-.cmd-i{display:flex;align-items:center;gap:11px;padding:14px var(--s2);border-bottom:1px solid var(--border-soft)}
-.cmd-i svg{width:17px;height:17px;color:var(--text-3);flex-shrink:0}
-.cmd-i input{border:0;background:none;flex:1;font-size:15px;outline:none}
-.cmd-i input::placeholder{color:var(--text-3)}
-.cmd-l{max-height:min(420px,54vh);overflow-y:auto;padding:6px}
-.cmd-g{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;
-  color:var(--text-3);padding:9px 11px 5px}
-.cmd-r{display:flex;align-items:center;gap:11px;padding:9px 11px;border-radius:8px;width:100%;
-  text-align:left;font-size:13.5px}
-.cmd-r svg{width:15px;height:15px;color:var(--text-3);flex-shrink:0}
-.cmd-r.on{background:var(--amber-wash)}
-.cmd-r.on svg{color:var(--amber-text)}
-.cmd-r .k{margin-left:auto;font-size:11px;color:var(--text-3)}
-
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--charcoal);
-  color:#fff;padding:11px 17px;border-radius:11px;font-size:13px;z-index:90;display:flex;
-  align-items:center;gap:9px;box-shadow:0 8px 26px rgba(0,0,0,.28);animation:tst 240ms var(--ease) both;
-  max-width:min(520px,92vw);transition:opacity 240ms var(--ease)}
-@keyframes tst{from{opacity:0;transform:translateX(-50%) translateY(10px)}to{opacity:1;transform:translateX(-50%)}}
-.toast svg{width:16px;height:16px;color:var(--ok-fill);flex-shrink:0}
-
-/* ================= CHART ================= */
-.chart{width:100%;display:block;overflow:visible}
-.chart .grid-l{stroke:var(--border-soft);stroke-width:1}
-.chart .ax{fill:var(--text-3);font-size:10.5px;font-family:var(--sans)}
-.chart .ln{fill:none;stroke-linecap:round;stroke-linejoin:round}
-.chart .dash{stroke-dasharray:4 4}
-.legend{display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--text-2);margin-top:10px}
-.legend span.it{display:flex;align-items:center;gap:6px}
-.legend .sw{width:12px;height:3px;border-radius:2px}
-.legend .sw.sq{width:9px;height:9px;border-radius:2px}
 
 /* ================= RESPONSIVE ================= */
 .mob-nav{display:none}
@@ -491,8 +132,8 @@ tbody tr.row-link{cursor:pointer}
   .head-sub{max-width:40vw}
   .kbar{min-width:0;width:34px;padding:6px;justify-content:center}
   .kbar span,.kbar kbd{display:none}
-  .mob-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--card);
-    border-top:1px solid var(--border);z-index:50;padding:6px 4px 8px;justify-content:space-around}
+  .mob-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--ink-1);
+    border-top:1px solid var(--line);z-index:50;padding:6px 4px 8px;justify-content:space-around}
   .mob-i{display:flex;flex-direction:column;align-items:center;gap:3px;padding:5px 9px;
     border-radius:9px;color:var(--text-3);font-size:10px;font-weight:500;min-width:56px}
   .mob-i svg{width:20px;height:20px}
@@ -503,12 +144,10 @@ tbody tr.row-link{cursor:pointer}
 @media print{
   .rail,.head,#errBanner,.mob-nav,.btn,.tabs,.toast{display:none!important}
   .app{display:block}
-  .work{padding:0;gap:14px}
-  .card{box-shadow:none;border:1px solid #999;break-inside:avoid}
-  body{font-size:11px;background:#fff}
+  .work{padding:0;gap:14px;max-width:none}
+  body{font-size:11px;background:#fff;color:#000}
 }
 </style>
-<link rel="stylesheet" href="/assets/brand.css">
 </head>
 <body>
 
@@ -847,6 +486,27 @@ function kpi(label, value, foot, icon, act) {
 function emptyState(title, body, icon) {
   return `<div class="empty">${ic(icon || 'chkc')}<b>${esc(title)}</b><p>${esc(body || '')}</p></div>`;
 }
+/* One connected, segmented bar instead of a wall of same-size KPI tiles --
+   how many segments there are and how big each is IS the information a
+   tile grid can't show. Zero-count segments still take their sliver of
+   the track (never fully vanish) so the bar's total length stays a
+   stable, comparable "all ingredients" reference across visits; the
+   legend only lists segments that actually have something in them. */
+function statusBand(segments) {
+  const total = segments.reduce((s, x) => s + x.count, 0);
+  const track = segments.map(s =>
+    `<div class="sb-seg" style="flex-grow:${Math.max(s.count, total ? total * 0.006 : 1)};background:${s.color}"
+       title="${esc(s.label)}: ${s.count}" ${s.act ? `data-nav="${s.act}"` : ''}></div>`
+  ).join('');
+  const legend = segments.filter(s => s.count > 0).map(s =>
+    `<button class="sb-item"${s.act ? ` data-nav="${s.act}"` : ''}>
+       <span class="sb-dot" style="background:${s.color}"></span>
+       <span class="sb-n">${s.count}</span><span class="sb-l">${esc(s.label)}</span>
+     </button>`
+  ).join('');
+  return `<div class="status-band"><div class="sb-track">${track}</div>
+    <div class="sb-legend">${legend || `<span class="sb-item"><span class="sb-n">${total}</span><span class="sb-l">all healthy</span></span>`}</div></div>`;
+}
 const REASON_LABELS = {
   purchase_receipt: 'Delivery received',
   sale_commit: 'Sold',
@@ -872,10 +532,17 @@ function expiryChip(b) {
   if (b.days_to_expiry <= 7) return `<span class="chip warn">${b.days_to_expiry}d left</span>`;
   return `<span class="chip ok">${b.days_to_expiry}d left</span>`;
 }
+const RISK_CLASS = { out: 'bad', critical: 'bad', warning: 'warn', idle: 'mute', ok: 'ok', no_data: 'mute' };
+const RISK_LABEL = { out: 'Out of stock', critical: 'Reorder now', warning: 'Reorder soon', idle: 'Not selling lately', ok: 'Enough stock', no_data: 'No sales yet' };
 function riskChip(risk) {
-  const map = { out: 'bad', critical: 'bad', warning: 'warn', idle: 'mute', ok: 'ok', no_data: 'mute' };
-  const label = { out: 'Out of stock', critical: 'Reorder now', warning: 'Reorder soon', idle: 'Not selling lately', ok: 'Enough stock', no_data: 'No sales yet' };
-  return `<span class="chip ${map[risk]}">${esc(label[risk])}</span>`;
+  return `<span class="chip ${RISK_CLASS[risk]}">${esc(RISK_LABEL[risk])}</span>`;
+}
+/* The real day count next to the label, not a bare colored chip standing
+   in for a number the reader actually needs to act on. */
+function runwayCell(risk, days) {
+  if (!risk) return '<span class="sub">—</span>';
+  const rn = days != null ? `${num(days, 1)} d` : (risk === 'ok' ? 'Comfortable' : '—');
+  return `<div class="runway-cell"><span class="rn">${rn}</span><span class="rl ${RISK_CLASS[risk] === 'bad' ? 'bad' : RISK_CLASS[risk] === 'warn' ? 'warn' : RISK_CLASS[risk] === 'ok' ? 'ok' : 'mute'}">${esc(RISK_LABEL[risk])}</span></div>`;
 }
 function note(text, title, kind) {
   return `<div class="note ${kind || ''}">${ic('spark')}<div><b>${esc(title || 'How this works')}</b><p>${esc(text)}</p></div></div>`;
@@ -984,6 +651,11 @@ function closeDrawer() {
    every movement it has had. All three write actions live here too. */
 let DRAWER_ING = null;
 async function openIngredientDrawer(pk) {
+  // A genuinely different ingredient starts back on the Stock tab; a
+  // refresh of the SAME one (see refreshAfterDrawerAction) leaves
+  // DRAWER_TAB alone, so taking an action doesn't kick you off whatever
+  // tab you were actually looking at.
+  if (!DRAWER_ING || DRAWER_ING.ingredient.id !== pk) DRAWER_TAB = 'stock';
   openDrawer(`<div class="dr-h"><h2>Loading…</h2>
       <div class="r"><button class="icon-btn" data-act="drawer-close">${ic('x')}</button></div></div>
     <div class="dr-b"><span class="sub">Working…</span></div>`);
@@ -1011,8 +683,8 @@ async function openIngredientDrawer(pk) {
 function drawerBatchCard(b, idx, baseUnit, avgDaily) {
   const notTracked = b.tracking === 'not_tracked';
   const estimated = b.tracking === 'estimated_shelf_life';
-  const color = notTracked ? 'var(--text-3)' : b.expired ? 'var(--bad-fill)'
-    : b.days_to_expiry <= 7 ? 'var(--warn-fill)' : 'var(--ok-fill)';
+  const color = notTracked ? 'var(--text-3)' : b.expired ? 'var(--bad)'
+    : b.days_to_expiry <= 7 ? 'var(--warn)' : 'var(--ok)';
   const usesUpIn = (!notTracked && avgDaily) ? b.qty_base / avgDaily : null;
   return `<div class="batch" style="border-left-color:${color}">
     <div class="batch-h"><b>${idx === 0 ? 'Use this one first' : 'Batch #' + (idx + 1)}</b>
@@ -1027,6 +699,16 @@ function drawerBatchCard(b, idx, baseUnit, avgDaily) {
     </div></div>`;
 }
 
+/* Progressive disclosure, not everything-at-once: a fixed identity/stats
+   header, then ONE of five tabs at a time. DRAWER_TAB persists across a
+   refresh of the SAME ingredient (so taking an action doesn't kick you
+   back to Stock if you were looking at Movements) and resets only when a
+   different ingredient is opened, in openIngredientDrawer(). */
+let DRAWER_TAB = 'stock';
+const DRAWER_TABS = [
+  ['stock', 'Stock'], ['batches', 'FEFO Batches'], ['movements', 'Movements'],
+  ['consumption', 'Consumption'], ['verify', 'Verification'],
+];
 function renderIngredientDrawer(d) {
   const i = d.ingredient, dep = d.depletion;
   const statusChipHtml = !i.is_deductable
@@ -1045,25 +727,8 @@ function renderIngredientDrawer(d) {
 
   const batches = d.batches || [];
 
-  openDrawer(`
-    <div class="dr-h">
-      <h2>${esc(i.name)}</h2>${statusChipHtml}${tchip ? `<span class="chip ${tchip[0]} no-dot">${esc(tchip[1])}</span>` : ''}
-      <div class="r">
-        <button class="icon-btn" data-act="drawer-edit" data-id="${i.id}" title="Edit">${ic('set')}</button>
-        <button class="icon-btn" data-act="drawer-close" title="Close">${ic('x')}</button>
-      </div>
-    </div>
-    <div class="dr-b">
-
-      <!-- A — STOCK -->
-      <div class="grid g2">
-        <div class="kpi"><div class="l">Available</div>
-          <div class="v">${esc(i.on_hand_display)}</div>
-          <div class="f">${i.reserved_base > 0 ? num(i.reserved_base, 2) + ' ' + esc(i.base_unit) + ' reserved' : 'nothing reserved'}</div></div>
-        <div class="kpi"><div class="l">Days of supply</div>
-          <div class="v">${dep && dep.days_remaining != null ? num(dep.days_remaining, 1) : '—'}<small>days</small></div>
-          <div class="f">${dep && dep.avg_daily_consumption ? 'uses ' + num(dep.avg_daily_consumption, 2) + ' ' + esc(i.base_unit) + '/day' : 'no recent usage'}</div></div>
-      </div>
+  const tabs = {
+    stock: `
       <div>
         <div class="dr-t">Stock</div>
         <dl class="dl">
@@ -1076,7 +741,6 @@ function renderIngredientDrawer(d) {
           <dt>Max stock</dt><dd>${i.max_stock_base != null ? num(i.max_stock_base, 2) + ' ' + esc(i.base_unit) : '<span class="sub">no ceiling set</span>'}</dd>
         </dl>
       </div>
-
       <div>
         <div class="dr-t">Actions</div>
         <div class="act-row">
@@ -1100,58 +764,20 @@ function renderIngredientDrawer(d) {
           <span class="lbl">${esc(i.base_unit)} thrown away</span>
           <button class="btn btn-d btn-sm" id="drWasteBtn">${ic('warn')}Log waste</button>
         </div>
-        <div id="drErr" style="color:var(--bad-text);font-size:12.5px;display:none;margin-top:4px"></div>
-      </div>
+        <div id="drErr" class="dr-err" style="display:none"></div>
+      </div>`,
 
-      <!-- B — EXPIRY / FEFO -->
+    batches: `
       <div>
         <div class="dr-t">Stock batches (${batches.length})</div>
-        <p class="sub" style="margin:0 0 10px">Stock with the earliest expiry is used first — this is the order it will actually be drawn down in.</p>
+        <p class="lede">Stock with the earliest expiry is used first — this is the order it will actually be drawn down in.</p>
         ${batches.length
-          ? `<div style="display:flex;flex-direction:column;gap:9px">${batches.map((b, idx) =>
+          ? `<div class="stack-sm" style="margin-top:10px">${batches.map((b, idx) =>
               drawerBatchCard(b, idx, i.base_unit, dep && dep.avg_daily_consumption)).join('')}</div>`
-          : `<p class="sub" style="margin:0">No open batches — nothing has been received for this ingredient yet.</p>`}
-      </div>
+          : `<p class="lede">No open batches — nothing has been received for this ingredient yet.</p>`}
+      </div>`,
 
-      <!-- D/E — USAGE & OUTLOOK -->
-      <div>
-        <div class="dr-t">Usage &amp; outlook</div>
-        ${!i.is_deductable ? `<p class="sub" style="margin:0">This ingredient can't be deducted yet (${esc(i.block_reason || 'no pack size set')}), so usage can't be measured.</p>`
-        : `<p style="margin:0 0 10px;font-size:13px;line-height:1.55">
-            ${dep && dep.avg_daily_consumption
-              ? `Over the last 30 days, this used about <b>${num(dep.avg_daily_consumption, 2)} ${esc(i.base_unit)}/day</b> on average.${dep.days_remaining != null ? ` At that pace, the current stock covers about <b>${num(dep.days_remaining, 1)} more day${dep.days_remaining === 1 ? '' : 's'}</b>.` : ''}`
-              : `No consumption has been recorded for this ingredient in the last 30 days — there's nothing yet to project a runway from.`}
-          </p>
-          ${dep && dep.suggested_order_qty != null
-            ? note(`About ${dep.suggested_order_qty} ${dep.suggested_order_unit}${dep.suggested_order_qty === 1 ? '' : 's'} — enough to cover the ${i.lead_time_days}-day delivery time plus a few days' buffer.`, 'Suggested reorder', 'info')
-            : ''}`}
-      </div>
-
-      <div>
-        <div class="dr-t">Conversion &amp; cost</div>
-        <dl class="dl">
-          <dt>Deducted in</dt><dd>${esc(i.base_unit)}</dd>
-          <dt>Bought as</dt><dd>${esc(i.purchase_unit)}</dd>
-          <dt>Pack size</dt><dd>${i.pack_size != null ? num(i.pack_size, 2) + ' ' + esc(i.base_unit) : '<span class="sub">not set</span>'} ${vchip(i.pack_size_status)}</dd>
-          <dt>Usable after prep</dt><dd>${num(i.yield_factor, 2)} ${vchip(i.yield_factor_status)}</dd>
-          <dt>Cost</dt><dd>${i.unit_cost != null ? money(i.unit_cost) + ' / ' + esc(i.purchase_unit) : '<span class="sub">not set</span>'} ${vchip(i.unit_cost_status)}</dd>
-          <dt>In purchase units</dt><dd>${inPurchase != null ? num(inPurchase, 2) + ' ' + esc(i.purchase_unit) : '—'}</dd>
-          <dt>Expiry tracking</dt><dd>${expiryLine}</dd>
-          <dt>Supplier</dt><dd>${i.supplier ? esc(i.supplier) : '<span class="sub">not set</span>'}</dd>
-          <dt>Supplier contact</dt><dd>${i.supplier_contact ? esc(i.supplier_contact) : '<span class="sub">not set</span>'}</dd>
-        </dl>
-      </div>
-
-      <div>
-        <div class="dr-t">Used in ${d.used_in.length} recipe${d.used_in.length === 1 ? '' : 's'}</div>
-        ${d.used_in.length ? `<dl class="dl">${d.used_in.slice(0, 12).map(u =>
-          `<dt>${esc(u.name)}${u.kind === 'sub_recipe' ? ' <span class="sub">(house-made)</span>' : ''}</dt>
-           <dd>${num(u.qty_base, 3)} ${esc(i.base_unit)}</dd>`).join('')}</dl>
-          ${d.used_in.length > 12 ? `<div class="sub" style="margin-top:8px">+ ${d.used_in.length - 12} more</div>` : ''}`
-        : `<p class="sub" style="margin:0">Not used by any recipe yet.</p>`}
-      </div>
-
-      <!-- C — MOVEMENT HISTORY -->
+    movements: `
       <div>
         <div class="dr-t">Recent stock movements</div>
         ${d.movements.length ? `<div class="tl">${d.movements.slice(0, 12).map(m => {
@@ -1163,10 +789,80 @@ function renderIngredientDrawer(d) {
               <span> · left ${num(m.balance_after_base, 2)} ${esc(i.base_unit)}</span>
               <span style="display:block">${esc(m.created_at)}${m.note ? ' · ' + esc(m.note) : ''}</span></div>
           </div>`;
-        }).join('')}</div>` : `<p class="sub" style="margin:0">No movements yet.</p>`}
+        }).join('')}</div>` : `<p class="lede">No movements yet.</p>`}
+      </div>`,
+
+    consumption: `
+      <div>
+        <div class="dr-t">Usage &amp; outlook</div>
+        ${!i.is_deductable ? `<p class="lede">This ingredient can't be deducted yet (${esc(i.block_reason || 'no pack size set')}), so usage can't be measured.</p>`
+        : `<p class="lede">
+            ${dep && dep.avg_daily_consumption
+              ? `Over the last 30 days, this used about <b>${num(dep.avg_daily_consumption, 2)} ${esc(i.base_unit)}/day</b> on average.${dep.days_remaining != null ? ` At that pace, the current stock covers about <b>${num(dep.days_remaining, 1)} more day${dep.days_remaining === 1 ? '' : 's'}</b>.` : ''}`
+              : `No consumption has been recorded for this ingredient in the last 30 days — there's nothing yet to project a runway from.`}
+          </p>
+          ${dep && dep.suggested_order_qty != null
+            ? note(`About ${dep.suggested_order_qty} ${dep.suggested_order_unit}${dep.suggested_order_qty === 1 ? '' : 's'} — enough to cover the ${i.lead_time_days}-day delivery time plus a few days' buffer.`, 'Suggested reorder', 'info')
+            : ''}`}
+      </div>`,
+
+    verify: `
+      <div>
+        <div class="dr-t">Conversion &amp; cost</div>
+        <dl class="dl">
+          <dt>Pack size</dt><dd>${i.pack_size != null ? num(i.pack_size, 2) + ' ' + esc(i.base_unit) : '<span class="sub">not set</span>'} ${vchip(i.pack_size_status)}</dd>
+          <dt>Usable after prep</dt><dd>${num(i.yield_factor, 2)} ${vchip(i.yield_factor_status)}</dd>
+          <dt>Cost</dt><dd>${i.unit_cost != null ? money(i.unit_cost) + ' / ' + esc(i.purchase_unit) : '<span class="sub">not set</span>'} ${vchip(i.unit_cost_status)}</dd>
+          <dt>Expiry tracking</dt><dd>${expiryLine}</dd>
+        </dl>
+      </div>
+      <details class="tech">
+        <summary>Technical details</summary>
+        <dl class="dl">
+          <dt>Deducted in</dt><dd>${esc(i.base_unit)}</dd>
+          <dt>Bought as</dt><dd>${esc(i.purchase_unit)}</dd>
+          <dt>In purchase units</dt><dd>${inPurchase != null ? num(inPurchase, 2) + ' ' + esc(i.purchase_unit) : '—'}</dd>
+          <dt>Supplier</dt><dd>${i.supplier ? esc(i.supplier) : '<span class="sub">not set</span>'}</dd>
+          <dt>Supplier contact</dt><dd>${i.supplier_contact ? esc(i.supplier_contact) : '<span class="sub">not set</span>'}</dd>
+        </dl>
+      </details>
+      <div>
+        <div class="dr-t">Used in ${d.used_in.length} recipe${d.used_in.length === 1 ? '' : 's'}</div>
+        ${d.used_in.length ? `<dl class="dl">${d.used_in.slice(0, 12).map(u =>
+          `<dt>${esc(u.name)}${u.kind === 'sub_recipe' ? ' <span class="sub">(house-made)</span>' : ''}</dt>
+           <dd>${num(u.qty_base, 3)} ${esc(i.base_unit)}</dd>`).join('')}</dl>
+          ${d.used_in.length > 12 ? `<div class="sub" style="margin-top:8px">+ ${d.used_in.length - 12} more</div>` : ''}`
+        : `<p class="lede">Not used by any recipe yet.</p>`}
+      </div>`,
+  };
+
+  openDrawer(`
+    <div class="dr-h">
+      <h2>${esc(i.name)}</h2>${statusChipHtml}${tchip ? `<span class="chip ${tchip[0]} no-dot">${esc(tchip[1])}</span>` : ''}
+      <div class="r">
+        <button class="icon-btn" data-act="drawer-edit" data-id="${i.id}" title="Edit">${ic('set')}</button>
+        <button class="icon-btn" data-act="drawer-close" title="Close">${ic('x')}</button>
       </div>
     </div>
+    <div class="dr-sub">
+      <div class="grid g2">
+        <div class="kpi"><div class="l">Available</div>
+          <div class="v">${esc(i.on_hand_display)}</div>
+          <div class="f">${i.reserved_base > 0 ? num(i.reserved_base, 2) + ' ' + esc(i.base_unit) + ' reserved' : 'nothing reserved'}</div></div>
+        <div class="kpi"><div class="l">Days of supply</div>
+          <div class="v">${dep && dep.days_remaining != null ? num(dep.days_remaining, 1) : '—'}<small>days</small></div>
+          <div class="f">${dep && dep.avg_daily_consumption ? 'uses ' + num(dep.avg_daily_consumption, 2) + ' ' + esc(i.base_unit) + '/day' : 'no recent usage'}</div></div>
+      </div>
+      <div class="tabs">${DRAWER_TABS.map(([k, l]) =>
+        `<button class="tab ${DRAWER_TAB === k ? 'on' : ''}" data-drawer-tab="${k}">${esc(l)}${k === 'batches' && batches.length ? ` <span class="sub">${batches.length}</span>` : ''}</button>`).join('')}</div>
+    </div>
+    <div class="dr-b">${tabs[DRAWER_TAB]}</div>
     <div class="dr-f"><button class="btn btn-s" style="flex:1" data-act="drawer-close">Close</button></div>`);
+
+  document.querySelectorAll('[data-drawer-tab]').forEach(b => b.addEventListener('click', () => {
+    DRAWER_TAB = b.dataset.drawerTab;
+    renderIngredientDrawer(d);
+  }));
 
   const err = m => { const e = $('#drErr'); if (e) { e.textContent = m; e.style.display = 'block'; } };
   const run = async (btnId, fn) => {
@@ -1733,8 +1429,8 @@ async function loadDashboard() {
     const usesUpIn = rate ? b.qty_base / rate : null;
     return { ...b, uses_up_in_days: usesUpIn, at_risk: !b.expired && (usesUpIn == null || usesUpIn > b.days_to_expiry) };
   });
-  const useFirstColor = b => (b.expired || b.days_to_expiry <= 7) ? 'var(--bad-fill)'
-    : b.days_to_expiry <= 30 ? 'var(--warn-fill)' : 'var(--info-fill)';
+  const useFirstColor = b => (b.expired || b.days_to_expiry <= 7) ? 'var(--bad)'
+    : b.days_to_expiry <= 30 ? 'var(--warn)' : 'var(--info)';
 
   const toBuy = dep.ingredients.filter(i => i.suggested_order_qty != null)
     .sort((a, b) => (a.days_remaining ?? 1e9) - (b.days_remaining ?? 1e9)).slice(0, 6);
@@ -1787,28 +1483,28 @@ async function loadDashboard() {
       <span class="att-m">${a.m}${ic('chev')}</span></button>`).join('')}</div>
   </div>` : ''}
 
-  <!-- SECTION 2 — Today's position -->
-  <div class="sec-t"><h2>Today's position</h2><p>Every ingredient, sorted into one real state</p></div>
-  <div class="grid g5">
-    ${kpi('Tracked', ing.ingredients.length, 'active ingredients', 'inv', 'inventory')}
-    ${kpi('Critical', out.length + crit.length, 'out of stock or about to be', 'warn', 'inventory')}
-    ${kpi('Running low', warn.length, 'inside delivery time', 'clock', 'inventory')}
-    ${kpi('Expiring soon', expiringSoonIngredients, 'ingredient(s), within 7 days', 'exp', 'expiry')}
-    ${kpi('Not measured yet', notMeasured.length, 'no usage recorded to judge by', 'db', 'inventory')}
-  </div>
+  <!-- SECTION 2 — Today's position: one connected band, not five tiles -->
+  <div class="sec-t"><h2>Today's position</h2><p>${ing.ingredients.length} ingredients tracked, sorted into one real state</p></div>
+  <div class="card"><div class="card-b">${statusBand([
+    { label: 'Critical', count: out.length + crit.length, color: 'var(--bad)', act: 'inventory' },
+    { label: 'Running low', count: warn.length, color: 'var(--warn)', act: 'inventory' },
+    { label: 'Expiring soon', count: expiringSoonIngredients, color: 'var(--info)', act: 'expiry' },
+    { label: 'Not measured yet', count: notMeasured.length, color: 'var(--text-3)', act: 'inventory' },
+    { label: 'Healthy', count: ing.ingredients.length - out.length - crit.length - warn.length - notMeasured.length, color: 'var(--ok)', act: 'inventory' },
+  ])}</div></div>
 
   <div class="grid g-split">
-    <div style="display:flex;flex-direction:column;gap:var(--s2)">
+    <div class="stack">
 
       <!-- SECTION 3 — Consumption -->
       <div class="card"><div class="card-h"><h2>What's being consumed</h2></div>
         <div class="card-b tight">
-          <p style="margin:0;font-size:13px;line-height:1.6">
+          <p class="lede">
             <b>${measured}</b> of <b>${dep.ingredients.length}</b> ingredients have real usage recorded in the last
             30 days${measured ? ` — for those, the "used/day" figures below are a <b>calculated average</b> over that window, not a single reading` : ''}.
             ${notMeasured.length ? ` <b>${notMeasured.length}</b> have no usage recorded yet, so there's nothing to judge them by — that's a data gap, not a sign anything's wrong.` : ''}
           </p>
-          ${highAnomalies.length ? `<p style="margin:10px 0 0;font-size:13px;line-height:1.6">
+          ${highAnomalies.length ? `<p class="lede">
             <b>${highAnomalies.length}</b> unusual stock loss${highAnomalies.length === 1 ? '' : 'es'} flagged in the last 30 days — see above.</p>` : ''}
         </div>
       </div>
@@ -1832,7 +1528,7 @@ async function loadDashboard() {
       </div>
 
       <div class="card" id="tomorrowCard">
-        <div class="card-h"><h2>What's likely to sell tomorrow</h2></div>
+        <div class="card-h"><h2>Menu demand forecast</h2><p>What's likely to sell tomorrow</p></div>
         <div class="card-b tight"><span class="sub">Working…</span></div>
       </div>
     </div>
@@ -1842,7 +1538,7 @@ async function loadDashboard() {
       <div class="card-h"><div><h2>Use first</h2>
         <p>Stock with the earliest expiry goes first — this is that order, soonest at top</p></div>
         <div class="r"><button class="btn btn-s btn-sm" data-nav="expiry">${ic('exp')}Full expiry list</button></div></div>
-      ${useFirst.length ? `<div style="display:flex;flex-direction:column;gap:9px;padding:var(--s2)">${useFirst.map(b =>
+      ${useFirst.length ? `<div class="stack-sm card-b">${useFirst.map(b =>
         expiryCard(b, 90, useFirstColor(b))).join('')}</div>`
         : emptyState('Nothing expiring soon', 'No open batch carries a near-term expiry within the next 90 days.')}
     </div>
@@ -1852,7 +1548,7 @@ async function loadDashboard() {
   ${r.needs_verification ? `
   <div class="note">${ic('db')}<div><b>Setup details still need confirming</b>
     <p><b>${r.needs_verification}</b> value${r.needs_verification === 1 ? '' : 's'} (pack sizes, costs, recipe quantities) ${r.needs_verification === 1 ? 'is' : 'are'} still placeholders from setup. This is about the data behind the numbers, not the stock itself — a healthy ingredient can still have an unconfirmed price.
-    <a href="#" data-nav="verification" style="margin-left:6px">Review →</a></p></div>
+    <a href="#" data-nav="verification">Review →</a></p></div>
   </div>` : ''}`);
 
   const ready = (dem.items || []).filter(x => !x.insufficient_data);
@@ -1870,11 +1566,12 @@ async function loadTomorrowForecast(item) {
     const c = forecastChart(d, 130, 21);
     const t = d.forecast[0];
     card.innerHTML = `
-      <div class="card-h"><div><h2>What's likely to sell tomorrow</h2>
+      <div class="card-h"><div><h2>Menu demand forecast</h2>
         <p>${esc(item.name)} · forecasted menu-item demand, not an ingredient figure</p></div></div>
       <div class="card-b tight">
-        <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px">
-          <span class="num" style="font-size:23px;font-weight:600">${num(t.qty, 1)}</span>
+        <p class="chart-q">How many will sell tomorrow?</p>
+        <div class="stat-row">
+          <span class="stat-num">${num(t.qty, 1)}</span>
           <span class="sub">predicted units${c.hasRange ? ` · likely ${num(t.low, 1)}–${num(t.high, 1)}` : ''}</span>
         </div>
         ${c.svg}${c.legend}
@@ -1969,17 +1666,18 @@ function renderInventory() {
   const expiringSoon = st.data.filter(i => { const e = expiryStatus(i); return e && (e.expired || e.days_to_expiry <= 7); }).length;
   const needsConfirming = st.data.filter(i => confidenceStatus(i) !== 'confirmed').length;
   setWork(`
-    <div class="grid g4">
-      ${kpi('Inventory value', money0(val.total), `${val.priced} of ${val.total_count} priced`, 'cash')}
-      ${kpi('Out of stock', count('out'), 'blocking menu items', 'warn')}
-      ${kpi('Expiring within 7 days', expiringSoon, 'or already expired', 'exp', 'expiry')}
-      ${kpi('Needs confirming', needsConfirming, 'pack size, cost or usable amount', 'db', 'verification')}
-    </div>
+    <div class="sec-t"><h2>Inventory</h2><p>${st.data.length} ingredients tracked, ${money0(val.total)} on hand (${val.priced} of ${val.total_count} priced)</p></div>
+    <div class="card"><div class="card-b">${statusBand([
+      { label: 'Out of stock', count: count('out'), color: 'var(--bad)', act: null },
+      { label: 'Expiring within 7 days', count: expiringSoon, color: 'var(--info)', act: null },
+      { label: 'Needs confirming', count: needsConfirming, color: 'var(--warn)', act: null },
+      { label: 'Confirmed and stocked', count: st.data.length - count('out') - needsConfirming, color: 'var(--ok)', act: null },
+    ])}</div></div>
     <div class="card">
       <div class="card-h">
-        <div><h2>Ingredients</h2><p>${st.data.length} tracked · click any row for its full detail, conversions and history</p></div>
+        <div><h2>Full record</h2><p>Click any row for its full detail, conversions and history</p></div>
         <div class="r">
-          <label class="search">${ic('srch')}<input class="field-sm" data-bind="inv-q" placeholder="Search ingredients…" value="${esc(st.q)}" style="width:200px"></label>
+          <label class="search">${ic('srch')}<input class="field-sm search-w" data-bind="inv-q" placeholder="Search ingredients…" value="${esc(st.q)}"></label>
           <select class="field-sm" data-act="inv-cat-sel">${Object.keys(CAT_LABELS).map(c =>
             `<option value="${c}" ${st.cat === c ? 'selected' : ''}>${esc(c ? CAT_LABELS[c] : 'All categories')}</option>`).join('')}</select>
           <select class="field-sm" data-act="inv-exp-sel">${Object.keys(EXP_LABELS).map(k =>
@@ -1997,6 +1695,7 @@ function renderInventory() {
           <th>Runway</th><th>Expiry</th><th>Confidence</th><th></th></tr></thead>
         <tbody>${list.length ? list.map(i => {
           const risk = stockRisk(i);
+          const dep = STATE.inventory.dep[i.id];
           const ex = expiryStatus(i);
           const cchip = CONF_CHIP[confidenceStatus(i)];
           const tchip = TYPE_CHIP[i.inventory_type];
@@ -2005,7 +1704,7 @@ function renderInventory() {
               <div class="sub">${esc(i.ingredient_id)}</div></td>
             <td class="sub">${esc(CAT_LABELS[i.category] || i.category)}</td>
             <td class="n">${esc(i.on_hand_display)}</td>
-            <td>${risk ? riskChip(risk) : '<span class="sub">—</span>'}</td>
+            <td>${runwayCell(risk, dep && dep.days_remaining)}</td>
             <td>${ex ? expiryChip(ex) + (ex.tracking === 'estimated_shelf_life' ? ` <span class="sub">est.</span>` : '') : '<span class="sub">—</span>'}</td>
             <td><span class="chip ${cchip[0]}">${esc(cchip[1])}</span></td>
             <td><div class="toolbar">
@@ -2919,9 +2618,10 @@ async function runUnliRecalibration(dryRun) {
 
 /* ===================== EXPIRY MONITOR ===================== */
 async function loadExpiry() {
-  const [d, dep] = await Promise.all([
+  const [d, dep, ing] = await Promise.all([
     api('/console/expiry?within_days=' + STATE.expiry.within),
     fetchDepletion(),
+    api('/console/ingredients?limit=500'),
   ]);
   const burn = {};
   dep.ingredients.forEach(i => { burn[i.ingredient_id] = i.avg_daily_consumption; });
@@ -2930,24 +2630,40 @@ async function loadExpiry() {
     const usesUpIn = rate ? b.qty_base / rate : null;
     return { ...b, uses_up_in_days: usesUpIn, at_risk: !b.expired && (usesUpIn == null || usesUpIn > b.days_to_expiry) };
   });
+  // /console/expiry only ever returns batches that carry a real expiry
+  // signal (see its own docstring) -- an ingredient with stock on hand but
+  // no batch appearing here at all is exactly "no expiry data", which
+  // deserves its own named bucket rather than silently not showing up
+  // anywhere. Computed here by set difference against the ingredient list
+  // this page already needs for names/on-hand -- not a new calculation on
+  // top of what the server already decided, just grouping what it returned
+  // (and what it didn't) into a fourth bucket.
+  const trackedIngredientIds = new Set(d.batches.map(b => b.ingredient_id));
+  STATE.expiry.noData = ing.ingredients.filter(i =>
+    i.is_deductable && i.on_hand_base > 0 && i.kind !== 'sub_recipe' && !trackedIngredientIds.has(i.id));
   renderExpiry();
 }
+// Named by what the kitchen should DO, not by an arbitrary day window --
+// per Phase 10: Use Today / Expiring Soon / Expired / No Expiry Data.
 const EXPIRY_BUCKETS = [
-  { key: 'expired', label: 'Expired or today', color: 'var(--bad-fill)', test: b => b.expired || b.days_to_expiry <= 0 },
-  { key: 'soon', label: 'Within 7 days', color: 'var(--bad-fill)', test: b => !b.expired && b.days_to_expiry > 0 && b.days_to_expiry <= 7 },
-  { key: 'month', label: '8–30 days', color: 'var(--warn-fill)', test: b => !b.expired && b.days_to_expiry > 7 && b.days_to_expiry <= 30 },
-  { key: 'later', label: '31–90 days', color: 'var(--info-fill)', test: b => !b.expired && b.days_to_expiry > 30 },
+  { key: 'expired', label: 'Expired', color: 'var(--bad)', chip: 'bad', test: b => b.expired },
+  { key: 'today', label: 'Use today', color: 'var(--bad)', chip: 'bad', test: b => !b.expired && b.days_to_expiry <= 1 },
+  { key: 'soon', label: 'Expiring soon', color: 'var(--warn)', chip: 'warn', test: b => !b.expired && b.days_to_expiry > 1 && b.days_to_expiry <= 30 },
+  { key: 'later', label: 'Later', color: 'var(--info)', chip: 'info', test: b => !b.expired && b.days_to_expiry > 30 },
 ];
 function renderExpiry() {
-  const st = STATE.expiry, list = st.data;
+  const st = STATE.expiry, list = st.data, noData = st.noData || [];
   const windows = [7, 30, 90, 180];
   const buckets = EXPIRY_BUCKETS.map(bk => ({ ...bk, items: list.filter(bk.test) }));
   const atRisk = list.filter(b => b.at_risk).length;
   setWork(`
-    <div class="grid g4">${buckets.map(bk =>
-      `<div class="kpi"><div class="l">${ic('exp')}${esc(bk.label)}</div>
-        <div class="v" style="color:${bk.items.length ? bk.color : 'inherit'}">${bk.items.length}</div>
-        <div class="f">batch${bk.items.length === 1 ? '' : 'es'}</div></div>`).join('')}</div>
+    <div class="card"><div class="card-b">${statusBand([
+      { label: 'Expired', count: buckets[0].items.length, color: 'var(--bad)' },
+      { label: 'Use today', count: buckets[1].items.length, color: 'var(--bad)' },
+      { label: 'Expiring soon', count: buckets[2].items.length, color: 'var(--warn)' },
+      { label: 'Later', count: buckets[3].items.length, color: 'var(--info)' },
+      { label: 'No expiry data', count: noData.length, color: 'var(--text-3)' },
+    ])}</div></div>
     <div class="card">
       <div class="card-h"><div><h2>Expiry timeline</h2><p>Oldest stock first, so it gets used before it turns${atRisk ? ` · ${atRisk} batch${atRisk === 1 ? '' : 'es'} may not be used up in time` : ''}</p></div>
       <div class="r">
@@ -2955,16 +2671,29 @@ function renderExpiry() {
         <button class="btn btn-s btn-sm" data-act="export-expiry">${ic('dl')}Download</button>
         <button class="btn btn-s btn-sm" data-act="print-section">${ic('prn')}Print</button>
       </div></div>
-      <div class="card-b" style="display:flex;flex-direction:column;gap:var(--s3)">
+      <div class="card-b stack" style="gap:var(--s3)">
         ${list.length ? buckets.filter(bk => bk.items.length).map(bk => `
           <div>
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:11px">
-              <span class="chip ${bk.key === 'expired' || bk.key === 'soon' ? 'bad' : bk.key === 'month' ? 'warn' : 'info'}">${esc(bk.label)}</span>
+            <div class="expiry-sec-h">
+              <span class="chip ${bk.chip}">${esc(bk.label)}</span>
               <span class="sub">${bk.items.length} batch${bk.items.length === 1 ? '' : 'es'}</span>
             </div>
             <div class="grid g3">${bk.items.map(b => expiryCard(b, st.within, bk.color)).join('')}</div>
           </div>`).join('')
         : emptyState('Nothing expiring in this window', 'Widen the window above, or check back later.', 'exp')}
+        ${noData.length ? `
+          <div>
+            <div class="expiry-sec-h">
+              <span class="chip mute">No expiry data</span>
+              <span class="sub">${noData.length} ingredient${noData.length === 1 ? '' : 's'} in stock with nothing recorded</span>
+            </div>
+            <p class="lede">These have stock on hand but no batch carries a usable expiry signal — not "safe," just genuinely unknown. Receive fresh stock with a date, or set an estimated shelf life on the ingredient, to bring these into the tracked buckets above.</p>
+            <div class="grid g3">${noData.map(i => `
+              <div class="batch" style="border-left-color:var(--text-3)">
+                <div class="batch-h"><b>${esc(i.name)}</b><span class="d" style="color:var(--text-3)">no data</span></div>
+                <div class="batch-m"><span>${esc(i.on_hand_display)}</span><span>not tracked</span></div>
+              </div>`).join('')}</div>
+          </div>` : ''}
       </div>
     </div>`);
 }
@@ -3047,27 +2776,35 @@ function renderVerification() {
         <button class="tab ${!st.field ? 'on' : ''}" data-act="verify-field" data-f="">All types</button>
         ${fields.map(f => `<button class="tab ${st.field === f ? 'on' : ''}" data-act="verify-field" data-f="${f}">${esc(d.items.find(i => i.field === f).field_label)}</button>`).join('')}
       </div></div>` : ''}
-      <div class="card-b" style="display:flex;flex-direction:column;gap:16px">
+      <div class="card-b stack">
         ${sections.length ? sections.map(sec => `
           <div>
-            <div style="font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin-bottom:6px">${esc(sec.label)}</div>
-            <div style="display:flex;flex-direction:column;gap:10px">
+            <div class="dr-t">${esc(sec.label)}</div>
+            <div class="stack-sm">
               ${sec.groups.filter(() => shown++ < VERIFY_GROUP_CAP).map(g => `
                 <div class="verify-group">
-                  <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
-                    <b style="font-size:13px">${esc(g.entity_name)}</b>
+                  <div class="verify-group-h">
+                    <b>${esc(g.entity_name)}</b>
                     <span class="sub">${g.items.length} to confirm</span>
                   </div>
-                  <div style="display:flex;flex-direction:column;gap:8px">
+                  <div class="stack-sm">
                     ${g.items.map(i => `
-                      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:8px 0;border-top:1px solid var(--border)">
-                        <div style="flex:1;min-width:0">
-                          <div style="font-size:13px;font-weight:600">${esc(i.question)}</div>
-                          <div class="sub" style="margin-top:2px">${esc(i.why_it_matters)}</div>
-                          <div class="sub" style="margin-top:4px">Currently: <b>${esc(i.current_value === null || i.current_value === undefined ? 'not set' : i.current_value)}</b>${i.context ? ' — ' + esc(i.context) : ''}</div>
-                          <div class="sub" data-act="verify-history" data-key="${esc(verifyKey(i))}" style="margin-top:2px;cursor:pointer;text-decoration:underline">History</div>
+                      <div class="verify-item">
+                        <div class="verify-item-b">
+                          <div class="verify-q">${esc(i.question)}</div>
+                          <div class="sub">${esc(i.why_it_matters)}</div>
+                          <div class="sub">Currently: <b>${esc(i.current_value === null || i.current_value === undefined ? 'not set' : i.current_value)}</b>${i.context ? ' — ' + esc(i.context) : ''}</div>
+                          <button class="verify-hist" data-act="verify-history" data-key="${esc(verifyKey(i))}">History</button>
+                          <details class="tech">
+                            <summary>Technical details</summary>
+                            <dl class="dl">
+                              <dt>Field</dt><dd>${esc(i.field)}</dd>
+                              <dt>Row ID</dt><dd>${esc(i.row_id)}</dd>
+                              <dt>Priority</dt><dd>${esc(i.priority_label)}</dd>
+                            </dl>
+                          </details>
                         </div>
-                        <div style="display:flex;flex-direction:column;gap:4px;flex-shrink:0">
+                        <div class="verify-item-act">
                           <button class="btn btn-p btn-sm" data-act="verify-open" data-key="${esc(verifyKey(i))}">${ic('chk')}Review</button>
                         </div>
                       </div>`).join('')}
@@ -3133,7 +2870,7 @@ async function openVerifyHistory(key) {
     <p class="sub">${esc(item.question)}</p>
     ${events.length ? `<div style="display:flex;flex-direction:column;gap:8px;margin-top:8px">
       ${events.map(e => `
-        <div style="border-top:1px solid var(--border);padding-top:6px">
+        <div style="border-top:1px solid var(--line);padding-top:6px">
           <div><b>${esc(ACTION_LABEL[e.action] || e.action)}</b> by ${esc(e.user_id || 'unknown')} on ${esc((e.created_at || '').replace('T', ' '))}</div>
           ${e.action === 'changed' ? `<div class="sub">${esc(e.previous_value)} → ${esc(e.new_value)}</div>` : ''}
           ${e.note ? `<div class="sub">${esc(e.note)}</div>` : ''}
@@ -3391,6 +3128,20 @@ function loadSettings() {
         </div></div></div>
     </div>
     <div class="card">
+      <div class="card-h"><div><h2>Security</h2><p>Passwords and access</p></div></div>
+      <div class="setting-row">
+        <div><div class="sr-k">Change my password</div>
+          <div class="sr-d">Requires your current password. Signs out every other device immediately.</div></div>
+        <div class="sr-c"><button class="btn btn-s btn-sm" data-act="open-change-password">${ic('set')}Change</button></div>
+      </div>
+      ${ROLE === 'admin' ? `
+      <div class="setting-row">
+        <div><div class="sr-k">Reset another user's password</div>
+          <div class="sr-d">Generates a one-time password and shows it once — it is never logged or stored anywhere else.</div></div>
+        <div class="sr-c"><button class="btn btn-s btn-sm" data-act="open-reset-password">${ic('set')}Reset</button></div>
+      </div>` : ''}
+    </div>
+    <div class="card">
       <div class="card-h"><div><h2>Who can do what</h2><p>Enforced by the server on every request, not just hidden in the interface</p></div></div>
       <div class="tw"><table><thead><tr><th>Capability</th><th class="n">Cashier</th><th class="n">Kitchen</th><th class="n">Manager</th><th class="n">Admin</th></tr></thead>
       <tbody>${CAP_TABLE.map(c => `<tr><td class="nm">${esc(c.label)}</td>${['cashier', 'kitchen', 'manager', 'admin'].map(r =>
@@ -3404,6 +3155,65 @@ function loadSettings() {
         <a class="btn btn-s" href="/docs" target="_blank" rel="noopener">API documentation ${ic('chev')}</a>
       </div></div>
     </div>`);
+}
+
+function openChangePasswordModal() {
+  openModal(`
+    <h3>Change my password</h3>
+    <p class="sub">This immediately signs out every other session on this account.</p>
+    <label>Current password</label>
+    <input class="field" id="cpCurrent" type="password" autocomplete="current-password">
+    <label>New password (at least 10 characters)</label>
+    <input class="field" id="cpNew" type="password" autocomplete="new-password">
+    <label>Confirm new password</label>
+    <input class="field" id="cpConfirm" type="password" autocomplete="new-password">
+    <div id="modalErr"></div>
+    <div class="actions"><button class="btn btn-s" data-act="modal-cancel">Cancel</button><button class="btn btn-p" id="cpSubmit">Change password</button></div>
+  `);
+  $('#cpSubmit').addEventListener('click', async () => {
+    const current = $('#cpCurrent').value, next = $('#cpNew').value, confirm2 = $('#cpConfirm').value;
+    if (!current) { modalError('Enter your current password.'); return; }
+    if (next.length < 10) { modalError('New password must be at least 10 characters.'); return; }
+    if (next !== confirm2) { modalError('New password and confirmation do not match.'); return; }
+    $('#cpSubmit').disabled = true;
+    try {
+      const r = await api('/auth/change_password', {
+        method: 'POST', body: JSON.stringify({
+          current_password: current, new_password: next, confirm_new_password: confirm2,
+        }),
+      });
+      TOKEN = r.token; localStorage.setItem(NS + 'token', TOKEN);
+      closeModal();
+      toast('Password changed. Every other device has been signed out.');
+    } catch (e) { modalError(e.message); }
+    finally { const b = $('#cpSubmit'); if (b) b.disabled = false; }
+  });
+}
+
+function openResetPasswordModal() {
+  openModal(`
+    <h3>Reset a user's password</h3>
+    <p class="sub">Generates a random password and shows it exactly once — hand it to the account holder directly. It is never logged or stored anywhere else.</p>
+    <label>Username</label>
+    <input class="field" id="rpUser" placeholder="e.g. cashier1" autocomplete="off">
+    <div id="modalErr"></div>
+    <div class="actions"><button class="btn btn-s" data-act="modal-cancel">Cancel</button><button class="btn btn-p" id="rpSubmit">Reset password</button></div>
+  `);
+  $('#rpSubmit').addEventListener('click', async () => {
+    const u = $('#rpUser').value.trim();
+    if (!u) { modalError('Enter a username.'); return; }
+    $('#rpSubmit').disabled = true;
+    try {
+      const r = await api(`/console/users/${encodeURIComponent(u)}/reset_password`, { method: 'POST' });
+      openModal(`
+        <h3>New password for ${esc(r.username)}</h3>
+        <p class="sub">${esc(r.note)}</p>
+        <div class="dl"><dt>Temporary password</dt><dd class="mono">${esc(r.temporary_password)}</dd></div>
+        <div class="actions"><button class="btn btn-p" data-act="modal-cancel" style="flex:1">Done</button></div>
+      `);
+    } catch (e) { modalError(e.message); }
+    finally { const b = $('#rpSubmit'); if (b) b.disabled = false; }
+  });
 }
 
 /* ===================== ROUTER / SHELL ===================== */
@@ -3726,6 +3536,8 @@ document.addEventListener('click', async e => {
   if ((t = el2('[data-act="print-section"]'))) { window.print(); return; }
   if ((t = el2('[data-act="modal-cancel"]'))) { closeModal(); return; }
   if ((t = el2('[data-act="logout"]'))) { doLogout(); return; }
+  if ((t = el2('[data-act="open-change-password"]'))) { openChangePasswordModal(); return; }
+  if ((t = el2('[data-act="open-reset-password"]'))) { openResetPasswordModal(); return; }
 });
 $('#work').addEventListener('change', async e => {
   const el2 = a => e.target.closest(a);
