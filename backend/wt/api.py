@@ -774,12 +774,18 @@ def verify_constant(
 ):
     """Confirm a physical constant. This is the only path that moves a value
     from needs_verification to verified — it cannot happen as a side effect of
-    an ordinary edit."""
+    an ordinary edit.
+
+    Validated the same way /console/queues/verification/resolve validates
+    the same three columns (verification.validate_numeric_value) — pydantic's
+    plain `float` type accepts NaN and infinity by default, which is not
+    caught by body: VerifyIn alone."""
+    value = verification.validate_numeric_value(f"ingredient.{body.field}", body.value)
     with db.write_tx(c):
         cur = c.execute(
             f"UPDATE ingredient SET {body.field}=?, {body.field}_status='verified', "
             f"updated_at=datetime('now') WHERE id=?",
-            (body.value, pk),
+            (value, pk),
         )
         if cur.rowcount != 1:
             raise HTTPException(404, "ingredient not found")
@@ -795,7 +801,7 @@ def verify_constant(
                 """,
                 (pk, pk, pk),
             )
-    return {"ok": True, "field": body.field, "value": body.value, "verified_by": p["sub"]}
+    return {"ok": True, "field": body.field, "value": value, "verified_by": p["sub"]}
 
 
 class ReceiveIn(BaseModel):

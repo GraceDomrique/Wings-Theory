@@ -24,10 +24,12 @@ stays reproducible and only orders from now on see the new rate.
 """
 from __future__ import annotations
 
+import datetime as _dt
+import math
 import sqlite3
 
 from .db import write_tx
-from .errors import InvalidStateError, NotFoundError
+from .errors import InvalidStateError, NotFoundError, ValidationError
 
 # ---------------------------------------------------------------------------
 # Priority: what breaks if this specific field is wrong.
@@ -123,6 +125,62 @@ GROUP_LABEL = {
     "unli_coefficient.lambda": "Unlimited consumption rates",
     "fefo_batch.expires_at": "Stock batch expiry dates",
 }
+
+
+# Every numeric field in this workflow represents a strictly positive
+# physical or business quantity: a pack always contains more than zero
+# units, a yield factor of zero would mean the ingredient never yields
+# anything, a recipe line consuming exactly zero of something is a data
+# error (an ingredient that's genuinely not used shouldn't have a line at
+# all -- see seed.py's import_recipes, which drops qty_base <= 0 lines
+# rather than storing them), an unlimited stream deducting zero per head
+# defeats the point of tracking it, and a negative cost, quantity, or rate
+# is never physically meaningful here. One rule -- new_value > 0 -- covers
+# all five; see validate_numeric_value. Public (no leading underscore) --
+# api.py's older /console/ingredients/{pk}/verify endpoint reuses it too,
+# so both paths that can move one of these three ingredient columns share
+# exactly one validation rule instead of two that could drift apart.
+NUMERIC_FIELDS = {
+    "ingredient.pack_size", "ingredient.yield_factor", "ingredient.unit_cost",
+    "recipe_line.qty_base", "unli_coefficient.lambda",
+}
+
+
+def validate_numeric_value(field: str, raw: float | str | None) -> float:
+    """Runs before any database write -- see resolve(), which validates
+    before entering write_tx at all for a numeric field, so a rejected
+    value never opens a transaction in the first place. Never lets a raw
+    ValueError/TypeError (from a malformed string, e.g. "500g" instead of
+    500) reach the caller -- everything here becomes a clean
+    ValidationError (422) with a message safe to show directly."""
+    if isinstance(raw, bool) or not isinstance(raw, (int, float, str)):
+        raise ValidationError(f"{field}: new_value must be a number")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise ValidationError(f"{field}: {raw!r} is not a valid number")
+    if math.isnan(value) or math.isinf(value):
+        raise ValidationError(f"{field}: new_value must be a finite number")
+    if value <= 0:
+        raise ValidationError(f"{field}: new_value must be greater than zero")
+    return value
+
+
+def _validate_date_value(field: str, raw: float | str | None) -> str:
+    """fefo_batch.expires_at is the one non-numeric changeable field --
+    validates as a real calendar date (YYYY-MM-DD, the format every other
+    date in this schema uses) rather than trusting an arbitrary string
+    into a column FEFO ordering depends on."""
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValidationError(f"{field}: new_value must be a date")
+    cleaned = raw.strip()
+    try:
+        _dt.date.fromisoformat(cleaned)
+    except ValueError:
+        raise ValidationError(
+            f"{field}: {raw!r} is not a valid date (expected YYYY-MM-DD)"
+        )
+    return cleaned
 
 
 def _sub_recipe_ids(conn: sqlite3.Connection) -> set[int]:
@@ -222,6 +280,20 @@ def resolve(
     if field not in PRIORITY:
         raise InvalidStateError(f"unknown verification field '{field}'")
 
+    # Validated BEFORE write_tx opens, not inside it -- a rejected value
+    # never starts a transaction, never reaches a database UPDATE, and
+    # never reaches _log() (no verification_event row for a change that
+    # didn't happen). A malformed new_value (wrong type, NaN/infinite,
+    # zero, negative, or an unparseable string) becomes a clean
+    # ValidationError here, never a raw ValueError/TypeError escaping to
+    # the caller as an opaque 500.
+    validated_value: float | str | None = None
+    if action == "change":
+        if field in NUMERIC_FIELDS:
+            validated_value = validate_numeric_value(field, new_value)
+        elif field == "fefo_batch.expires_at":
+            validated_value = _validate_date_value(field, new_value)
+
     with write_tx(conn):
         if field in ("ingredient.pack_size", "ingredient.yield_factor", "ingredient.unit_cost"):
             col = field.split(".")[1]
@@ -230,7 +302,7 @@ def resolve(
             if action == "keep_estimate":
                 _log(conn, field, row_id, ing["name"], "kept_estimate", current, None, note, user_id)
                 return {"field": field, "row_id": row_id, "action": action, "value": current}
-            value = current if action == "confirm" else float(new_value)
+            value = current if action == "confirm" else validated_value
             conn.execute(
                 f"UPDATE ingredient SET {col}=?, {col}_status='verified', "
                 f"updated_at=datetime('now') WHERE id=?",
@@ -267,7 +339,7 @@ def resolve(
             if action == "keep_estimate":
                 _log(conn, field, row_id, entity_name, "kept_estimate", current, None, note, user_id)
                 return {"field": field, "row_id": row_id, "action": action, "value": current}
-            value = current if action == "confirm" else float(new_value)
+            value = current if action == "confirm" else validated_value
             conn.execute(
                 "UPDATE recipe_line SET qty_base=?, qty_status='verified' WHERE id=?",
                 (value, row_id),
@@ -288,7 +360,7 @@ def resolve(
             if action == "keep_estimate":
                 _log(conn, field, row_id, batch["ingredient_name"], "kept_estimate", current, None, note, user_id)
                 return {"field": field, "row_id": row_id, "action": action, "value": current}
-            value = current if action == "confirm" else str(new_value)
+            value = current if action == "confirm" else validated_value
             conn.execute(
                 "UPDATE fefo_batch SET expires_at=?, expiry_status='verified' WHERE id=?",
                 (value, row_id),
@@ -323,7 +395,7 @@ def resolve(
             # what an already-reconciled day is judged against. Insert a new
             # row instead, exactly like recalibrate() does, so only orders
             # from this moment on see the new rate.
-            value = float(new_value)
+            value = validated_value
             conn.execute(
                 "INSERT INTO unli_coefficient (unli_item_id, lambda_value, role, status, effective_from) "
                 "VALUES (?,?,?, 'verified', datetime('now'))",

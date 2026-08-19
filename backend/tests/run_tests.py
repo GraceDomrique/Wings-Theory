@@ -1366,6 +1366,82 @@ class TestVerificationWorkflow(unittest.TestCase):
         self.assertEqual(before, after,
                          "verifying a rate later must not change what an already-committed order is judged against")
 
+    # -- P1-2: input validation, at the function level -----------------
+    def _fefo_reconciliation_snapshot(self):
+        return {
+            r["id"]: r["q"] for r in self.conn.execute(
+                "SELECT ingredient_id AS id, COALESCE(SUM(qty_base),0) AS q FROM fefo_batch "
+                "WHERE state='open' GROUP BY ingredient_id"
+            ).fetchall()
+        }
+
+    def _ledger_snapshot(self):
+        return self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+
+    def test_resolve_rejects_a_string_that_is_not_a_number(self):
+        from wt.verification import resolve
+        from wt.errors import ValidationError
+        row = self.conn.execute("SELECT id, on_hand_base FROM ingredient WHERE name='Wings'").fetchone()
+        fefo_before, ledger_before = self._fefo_reconciliation_snapshot(), self._ledger_snapshot()
+        with self.assertRaises(ValidationError):
+            resolve(self.conn, "ingredient.pack_size", row["id"], "change", "not-a-number", None, "u")
+        self.assertEqual(self._fefo_reconciliation_snapshot(), fefo_before)
+        self.assertEqual(self._ledger_snapshot(), ledger_before)
+        self.assertEqual(self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (row["id"],)
+        ).fetchone()["on_hand_base"], row["on_hand_base"])
+
+    def test_resolve_rejects_zero_for_a_recipe_line(self):
+        from wt.verification import resolve
+        from wt.errors import ValidationError
+        row = self.conn.execute(
+            "SELECT id, qty_base FROM recipe_line WHERE qty_status='needs_verification' LIMIT 1"
+        ).fetchone()
+        with self.assertRaises(ValidationError):
+            resolve(self.conn, "recipe_line.qty_base", row["id"], "change", 0, None, "u")
+        self.assertEqual(self.conn.execute(
+            "SELECT qty_base, qty_status FROM recipe_line WHERE id=?", (row["id"],)
+        ).fetchone()["qty_base"], row["qty_base"])
+
+    def test_resolve_rejects_negative_lambda(self):
+        from wt.verification import resolve
+        from wt.errors import ValidationError
+        coeff = self.conn.execute(
+            "SELECT id, lambda_value FROM unli_coefficient WHERE role='rolling' LIMIT 1").fetchone()
+        n_before = self.conn.execute("SELECT COUNT(*) AS n FROM unli_coefficient").fetchone()["n"]
+        with self.assertRaises(ValidationError):
+            resolve(self.conn, "unli_coefficient.lambda", coeff["id"], "change", -10.0, None, "u")
+        n_after = self.conn.execute("SELECT COUNT(*) AS n FROM unli_coefficient").fetchone()["n"]
+        self.assertEqual(n_after, n_before, "a rejected lambda must not insert a new coefficient row")
+
+    def test_resolve_rejects_nan_and_infinite_values(self):
+        from wt.verification import resolve
+        from wt.errors import ValidationError
+        row = self.conn.execute("SELECT id FROM ingredient WHERE name='Cheese Bars'").fetchone()
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            with self.assertRaises(ValidationError):
+                resolve(self.conn, "ingredient.yield_factor", row["id"], "change", bad, None, "u")
+
+    def test_resolve_rejects_a_malformed_expiry_date(self):
+        from wt.verification import resolve
+        from wt.errors import ValidationError
+        batch = self.conn.execute(
+            "SELECT id, expires_at FROM fefo_batch WHERE expiry_status='needs_verification' "
+            "AND state='open' LIMIT 1"
+        ).fetchone()
+        for bad in ("not-a-date", "2027-13-40", "", 12345):
+            with self.assertRaises(ValidationError):
+                resolve(self.conn, "fefo_batch.expires_at", batch["id"], "change", bad, None, "u")
+        self.assertEqual(self.conn.execute(
+            "SELECT expires_at FROM fefo_batch WHERE id=?", (batch["id"],)
+        ).fetchone()["expires_at"], batch["expires_at"])
+
+    def test_resolve_accepts_a_valid_positive_value(self):
+        from wt.verification import resolve
+        row = self.conn.execute("SELECT id FROM ingredient WHERE name='Iodized Salt'").fetchone()
+        r = resolve(self.conn, "ingredient.pack_size", row["id"], "change", 1500.0, "recounted", "u")
+        self.assertEqual(r["value"], 1500.0)
+
 
 # ===========================================================================
 class TestConsoleAPI(unittest.TestCase):
@@ -1820,6 +1896,117 @@ class TestConsoleAPI(unittest.TestCase):
         r = self.client.post(f"/console/ingredients/{ing['id']}/waste", headers=self.H_MGR,
                              json={"qty_base": 1e9})
         self.assertEqual(r.status_code, 409)
+
+    def test_verification_resolve_requires_queue_resolve_capability(self):
+        ing = self.conn.execute("SELECT id FROM ingredient WHERE name='Wings'").fetchone()
+        r = self.client.post(
+            "/console/queues/verification/resolve", headers=self.H_CASH,
+            json={"field": "ingredient.pack_size", "row_id": ing["id"], "action": "confirm"},
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_verification_resolve_valid_manager_change_succeeds(self):
+        ing = self.conn.execute("SELECT id FROM ingredient WHERE name='Bacon'").fetchone()
+        r = self.client.post(
+            "/console/queues/verification/resolve", headers=self.H_MGR,
+            json={"field": "ingredient.unit_cost", "row_id": ing["id"], "action": "change",
+                  "new_value": 250.0, "note": "receipt checked"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["value"], 250.0)
+        row = self.conn.execute(
+            "SELECT unit_cost, unit_cost_status FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
+        self.assertEqual(row["unit_cost"], 250.0)
+        self.assertEqual(row["unit_cost_status"], "verified")
+
+    def _assert_verification_change_rejected(self, ingredient_name, new_value):
+        """Shared assertion for P1-2: a rejected new_value must come back as
+        the application's normal validation_error JSON shape (never a raw
+        traceback or an opaque 500), and must leave absolutely no trace --
+        not the column, not its status, not a verification_event row."""
+        ing = self.conn.execute(
+            "SELECT id, pack_size, pack_size_status FROM ingredient WHERE name=?", (ingredient_name,)
+        ).fetchone()
+        events_before = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM verification_event").fetchone()["n"]
+
+        r = self.client.post(
+            "/console/queues/verification/resolve", headers=self.H_MGR,
+            json={"field": "ingredient.pack_size", "row_id": ing["id"], "action": "change",
+                  "new_value": new_value},
+        )
+        self.assertIn(r.status_code, (400, 422), r.text)
+        body = r.json()
+        self.assertNotIn("Traceback", str(body))
+        self.assertNotIn("sqlite3", str(body).lower())
+
+        row = self.conn.execute(
+            "SELECT pack_size, pack_size_status FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
+        self.assertEqual(row["pack_size"], ing["pack_size"], "a rejected value must not reach the column")
+        self.assertEqual(row["pack_size_status"], ing["pack_size_status"])
+        events_after = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM verification_event").fetchone()["n"]
+        self.assertEqual(events_after, events_before, "a rejected value must not write an audit event")
+
+    def test_verification_resolve_rejects_non_numeric_value(self):
+        self._assert_verification_change_rejected("Flour", "not-a-number")
+
+    def test_verification_resolve_rejects_zero(self):
+        self._assert_verification_change_rejected("Rice", 0)
+
+    def test_verification_resolve_rejects_negative(self):
+        self._assert_verification_change_rejected("Pasta", -500)
+
+    def test_verification_resolve_rejects_nan(self):
+        import json as _json
+        ing = self.conn.execute("SELECT id, pack_size FROM ingredient WHERE name='Butter'").fetchone()
+        events_before = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM verification_event").fetchone()["n"]
+        body = _json.dumps({"field": "ingredient.pack_size", "row_id": ing["id"],
+                            "action": "change", "new_value": float("nan")})
+        r = self.client.post(
+            "/console/queues/verification/resolve",
+            headers={**self.H_MGR, "Content-Type": "application/json"}, content=body,
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        row = self.conn.execute("SELECT pack_size FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
+        self.assertEqual(row["pack_size"], ing["pack_size"])
+        events_after = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM verification_event").fetchone()["n"]
+        self.assertEqual(events_after, events_before)
+
+    def test_verification_resolve_rejects_infinity(self):
+        import json as _json
+        ing = self.conn.execute("SELECT id, pack_size FROM ingredient WHERE name='Honey'").fetchone()
+        body = _json.dumps({"field": "ingredient.pack_size", "row_id": ing["id"],
+                            "action": "change", "new_value": float("inf")})
+        r = self.client.post(
+            "/console/queues/verification/resolve",
+            headers={**self.H_MGR, "Content-Type": "application/json"}, content=body,
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        row = self.conn.execute("SELECT pack_size FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
+        self.assertEqual(row["pack_size"], ing["pack_size"])
+
+    def test_verification_resolve_rejects_a_value_with_a_unit_suffix(self):
+        self._assert_verification_change_rejected("Cornstarch", "500g")
+
+    def test_verification_resolve_ingredients_verify_endpoint_also_rejects_nan(self):
+        # The older /console/ingredients/{pk}/verify endpoint moves the same
+        # three columns through a different code path (pydantic's plain
+        # `float`, not verification.resolve) -- it shares
+        # verification.validate_numeric_value rather than trusting pydantic
+        # alone, since pydantic's float type accepts NaN/inf by default.
+        import json as _json
+        ing = self.conn.execute("SELECT id, pack_size FROM ingredient WHERE name='Sriracha'").fetchone()
+        body = _json.dumps({"field": "pack_size", "value": float("nan")})
+        r = self.client.post(
+            f"/console/ingredients/{ing['id']}/verify",
+            headers={**self.H_MGR, "Content-Type": "application/json"}, content=body,
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        row = self.conn.execute("SELECT pack_size FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
+        self.assertEqual(row["pack_size"], ing["pack_size"])
 
     def test_prophet_response_carries_the_fitted_line_and_outliers(self):
         items = self.client.get("/console/forecasts/demand", headers=self.H_MGR).json()["items"]
