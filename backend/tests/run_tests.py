@@ -1456,7 +1456,7 @@ class TestConsoleAPI(unittest.TestCase):
         stayed looking logged-in and every request failed for the rest of
         the shift, because clients only clear a session on 401."""
         from wt import auth as _auth
-        stale = _auth.issue_token("manager", "manager", ttl=-1)
+        stale = _auth.issue_token("manager", "manager", "irrelevant-expiry-checked-first", ttl=-1)
         r = self.client.get("/console/readiness", headers={"Authorization": f"Bearer {stale}"})
         self.assertEqual(r.status_code, 401)
 
@@ -1466,7 +1466,7 @@ class TestConsoleAPI(unittest.TestCase):
         escape as a 500, so one corrupted localStorage entry took the
         endpoint down instead of prompting a fresh sign-in."""
         from wt import auth as _auth
-        good = _auth.issue_token("manager", "manager")
+        good = _auth.issue_token("manager", "manager", "irrelevant-only-used-tampered")
         tampered = good[:-4] + ("aaaa" if not good.endswith("aaaa") else "bbbb")
         for bad in ["not-a-token", "a.b.c", "...", "x.y.z", tampered, ""]:
             r = self.client.get("/console/readiness", headers={"Authorization": f"Bearer {bad}"})
@@ -1837,6 +1837,207 @@ class TestConsoleAPI(unittest.TestCase):
         for o in d["outliers"]:
             self.assertGreaterEqual(o["sigma"], 2.5)
             self.assertLess(o["index"], len(d["series"]))
+
+
+class TestPasswordSecurity(unittest.TestCase):
+    """P0-2: self-service password change, admin reset, and the token
+    invalidation that makes either one actually take effect immediately
+    instead of waiting out the old token's 12-hour TTL."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        # unittest runs test methods in alphabetical order, and every test
+        # that actually completes a password change/reset mutates real
+        # state -- reusing the four fixed seeded accounts (owner, manager,
+        # cashier1, kitchen1) across more than one mutating test would make
+        # later tests depend on what an earlier one (in alphabetical, not
+        # narrative, order) left behind. Each mutating test below gets its
+        # own dedicated account instead; only 'owner' (never mutated by any
+        # test here) and 'cashier1' (only ever used in tests that fail
+        # validation before any UPDATE runs) are shared.
+        from wt.auth import hash_password
+        for username in ("pwtest_selfchange", "pwtest_tokeninvalidation",
+                         "pwtest_adminreset", "pwtest_noleak"):
+            h, s = hash_password("wingstheory")
+            cls.conn.execute(
+                "INSERT INTO app_user (username, display_name, role, password_hash, "
+                "password_salt, must_change_password) VALUES (?,?, 'manager', ?,?, 1)",
+                (username, username, h, s),
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _login(self, username, password="wingstheory"):
+        return self.client.post("/auth/login", json={"username": username, "password": password})
+
+    def _token(self, username, password="wingstheory"):
+        return self._login(username, password).json()["token"]
+
+    def _auth_headers(self, token):
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_fresh_seeded_account_is_flagged_must_change_password(self):
+        r = self._login("cashier1")
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["must_change_password"])
+
+    def test_self_service_change_requires_correct_current_password(self):
+        token = self._token("cashier1")
+        r = self.client.post(
+            "/auth/change_password", headers=self._auth_headers(token),
+            json={"current_password": "wrong", "new_password": "a-real-new-password-1",
+                  "confirm_new_password": "a-real-new-password-1"},
+        )
+        self.assertEqual(r.status_code, 401)
+
+    def test_self_service_change_requires_matching_confirmation(self):
+        token = self._token("cashier1")
+        r = self.client.post(
+            "/auth/change_password", headers=self._auth_headers(token),
+            json={"current_password": "wingstheory", "new_password": "a-real-new-password-2",
+                  "confirm_new_password": "does-not-match"},
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["code"], "validation_error")
+
+    def test_self_service_change_rejects_short_password(self):
+        token = self._token("cashier1")
+        r = self.client.post(
+            "/auth/change_password", headers=self._auth_headers(token),
+            json={"current_password": "wingstheory", "new_password": "short1",
+                  "confirm_new_password": "short1"},
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_self_service_change_rejects_the_known_compromised_default(self):
+        token = self._token("cashier1")
+        r = self.client.post(
+            "/auth/change_password", headers=self._auth_headers(token),
+            json={"current_password": "wingstheory", "new_password": "wingstheory",
+                  "confirm_new_password": "wingstheory"},
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_self_service_change_rejects_password_equal_to_username(self):
+        token = self._token("cashier1")
+        r = self.client.post(
+            "/auth/change_password", headers=self._auth_headers(token),
+            json={"current_password": "wingstheory", "new_password": "cashier1",
+                  "confirm_new_password": "cashier1"},
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_successful_change_clears_must_change_password_and_old_password_stops_working(self):
+        old_token = self._token("pwtest_selfchange")
+        r = self.client.post(
+            "/auth/change_password", headers=self._auth_headers(old_token),
+            json={"current_password": "wingstheory", "new_password": "a-real-chosen-password-1",
+                  "confirm_new_password": "a-real-chosen-password-1"},
+        )
+        self.assertEqual(r.status_code, 200)
+        new_token = r.json()["token"]
+        self.assertTrue(new_token)
+
+        # old credential is dead
+        stale_login = self._login("pwtest_selfchange", "wingstheory")
+        self.assertEqual(stale_login.status_code, 401)
+
+        # the flag this change was supposed to clear is actually cleared
+        fresh_login = self._login("pwtest_selfchange", "a-real-chosen-password-1")
+        self.assertEqual(fresh_login.status_code, 200)
+        self.assertFalse(fresh_login.json()["must_change_password"])
+
+    def test_token_issued_before_a_password_change_is_rejected_after_it(self):
+        old_token = self._token("pwtest_tokeninvalidation")
+        r = self.client.post(
+            "/auth/change_password", headers=self._auth_headers(old_token),
+            json={"current_password": "wingstheory", "new_password": "another-real-password-1",
+                  "confirm_new_password": "another-real-password-1"},
+        )
+        self.assertEqual(r.status_code, 200)
+
+        # the OLD token -- issued before the change -- must no longer work,
+        # even though it has not naturally expired
+        stale = self.client.get("/console/readiness", headers=self._auth_headers(old_token))
+        self.assertEqual(stale.status_code, 401)
+
+        # the token the change endpoint just handed back still works
+        new_token = r.json()["token"]
+        fresh = self.client.get("/console/readiness", headers=self._auth_headers(new_token))
+        self.assertEqual(fresh.status_code, 200)
+
+    def test_admin_reset_is_forbidden_for_non_admin_roles(self):
+        cash_token = self._token("cashier1")
+        r = self.client.post(
+            "/console/users/pwtest_adminreset/reset_password", headers=self._auth_headers(cash_token),
+        )
+        self.assertEqual(r.status_code, 403)
+
+    def test_admin_reset_generates_a_working_password_and_invalidates_old_tokens(self):
+        admin_token = self._token("owner")
+        old_token = self._token("pwtest_adminreset")
+
+        r = self.client.post(
+            "/console/users/pwtest_adminreset/reset_password", headers=self._auth_headers(admin_token),
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        temp_password = body["temporary_password"]
+        self.assertGreaterEqual(len(temp_password), 16)
+
+        # old session is dead immediately, not after 12 hours
+        stale = self.client.get("/console/readiness", headers=self._auth_headers(old_token))
+        self.assertEqual(stale.status_code, 401)
+
+        # the generated password actually works, and is flagged for change
+        fresh_login = self._login("pwtest_adminreset", temp_password)
+        self.assertEqual(fresh_login.status_code, 200)
+        self.assertTrue(fresh_login.json()["must_change_password"])
+
+    def test_admin_reset_unknown_username_is_404(self):
+        admin_token = self._token("owner")
+        r = self.client.post(
+            "/console/users/does-not-exist/reset_password", headers=self._auth_headers(admin_token),
+        )
+        self.assertEqual(r.status_code, 404)
+
+    def test_reset_endpoint_never_echoes_the_password_anywhere_but_this_response(self):
+        # Not a network capture test -- verifies the one thing under this
+        # process's control: the generated password does not appear in any
+        # row this project's own audit trail (verification_event) writes,
+        # confirming the reset path never routed it through that table.
+        admin_token = self._token("owner")
+        r = self.client.post(
+            "/console/users/pwtest_noleak/reset_password", headers=self._auth_headers(admin_token),
+        )
+        self.assertEqual(r.status_code, 200)
+        temp_password = r.json()["temporary_password"]
+        leaked = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM verification_event WHERE note LIKE ? OR new_value LIKE ?",
+            (f"%{temp_password}%", f"%{temp_password}%"),
+        ).fetchone()["n"]
+        self.assertEqual(leaked, 0)
 
 
 class TestForecasting(Base):
@@ -5137,7 +5338,8 @@ def main() -> int:
             TestRefillReconciliationLink, TestRefillAPI,
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
-            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestForecasting, TestAnomaly, TestAssociations,
+            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestPasswordSecurity,
+            TestForecasting, TestAnomaly, TestAssociations,
             TestMigrationSafety, TestEnvironmentSafety,
         )
     )

@@ -21,9 +21,10 @@ import hmac
 import json
 import os
 import secrets
+import string
 import time
 
-from .errors import AuthenticationError, PermissionError_, WTError
+from .errors import AuthenticationError, PermissionError_, ValidationError, WTError
 
 ALGO = "HS256"
 TOKEN_TTL = 12 * 3600          # one shift plus overtime
@@ -33,6 +34,14 @@ ITERATIONS = 240_000
 # startup check (db.validate_production_startup) can refuse to run with it
 # still in effect, instead of duplicating the literal in two files.
 DEFAULT_SECRET = "dev-only-change-in-production"
+
+# The shared seed password every account was created with (seed.py
+# seed_users). Rejected outright as a *new* password on either the
+# self-service change or the admin reset path -- a reset that could put the
+# very credential this phase exists to retire back in place would defeat
+# the point of having a reset endpoint at all.
+KNOWN_COMPROMISED_PASSWORDS = {"wingstheory"}
+MIN_PASSWORD_LENGTH = 10
 
 ROLES = ("admin", "manager", "cashier", "kitchen")
 
@@ -105,15 +114,50 @@ def verify_password(password: str, stored_hash: str, salt: str) -> bool:
     return hmac.compare_digest(candidate, stored_hash)
 
 
+def validate_new_password(password: str, *, username: str | None = None) -> None:
+    """Rejects a proposed password before it is ever hashed or written.
+    Used by both the self-service change and the admin reset path (the
+    latter only for defense in depth -- generate_temp_password() below
+    already produces something that passes this on its own)."""
+    if not isinstance(password, str) or len(password) < MIN_PASSWORD_LENGTH:
+        raise ValidationError(
+            f"password must be at least {MIN_PASSWORD_LENGTH} characters"
+        )
+    if password.lower() in KNOWN_COMPROMISED_PASSWORDS:
+        raise ValidationError(
+            "that password is a known shared/compromised default and cannot be used"
+        )
+    if username and password.lower() == username.lower():
+        raise ValidationError("password cannot be the same as the username")
+
+
+def generate_temp_password(length: int = 16) -> str:
+    """A cryptographically random password for the admin-reset path -- the
+    admin never types (and therefore never has to invent, remember, or
+    reuse) the credential a reset hands back."""
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
 # ---------------------------------------------------------------------------
 # tokens
 # ---------------------------------------------------------------------------
-def issue_token(username: str, role: str, ttl: int = TOKEN_TTL) -> str:
+def issue_token(username: str, role: str, password_changed_at: str, ttl: int = TOKEN_TTL) -> str:
+    """password_changed_at is embedded as the 'pwd' claim so a token minted
+    before a password change can be told apart, at request time, from one
+    minted after it -- see api.principal(), which compares this claim
+    against app_user's current column value and rejects a mismatch. Without
+    this, changing or resetting a password would leave every token already
+    issued for that account valid until its own 12-hour expiry, which
+    defeats the point of an emergency reset."""
     if role not in ROLES:
         raise WTError(f"unknown role {role!r}")
     header = {"alg": ALGO, "typ": "JWT"}
     now = int(time.time())
-    payload = {"sub": username, "role": role, "iat": now, "exp": now + ttl}
+    payload = {
+        "sub": username, "role": role, "iat": now, "exp": now + ttl,
+        "pwd": password_changed_at,
+    }
     signing_input = f"{_b64(json.dumps(header).encode())}.{_b64(json.dumps(payload).encode())}"
     sig = hmac.new(_secret(), signing_input.encode(), hashlib.sha256).digest()
     return f"{signing_input}.{_b64(sig)}"

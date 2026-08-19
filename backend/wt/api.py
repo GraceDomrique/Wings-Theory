@@ -25,7 +25,7 @@ from .anomaly import consumption_model_details
 from .anomaly import model_details as anomaly_model_details
 from .associations import product_combinations
 from .associations import model_details as association_model_details
-from .errors import WTError
+from .errors import AuthenticationError, NotFoundError, ValidationError, WTError
 from .forecasting import (
     evaluate_demand_model, ingredient_depletion, menu_item_demand, menu_item_demand_prophet,
 )
@@ -91,10 +91,30 @@ def health(c: sqlite3.Connection = Depends(conn)):
     return db.integrity_report(c)
 
 
-def principal(authorization: str = Header(default="")) -> dict:
+def principal(
+    authorization: str = Header(default=""), c: sqlite3.Connection = Depends(conn),
+) -> dict:
+    """Identity check. Beyond the signature/expiry auth.decode_token already
+    verifies, this also confirms the account is still active and that the
+    token was issued after the account's current password_changed_at --
+    see auth.issue_token's 'pwd' claim. Without the second check, changing
+    or resetting a password (P0-2) would leave every token already issued
+    for that account valid until its own 12-hour expiry, which defeats the
+    point of an emergency reset. Both failure modes are 401, same as every
+    other identity failure here: the client still just needs to sign in
+    again, not be told it lacks permission."""
     if not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "missing bearer token")
-    return auth.decode_token(authorization.split(" ", 1)[1])
+    payload = auth.decode_token(authorization.split(" ", 1)[1])
+    row = c.execute(
+        "SELECT password_changed_at, is_active FROM app_user WHERE username=?",
+        (payload.get("sub"),),
+    ).fetchone()
+    if not row or not row["is_active"]:
+        raise AuthenticationError("account no longer active — please sign in again")
+    if payload.get("pwd") != row["password_changed_at"]:
+        raise AuthenticationError("session invalidated by a password change — please sign in again")
+    return payload
 
 
 def needs(capability: str):
@@ -124,9 +144,89 @@ def login(body: Login, c: sqlite3.Connection = Depends(conn)):
     if not row or not auth.verify_password(body.password, row["password_hash"], row["password_salt"]):
         raise HTTPException(401, "invalid credentials")
     return {
-        "token": auth.issue_token(row["username"], row["role"]),
+        "token": auth.issue_token(row["username"], row["role"], row["password_changed_at"]),
         "role": row["role"],
         "display_name": row["display_name"],
+        # Data only -- nothing blocks this login or any later request on it.
+        # Lets a future console/POS screen prompt a change; today it's what
+        # the go-live checklist queries to see which seeded accounts still
+        # carry the shared placeholder password.
+        "must_change_password": bool(row["must_change_password"]),
+    }
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_new_password: str
+
+
+@app.post("/auth/change_password", tags=["auth"])
+def change_password(
+    body: ChangePasswordIn, c: sqlite3.Connection = Depends(conn), p: dict = Depends(principal),
+):
+    """Self-service password change. Always requires the caller's own
+    current password -- a valid bearer token alone is not enough to change
+    what unlocks the account -- rejects a mismatched confirmation and
+    anything auth.validate_new_password refuses, and immediately
+    invalidates every token issued before this change by advancing
+    password_changed_at (see auth.issue_token's 'pwd' claim and
+    api.principal's freshness check). Returns a fresh token for the new
+    password so the caller isn't logged out by their own change."""
+    row = c.execute(
+        "SELECT * FROM app_user WHERE username=? AND is_active=1", (p["sub"],)
+    ).fetchone()
+    if not row:
+        raise AuthenticationError("account no longer active — please sign in again")
+    if not auth.verify_password(body.current_password, row["password_hash"], row["password_salt"]):
+        raise AuthenticationError("current password is incorrect")
+    if body.new_password != body.confirm_new_password:
+        raise ValidationError("new password and confirmation do not match")
+    auth.validate_new_password(body.new_password, username=row["username"])
+
+    h, s = auth.hash_password(body.new_password)
+    with db.write_tx(c):
+        c.execute(
+            "UPDATE app_user SET password_hash=?, password_salt=?, "
+            "password_changed_at=datetime('now'), must_change_password=0 WHERE id=?",
+            (h, s, row["id"]),
+        )
+    new_changed_at = c.execute(
+        "SELECT password_changed_at FROM app_user WHERE id=?", (row["id"],)
+    ).fetchone()["password_changed_at"]
+    return {"ok": True, "token": auth.issue_token(row["username"], row["role"], new_changed_at)}
+
+
+@app.post("/console/users/{username}/reset_password", tags=["console"])
+def reset_password(
+    username: str, c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage")),
+):
+    """Admin-only emergency reset (auth.CAPABILITIES already scopes
+    user.manage to admin). Generates a random password server-side --
+    the admin never types, and therefore never has to invent or reuse, the
+    credential this hands back -- and returns it exactly once, in this
+    response body only. It is never logged and never written anywhere
+    else (not even the audit trail this project keeps for inventory
+    verification, which is a different domain): if this response is lost,
+    the only recovery is to reset again. Flags must_change_password=1 so
+    the go-live checklist can tell a still-temporary password apart from
+    one the account holder actually chose."""
+    row = c.execute("SELECT * FROM app_user WHERE username=?", (username,)).fetchone()
+    if not row:
+        raise NotFoundError(f"user '{username}' not found")
+    temp_password = auth.generate_temp_password()
+    h, s = auth.hash_password(temp_password)
+    with db.write_tx(c):
+        c.execute(
+            "UPDATE app_user SET password_hash=?, password_salt=?, "
+            "password_changed_at=datetime('now'), must_change_password=1 WHERE id=?",
+            (h, s, row["id"]),
+        )
+    return {
+        "ok": True,
+        "username": username,
+        "temporary_password": temp_password,
+        "note": "Shown once. Give this to the user directly — it is not stored or logged anywhere.",
     }
 
 

@@ -71,6 +71,17 @@ class PermissionError_(WTError):
     http_status = 403
 
 
+class ValidationError(WTError):
+    """Input failed validation before it ever reached a write -- a bad
+    verification value, a weak password, a malformed request field. The
+    boundary that catches ValueError/TypeError/sqlite3 errors and raises
+    this instead is responsible for making sure `message` is safe to show
+    a user directly; it must never carry a raw exception string or a SQL
+    fragment."""
+    code = "validation_error"
+    http_status = 422
+
+
 class AuthenticationError(WTError):
     """The caller could not be identified at all — no token, expired token,
     malformed token, bad signature.

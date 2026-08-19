@@ -448,6 +448,11 @@ def import_unli(conn, ids: dict[str, int]) -> int:
 
 
 def seed_users(conn) -> None:
+    """Every seeded account shares the same placeholder password
+    ('wingstheory') and is flagged must_change_password=1 for exactly that
+    reason -- see migration 0014's docstring for why the same flag is set
+    there too (that UPDATE only reaches rows that already exist, so a fresh
+    install needs it set here at INSERT time instead)."""
     from .auth import hash_password
     for username, display, role in [
         ("owner", "R. Alonzo", "admin"),
@@ -458,7 +463,8 @@ def seed_users(conn) -> None:
         h, s = hash_password("wingstheory")
         conn.execute(
             "INSERT OR IGNORE INTO app_user "
-            "(username, display_name, role, password_hash, password_salt) VALUES (?,?,?,?,?)",
+            "(username, display_name, role, password_hash, password_salt, must_change_password) "
+            "VALUES (?,?,?,?,?,1)",
             (username, display, role, h, s),
         )
 
