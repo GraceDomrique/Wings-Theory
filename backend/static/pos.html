@@ -213,7 +213,8 @@ svg{width:18px;height:18px}
 
 .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--charcoal);
   color:#fff;padding:12px 20px;border-radius:11px;font-size:14px;z-index:80;
-  box-shadow:0 8px 26px rgba(0,0,0,.3);animation:up .2s ease both}
+  box-shadow:0 8px 26px rgba(0,0,0,.3);animation:up .2s ease both;
+  white-space:pre-line;text-align:left;max-width:340px}
 @keyframes up{from{opacity:0;transform:translate(-50%,10px)}to{opacity:1;transform:translate(-50%,0)}}
 
 /* Below ~1180px the full lockup no longer fits a comfortable rail, so the
@@ -838,10 +839,35 @@ function paintGrid() {
 }
 $('#search').oninput = e => { Q = e.target.value; paintGrid(); };
 $('#cats').onclick = e => { const b = e.target.closest('[data-cat]'); if (b) { CAT = b.dataset.cat; paintCats(); paintGrid(); } };
+// A tap on a blocked tile fetches the real numbers behind "Out of stock"
+// (Phase 09A section 7) rather than repeating the same one-line reason
+// already on the tile. Only worth the extra call for a genuine stock
+// shortage -- a structural block (no recipe, unmapped ingredient) has no
+// Available/Required number to show, so it falls back to the same
+// humanized reason instantly, no request needed.
+async function explainUnavailable(m) {
+  if (!m.block_reason || !m.block_reason.startsWith('out of stock:')) {
+    toast(`${m.name}: ${humanizeBlockReason(m.block_reason)}`);
+    return;
+  }
+  try {
+    const a = await api(`/pos/menu/${m.menu_item_pk}/availability`);
+    if (a.shortfall) {
+      const s = a.shortfall;
+      toast(`${m.name} — ITEM UNAVAILABLE\n`
+          + `Reason: Not enough ${s.ingredient}\n`
+          + `Available: ${s.available} ${s.unit}\n`
+          + `Required: ${s.required} ${s.unit}\n`
+          + `Shortfall: ${s.shortfall} ${s.unit}`);
+      return;
+    }
+  } catch (e) { /* fall through to the generic reason below */ }
+  toast(`${m.name}: ${humanizeBlockReason(m.block_reason)}`);
+}
 $('#grid').onclick = e => {
   const b = e.target.closest('[data-add]'); if (!b) return;
   const m = MENU.find(x => x.menu_item_pk == b.dataset.add);
-  if (!m.sellable) { toast(`${m.name}: ${humanizeBlockReason(m.block_reason)}`); return; }
+  if (!m.sellable) { explainUnavailable(m); return; }
   if (m.flavor_slots > 0) { openCustomize(m); return; }
   addToCart(m, null);
   bumpCartCount();

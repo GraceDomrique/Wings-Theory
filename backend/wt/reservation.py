@@ -72,6 +72,10 @@ class Shortfall:
             "name": self.name,
             "needed": round(self.needed_base, 3),
             "available": round(self.available_base, 3),
+            # Computed here, not by the caller -- a POS rendering "Available
+            # X, Required Y, Shortfall Z" (Phase 09A section 7) should never
+            # have to subtract two numbers itself.
+            "shortfall": round(max(self.needed_base - self.available_base, 0), 3),
             "unit": self.base_unit,
         }
 
@@ -778,24 +782,41 @@ def record_usage(
 
 
 def availability_for_menu_item(conn: sqlite3.Connection, menu_item_pk: int, qty: int = 1) -> dict:
-    """How many of this menu item current stock could still cover.
+    """How many of this menu item current stock could still cover, and — for
+    the specific case of "there just isn't enough of one ingredient" — the
+    real numbers behind that, so a POS can tell a cashier something more
+    useful than the word "Unavailable" (Phase 09A section 7).
 
     Read-only and advisory — the authoritative check is the guarded UPDATE in
     reserve_order. A POS that trusted this number alone would be back to
     read-then-write.
+
+    Two different kinds of "blocked" are told apart on purpose:
+
+      structurally blocked -- no recipe linked, an unmapped ingredient, an
+      ingredient with no pack size configured. There is no meaningful
+      Available/Required number for "the recipe doesn't fully exist yet";
+      `shortfall` stays None and `block_reason` (already plain language,
+      see v_menu_item_availability) is the whole story.
+
+      blocked purely on physical stock -- the recipe is complete and every
+      ingredient it needs is deductable; there just isn't enough of the one
+      that runs out first. This is the case with real numbers to show, and
+      the one this function used to short-circuit before ever computing.
     """
     row = conn.execute(
         "SELECT * FROM v_menu_item_availability WHERE menu_item_pk=?", (menu_item_pk,)
     ).fetchone()
     if not row:
         raise NotFoundError(f"menu item {menu_item_pk} not found")
-    if not row["sellable"]:
+    if not row["structurally_ready"]:
         return {
             "menu_item_id": row["menu_item_id"],
             "name": row["name"],
             "sellable": False,
             "block_reason": row["block_reason"],
             "max_qty": 0,
+            "shortfall": None,
         }
 
     leaves = conn.execute(
@@ -810,18 +831,32 @@ def availability_for_menu_item(conn: sqlite3.Connection, menu_item_pk: int, qty:
 
     max_qty = None
     limiting = None
+    limiting_row = None
     for l in leaves:
         if l["qty_base"] <= 0:
             continue
         possible = int((l["available"] + EPS) // l["qty_base"])
         if max_qty is None or possible < max_qty:
-            max_qty, limiting = possible, l["name"]
+            max_qty, limiting, limiting_row = possible, l["name"], l
+
+    sellable = (max_qty or 0) >= qty
+    shortfall = None
+    if not sellable and limiting_row is not None:
+        required = limiting_row["qty_base"] * qty
+        shortfall = {
+            "ingredient": limiting_row["name"],
+            "available": round(limiting_row["available"], 3),
+            "required": round(required, 3),
+            "shortfall": round(max(required - limiting_row["available"], 0), 3),
+            "unit": limiting_row["base_unit"],
+        }
 
     return {
         "menu_item_id": row["menu_item_id"],
         "name": row["name"],
-        "sellable": (max_qty or 0) >= qty,
-        "block_reason": None if (max_qty or 0) >= qty else "insufficient stock",
+        "sellable": sellable,
+        "block_reason": None if sellable else "insufficient stock",
         "max_qty": max_qty or 0,
         "limiting_ingredient": limiting,
+        "shortfall": shortfall,
     }

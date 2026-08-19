@@ -596,6 +596,12 @@ class TestReservation(Base):
         self.assertEqual(
             self.conn.execute("SELECT COUNT(*) AS n FROM reservation").fetchone()["n"], 0)
         self.assertEqual(ctx.exception.shortfalls[0]["name"], "Sauce")
+        # Available/Required/Shortfall (Phase 09A section 7) -- computed
+        # server-side so a POS never has to subtract needed - available itself
+        sauce_shortfall = ctx.exception.shortfalls[0]
+        self.assertEqual(sauce_shortfall["needed"], 900)
+        self.assertEqual(sauce_shortfall["available"], 10)
+        self.assertEqual(sauce_shortfall["shortfall"], 890)
 
     def test_reserved_stock_is_invisible_to_the_next_order(self):
         o1 = add_order(self.conn, [(self.menu, 2)])                 # 1000 g — all of it
@@ -611,6 +617,33 @@ class TestReservation(Base):
         a = availability_for_menu_item(self.conn, m)
         self.assertEqual(a["max_qty"], 2)                           # 120/60 beats 1000/100
         self.assertEqual(a["limiting_ingredient"], "Sauce")
+        self.assertIsNone(a["shortfall"], "still sellable at qty=1 -- nothing to explain")
+
+    def test_availability_shortfall_names_available_required_and_the_gap(self):
+        """Phase 09A section 7: a cashier tapping a blocked item must see
+        more than the word 'Unavailable'. Requesting more than stock can
+        cover must report the real numbers, not just max_qty."""
+        sauce = add_ingredient(self.conn, "Sauce", on_hand=120)
+        r = add_recipe(self.conn, "Combo", [(self.wings, 100), (sauce, 60)])
+        m = add_menu_item(self.conn, "Combo", r)
+        a = availability_for_menu_item(self.conn, m, qty=5)          # only 2 actually possible
+        self.assertFalse(a["sellable"])
+        self.assertEqual(a["limiting_ingredient"], "Sauce")
+        self.assertIsNotNone(a["shortfall"])
+        self.assertEqual(a["shortfall"]["ingredient"], "Sauce")
+        self.assertEqual(a["shortfall"]["available"], 120)
+        self.assertEqual(a["shortfall"]["required"], 300)            # 60 x 5
+        self.assertEqual(a["shortfall"]["shortfall"], 180)           # 300 - 120
+
+    def test_availability_structural_block_has_no_numeric_shortfall(self):
+        """A missing recipe/unmapped ingredient has no Available/Required
+        number to report -- block_reason is the whole story, and shortfall
+        must stay None rather than a misleading zero or guess."""
+        m = add_menu_item(self.conn, "No Recipe Item", recipe_pk=None)
+        a = availability_for_menu_item(self.conn, m)
+        self.assertFalse(a["sellable"])
+        self.assertIsNone(a["shortfall"])
+        self.assertEqual(a["block_reason"], "no recipe linked")
 
     def test_state_machine_rejects_double_commit(self):
         o = add_order(self.conn, [(self.menu, 1)])
