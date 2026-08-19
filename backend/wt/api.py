@@ -34,7 +34,7 @@ from .reservation import (
     record_wastage, release_order, reserve_order, void_after_commit,
 )
 from .resolver import expand_recipe, recipe_cost, validate_recipe
-from .units import format_base, normalise_label, to_base
+from .units import format_base, normalise_label, purchase_to_base, to_base
 
 app = FastAPI(title="Wings Theory", version="0.2.0",
               description="Inventory & POS backend — Phase 2 (data model & deduction)")
@@ -829,6 +829,36 @@ class ReceiveIn(BaseModel):
     purchase_qty: float = Field(gt=0, description="in the ingredient's own purchase unit")
     lot_no: str | None = None
     expires_at: str | None = Field(default=None, description="YYYY-MM-DD, if known")
+
+
+@app.get("/console/ingredients/{pk}/receive/preview", tags=["console"])
+def receive_preview(
+    pk: int, purchase_qty: float = Query(gt=0),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """What a delivery of this size WOULD do, without writing anything --
+    Phase 10's receiving flow shows this before the operator confirms.
+    Calls the exact same units.purchase_to_base() conversion
+    reservation.receive_stock() uses to actually post the delivery, so the
+    preview can never drift from what posting really does -- there is no
+    second copy of this arithmetic in the frontend. Read-only, gated on
+    inventory.read rather than .write: looking at a preview isn't a write."""
+    row = c.execute(
+        "SELECT name, pack_size, yield_factor, base_unit, on_hand_base "
+        "FROM ingredient WHERE id=?", (pk,),
+    ).fetchone()
+    if not row:
+        raise NotFoundError(f"ingredient {pk} not found")
+    base_qty = purchase_to_base(purchase_qty, row["pack_size"], row["yield_factor"])
+    return {
+        "ingredient_id": pk,
+        "name": row["name"],
+        "purchase_qty": purchase_qty,
+        "base_qty": round(base_qty, 3),
+        "base_unit": row["base_unit"],
+        "current_on_hand_base": row["on_hand_base"],
+        "new_on_hand_base": round(row["on_hand_base"] + base_qty, 3),
+    }
 
 
 @app.post("/console/ingredients/{pk}/receive", tags=["console"])

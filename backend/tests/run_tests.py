@@ -1910,6 +1910,52 @@ class TestConsoleAPI(unittest.TestCase):
         self.assertIsNone(new_batches[2]["days_to_expiry"])
         self.assertIsNone(new_batches[2]["storage_status"])
 
+    def test_receive_preview_matches_what_posting_actually_does(self):
+        """Phase 10: the receiving flow's review step reads this endpoint
+        before the operator confirms. It must compute exactly what
+        POST .../receive is about to do -- not a separate approximation."""
+        ing = next(i for i in self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+                   if i.get("pack_size"))
+        preview = self.client.get(
+            f"/console/ingredients/{ing['id']}/receive/preview?purchase_qty=3", headers=self.H_MGR
+        ).json()
+        self.assertEqual(preview["purchase_qty"], 3)
+        self.assertEqual(preview["current_on_hand_base"], ing["on_hand_base"])
+
+        posted = self.client.post(
+            f"/console/ingredients/{ing['id']}/receive", headers=self.H_MGR,
+            json={"purchase_qty": 3, "lot_no": "PREVIEW-MATCH-TEST"},
+        ).json()
+        self.assertAlmostEqual(preview["base_qty"], posted["received_base"], places=3)
+        self.assertAlmostEqual(preview["new_on_hand_base"], posted["on_hand_base"], places=3)
+
+    def test_receive_preview_requires_inventory_read_not_write(self):
+        ing = self.client.get("/console/ingredients?limit=1", headers=self.H_MGR).json()["ingredients"][0]
+        # cashier holds neither inventory.read nor .write -- still refused
+        r = self.client.get(
+            f"/console/ingredients/{ing['id']}/receive/preview?purchase_qty=1", headers=self.H_CASH)
+        self.assertEqual(r.status_code, 403)
+        # manager holds inventory.read -- a preview is not a write, so this
+        # must succeed even though the endpoint never touches the database
+        r2 = self.client.get(
+            f"/console/ingredients/{ing['id']}/receive/preview?purchase_qty=1", headers=self.H_MGR)
+        self.assertEqual(r2.status_code, 200)
+
+    def test_receive_preview_refuses_missing_pack_size_same_as_posting_would(self):
+        cur = self.conn.execute("SELECT COUNT(*) AS n FROM ingredient").fetchone()["n"]
+        self.conn.execute(
+            "INSERT INTO ingredient (ingredient_id, name, category, kind, base_unit, "
+            "purchase_unit, pack_size, pack_size_status, yield_factor, yield_factor_status, "
+            "on_hand_base, unit_cost, unit_cost_status) "
+            "VALUES (?, 'Preview Unset Item', 'dry_food', 'raw', 'g', 'pack', NULL, 'unset', "
+            "1.0, 'verified', 0, 100.0, 'verified')",
+            (f"ING-PREVIEW-{cur+1}",))
+        unset_id = self.conn.execute(
+            "SELECT id FROM ingredient WHERE name='Preview Unset Item'").fetchone()["id"]
+        r = self.client.get(
+            f"/console/ingredients/{unset_id}/receive/preview?purchase_qty=1", headers=self.H_MGR)
+        self.assertEqual(r.status_code, 422, r.text)
+
     def test_waste_endpoint_requires_inventory_write_and_moves_stock(self):
         ing = next(i for i in self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
                    if i["on_hand_base"] > 50)
