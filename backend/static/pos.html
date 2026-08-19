@@ -37,24 +37,35 @@ svg{width:18px;height:18px}
 .chip.warn{background:#FFF3DC;color:#8A5A00}
 .chip.mute{background:var(--sunken);color:var(--text-2)}
 
-/* ---------- login ---------- */
+/* ---------- login ----------
+   Fixed dark values, not theme tokens: this app has no dark mode for its
+   own working screens (unlike the console, which does), but the sign-in
+   gate is the one screen every client shares and should look identical
+   across POS/KDS/Console regardless. Scoped under #login so none of this
+   touches the light-themed till UI underneath. */
 #login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-  background:var(--ink);padding:20px}
-.login-box{background:var(--card);border-radius:16px;padding:32px 28px;width:100%;max-width:360px;
-  box-shadow:0 20px 50px rgba(0,0,0,.3)}
-.login-mark{height:44px;display:inline-flex;align-items:center;margin-bottom:14px}
-.login-mark img{height:100%;width:auto;display:block}
-.login-box h1{font-size:20px;margin:0 0 4px;letter-spacing:-.01em}
-.login-box p{color:var(--text-3);font-size:13px;margin:0 0 22px}
-.login-box .field{margin-bottom:12px}
-.pass-wrap{position:relative}
-.login-box .pass-wrap{margin-bottom:12px}
-.login-box .pass-wrap .field{margin-bottom:0;padding-right:42px}
-.pass-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;
-  padding:8px;border-radius:8px;display:flex;color:var(--text-3);cursor:pointer}
-.pass-toggle:hover{color:var(--text)}
-.pass-toggle svg{width:17px;height:17px;display:block}
-#loginErr{color:var(--bad-text);font-size:13px;margin:10px 0 0;min-height:16px}
+  background:#1F1F1F;padding:20px}
+#login .login-box{background:#191B1E;border-radius:16px;padding:32px 28px;width:100%;max-width:360px;
+  box-shadow:0 20px 50px rgba(0,0,0,.34)}
+#login .login-mark{height:44px;display:inline-flex;align-items:center;margin-bottom:14px}
+#login .login-mark img{height:100%;width:auto;display:block}
+#login .login-box h1{font-size:20px;margin:0 0 4px;letter-spacing:-.01em;color:#E8EAED}
+#login .login-box p{color:#9BA1AA;font-size:13px;margin:0 0 22px}
+#login .field{margin-bottom:12px;background:#191B1E;color:#E8EAED;border-color:#2A2E34}
+#login .field::placeholder{color:#6E747D}
+#login .pass-wrap{position:relative}
+#login .pass-wrap{margin-bottom:12px}
+#login .pass-wrap .field{margin-bottom:0;padding-right:42px}
+#login .pass-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;
+  padding:8px;border-radius:8px;display:flex;color:#6E747D;cursor:pointer}
+#login .pass-toggle:hover{color:#E8EAED}
+#login .pass-toggle svg{width:17px;height:17px;display:block}
+/* The till's own amber/orange gradient stays for everything else in this
+   app -- the login button specifically matches the shared sign-in amber
+   (#F4B400) so it reads the same across all three clients. */
+#login .btn-p{background:#F4B400;color:#1F1F1F}
+#login .btn-p:active{filter:brightness(.94)}
+#loginErr{color:#FF8177;font-size:13px;margin:10px 0 0;min-height:16px}
 
 /* ================= APP SHELL — three panes ================= */
 #app{display:none;height:100vh}
