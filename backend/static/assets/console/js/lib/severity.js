@@ -33,18 +33,33 @@ export function severityFromDays(days) {
 }
 
 /**
- * The backend's `risk` field on a depletion row (wt/forecasting.py) mapped to
- * a display severity. Unknown strings fall to `flat` rather than being
- * guessed at.
+ * The backend's `risk` field on a depletion row (wt/forecasting.py's
+ * RISK_ORDER = {"out":0, "critical":1, "warning":2, "idle":3, "ok":4,
+ * "no_data":5}) mapped to a display severity. Unknown strings fall to
+ * `flat` rather than being guessed at.
+ *
+ * 2026-08 audit finding: this switch was written against a risk
+ * vocabulary ('out_of_stock', 'low', 'healthy', 'unknown', 'no_usage')
+ * the backend has never actually emitted — RISK_ORDER above is the real,
+ * only vocabulary forecasting.py produces. Because 'out' (the single most
+ * urgent tier — an ingredient with zero runway left) had no matching
+ * case, it fell through to the same 'info'/neutral-blue default as an
+ * unrecognized string, which also meant it failed the crit/warn filter
+ * Reports.js's Attention Needed card uses to decide what counts as "low
+ * stock." Confirmed against the live dev data: Rice was at risk='out'
+ * (completely depleted) and rendered as a calm gray "no usage rate" pill,
+ * invisible to the one report specifically built to surface it. Fixed by
+ * matching RISK_ORDER's real six values exactly, not by re-guessing a
+ * vocabulary that never matched.
  * @param {string|null} risk
  * @returns {Severity}
  */
 export function severityFromRisk(risk) {
   switch (risk) {
-    case 'critical': case 'out_of_stock': return 'crit';
-    case 'low': case 'warning': return 'warn';
-    case 'ok': case 'healthy': return 'good';
-    case 'unknown': case 'no_usage': return 'flat';
+    case 'out': case 'critical': return 'crit';
+    case 'warning': return 'warn';
+    case 'ok': return 'good';
+    case 'idle': case 'no_data': return 'flat';
     default: return risk ? 'info' : 'flat';
   }
 }

@@ -112,6 +112,11 @@ function ropCell(r) {
 
 function statusCell(r) {
   if (r.belowReorderPoint) return Pill('crit', 'below reorder point');
+  // r.risk is the backend's own un-collapsed value (RISK_ORDER in
+  // forecasting.py) -- 'out' and 'critical' both map to the 'crit'
+  // severity for color, but they're different urgency, so distinguish the
+  // label using the raw value rather than only the collapsed severity.
+  if (r.risk === 'out') return Pill('crit', 'out of stock');
   switch (r.status) {
     case 'crit': return Pill('crit', 'running out');
     case 'warn': return Pill('warn', 'order soon');
