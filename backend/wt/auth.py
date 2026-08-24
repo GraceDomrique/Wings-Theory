@@ -51,22 +51,49 @@ LOCKOUT_MINUTES = 15
 
 ROLES = ("admin", "manager", "cashier", "kitchen")
 
-# Capability -> roles allowed. Mirrors the access matrix in the build document.
+# Capability -> roles allowed.
+#
+# 2026-08 RBAC audit finding: 'admin' and 'manager' were IDENTICAL in every
+# capability below except user.manage — the owner's account (seed.py maps
+# username 'owner' to role 'admin') could silently create, void, and edit
+# every operational record a manager could, with no separation of duties.
+# That is a real accountability gap: it means the one person with no
+# on-site supervisor could alter inventory, prices, or sales records and
+# there would be nothing structurally distinguishing that from a manager's
+# routine action.
+#
+# Redesigned around one rule: 'admin' keeps read access to everything (the
+# owner must be able to monitor the restaurant remotely) plus the specific
+# actions that are inherently an OWNER-LEVEL oversight decision rather than
+# a floor operation — user administration, confirming a physical constant
+# is correct (queue.resolve — the owner is often the one who actually
+# negotiated the pack size/cost with the supplier), and approving a
+# reconciliation a manager or kitchen already performed (unli.approve —
+# a second-party sign-off is a control, not a risk). Everything that
+# directly creates or mutates a live operational record on the floor
+# (orders, inventory quantities, recipes/prices, unlimited refills/
+# sessions) now requires the operational role that actually did the work
+# — 'manager' for back-of-house writes, 'cashier'/'kitchen' for their own
+# station — so the owner's account is structurally read-only plus sign-off
+# there, never a route to unilaterally alter or erase what a manager or
+# line worker was accountable for. See TestRBAC in run_tests.py.
 CAPABILITIES = {
-    "order.create":       ("cashier", "admin"),
+    "order.create":       ("cashier",),
     # Kitchen can void too, but only ever reaches a 'punched' (not-yet-
     # started) ticket from the KDS UI — releasing a hold with zero ledger
     # impact. Voiding an order already in progress still requires walking
     # back to the till; that path posts a real compensating wastage entry
-    # and stays a cashier/manager/admin decision.
-    "order.void":         ("cashier", "manager", "kitchen", "admin"),
-    "order.status":       ("kitchen", "admin"),
+    # and stays a cashier/manager decision — not the owner's account,
+    # which is not present at the till and should not be able to erase or
+    # adjust a sales record it did not create.
+    "order.void":         ("cashier", "manager", "kitchen"),
+    "order.status":       ("kitchen",),
     "order.read":         ("cashier", "manager", "admin"),
     "menu.read":          ("cashier", "kitchen", "manager", "admin"),
     "inventory.read":     ("manager", "admin"),
-    "inventory.write":    ("manager", "admin"),
+    "inventory.write":    ("manager",),
     "recipe.read":        ("manager", "admin"),
-    "recipe.write":       ("manager", "admin"),
+    "recipe.write":       ("manager",),
     "queue.read":         ("manager", "admin"),
     "queue.resolve":      ("manager", "admin"),
     # Narrowly scoped on purpose. Reconciling an unlimited stream is a kitchen
@@ -74,22 +101,27 @@ CAPABILITIES = {
     # is the ONLY inventory-affecting thing the kitchen may do. Granting
     # inventory.write to make it work would also hand a kitchen tablet stock
     # receiving, write-offs, physical counts and every ingredient field in the
-    # console, none of which it has any business touching.
-    "unli.reconcile":     ("kitchen", "manager", "admin"),
+    # console, none of which it has any business touching. The owner's
+    # account cannot weigh a tray remotely either, so it is not here.
+    "unli.reconcile":     ("kitchen", "manager"),
     # Signing off a day that fell outside tolerance, and recalibrating a
     # coefficient off the validated history, both change what the POS will
-    # deduct tomorrow. That is a management decision, not a line one.
+    # deduct tomorrow. That is a management decision — and unlike the write
+    # capabilities above, a second-party sign-off from the owner's account
+    # is a genuine control (the person approving did not also perform the
+    # reconciliation being approved), so admin keeps this one.
     "unli.approve":       ("manager", "admin"),
     # Recording a round of unlimited wings. Both stations legitimately do this
     # — the cashier takes the table's flavour, the kitchen serves it — so both
     # hold it. It grants nothing beyond refills: the sauce deduction it
     # triggers is sized by the server from the session's own head count, so
-    # holding this capability is not a way to move arbitrary stock.
-    "unli.refill":        ("cashier", "kitchen", "manager", "admin"),
+    # holding this capability is not a way to move arbitrary stock. Still a
+    # floor action the owner's account does not perform remotely.
+    "unli.refill":        ("cashier", "kitchen", "manager"),
     # Closing or cancelling a table's session. The floor owns this; reopening
     # a closed one is deliberately separate (unli.approve) so a session cannot
     # be resurrected by the same accidental tap that ended it.
-    "unli.session":       ("cashier", "kitchen", "manager", "admin"),
+    "unli.session":       ("cashier", "kitchen", "manager"),
     "user.manage":        ("admin",),
 }
 

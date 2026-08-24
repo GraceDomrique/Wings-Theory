@@ -9,21 +9,38 @@
  * files; this only moves JSON.
  */
 
-const TOKEN_KEY = 'wt.console.token';
-const USER_KEY = 'wt.console.user';
+// 'wt_console_' + token/role/name, not a single combined-JSON key: this is
+// the same three-key scheme landing.html writes for admin/manager
+// (DEST.ns) and POS/KDS use for their own roles (wt_pos_*, wt_kds_*) — see
+// landing.html's "Signed in as X · Continue" resume flow, which reads
+// wt_console_token/role/name directly. A prior version of this module used
+// 'wt.console.token'/'wt.console.user' instead, which landing.html never
+// wrote to, so signing in on the landing page and clicking Continue into
+// the console silently failed to be recognized and re-showed the login
+// screen. mustChangePassword is intentionally not persisted here (no
+// caller reads it back from storage — it only matters in the instant
+// right after login, from the /auth/login response itself).
+const NS = 'wt_console_';
+const TOKEN_KEY = NS + 'token';
+const ROLE_KEY = NS + 'role';
+const NAME_KEY = NS + 'name';
 
 export const session = {
   get token() { return localStorage.getItem(TOKEN_KEY); },
   get user() {
-    try { return JSON.parse(localStorage.getItem(USER_KEY) || 'null'); } catch { return null; }
+    const role = localStorage.getItem(ROLE_KEY);
+    if (!role) return null;
+    return { displayName: localStorage.getItem(NAME_KEY) || '', role };
   },
   start(token, user) {
     localStorage.setItem(TOKEN_KEY, token);
-    localStorage.setItem(USER_KEY, JSON.stringify(user));
+    localStorage.setItem(ROLE_KEY, user.role);
+    localStorage.setItem(NAME_KEY, user.displayName || '');
   },
   end() {
     localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(USER_KEY);
+    localStorage.removeItem(ROLE_KEY);
+    localStorage.removeItem(NAME_KEY);
   },
 };
 
@@ -90,12 +107,24 @@ export const api = {
   patch: (path, body) => request('PATCH', path, body),
 };
 
+// The console is the manager/owner surface — matches POS's ['cashier','admin']
+// and KDS's ['kitchen','admin'] guards (pos.html, kds.html), and the old
+// console (console.html.bak) before this module's Phase 10 rebuild dropped
+// it. Checked both here (refuse before a token is ever stored) and at
+// startup in app.js (refuse a token stored by a role that no longer
+// qualifies, e.g. after a role change).
+export const ALLOWED_ROLES = ['manager', 'admin'];
+
 /**
  * Sign in. Returns the principal the sidebar shows.
  * POST /auth/login -> { token, role, display_name, must_change_password }
  */
 export async function login(username, password) {
   const out = await request('POST', '/auth/login', { username, password });
+  if (!ALLOWED_ROLES.includes(out.role)) {
+    throw new ApiError(403,
+      `The ${out.role} role does not have access to the console.`, null);
+  }
   session.start(out.token, {
     username,
     displayName: out.display_name || username,

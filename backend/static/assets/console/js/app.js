@@ -1,7 +1,7 @@
 import { mount } from './lib/dom.js';
 import { AppShell } from './layout/AppShell.js';
 import { Login } from './layout/Login.js';
-import { session } from './lib/api/client.js';
+import { session, ALLOWED_ROLES } from './lib/api/client.js';
 import { destroyAllCharts } from './components/charts/base.js';
 
 import * as today from './routes/today/Today.js';
@@ -41,5 +41,14 @@ function showLogin(expired = false) {
   mount(root, Login({ onSuccess: showShell, expired }));
 }
 
-if (session.token) showShell();
-else showLogin();
+// A stored token from a role the console no longer serves (e.g. a role
+// change on the account, or a stray wt_console_* key from some other
+// cause) is treated the same as no session at all, not shown the shell.
+if (session.token && ALLOWED_ROLES.includes((session.user || {}).role)) {
+  showShell();
+} else if (session.token) {
+  session.end();
+  showLogin();
+} else {
+  showLogin();
+}

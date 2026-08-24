@@ -2183,6 +2183,126 @@ class TestAdminAuditLog(unittest.TestCase):
         self.assertNotIn(temp_password, str(events[0]))
 
 
+class TestRBAC(unittest.TestCase):
+    """2026-08 RBAC audit finding: 'admin' and 'manager' were identical in
+    every capability except user.manage — the owner's account (username
+    'owner', role 'admin') could silently create, void, and edit every
+    operational record a manager could. Redesigned so admin keeps read
+    access everywhere plus the two genuinely owner-level actions
+    (queue.resolve, unli.approve) and user.manage, but loses every
+    capability that directly writes a floor/operational record (orders,
+    inventory quantities, recipes/prices, unlimited refills/sessions) —
+    see the CAPABILITIES dict comment in auth.py. These tests prove the
+    new boundary from both sides: admin is refused exactly where it
+    should be, and every read/oversight capability admin is supposed to
+    keep still works."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def test_admin_can_no_longer_create_an_order(self):
+        item = self.conn.execute("SELECT id FROM menu_item LIMIT 1").fetchone()
+        r = self.client.post(
+            "/pos/orders", headers=self.H_OWNER,
+            json={"lines": [{"menu_item_pk": item["id"], "qty": 1}]},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_admin_can_no_longer_edit_an_ingredient(self):
+        ing = self.conn.execute("SELECT id FROM ingredient LIMIT 1").fetchone()
+        r = self.client.patch(
+            f"/console/ingredients/{ing['id']}", headers=self.H_OWNER,
+            json={"supplier": "Should Be Refused"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_admin_can_no_longer_edit_a_menu_price(self):
+        item = self.conn.execute("SELECT id, price FROM menu_item LIMIT 1").fetchone()
+        r = self.client.patch(
+            f"/console/menu-items/{item['id']}/price", headers=self.H_OWNER,
+            json={"price": item["price"] + 5},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_admin_can_no_longer_record_an_unli_refill(self):
+        stream = self.conn.execute(
+            "SELECT id FROM unli_session WHERE status='open' LIMIT 1"
+        ).fetchone()
+        r = self.client.post(
+            f"/unli/sessions/{stream['id']}/refills" if stream else "/unli/sessions/0/refills",
+            headers=self.H_OWNER, json={"flavor_id": 1},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_admin_retains_read_access_to_inventory_and_queues(self):
+        for path in ("/console/ingredients", "/console/queues/verification",
+                     "/console/queues/unmapped"):
+            r = self.client.get(path, headers=self.H_OWNER)
+            self.assertIn(r.status_code, (200,), f"{path} -> {r.status_code}: {r.text}")
+
+    def test_admin_retains_queue_resolve_and_unli_approve(self):
+        # capability-gate only, not a full workflow exercise: a 403 here
+        # would mean the boundary regressed; a 404/422/other 4xx for a
+        # made-up target still proves the capability check itself passed.
+        r = self.client.post(
+            "/console/queues/verification/resolve", headers=self.H_OWNER,
+            json={"field": "ingredient.pack_size", "row_id": 999999,
+                  "action": "keep_estimate"},
+        )
+        self.assertNotEqual(r.status_code, 403, r.text)
+        r = self.client.post(
+            "/unli/reconciliation/999999/review", headers=self.H_OWNER,
+            json={"approve": True},
+        )
+        self.assertNotEqual(r.status_code, 403, r.text)
+
+    def test_admin_still_holds_user_manage(self):
+        # cashier1, not manager -- resetting manager's password here would
+        # invalidate the class-level H_MGR token every other test in this
+        # class shares, since app_user's password_changed_at is embedded
+        # in every token issued for that account.
+        r = self.client.post(
+            "/console/users/cashier1/reset_password", headers=self.H_OWNER,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_manager_is_unaffected_by_the_narrowing(self):
+        ing = self.conn.execute("SELECT id FROM ingredient LIMIT 1").fetchone()
+        r = self.client.patch(
+            f"/console/ingredients/{ing['id']}", headers=self.H_MGR,
+            json={"supplier": "Manager Can Still Edit"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+
 class TestPasswordSecurity(unittest.TestCase):
     """P0-2: self-service password change, admin reset, and the token
     invalidation that makes either one actually take effect immediately
@@ -6489,7 +6609,7 @@ def main() -> int:
             TestRefillReconciliationLink, TestRefillAPI,
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
-            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestAdminAuditLog, TestPasswordSecurity,
+            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestAdminAuditLog, TestRBAC, TestPasswordSecurity,
             TestForecasting, TestAnomaly, TestAssociations,
             TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,
