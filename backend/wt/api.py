@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import audit, auth, db, refills, timeutil, unli, verification
+from .cache import TTLCache
 from .anomaly import detect_anomalies, detect_consumption_anomalies
 from .anomaly import consumption_model_details
 from .anomaly import model_details as anomaly_model_details
@@ -63,6 +64,18 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PATCH"],
     allow_headers=["Authorization", "Content-Type"],
 )
+
+# 2026-08 audit: forecasting.py's single-item Prophet fit and both of
+# anomaly.py's Isolation Forest passes ran fresh on every request with no
+# caching. See wt/cache.py's module docstring for the full reasoning --
+# short version: each cache key includes a cheap fingerprint of the table
+# the computation actually reads (MAX(id)), so a genuinely new order or
+# ledger row invalidates it immediately; TTL/max_entries only bound memory
+# over a long-running process. Two separate instances because the two
+# computations have unrelated data-change triggers (orders vs. ledger/
+# reconciliation rows) and unrelated cost profiles.
+_forecast_cache = TTLCache()
+_anomaly_cache = TTLCache()
 
 
 @app.on_event("startup")
@@ -1626,9 +1639,21 @@ def forecast_demand(
     uncertainty bounds), or every POS-visible item's quick summary if
     menu_item_pk is omitted. The bulk list intentionally uses the cheap
     trailing-average method — see wt/forecasting.py for why running Prophet
-    for 20-30 items on one page load isn't practical."""
+    for 20-30 items on one page load isn't practical.
+
+    The single-item Prophet fit is cached (wt/cache.py) — several seconds
+    per fit, and a manager re-opening the same item's forecast a minute
+    later would otherwise pay that cost again for an answer that could not
+    have changed. Cache key includes MAX(customer_order.id), so a new order
+    invalidates it immediately; never serves a result that predates an
+    order actually in the database."""
     if menu_item_pk is not None:
-        return menu_item_demand_prophet(c, menu_item_pk, horizon_days, max(lookback_days, 90))
+        bound = max(lookback_days, 90)
+        max_order = c.execute("SELECT MAX(id) AS m FROM customer_order").fetchone()["m"] or 0
+        key = (str(db.db_path()), menu_item_pk, horizon_days, bound, max_order)
+        return _forecast_cache.get_or_compute(
+            key, lambda: menu_item_demand_prophet(c, menu_item_pk, horizon_days, bound)
+        )
     items = rows(c.execute("SELECT id FROM menu_item WHERE pos_visible=1 ORDER BY name"))
     return {"items": [menu_item_demand(c, i["id"], horizon_days, lookback_days) for i in items]}
 
@@ -1647,10 +1672,26 @@ def anomalies(
 
     `anomalies` is kept as an alias of the stock-loss list so the existing
     console page and any client built against it keep working unchanged.
-    See wt/anomaly.py for both methods."""
-    losses = detect_anomalies(c, lookback_days)
+    See wt/anomaly.py for both methods.
+
+    Both passes are cached (wt/cache.py) on a key that includes MAX(id)
+    from the table each one actually reads (stock_ledger for the loss
+    pass, unli_reconciliation for the consumption pass) — a new wastage
+    entry or a newly reconciled day invalidates only the pass it actually
+    affects, immediately, never a stale result masquerading as current."""
+    max_ledger = c.execute("SELECT MAX(id) AS m FROM stock_ledger").fetchone()["m"] or 0
+    max_recon = c.execute("SELECT MAX(id) AS m FROM unli_reconciliation").fetchone()["m"] or 0
+    path = str(db.db_path())
+    losses = _anomaly_cache.get_or_compute(
+        (path, "stock_loss", lookback_days, max_ledger),
+        lambda: detect_anomalies(c, lookback_days),
+    )
+    consumption = _anomaly_cache.get_or_compute(
+        (path, "consumption", lookback_days, max_recon),
+        lambda: detect_consumption_anomalies(c, lookback_days),
+    )
     return {
-        "consumption_anomalies": detect_consumption_anomalies(c, lookback_days),
+        "consumption_anomalies": consumption,
         "stock_loss_anomalies": losses,
         "anomalies": losses,
     }

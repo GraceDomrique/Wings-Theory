@@ -11,12 +11,15 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from wt import db, refills, timeutil, units, unli                   # noqa: E402
+from wt.cache import TTLCache                                       # noqa: E402
 from wt.anomaly import consumption_model_details                    # noqa: E402
 from wt.anomaly import detect_anomalies, detect_consumption_anomalies  # noqa: E402
 from wt.anomaly import model_details as anomaly_model_details       # noqa: E402
@@ -364,6 +367,64 @@ class TestUnits(unittest.TestCase):
         p = units.parse_quantity("½ pc (25 g)")
         self.assertEqual(p.qty, 0.5)
         self.assertEqual(p.unit, "pc")
+
+
+# ===========================================================================
+class TestTTLCache(unittest.TestCase):
+    """wt/cache.py — the in-process cache for expensive per-request ML
+    computations (2026-08 audit: Prophet/Isolation Forest ran fresh on
+    every request with no caching at all). Pure unit tests, no database —
+    the data-driven invalidation itself (a cache key including MAX(id)
+    from the table each computation reads) is exercised at the API level
+    in TestMLResultCaching below."""
+
+    def test_repeated_key_returns_the_cached_value_without_recomputing(self):
+        cache = TTLCache(ttl_seconds=60)
+        calls = []
+
+        def compute():
+            calls.append(1)
+            return "result"
+
+        self.assertEqual(cache.get_or_compute("k", compute), "result")
+        self.assertEqual(cache.get_or_compute("k", compute), "result")
+        self.assertEqual(len(calls), 1)
+
+    def test_different_keys_are_independent(self):
+        cache = TTLCache(ttl_seconds=60)
+        self.assertEqual(cache.get_or_compute("a", lambda: "A"), "A")
+        self.assertEqual(cache.get_or_compute("b", lambda: "B"), "B")
+        self.assertEqual(len(cache), 2)
+
+    def test_expired_entry_is_recomputed(self):
+        cache = TTLCache(ttl_seconds=0.05)
+        calls = []
+
+        def compute():
+            calls.append(1)
+            return len(calls)
+
+        self.assertEqual(cache.get_or_compute("k", compute), 1)
+        time.sleep(0.1)
+        self.assertEqual(cache.get_or_compute("k", compute), 2)
+
+    def test_max_entries_evicts_the_oldest(self):
+        cache = TTLCache(ttl_seconds=60, max_entries=2)
+        cache.get_or_compute("a", lambda: "A")
+        time.sleep(0.01)
+        cache.get_or_compute("b", lambda: "B")
+        time.sleep(0.01)
+        cache.get_or_compute("c", lambda: "C")  # evicts "a", the oldest
+        self.assertEqual(len(cache), 2)
+        calls = []
+        cache.get_or_compute("a", lambda: (calls.append(1), "A-recomputed")[1])
+        self.assertEqual(calls, [1])  # "a" was evicted, so this recomputed
+
+    def test_clear_empties_the_cache(self):
+        cache = TTLCache(ttl_seconds=60)
+        cache.get_or_compute("k", lambda: "v")
+        cache.clear()
+        self.assertEqual(len(cache), 0)
 
 
 # ===========================================================================
@@ -2492,6 +2553,113 @@ class TestLoginAudit(unittest.TestCase):
         ).json()["token"]
         r = self.client.get("/console/audit/actions", headers={"Authorization": f"Bearer {mgr_token}"})
         self.assertEqual(r.status_code, 403)
+
+
+class TestMLResultCaching(unittest.TestCase):
+    """2026-08 audit: the single-item Prophet fit and both Isolation Forest
+    passes ran fresh on every request, no caching (wt/cache.py). These
+    tests prove the caching actually works end to end through the real
+    HTTP endpoints, not just the TTLCache unit -- patching the underlying
+    forecasting.py/anomaly.py functions to count real calls, so a passing
+    test means the cache genuinely prevented a recompute, not just that
+    the response happened to look the same."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        from fastapi.testclient import TestClient
+        from wt import api as api_module
+        cls.api_module = api_module
+        cls.client = TestClient(api_module.app)
+        cls.conn = db.get_conn()
+        cls.H_MGR = {"Authorization": f"Bearer {cls._token('manager')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {cls._token('cashier1')}"}
+
+    @classmethod
+    def _token(cls, username):
+        r = cls.client.post("/auth/login", json={"username": username, "password": "wingstheory"})
+        return r.json()["token"]
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def setUp(self):
+        # each test starts from an empty cache so one test's cached keys
+        # cannot mask another test's assertions about call counts
+        self.api_module._forecast_cache.clear()
+        self.api_module._anomaly_cache.clear()
+
+    def test_repeated_forecast_request_does_not_refit_prophet(self):
+        item = self.conn.execute("SELECT id FROM menu_item LIMIT 1").fetchone()["id"]
+        with patch.object(self.api_module, "menu_item_demand_prophet",
+                           wraps=self.api_module.menu_item_demand_prophet) as spy:
+            r1 = self.client.get("/console/forecasts/demand",
+                                  params={"menu_item_pk": item}, headers=self.H_MGR)
+            r2 = self.client.get("/console/forecasts/demand",
+                                  params={"menu_item_pk": item}, headers=self.H_MGR)
+            self.assertEqual(r1.status_code, 200)
+            self.assertEqual(r1.json(), r2.json())
+            self.assertEqual(spy.call_count, 1)
+
+    def test_a_new_order_invalidates_the_forecast_cache(self):
+        # excludes unlimited items -- those need a head_count on the order
+        # and are a distinct ordering path this test isn't about
+        item = self.conn.execute(
+            "SELECT id FROM menu_item WHERE pos_visible=1 AND is_unli=0 LIMIT 1"
+        ).fetchone()["id"]
+        with patch.object(self.api_module, "menu_item_demand_prophet",
+                           wraps=self.api_module.menu_item_demand_prophet) as spy:
+            self.client.get("/console/forecasts/demand", params={"menu_item_pk": item}, headers=self.H_MGR)
+            self.assertEqual(spy.call_count, 1)
+            order = self.client.post(
+                "/pos/orders", headers=self.H_CASH,
+                json={"lines": [{"menu_item_pk": item, "qty": 1}]},
+            )
+            self.assertEqual(order.status_code, 201, order.text)
+            self.client.get("/console/forecasts/demand", params={"menu_item_pk": item}, headers=self.H_MGR)
+            self.assertEqual(spy.call_count, 2)  # a real new order -> a real recompute
+
+    def test_repeated_anomaly_request_does_not_rerun_isolation_forest(self):
+        with patch.object(self.api_module, "detect_anomalies",
+                           wraps=self.api_module.detect_anomalies) as loss_spy, \
+             patch.object(self.api_module, "detect_consumption_anomalies",
+                           wraps=self.api_module.detect_consumption_anomalies) as consumption_spy:
+            self.client.get("/console/anomalies", headers=self.H_MGR)
+            self.client.get("/console/anomalies", headers=self.H_MGR)
+            self.assertEqual(loss_spy.call_count, 1)
+            self.assertEqual(consumption_spy.call_count, 1)
+
+    def test_new_wastage_invalidates_only_the_stock_loss_pass(self):
+        ing = self.conn.execute(
+            "SELECT id FROM ingredient WHERE is_active=1 AND on_hand_base > 1 LIMIT 1"
+        ).fetchone()["id"]
+        with patch.object(self.api_module, "detect_anomalies",
+                           wraps=self.api_module.detect_anomalies) as loss_spy, \
+             patch.object(self.api_module, "detect_consumption_anomalies",
+                           wraps=self.api_module.detect_consumption_anomalies) as consumption_spy:
+            self.client.get("/console/anomalies", headers=self.H_MGR)
+            self.client.post(f"/console/ingredients/{ing}/waste", headers=self.H_MGR,
+                              json={"qty_base": 0.01, "note": "cache invalidation test"})
+            self.client.get("/console/anomalies", headers=self.H_MGR)
+            # the wastage entry changed stock_ledger's MAX(id) -> the loss
+            # pass recomputes; unli_reconciliation is untouched -> the
+            # consumption pass is still served from cache
+            self.assertEqual(loss_spy.call_count, 2)
+            self.assertEqual(consumption_spy.call_count, 1)
 
 
 class TestPasswordSecurity(unittest.TestCase):
@@ -6796,7 +6964,7 @@ def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(
         loader.loadTestsFromTestCase(t) for t in (
-            TestUnits, TestSchemaConstraints, TestResolver, TestMenuGate,
+            TestUnits, TestTTLCache, TestSchemaConstraints, TestResolver, TestMenuGate,
             TestReservation, TestReceiveStock, TestRecordCount, TestRecordWastage,
             TestIngredientReconciliation, TestUnliOrders, TestConcurrency, TestFEFO,
             TestFEFODepletion, TestTimezoneHardening, TestUnliReconciliation, TestUnliRecalibration,
@@ -6808,7 +6976,7 @@ def main() -> int:
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
             TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestAdminAuditLog, TestRBAC,
-            TestLoginAudit, TestPasswordSecurity,
+            TestLoginAudit, TestMLResultCaching, TestPasswordSecurity,
             TestForecasting, TestAnomaly, TestAssociations,
             TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,
