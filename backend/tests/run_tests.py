@@ -2370,6 +2370,130 @@ class TestRBAC(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
 
 
+class TestLoginAudit(unittest.TestCase):
+    """2026-08 audit finding: failed_login_count/locked_until (migration
+    0016) is a counter the next attempt overwrites, not a durable record
+    of who signed in, when, and whether it succeeded. login_event
+    (migration 0017) is that record, written on every /auth/login call
+    -- these tests prove each outcome (success, wrong password, unknown
+    username, locked-out) is actually logged, and that the two new
+    admin-only read endpoints (audit_logins, audit_actions) work and are
+    correctly gated."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _last_event(self, username):
+        return dict(self.conn.execute(
+            "SELECT * FROM login_event WHERE username=? ORDER BY id DESC LIMIT 1",
+            (username,),
+        ).fetchone())
+
+    def test_successful_login_is_logged(self):
+        r = self.client.post("/auth/login", json={"username": "manager", "password": "wingstheory"})
+        self.assertEqual(r.status_code, 200)
+        ev = self._last_event("manager")
+        self.assertEqual(ev["success"], 1)
+        self.assertEqual(ev["role"], "manager")
+        self.assertIsNone(ev["reason"])
+
+    def test_wrong_password_is_logged_with_reason(self):
+        self.client.post("/auth/login", json={"username": "cashier1", "password": "wrong"})
+        ev = self._last_event("cashier1")
+        self.assertEqual(ev["success"], 0)
+        self.assertEqual(ev["reason"], "invalid_credentials")
+        self.assertEqual(ev["role"], "cashier")  # resolved even though the password was wrong
+
+    def test_unknown_username_is_logged_with_no_role(self):
+        self.client.post("/auth/login", json={"username": "not-a-real-user", "password": "x"})
+        ev = self._last_event("not-a-real-user")
+        self.assertEqual(ev["success"], 0)
+        self.assertEqual(ev["reason"], "unknown_user")
+        self.assertIsNone(ev["role"])
+
+    def test_locked_out_attempt_is_logged(self):
+        from wt.auth import MAX_LOGIN_ATTEMPTS
+        for _ in range(MAX_LOGIN_ATTEMPTS):
+            self.client.post("/auth/login", json={"username": "kitchen1", "password": "wrong"})
+        # account is now locked; this attempt never reaches password
+        # verification at all
+        r = self.client.post("/auth/login", json={"username": "kitchen1", "password": "wingstheory"})
+        self.assertEqual(r.status_code, 423)
+        ev = self._last_event("kitchen1")
+        self.assertEqual(ev["success"], 0)
+        self.assertEqual(ev["reason"], "locked_out")
+
+    def test_login_event_is_append_only(self):
+        self.client.post("/auth/login", json={"username": "manager", "password": "wingstheory"})
+        row_id = self.conn.execute("SELECT MAX(id) AS id FROM login_event").fetchone()["id"]
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE login_event SET success=0 WHERE id=?", (row_id,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM login_event WHERE id=?", (row_id,))
+
+    def test_audit_logins_endpoint_requires_user_manage(self):
+        mgr_token = self.client.post(
+            "/auth/login", json={"username": "manager", "password": "wingstheory"}
+        ).json()["token"]
+        r = self.client.get("/console/audit/logins", headers={"Authorization": f"Bearer {mgr_token}"})
+        self.assertEqual(r.status_code, 403)
+
+    def test_audit_logins_endpoint_returns_recent_events(self):
+        owner_token = self.client.post(
+            "/auth/login", json={"username": "owner", "password": "wingstheory"}
+        ).json()["token"]
+        r = self.client.get(
+            "/console/audit/logins", headers={"Authorization": f"Bearer {owner_token}"}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        events = r.json()["events"]
+        self.assertTrue(any(e["username"] == "owner" and e["success"] == 1 for e in events))
+
+    def test_audit_actions_endpoint_requires_user_manage_and_returns_events(self):
+        owner_token = self.client.post(
+            "/auth/login", json={"username": "owner", "password": "wingstheory"}
+        ).json()["token"]
+        self.client.post(
+            "/console/users/cashier1/reset_password",
+            headers={"Authorization": f"Bearer {owner_token}"},
+        )
+        r = self.client.get(
+            "/console/audit/actions", headers={"Authorization": f"Bearer {owner_token}"}
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        events = r.json()["events"]
+        self.assertTrue(any(e["action"] == "password_reset" and e["entity_id"] == "cashier1"
+                             for e in events))
+
+        mgr_token = self.client.post(
+            "/auth/login", json={"username": "manager", "password": "wingstheory"}
+        ).json()["token"]
+        r = self.client.get("/console/audit/actions", headers={"Authorization": f"Bearer {mgr_token}"})
+        self.assertEqual(r.status_code, 403)
+
+
 class TestPasswordSecurity(unittest.TestCase):
     """P0-2: self-service password change, admin reset, and the token
     invalidation that makes either one actually take effect immediately
@@ -6683,7 +6807,8 @@ def main() -> int:
             TestRefillReconciliationLink, TestRefillAPI,
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
-            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestAdminAuditLog, TestRBAC, TestPasswordSecurity,
+            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestAdminAuditLog, TestRBAC,
+            TestLoginAudit, TestPasswordSecurity,
             TestForecasting, TestAnomaly, TestAssociations,
             TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,

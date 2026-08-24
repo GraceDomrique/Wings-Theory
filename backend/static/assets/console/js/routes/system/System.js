@@ -4,8 +4,11 @@ import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { toast } from '../../components/ui/Feedback.js';
+import { stamp } from '../../lib/format.js';
 import { session } from '../../lib/api/client.js';
-import { getChecks, getModelDetails, CAPABILITY_REFERENCE } from '../../lib/api/system.js';
+import {
+  getChecks, getModelDetails, getLoginAudit, getActionAudit, CAPABILITY_REFERENCE,
+} from '../../lib/api/system.js';
 import { changePassword, resetPassword, MIN_PASSWORD_LENGTH } from '../../lib/api/account.js';
 
 /**
@@ -17,9 +20,12 @@ import { changePassword, resetPassword, MIN_PASSWORD_LENGTH } from '../../lib/ap
  * repeated verbatim. Nothing here fills an unavailable metric with a zero.
  */
 export async function render(ctx) {
-  const [state, models] = await Promise.all([
+  const isAdmin = (session.user || {}).role === 'admin';
+  const [state, models, logins, actions] = await Promise.all([
     getChecks(),
     getModelDetails().catch(() => null),
+    isAdmin ? getLoginAudit(50).catch(() => null) : Promise.resolve(null),
+    isAdmin ? getActionAudit(50).catch(() => null) : Promise.resolve(null),
   ]);
 
   return h('div', {},
@@ -63,9 +69,57 @@ export async function render(ctx) {
       h('div', { class: 't-xs t-faint', style: { marginTop: '10px' } },
         `Signed in as ${(session.user || {}).displayName || 'unknown'} · role: ${(session.user || {}).role || 'unknown'}`)),
 
-    h('div', { class: 'grid', style: { gridTemplateColumns: (session.user || {}).role === 'admin' ? '1fr 1fr' : '1fr' } },
+    h('div', { class: 'grid', style: { gridTemplateColumns: isAdmin ? '1fr 1fr' : '1fr', marginBottom: '14px' } },
       changePasswordCard(),
-      (session.user || {}).role === 'admin' ? resetPasswordCard() : null));
+      isAdmin ? resetPasswordCard() : null),
+
+    isAdmin ? auditLogCard(logins, actions) : null);
+}
+
+/**
+ * Admin-only (user.manage) — recent login attempts and recent sensitive
+ * mutations, straight from the append-only login_event/admin_audit_log
+ * tables. Not filtered or summarised beyond "most recent N": this is the
+ * accountability record, so it shows exactly what was written, in order.
+ */
+function auditLogCard(logins, actions) {
+  return h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr' } },
+    Card({},
+      CardHeader({ title: 'Recent sign-ins', desc: 'Every /auth/login attempt, successful or not' }),
+      logins
+        ? Table({
+          columns: [
+            { key: 'when', label: 'When', render: (e) => h('span', { class: 'mono t-xs' }, stamp(e.at)) },
+            { key: 'who', label: 'Username', render: (e) => e.username },
+            { key: 'role', label: 'Role', render: (e) => e.role || '—' },
+            {
+              key: 'result', label: 'Result',
+              render: (e) => e.success
+                ? Pill('good', 'signed in')
+                : Pill('warn', (e.reason || 'failed').replace(/_/g, ' ')),
+            },
+          ],
+          rows: logins,
+        })
+        : h('div', { class: 't-sm t-faint' }, 'Could not load sign-in history.')),
+    Card({},
+      CardHeader({ title: 'Recent admin actions', desc: 'Ingredient edits, recipe changes, price changes, password resets' }),
+      actions
+        ? Table({
+          columns: [
+            { key: 'when', label: 'When', render: (e) => h('span', { class: 'mono t-xs' }, stamp(e.at)) },
+            { key: 'who', label: 'By', render: (e) => e.userId },
+            { key: 'what', label: 'What', render: (e) => `${e.action} · ${e.entityType} ${e.entityId}${e.field ? ' · ' + e.field : ''}` },
+            {
+              key: 'change', label: 'Change',
+              render: (e) => e.previousValue !== null || e.newValue !== null
+                ? h('span', { class: 't-xs' }, `${e.previousValue ?? '—'} → ${e.newValue ?? '—'}`)
+                : h('span', { class: 't-xs t-faint' }, '—'),
+            },
+          ],
+          rows: actions,
+        })
+        : h('div', { class: 't-sm t-faint' }, 'Could not load action history.')));
 }
 
 /**

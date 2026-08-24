@@ -171,12 +171,14 @@ def login(body: Login, c: sqlite3.Connection = Depends(conn)):
         "SELECT * FROM app_user WHERE username=? AND is_active=1", (body.username,)
     ).fetchone()
     if row and row["locked_until"] and row["locked_until"] > timeutil.utc_now_sql():
+        with db.write_tx(c):
+            audit.log_login(c, body.username, row["role"], success=False, reason="locked_out")
         raise HTTPException(
             423, f"account locked until {row['locked_until']} (too many failed attempts)"
         )
     if not row or not auth.verify_password(body.password, row["password_hash"], row["password_salt"]):
-        if row:
-            with db.write_tx(c):
+        with db.write_tx(c):
+            if row:
                 count = row["failed_login_count"] + 1
                 if count >= auth.MAX_LOGIN_ATTEMPTS:
                     locked_until = timeutil.utc_sql_after_minutes(auth.LOCKOUT_MINUTES)
@@ -189,13 +191,16 @@ def login(body: Login, c: sqlite3.Connection = Depends(conn)):
                         "UPDATE app_user SET failed_login_count=? WHERE id=?",
                         (count, row["id"]),
                     )
+            audit.log_login(c, body.username, row["role"] if row else None, success=False,
+                             reason="invalid_credentials" if row else "unknown_user")
         raise HTTPException(401, "invalid credentials")
-    if row["failed_login_count"] or row["locked_until"]:
-        with db.write_tx(c):
+    with db.write_tx(c):
+        if row["failed_login_count"] or row["locked_until"]:
             c.execute(
                 "UPDATE app_user SET failed_login_count=0, locked_until=NULL WHERE id=?",
                 (row["id"],),
             )
+        audit.log_login(c, row["username"], row["role"], success=True)
     return {
         "token": auth.issue_token(row["username"], row["role"], row["password_changed_at"]),
         "role": row["role"],
@@ -284,6 +289,40 @@ def reset_password(
         "temporary_password": temp_password,
         "note": "Shown once. Give this to the user directly — it is not stored or logged anywhere.",
     }
+
+
+@app.get("/console/audit/logins", tags=["console"])
+def audit_logins(
+    limit: int = Query(100, ge=1, le=500),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage")),
+):
+    """Recent login attempts, successful and failed — migration 0017's
+    login_event, written on every /auth/login call. Admin-only (same
+    capability as user administration): who signed in, when, and whether
+    it succeeded is account-security data, not general operational
+    reading."""
+    rows = c.execute(
+        "SELECT username, role, success, reason, created_at FROM login_event "
+        "ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return {"events": [dict(r) for r in rows]}
+
+
+@app.get("/console/audit/actions", tags=["console"])
+def audit_actions(
+    limit: int = Query(100, ge=1, le=500),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage")),
+):
+    """Recent sensitive mutations — migration 0016's admin_audit_log
+    (ingredient edits, recipe creation, menu price changes, admin
+    password resets). Admin-only, same reasoning as audit_logins above."""
+    rows = c.execute(
+        "SELECT entity_type, entity_id, action, field, previous_value, new_value, "
+        "user_id, note, created_at FROM admin_audit_log ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return {"events": [dict(r) for r in rows]}
 
 
 # ===========================================================================
