@@ -2,13 +2,17 @@ import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
 import { Table } from '../../components/ui/Table.js';
+import { Pill } from '../../components/ui/Pill.js';
+import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading } from '../../components/ui/Feedback.js';
 import { BarChart } from '../../components/charts/BarChart.js';
 import { DoughnutChart } from '../../components/charts/DoughnutChart.js';
 import { palette, destroyAllCharts } from '../../components/charts/base.js';
-import { money, count, pct, nodata } from '../../lib/format.js';
+import { money, count, pct, nodata, daysShort, qty } from '../../lib/format.js';
 import { getSales, getCombinations, getValuation } from '../../lib/api/reports.js';
+import { getReplenishment } from '../../lib/api/intelligence.js';
+import { getExpiry } from '../../lib/api/expiry.js';
 
 /**
  * Reports — sales, product combinations and inventory value.
@@ -32,13 +36,17 @@ export async function render(ctx) {
   async function draw() {
     destroyAllCharts();
     mount(host, Loading('Loading reports…'));
-    const [sales, combos, valuation] = await Promise.all([
+    const [sales, combos, valuation, replenishment, expiry] = await Promise.all([
       getSales(rangeDays),
       getCombinations(90),
       getValuation(),
+      getReplenishment(30),
+      getExpiry(90),
     ]);
 
     mount(host,
+      attentionCard(replenishment, expiry),
+
       h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: '14px' } },
         Card({}, Stat({ value: money(sales.revenue, 'no sales yet'), label: `Revenue · ${rangeDays}d` })),
         Card({}, Stat({ value: count(sales.orders), label: 'Orders' })),
@@ -117,6 +125,77 @@ export async function render(ctx) {
 
   await draw();
   return host;
+}
+
+/**
+ * "Attention Needed" — a single consolidated, printable list of what a
+ * manager would otherwise have to check ingredient-by-ingredient: stock
+ * that's low or projected to run out, plus batches already expired or
+ * expiring soon. Every value here is exactly what Replenishment and
+ * Expiry Watch already compute server-side (wt/forecasting.py's
+ * ingredient_depletion, wt/api.py's expiry_monitor) — this only merges
+ * the two into one list, it derives nothing new.
+ *
+ * 2026-08 audit: no PDF/report generation existed anywhere in this
+ * codebase. Rather than add a server-side PDF dependency (reportlab/
+ * weasyprint) — new attack surface and a build/deploy dependency for a
+ * single-tenant LAN app — this uses the browser's own print-to-PDF
+ * (window.print(), every desktop browser can "Save as PDF" from the
+ * print dialog with zero setup). The on-screen preview and the printed
+ * output are the SAME dom node (.print-area, see styles/app.css's
+ * @media print block) rather than two representations that could drift
+ * apart, so "preview matches download" is true by construction, not by
+ * care.
+ */
+function attentionCard(replenishment, expiry) {
+  const lowStock = (replenishment.rows || []).filter(
+    (r) => r.status === 'crit' || r.status === 'warn'
+  );
+  const expiring = [...expiry.buckets.expired, ...expiry.buckets.soon];
+
+  const rows = [
+    ...lowStock.map((r) => ({
+      kind: 'Low stock', name: r.name, severity: r.status,
+      detail: r.daysLeft === null
+        ? nodata('no usage rate yet')
+        : h('span', {}, daysShort(r.daysLeft), ' left · ', qty(r.onHand, r.baseUnit)),
+      action: r.suggestedOrderQty
+        ? h('span', {}, 'Order ~', qty(r.suggestedOrderQty, r.suggestedOrderUnit || r.baseUnit))
+        : nodata('no suggestion yet'),
+    })),
+    ...expiring.map((b) => ({
+      kind: b.expired ? 'Expired' : 'Expiring soon', name: b.ingredientName,
+      severity: b.expired ? 'crit' : 'warn',
+      detail: h('span', {}, daysShort(b.daysToExpiry), ' · ', qty(b.qtyRemaining, b.baseUnit),
+        b.batchId ? ` · ${b.batchId}` : ''),
+      action: b.expired ? 'Remove from stock' : 'Use first (FEFO)',
+    })),
+  ];
+
+  return h('div', { class: 'print-area' },
+    Card({ style: { marginBottom: '14px' } },
+      CardHeader({
+        title: 'Attention needed',
+        desc: 'Low stock and expiring/expired batches, consolidated from Replenishment and Expiry Watch — nothing here is computed differently for this report',
+        right: h('div', { class: 'no-print' },
+          Button({ size: 'sm', onClick: () => window.print() }, 'Print / Save as PDF')),
+      }),
+      h('div', { class: 'print-only t-xs t-faint', style: { marginBottom: '8px' } },
+        `Wings Theory — Attention Needed — printed ${new Date().toLocaleString('en-PH')}`),
+      Table({
+        columns: [
+          { key: 'kind', label: 'Type', render: (r) => Pill(r.severity, r.kind) },
+          { key: 'name', label: 'Ingredient', render: (r) => r.name },
+          { key: 'detail', label: 'Detail', render: (r) => h('span', { class: 't-sm' }, r.detail) },
+          { key: 'action', label: 'Suggested action', render: (r) => h('span', { class: 't-sm' }, r.action) },
+        ],
+        rows,
+        empty: EmptyState({
+          icon: '✓',
+          title: 'Nothing needs attention right now',
+          description: 'No ingredient is low/critical on runway, and nothing is expired or expiring within 7 days.',
+        }),
+      })));
 }
 
 /**

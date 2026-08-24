@@ -279,3 +279,18 @@ canvas{max-width:100%;}
    Ingredient Queue mapper, …) — keep it even though the login screen itself
    no longer references it. */
 .login-err{color:var(--crit); font-size:11.5px; margin-top:10px;}
+
+/* ============ PRINT (Reports > Attention Needed > Print / Save as PDF) ====
+   No server-side PDF generation in this codebase (2026-08 audit) -- this is
+   the browser's own print-to-PDF instead, so the on-screen preview and the
+   printed output are the same DOM node, not two representations that could
+   drift apart. .print-only is the inverse: content (the printed-at
+   timestamp) that only makes sense on paper, hidden on screen. */
+.print-only{display:none;}
+@media print{
+  body *{visibility:hidden;}
+  .print-area, .print-area *{visibility:visible;}
+  .print-area{position:absolute; top:0; left:0; width:100%;}
+  .print-only{display:block;}
+  .no-print{display:none !important;}
+}
