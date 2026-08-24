@@ -119,11 +119,39 @@ def verify(path: str | Path) -> dict:
         conn.close()
 
 
-def backup(reason: str = "manual") -> dict:
+DEFAULT_KEEP = 30
+
+
+def prune_backups(keep: int = DEFAULT_KEEP, target_db: str | Path | None = None) -> list[Path]:
+    """Delete all but the `keep` most recent backup files for one target
+    database's stem, oldest first. backend/backups/ was documented as
+    growing unbounded with no retention policy (BACKUP_RESTORE.md) --
+    this is that policy, deliberately simple: keep is a floor, not a
+    schedule, and this only ever deletes a backup FILE (never touches a
+    live database), so a wrong keep value costs disk space, not data.
+
+    Scoped to one stem (e.g. "wings_theory" vs "wings_theory_dev") via the
+    filename pattern db.backup_now() writes -- `{stem}.{reason}.{stamp}
+    {suffix}` -- so pruning production backups can never delete a dev
+    backup or vice versa even though they share one directory."""
+    target = Path(target_db or db.db_path())
+    candidates = sorted(
+        db.BACKUP_DIR.glob(f"{target.stem}.*{target.suffix}"),
+        key=lambda p: p.stat().st_mtime,
+    )
+    to_delete = candidates[:-keep] if keep > 0 else candidates
+    for p in to_delete:
+        p.unlink()
+    return to_delete
+
+
+def backup(reason: str = "manual", *, keep: int = DEFAULT_KEEP) -> dict:
     """The BACKUP half. Backs up whatever db.db_path() currently resolves
     to -- there is no separate "which database" argument, so this always
     runs under the same WT_ENV/WT_DB gate as everything else in this
-    codebase -- then immediately verifies the file it just wrote."""
+    codebase -- then immediately verifies the file it just wrote, then
+    prunes this same target's own backup history down to the most recent
+    `keep` files (pass keep=0 to disable pruning for this call)."""
     conn = db.get_conn()
     dest = db.backup_now(reason, conn=conn)
     if dest is None:
@@ -131,7 +159,10 @@ def backup(reason: str = "manual") -> dict:
             "nothing to back up -- no database file exists yet at "
             f"{db.db_path()}"
         )
-    return {"backup_path": str(dest), "verify": verify(dest)}
+    result = {"backup_path": str(dest), "verify": verify(dest)}
+    if keep > 0:
+        result["pruned"] = [str(p) for p in prune_backups(keep)]
+    return result
 
 
 def restore(backup_path: str | Path, target: str, *, confirm_production: bool = False) -> dict:

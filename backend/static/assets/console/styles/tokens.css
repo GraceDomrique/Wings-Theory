@@ -1,0 +1,30 @@
+/* Design tokens — spec §1. Copied verbatim from design/wings-theory-console.html.
+   Nothing outside this file may define a color, font or radius. If a value is
+   needed that isn't here, it doesn't exist in the design system. */
+:root{
+  --bg:#F7F5F0;
+  --surface:#FFFFFF;
+  --surface-sunk:#FBF9F4;
+  --line:#E7E2D8;
+  --line-soft:#F0EDE4;
+  --ink:#1F1C17;
+  --ink-soft:#6E6656;
+  --ink-faint:#A39A87;
+  --amber:#C6791E;
+  --amber-deep:#9C5814;
+  --amber-tint:#FBEBD3;
+  --good:#3E7A55;
+  --good-tint:#E4F1E7;
+  --warn:#B4791B;
+  --warn-tint:#FBEED8;
+  --crit:#B23E30;
+  --crit-tint:#FBE6E2;
+  --info:#3D6A96;
+  --info-tint:#E5EEF6;
+  --radius:10px;
+  --radius-sm:6px;
+  --shadow:0 1px 2px rgba(31,28,23,0.04), 0 1px 10px rgba(31,28,23,0.03);
+  --font-display:'Fraunces', serif;
+  --font-body:'Inter', sans-serif;
+  --font-mono:'JetBrains Mono', monospace;
+}

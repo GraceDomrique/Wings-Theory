@@ -43,6 +43,12 @@ DEFAULT_SECRET = "dev-only-change-in-production"
 KNOWN_COMPROMISED_PASSWORDS = {"wingstheory"}
 MIN_PASSWORD_LENGTH = 10
 
+# Login lockout. Not defending a public endpoint (see module docstring) --
+# defending a lost/compromised device and unlimited guesses against the
+# still-active shared seed password until an owner rotates it.
+MAX_LOGIN_ATTEMPTS = 5
+LOCKOUT_MINUTES = 15
+
 ROLES = ("admin", "manager", "cashier", "kitchen")
 
 # Capability -> roles allowed. Mirrors the access matrix in the build document.

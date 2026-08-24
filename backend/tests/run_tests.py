@@ -2036,23 +2036,6 @@ class TestConsoleAPI(unittest.TestCase):
     def test_verification_resolve_rejects_a_value_with_a_unit_suffix(self):
         self._assert_verification_change_rejected("Cornstarch", "500g")
 
-    def test_verification_resolve_ingredients_verify_endpoint_also_rejects_nan(self):
-        # The older /console/ingredients/{pk}/verify endpoint moves the same
-        # three columns through a different code path (pydantic's plain
-        # `float`, not verification.resolve) -- it shares
-        # verification.validate_numeric_value rather than trusting pydantic
-        # alone, since pydantic's float type accepts NaN/inf by default.
-        import json as _json
-        ing = self.conn.execute("SELECT id, pack_size FROM ingredient WHERE name='Sriracha'").fetchone()
-        body = _json.dumps({"field": "pack_size", "value": float("nan")})
-        r = self.client.post(
-            f"/console/ingredients/{ing['id']}/verify",
-            headers={**self.H_MGR, "Content-Type": "application/json"}, content=body,
-        )
-        self.assertEqual(r.status_code, 422, r.text)
-        row = self.conn.execute("SELECT pack_size FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
-        self.assertEqual(row["pack_size"], ing["pack_size"])
-
     def test_prophet_response_carries_the_fitted_line_and_outliers(self):
         items = self.client.get("/console/forecasts/demand", headers=self.H_MGR).json()["items"]
         ready = [i for i in items if not i["insufficient_data"]]
@@ -2069,6 +2052,135 @@ class TestConsoleAPI(unittest.TestCase):
         for o in d["outliers"]:
             self.assertGreaterEqual(o["sigma"], 2.5)
             self.assertLess(o["index"], len(d["series"]))
+
+
+class TestAdminAuditLog(unittest.TestCase):
+    """2026-08 audit finding: verification_event (migration 0013) only
+    covers the six owner-verification-queue fields. Every other sensitive
+    mutation -- general ingredient edits, recipe creation, menu price
+    changes, admin password resets -- wrote no durable record of who did
+    it or when. admin_audit_log (migration 0016) closes that gap; these
+    tests prove each of the four gap endpoints actually writes to it, with
+    correct before/after values and without leaking anything private (the
+    password reset's temporary password must never appear in the log)."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _events_for(self, entity_type, entity_id):
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type=? AND entity_id=? ORDER BY id",
+            (entity_type, str(entity_id)),
+        )]
+
+    def test_editing_an_ingredient_logs_one_event_per_changed_field(self):
+        ing = self.conn.execute(
+            "SELECT id, supplier, reorder_point_base FROM ingredient WHERE name='Flour'"
+        ).fetchone()
+        r = self.client.patch(
+            f"/console/ingredients/{ing['id']}", headers=self.H_MGR,
+            json={"supplier": "New Supplier Co.", "reorder_point_base": 5000},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self._events_for("ingredient", ing["id"])
+        self.assertEqual(len(events), 2)
+        by_field = {e["field"]: e for e in events}
+        self.assertEqual(by_field["supplier"]["previous_value"], ing["supplier"])
+        self.assertEqual(by_field["supplier"]["new_value"], "New Supplier Co.")
+        self.assertEqual(by_field["reorder_point_base"]["new_value"], "5000.0")
+        self.assertEqual(by_field["supplier"]["action"], "edit")
+        self.assertEqual(by_field["supplier"]["user_id"], "manager")
+
+    def test_editing_ingredient_unit_cost_rejects_infinity(self):
+        # httpx's `json=` kwarg cannot encode a non-finite float at all --
+        # same reason every other NaN/inf test in this suite hand-builds
+        # the body with json.dumps and sends it as raw `content=` instead.
+        import json as _json
+        ing = self.conn.execute("SELECT id, unit_cost FROM ingredient WHERE name='Sriracha'").fetchone()
+        body = _json.dumps({"unit_cost": float("inf")})
+        r = self.client.patch(
+            f"/console/ingredients/{ing['id']}",
+            headers={**self.H_MGR, "Content-Type": "application/json"}, content=body,
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        row = self.conn.execute("SELECT unit_cost FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
+        self.assertEqual(row["unit_cost"], ing["unit_cost"])
+        self.assertEqual(self._events_for("ingredient", ing["id"]), [])
+
+    def test_creating_a_recipe_logs_a_create_event(self):
+        ing = self.conn.execute("SELECT id FROM ingredient WHERE name='Flour'").fetchone()
+        r = self.client.post(
+            "/console/recipes", headers=self.H_MGR,
+            json={"name": "Audit Test Batter", "kind": "sub_recipe",
+                  "produces_ingredient_pk": ing["id"], "yield_qty": 1, "yield_unit": "batch",
+                  "lines": [{"ingredient_pk": ing["id"], "display_label": "Flour",
+                             "qty_base": 100, "is_optional": False}]},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        recipe_pk = r.json()["id"]
+        events = self._events_for("recipe", recipe_pk)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["action"], "create")
+        self.assertEqual(events[0]["new_value"], "Audit Test Batter")
+        self.assertEqual(events[0]["user_id"], "manager")
+
+    def test_changing_menu_price_logs_before_and_after(self):
+        item = self.conn.execute("SELECT id, price FROM menu_item LIMIT 1").fetchone()
+        new_price = item["price"] + 10
+        r = self.client.patch(
+            f"/console/menu-items/{item['id']}/price", headers=self.H_MGR,
+            json={"price": new_price},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self._events_for("menu_item", item["id"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["field"], "price")
+        self.assertEqual(events[0]["action"], "price_change")
+        self.assertEqual(float(events[0]["previous_value"]), item["price"])
+        self.assertEqual(float(events[0]["new_value"]), new_price)
+
+    def test_admin_password_reset_is_logged_without_the_password(self):
+        r = self.client.post(
+            "/console/users/cashier1/reset_password", headers=self.H_OWNER,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        temp_password = r.json()["temporary_password"]
+        events = self._events_for("user", "cashier1")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["action"], "password_reset")
+        self.assertEqual(events[0]["user_id"], "owner")
+        # the whole point: attribution without ever persisting the credential
+        self.assertIsNone(events[0]["previous_value"])
+        self.assertIsNone(events[0]["new_value"])
+        self.assertNotIn(temp_password, str(events[0]))
 
 
 class TestPasswordSecurity(unittest.TestCase):
@@ -2105,7 +2217,7 @@ class TestPasswordSecurity(unittest.TestCase):
         # validation before any UPDATE runs) are shared.
         from wt.auth import hash_password
         for username in ("pwtest_selfchange", "pwtest_tokeninvalidation",
-                         "pwtest_adminreset", "pwtest_noleak"):
+                         "pwtest_adminreset", "pwtest_noleak", "pwtest_lockout"):
             h, s = hash_password("wingstheory")
             cls.conn.execute(
                 "INSERT INTO app_user (username, display_name, role, password_hash, "
@@ -2271,6 +2383,30 @@ class TestPasswordSecurity(unittest.TestCase):
             (f"%{temp_password}%", f"%{temp_password}%"),
         ).fetchone()["n"]
         self.assertEqual(leaked, 0)
+
+    def test_repeated_wrong_passwords_lock_the_account(self):
+        from wt.auth import MAX_LOGIN_ATTEMPTS
+        for _ in range(MAX_LOGIN_ATTEMPTS - 1):
+            r = self._login("pwtest_lockout", "wrong-password")
+            self.assertEqual(r.status_code, 401)
+        # the attempt that trips the threshold locks the account ...
+        r = self._login("pwtest_lockout", "wrong-password")
+        self.assertEqual(r.status_code, 401)
+        # ... so even the CORRECT password is now refused until it expires
+        r = self._login("pwtest_lockout", "wingstheory")
+        self.assertEqual(r.status_code, 423, r.text)
+
+    def test_a_successful_login_clears_the_failure_counter(self):
+        from wt.auth import MAX_LOGIN_ATTEMPTS
+        for _ in range(MAX_LOGIN_ATTEMPTS - 2):
+            self._login("cashier1", "wrong-password")
+        good = self._login("cashier1", "wingstheory")
+        self.assertEqual(good.status_code, 200)
+        row = self.conn.execute(
+            "SELECT failed_login_count, locked_until FROM app_user WHERE username='cashier1'"
+        ).fetchone()
+        self.assertEqual(row["failed_login_count"], 0)
+        self.assertIsNone(row["locked_until"])
 
 
 class TestForecasting(Base):
@@ -6353,7 +6489,7 @@ def main() -> int:
             TestRefillReconciliationLink, TestRefillAPI,
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
-            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestPasswordSecurity,
+            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestAdminAuditLog, TestPasswordSecurity,
             TestForecasting, TestAnomaly, TestAssociations,
             TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,

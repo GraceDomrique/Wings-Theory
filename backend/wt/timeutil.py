@@ -111,6 +111,19 @@ def sql_business_date(column_expr: str) -> str:
     return f"date({column_expr}, '{_SQL_SHIFT}')"
 
 
+def utc_now_sql(now: _dt.datetime | None = None) -> str:
+    """The current instant as a string directly comparable to any
+    `datetime('now')`-stamped column (e.g. app_user.locked_until) --
+    SQLite's own 'YYYY-MM-DD HH:MM:SS' format, not ISO's 'T' separator."""
+    return (now or utc_now()).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def utc_sql_after_minutes(n: int, now: _dt.datetime | None = None) -> str:
+    """utc_now_sql(), n minutes in the future -- for stamping a column
+    meant to be compared against utc_now_sql() later (a lockout expiry)."""
+    return ((now or utc_now()) + _dt.timedelta(minutes=n)).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def business_date_n_days_ago(n: int, now: _dt.datetime | None = None) -> str:
     """Manila calendar date N days before today, as an ISO date string --
     for bounding a DATE-valued column such as unli_reconciliation.service_date

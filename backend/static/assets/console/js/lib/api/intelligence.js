@@ -1,0 +1,252 @@
+import { api } from './client.js';
+import { severityFromRisk, severityFromAnomaly } from '../severity.js';
+
+/**
+ * Forecast & Insights domain — forecasting, replenishment, anomalies,
+ * reconciliation.
+ *
+ * ROUTE MAP:
+ *   GET /forecast?menuItemId=   -> GET /console/forecasts/demand?menu_item_pk=
+ *   GET /replenishment          -> GET /console/forecasts/depletion
+ *   GET /anomalies?window=90d   -> GET /console/anomalies?lookback_days=90
+ *   GET /reconciliation/:date   -> GET /unli/reconciliation/pending?service_date=
+ *                                  + GET /unli/coefficients
+ *   POST /reconciliation/:date/submit -> POST /unli/reconciliation
+ *
+ * Nothing in this file computes a forecast, a runway or a flag. Prophet,
+ * the depletion arithmetic and the Isolation Forest all run server-side; these
+ * adapters only rename fields.
+ */
+
+/** Menu items with enough history to forecast, plus those that don't. */
+export async function listDemandSummaries() {
+  const out = await api.get('/console/forecasts/demand', { horizon_days: 7 });
+  return (out.items || []).map(toForecastSeries);
+}
+
+/** @returns {Promise<import('../types.js').ForecastSeries>} */
+export async function getForecast(menuItemPk, horizonDays = 7) {
+  const out = await api.get('/console/forecasts/demand', {
+    menu_item_pk: menuItemPk, horizon_days: horizonDays,
+  });
+  return toForecastSeries(out);
+}
+
+function toForecastSeries(r) {
+  return {
+    menuItemId: r.menu_item_id,
+    name: r.name,
+    // active_days is real days of sales on file. Below required_days the
+    // backend refuses to forecast, and so does the chart — spec section 4.
+    daysOfHistory: r.active_days ?? 0,
+    requiredDays: r.required_days ?? 7,
+    insufficientData: !!r.insufficient_data,
+    method: r.method,
+    prophetUnavailable: !!r.prophet_unavailable,
+    history: (r.series || []).map((p) => ({ date: p.date, qty: p.qty })),
+    series: (r.forecast || []).map((p) => ({
+      date: p.date,
+      predictedUnits: p.qty ?? null,
+      low: p.low ?? null,
+      high: p.high ?? null,
+    })),
+    trailingAvgDaily: r.trailing_avg_daily ?? null,
+    totalQtyInWindow: r.total_qty_in_window ?? null,
+    accuracy: null, // holdout metrics live on /console/model-details
+  };
+}
+
+/**
+ * Replenishment. `reorderPoint` stays null when the manager has not set one —
+ * the backend is explicit that an unset reorder point is never treated as
+ * zero, and neither is this. `suggestedReorderPoint` is advice, shown as such.
+ * @returns {Promise<{rows:import('../types.js').ReplenishmentRow[], belowReorderPoint:number, configured:number}>}
+ */
+export async function getReplenishment(lookbackDays = 30) {
+  const out = await api.get('/console/forecasts/depletion', { lookback_days: lookbackDays });
+  return {
+    rows: (out.ingredients || []).map((d) => ({
+      ingredientId: d.ingredient_id,
+      name: d.name,
+      onHand: d.available_base ?? null,
+      baseUnit: d.base_unit,
+      usedPerDay: d.avg_daily_consumption > 0 ? d.avg_daily_consumption : null,
+      daysLeft: d.days_remaining ?? null,
+      leadTimeDays: d.lead_time_days ?? null,
+      reorderPoint: d.reorder_point_base ?? null,
+      suggestedReorderPoint: d.suggested_reorder_point_base ?? null,
+      suggestedOrderQty: d.suggested_order_qty ?? null,
+      suggestedOrderUnit: d.suggested_order_unit ?? null,
+      belowReorderPoint: !!d.below_reorder_point,
+      status: severityFromRisk(d.risk),
+      risk: d.risk,
+    })),
+    belowReorderPoint: out.below_reorder_point || 0,
+    configured: out.reorder_points_configured || 0,
+  };
+}
+
+/**
+ * Anomalies. Two independent passes, reported separately — merging them would
+ * imply a single ranking that neither model produces.
+ *
+ * `flaggedBecause` is the backend's own sentence (wt/anomaly.py builds it as
+ * "N.Nx this ingredient's typical wastage"). It is displayed verbatim and
+ * never rewritten into something accusatory — spec section 6 point 5.
+ */
+export async function getAnomalies(lookbackDays = 90) {
+  const out = await api.get('/console/anomalies', { lookback_days: lookbackDays });
+  return {
+    stockLoss: (out.stock_loss_anomalies || []).map((a) => ({
+      id: String(a.ledger_id),
+      ingredientId: a.ingredient_id,
+      ingredientName: a.ingredient_name,
+      timestamp: a.created_at,
+      amount: a.delta_base ?? null,
+      baseUnit: a.base_unit,
+      reasonCode: a.wastage_reason || a.reason,
+      flaggedBecause: a.why,
+      priority: a.severity === 'high' ? 'review_soon' : 'worth_a_look',
+      severity: severityFromAnomaly(a.severity),
+      score: a.score ?? null,
+      note: a.note || null,
+    })),
+    consumption: out.consumption_anomalies || [],
+  };
+}
+
+/** Reconciliation: today's streams plus the coefficients that size them. */
+export async function getReconciliation(serviceDate) {
+  const [pending, coeff] = await Promise.all([
+    api.get('/unli/reconciliation/pending', { service_date: serviceDate }),
+    api.get('/unli/coefficients'),
+  ]);
+  return {
+    pending,
+    /** @type {import('../types.js').ReconciliationStream[]} */
+    streams: (coeff.streams || []).map((s) => {
+      const rolling = s.rolling_lambda ?? null;
+      const baseline = s.baseline_lambda ?? null;
+      return {
+        stream: s.label,
+        pk: s.id,
+        itemKey: s.item_key,
+        deductsFrom: s.ingredient_name,
+        baseUnit: s.base_unit,
+        coefficient: rolling,
+        baselineCoefficient: baseline,
+        // Drift is only meaningful when both numbers exist. No baseline means
+        // no drift to report — not 0% drift.
+        driftPct: rolling !== null && baseline ? ((rolling - baseline) / baseline) * 100 : null,
+        windowDays: s.window_days ?? null,
+        revisions: s.rolling_revisions ?? 0,
+      };
+    }),
+  };
+}
+
+/** Current auto sign-off tolerance (e.g. 0.10 for 10%). */
+export function getTolerance() {
+  return api.get('/unli/tolerance');
+}
+
+/** POST /unli/reconciliation — stage 2+3, posts only the difference to stock. */
+export function submitReconciliation({ serviceDate, itemKey, openingBase, closingBase, addedBase, note }) {
+  return api.post('/unli/reconciliation', {
+    service_date: serviceDate,
+    item_key: itemKey,
+    opening_base: openingBase,
+    closing_base: closingBase,
+    added_base: addedBase || 0,
+    note: note || null,
+  });
+}
+
+/**
+ * GET /unli/reconciliation — full history, most recent first. This is what
+ * the "Waiting for sign-off" list and the daily-history table are built from;
+ * `reconciliation_id` (not `id`) is the view's own PK column and is the value
+ * `reviewReconciliation` below expects.
+ */
+export async function getReconciliationHistory({ limit = 120, itemKey, days } = {}) {
+  const out = await api.get('/unli/reconciliation', { limit, item_key: itemKey, days });
+  return (out.reconciliations || []).map((h) => ({
+    id: h.reconciliation_id,
+    serviceDate: h.service_date,
+    stream: h.label,
+    itemKey: h.item_key,
+    baseUnit: h.base_unit,
+    heads: h.heads,
+    openingBase: h.opening_base,
+    addedBase: h.added_base,
+    closingBase: h.closing_base,
+    actualBase: h.actual_base,
+    theoreticalBase: h.theoretical_base,
+    varianceBase: h.variance_base,
+    variancePct: h.variance_pct,
+    actualPerHead: h.actual_per_head ?? null,
+    status: h.status,
+    correctionBase: h.correction_base,
+    validationState: h.validation_state,
+    note: h.note || null,
+  }));
+}
+
+/**
+ * POST /unli/reconciliation/{pk}/review — manager sign-off (or rejection) of
+ * a day that landed outside tolerance. Only governs whether the day may
+ * influence a future coefficient — the inventory correction was already
+ * posted when the measurement was recorded, so rejecting does NOT undo any
+ * stock change. Requires unli.approve (manager or admin).
+ */
+export function reviewReconciliation(pk, approve, note) {
+  return api.post(`/unli/reconciliation/${pk}/review`, { approve, note: note || null });
+}
+
+/**
+ * PATCH /unli/tolerance — the variance band before a day needs manager
+ * sign-off. Requires unli.approve (manager or admin). Already-reconciled
+ * days keep the tolerance they were judged against.
+ */
+export function setTolerance(toleranceRatio) {
+  return api.patch('/unli/tolerance', { tolerance_ratio: toleranceRatio });
+}
+
+/**
+ * POST /unli/coefficients/recalibrate — re-estimate each stream's rolling
+ * lambda from its own validated, sufficiently-covered reconciliation history.
+ * dry_run=true computes and returns the result without writing; the frozen
+ * baseline is never touched either way. Requires unli.approve.
+ */
+export function recalibrate({ itemKey, dryRun = false } = {}) {
+  return api.post('/unli/coefficients/recalibrate', { item_key: itemKey || null, dry_run: dryRun });
+}
+
+/**
+ * GET /unli/flavors?all_flavors=true — every selectable flavor, included and
+ * special. Prices are resolved server-side; the frontend never invents one.
+ */
+export async function listFlavors() {
+  const out = await api.get('/unli/flavors', { all_flavors: true });
+  return (out.flavors || []).map((f) => ({
+    pk: f.id,
+    name: f.display_name,
+    flavorType: f.flavor_type,
+    addonPrice: f.flavor_type === 'special' ? f.addon_price : null,
+    addonMenuItemName: f.addon_menu_item_name || null,
+    isDeductable: !!f.is_deductable,
+    isActive: !!f.is_active,
+  }));
+}
+
+/**
+ * PATCH /unli/flavors/{pk} — make a flavor premium/included, price it, or
+ * withdraw it from the POS. Requires recipe.write (manager or admin) — the
+ * same capability that edits a menu price, because a special flavor's
+ * add-on price is exactly that.
+ */
+export function setFlavor(pk, { flavorType, addonPrice, isActive }) {
+  const body = { flavor_type: flavorType, is_active: isActive };
+  if (flavorType === 'special') body.addon_price = addonPrice;
+  return api.patch(`/unli/flavors/${pk}`, body);
+}

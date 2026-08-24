@@ -137,9 +137,10 @@ GROUP_LABEL = {
 # defeats the point of tracking it, and a negative cost, quantity, or rate
 # is never physically meaningful here. One rule -- new_value > 0 -- covers
 # all five; see validate_numeric_value. Public (no leading underscore) --
-# api.py's older /console/ingredients/{pk}/verify endpoint reuses it too,
-# so both paths that can move one of these three ingredient columns share
-# exactly one validation rule instead of two that could drift apart.
+# api.py's /console/ingredients/{pk}/edit endpoint validates unit_cost the
+# same way before writing it, so both paths that can move one of these
+# ingredient columns share exactly one validation rule instead of two that
+# could drift apart.
 NUMERIC_FIELDS = {
     "ingredient.pack_size", "ingredient.yield_factor", "ingredient.unit_cost",
     "recipe_line.qty_base", "unli_coefficient.lambda",
@@ -310,8 +311,9 @@ def resolve(
             )
             if col in ("pack_size", "yield_factor"):
                 # Resync the cached on-hand total against the FEFO batches'
-                # own (unchanged) base-unit quantities -- see
-                # /console/ingredients/{pk}/verify, the same restatement.
+                # own (unchanged) base-unit quantities -- the conversion
+                # factor just changed, so on_hand_base is restated against
+                # the batches' real qty_base rather than left stale.
                 conn.execute(
                     """
                     UPDATE ingredient

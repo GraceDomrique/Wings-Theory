@@ -9,6 +9,7 @@ leak a capability the role does not hold.
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 from pathlib import Path as _Path
 from typing import Any, Literal
@@ -19,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, db, refills, timeutil, unli, verification
+from . import audit, auth, db, refills, timeutil, unli, verification
 from .anomaly import detect_anomalies, detect_consumption_anomalies
 from .anomaly import consumption_model_details
 from .anomaly import model_details as anomaly_model_details
@@ -159,11 +160,42 @@ class Login(BaseModel):
 
 @app.post("/auth/login", tags=["auth"])
 def login(body: Login, c: sqlite3.Connection = Depends(conn)):
+    """auth.py's threat model is explicit: this system does not defend a
+    public endpoint. It still defends a lost/compromised device, or a LAN
+    guest guessing a still-active seeded password -- all four real
+    accounts share one password until an owner rotates them (see
+    GO_LIVE_CHECKLIST.md) -- against unlimited guesses. Locks the account
+    for LOCKOUT_MINUTES after MAX_LOGIN_ATTEMPTS consecutive failures;
+    any successful login clears the counter."""
     row = c.execute(
         "SELECT * FROM app_user WHERE username=? AND is_active=1", (body.username,)
     ).fetchone()
+    if row and row["locked_until"] and row["locked_until"] > timeutil.utc_now_sql():
+        raise HTTPException(
+            423, f"account locked until {row['locked_until']} (too many failed attempts)"
+        )
     if not row or not auth.verify_password(body.password, row["password_hash"], row["password_salt"]):
+        if row:
+            with db.write_tx(c):
+                count = row["failed_login_count"] + 1
+                if count >= auth.MAX_LOGIN_ATTEMPTS:
+                    locked_until = timeutil.utc_sql_after_minutes(auth.LOCKOUT_MINUTES)
+                    c.execute(
+                        "UPDATE app_user SET failed_login_count=0, locked_until=? WHERE id=?",
+                        (locked_until, row["id"]),
+                    )
+                else:
+                    c.execute(
+                        "UPDATE app_user SET failed_login_count=? WHERE id=?",
+                        (count, row["id"]),
+                    )
         raise HTTPException(401, "invalid credentials")
+    if row["failed_login_count"] or row["locked_until"]:
+        with db.write_tx(c):
+            c.execute(
+                "UPDATE app_user SET failed_login_count=0, locked_until=NULL WHERE id=?",
+                (row["id"],),
+            )
     return {
         "token": auth.issue_token(row["username"], row["role"], row["password_changed_at"]),
         "role": row["role"],
@@ -220,18 +252,20 @@ def change_password(
 
 @app.post("/console/users/{username}/reset_password", tags=["console"])
 def reset_password(
-    username: str, c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage")),
+    username: str, c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("user.manage")),
 ):
     """Admin-only emergency reset (auth.CAPABILITIES already scopes
     user.manage to admin). Generates a random password server-side --
     the admin never types, and therefore never has to invent or reuse, the
     credential this hands back -- and returns it exactly once, in this
-    response body only. It is never logged and never written anywhere
-    else (not even the audit trail this project keeps for inventory
-    verification, which is a different domain): if this response is lost,
-    the only recovery is to reset again. Flags must_change_password=1 so
-    the go-live checklist can tell a still-temporary password apart from
-    one the account holder actually chose."""
+    response body only. The password itself is never logged and never
+    written anywhere else: if this response is lost, the only recovery is
+    to reset again. The event itself (which admin reset which account,
+    when) IS logged to admin_audit_log -- attribution for a sensitive
+    account action does not require persisting the credential it produced.
+    Flags must_change_password=1 so the go-live checklist can tell a
+    still-temporary password apart from one the account holder actually
+    chose."""
     row = c.execute("SELECT * FROM app_user WHERE username=?", (username,)).fetchone()
     if not row:
         raise NotFoundError(f"user '{username}' not found")
@@ -243,6 +277,7 @@ def reset_password(
             "password_changed_at=datetime('now','subsec'), must_change_password=1 WHERE id=?",
             (h, s, row["id"]),
         )
+        audit.log(c, "user", username, "password_reset", p["sub"])
     return {
         "ok": True,
         "username": username,
@@ -791,48 +826,6 @@ def create_ingredient(
         return {"id": cur.lastrowid, "ingredient_id": f"ING-{n + 1:04d}"}
 
 
-class VerifyIn(BaseModel):
-    field: Literal["pack_size", "yield_factor", "unit_cost"]
-    value: float
-
-
-@app.post("/console/ingredients/{pk}/verify", tags=["console"])
-def verify_constant(
-    pk: int, body: VerifyIn, c: sqlite3.Connection = Depends(conn),
-    p: dict = Depends(needs("inventory.write")),
-):
-    """Confirm a physical constant. This is the only path that moves a value
-    from needs_verification to verified — it cannot happen as a side effect of
-    an ordinary edit.
-
-    Validated the same way /console/queues/verification/resolve validates
-    the same three columns (verification.validate_numeric_value) — pydantic's
-    plain `float` type accepts NaN and infinity by default, which is not
-    caught by body: VerifyIn alone."""
-    value = verification.validate_numeric_value(f"ingredient.{body.field}", body.value)
-    with db.write_tx(c):
-        cur = c.execute(
-            f"UPDATE ingredient SET {body.field}=?, {body.field}_status='verified', "
-            f"updated_at=datetime('now') WHERE id=?",
-            (value, pk),
-        )
-        if cur.rowcount != 1:
-            raise HTTPException(404, "ingredient not found")
-        if body.field in ("pack_size", "yield_factor"):
-            # stock is held in base units, so changing the conversion restates it
-            c.execute(
-                """
-                UPDATE ingredient
-                   SET on_hand_base = (SELECT SUM(qty_base) FROM fefo_batch
-                                        WHERE ingredient_id=? AND state='open')
-                 WHERE id=? AND EXISTS (SELECT 1 FROM fefo_batch
-                                         WHERE ingredient_id=? AND state='open')
-                """,
-                (pk, pk, pk),
-            )
-    return {"ok": True, "field": body.field, "value": value, "verified_by": p["sub"]}
-
-
 class ReceiveIn(BaseModel):
     purchase_qty: float = Field(gt=0, description="in the ingredient's own purchase unit")
     lot_no: str | None = None
@@ -968,17 +961,37 @@ def edit_ingredient(
     fields = body.model_dump(exclude_unset=True)
     if not fields:
         raise HTTPException(422, "no fields to update")
+    # Pydantic's plain `float` accepts Infinity (ge=0/gt=0 alone lets it
+    # through -- inf >= 0 and inf > 0 are both true; only NaN fails those
+    # comparisons) -- the same gap verification.validate_numeric_value
+    # guards elsewhere. Checked explicitly rather than as a pydantic
+    # field_validator: FastAPI's default RequestValidationError handler
+    # echoes the raw rejected value back in the response body, and
+    # Starlette's JSONResponse refuses to serialize a non-finite float
+    # (allow_nan=False) -- raising ValidationError here instead reaches
+    # this project's own WTError handler, which never echoes raw input.
+    for field in ("unit_cost", "reorder_point_base", "max_stock_base"):
+        if field in fields and not math.isfinite(fields[field]):
+            raise ValidationError(f"{field} must be a finite number")
     set_sql = ", ".join(f"{k} = :{k}" for k in fields)
     if "unit_cost" in fields:
         set_sql += ", unit_cost_status = 'verified'"
     params = {**fields, "id": pk}
     with db.write_tx(c):
+        before = c.execute(
+            f"SELECT {', '.join(fields)} FROM ingredient WHERE id=?", (pk,)
+        ).fetchone()
+        if not before:
+            raise HTTPException(404, "ingredient not found")
         cur = c.execute(
             f"UPDATE ingredient SET {set_sql}, updated_at = datetime('now') WHERE id = :id",
             params,
         )
         if cur.rowcount != 1:
             raise HTTPException(404, "ingredient not found")
+        for k, new_value in fields.items():
+            audit.log(c, "ingredient", pk, "edit", p["sub"],
+                       field=k, previous_value=before[k], new_value=new_value)
     return {"ok": True, "updated": list(fields.keys())}
 
 
@@ -1120,7 +1133,7 @@ def get_recipe(
 @app.post("/console/recipes", tags=["console"], status_code=201)
 def create_recipe(
     body: RecipeIn, c: sqlite3.Connection = Depends(conn),
-    _p: dict = Depends(needs("recipe.write")),
+    p: dict = Depends(needs("recipe.write")),
 ):
     if body.kind == "sub_recipe" and body.produces_ingredient_pk is None:
         raise HTTPException(422, "a sub-recipe must declare which ingredient it produces")
@@ -1143,6 +1156,8 @@ def create_recipe(
                 (pk, ln.ingredient_pk, ln.display_label, ln.qty_base,
                  int(ln.is_optional), order, ln.note),
             )
+        audit.log(c, "recipe", pk, "create", p["sub"],
+                   new_value=body.name, note=f"{len(body.lines)} line(s)")
     problems = validate_recipe(c, pk)
     return {"id": pk, "problems": problems}
 
@@ -1154,17 +1169,22 @@ class MenuPriceIn(BaseModel):
 @app.patch("/console/menu-items/{pk}/price", tags=["console"])
 def edit_menu_price(
     pk: int, body: MenuPriceIn, c: sqlite3.Connection = Depends(conn),
-    _p: dict = Depends(needs("recipe.write")),
+    p: dict = Depends(needs("recipe.write")),
 ):
     """The only console-writable field on a menu item today. Everything
     else about it (what it's made of) is edited through its recipe."""
     with db.write_tx(c):
+        before = c.execute("SELECT price FROM menu_item WHERE id=?", (pk,)).fetchone()
+        if not before:
+            raise HTTPException(404, "menu item not found")
         cur = c.execute(
             "UPDATE menu_item SET price = ?, updated_at = datetime('now') WHERE id = ?",
             (body.price, pk),
         )
         if cur.rowcount != 1:
             raise HTTPException(404, "menu item not found")
+        audit.log(c, "menu_item", pk, "price_change", p["sub"],
+                   field="price", previous_value=before["price"], new_value=body.price)
     row = c.execute("SELECT id, name, price FROM menu_item WHERE id=?", (pk,)).fetchone()
     return dict(row)
 
