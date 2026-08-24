@@ -250,3 +250,33 @@ export function setFlavor(pk, { flavorType, addonPrice, isActive }) {
   if (flavorType === 'special') body.addon_price = addonPrice;
   return api.patch(`/unli/flavors/${pk}`, body);
 }
+
+/**
+ * GET /console/reconciliation/ingredients — the general-ingredient
+ * counterpart to the unli reconciliation above: recipe/wastage-driven
+ * consumption vs. what physical counts actually found, per ingredient,
+ * over the window. A flagged item is a variance worth a look, same
+ * "review, not accusation" framing as getAnomalies — nothing here names a
+ * cause.
+ */
+export async function getIngredientVariance(days = 30) {
+  const out = await api.get('/console/reconciliation/ingredients', { days });
+  return {
+    days: out.days,
+    since: out.since,
+    flagRatio: out.flag_ratio,
+    items: (out.items || []).map((i) => ({
+      ingredientId: i.ingredient_id,
+      name: i.name,
+      baseUnit: i.base_unit,
+      consumedBase: i.consumed_base,
+      receivedBase: i.received_base,
+      voidCreditBase: i.void_credit_base,
+      countVarianceBase: i.count_variance_base,
+      countEvents: i.count_events,
+      hasCountData: i.has_count_data,
+      varianceRatio: i.variance_ratio,
+      flagged: i.flagged,
+    })),
+  };
+}

@@ -59,6 +59,7 @@ export async function getCombinations(lookbackDays = 90) {
     insufficientData: !!out.insufficient_data,
     transactionCount: out.transaction_count ?? null,
     required: out.required ?? out.min_transactions ?? null,
+    comboPriceBasis: out.combo_price_basis ?? null,
     combos: (out.combos || []).map((c) => ({
       itemA: c.item_a,
       itemB: c.item_b,

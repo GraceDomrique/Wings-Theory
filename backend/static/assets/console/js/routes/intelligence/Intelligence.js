@@ -7,12 +7,14 @@ import * as Forecasting from './Forecasting.js';
 import * as Replenishment from './Replenishment.js';
 import * as AnomalyDetection from './AnomalyDetection.js';
 import * as Reconciliation from './Reconciliation.js';
+import * as Variance from './Variance.js';
 
 const TABS = [
   { id: 'forecast', label: 'Forecasting' },
   { id: 'replenish', label: 'Replenishment' },
   { id: 'anomaly', label: 'Anomaly Detection' },
   { id: 'recon', label: 'Reconciliation' },
+  { id: 'variance', label: 'Ingredient Variance' },
 ];
 
 const SUBVIEWS = {
@@ -20,6 +22,7 @@ const SUBVIEWS = {
   replenish: Replenishment,
   anomaly: AnomalyDetection,
   recon: Reconciliation,
+  variance: Variance,
 };
 
 export async function render(ctx) {

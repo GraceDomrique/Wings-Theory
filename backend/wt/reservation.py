@@ -48,6 +48,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from . import timeutil
 from .db import write_tx
 from .errors import InsufficientStockError, InvalidStateError, NotFoundError
 from .resolver import order_requirements
@@ -724,6 +725,93 @@ def record_wastage(
         "wasted_base": round(qty_base, 4),
         "reason": reason,
         "on_hand_base": round(new_on_hand, 4),
+    }
+
+
+# 2026-08 audit: unli.py's three-stage model (provisional deduction, actual
+# measurement, theoretical-vs-actual variance with a tolerance/review
+# status) only ever ran for unlimited-refill streams. Regular recipe-driven
+# ingredients had the SAME underlying comparison — record_count above
+# already writes expected-vs-actual as a count_adjustment ledger entry,
+# every time a physical count happens — but no periodic report pulled it
+# together the way unli's does. This is that report: a read-only rollup
+# over stock_ledger, not a new deduction or adjustment mechanism, and it
+# writes nothing.
+#
+# A physical count's own delta (actual - expected at that instant) already
+# IS the "measured vs. theoretical" gap: on_hand_base is maintained
+# transaction-by-transaction from every sale, receipt and write-off in
+# between, so the count's variance already nets out everything that
+# happened since the last count. This report re-groups those same ledger
+# rows by reason over a chosen window so a manager can see, per ingredient,
+# how much of the period's stock movement was recipe/wastage consumption,
+# how much was received, and how much of a net gap the physical counts in
+# that window actually found — without re-deriving anything the ledger
+# doesn't already record.
+CONSUMPTION_REASONS = ("sale_commit", "wastage", "spoilage", "operational_use")
+# A variance below this fraction of the period's own consumption is normal
+# measurement noise (scoop-to-scoop variation, scale rounding) — flagging
+# it would just be noise dressed up as a finding. Chosen to match the same
+# order of magnitude as unli's own default tolerance band (unli.py), not
+# derived from this dataset.
+VARIANCE_FLAG_RATIO = 0.10
+
+
+def ingredient_reconciliation_report(conn: sqlite3.Connection, days: int = 30) -> dict:
+    """Expected (recipe/wastage) consumption vs. what physical counts
+    actually found, per ingredient, over the last `days` days. A flagged
+    ingredient is a variance worth a look, never an accusation — same
+    framing as anomaly.py's own descriptive-only rule (see its docstring):
+    this only ever surfaces a fact and a ratio, it does not name a cause.
+    """
+    since = timeutil.utc_bound_n_manila_days_ago(days)
+    rows = conn.execute(
+        """
+        SELECT i.id, i.name, i.base_unit,
+               SUM(CASE WHEN l.reason IN ('sale_commit','wastage','spoilage','operational_use')
+                        THEN -l.delta_base ELSE 0 END) AS consumed_base,
+               SUM(CASE WHEN l.reason = 'purchase_receipt' THEN l.delta_base ELSE 0 END) AS received_base,
+               SUM(CASE WHEN l.reason = 'void_credit' THEN l.delta_base ELSE 0 END) AS void_credit_base,
+               SUM(CASE WHEN l.reason = 'count_adjustment' THEN l.delta_base ELSE 0 END) AS count_variance_base,
+               SUM(CASE WHEN l.reason = 'count_adjustment' THEN 1 ELSE 0 END) AS count_events
+          FROM ingredient i
+          JOIN stock_ledger l ON l.ingredient_id = i.id
+         WHERE l.created_at >= ? AND i.is_active = 1
+         GROUP BY i.id, i.name, i.base_unit
+        """,
+        (since,),
+    ).fetchall()
+
+    items = []
+    for r in rows:
+        consumed = round(r["consumed_base"] or 0.0, 4)
+        variance = round(r["count_variance_base"] or 0.0, 4)
+        count_events = r["count_events"] or 0
+        has_count_data = count_events > 0
+        variance_ratio = (
+            round(abs(variance) / consumed, 4) if has_count_data and consumed > EPS else None
+        )
+        flagged = has_count_data and variance_ratio is not None and variance_ratio >= VARIANCE_FLAG_RATIO
+        items.append({
+            "ingredient_id": r["id"],
+            "name": r["name"],
+            "base_unit": r["base_unit"],
+            "consumed_base": consumed,
+            "received_base": round(r["received_base"] or 0.0, 4),
+            "void_credit_base": round(r["void_credit_base"] or 0.0, 4),
+            "count_variance_base": variance,
+            "count_events": count_events,
+            "has_count_data": has_count_data,
+            "variance_ratio": variance_ratio,
+            "flagged": flagged,
+        })
+
+    items.sort(key=lambda x: (not x["flagged"], -(x["variance_ratio"] or 0)))
+    return {
+        "days": days,
+        "since": since,
+        "flag_ratio": VARIANCE_FLAG_RATIO,
+        "items": items,
     }
 
 

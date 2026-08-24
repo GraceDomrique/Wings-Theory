@@ -24,6 +24,22 @@ MIN_CONFIDENCE = 0.3      # given item A, item B follows at least 30% of the tim
 MIN_LIFT = 1.2            # co-occurs 20%+ more than random chance predicts
 COMBO_DISCOUNT = 0.92     # suggested bundle price = 8% off the sum of both items
 
+# 2026-08 audit: suggested_combo_price is a flat discount off current menu
+# PRICES only -- it has never read ingredient.unit_cost and makes no claim
+# about margin or profit. That is honest as far as it goes, but the UI
+# rendered a bare currency figure with nothing distinguishing it from a
+# verified cost calculation, and most ingredients' unit_cost is itself
+# still sitting in the owner-verification queue -- so even a
+# cost-aware price would be provisional today. This static string travels
+# with every response so the console can label the figure for what it
+# actually is (a list-price heuristic) rather than implying more
+# precision than the calculation has.
+COMBO_PRICE_BASIS = (
+    f"List price only ({int(round((1 - COMBO_DISCOUNT) * 100))}% off the sum of "
+    "current menu prices). Not a margin or profit calculation -- ingredient "
+    "cost is not part of this figure."
+)
+
 
 def _rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
@@ -93,7 +109,8 @@ def product_combinations(conn: sqlite3.Connection, lookback_days: int = 90, top_
             break
 
     return {"insufficient_data": False, "transaction_count": transaction_count,
-            "required": MIN_TRANSACTIONS, "combos": combos}
+            "required": MIN_TRANSACTIONS, "combos": combos,
+            "combo_price_basis": COMBO_PRICE_BASIS}
 
 
 def model_details(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:

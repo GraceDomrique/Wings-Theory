@@ -31,8 +31,8 @@ from .forecasting import (
     evaluate_demand_model, ingredient_depletion, menu_item_demand, menu_item_demand_prophet,
 )
 from .reservation import (
-    availability_for_menu_item, commit_order, receive_stock, record_count, record_usage,
-    record_wastage, release_order, reserve_order, void_after_commit,
+    availability_for_menu_item, commit_order, ingredient_reconciliation_report, receive_stock,
+    record_count, record_usage, record_wastage, release_order, reserve_order, void_after_commit,
 )
 from .resolver import expand_recipe, recipe_cost, validate_recipe
 from .units import format_base, normalise_label, to_base
@@ -1450,6 +1450,20 @@ def expiry_monitor(
         out.append(annotated)
     out.sort(key=lambda x: x["days_to_expiry"])
     return {"batches": out, "count": len(out)}
+
+
+@app.get("/console/reconciliation/ingredients", tags=["console"])
+def ingredient_reconciliation(
+    days: int = Query(30, ge=1, le=365),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Recipe/wastage-driven consumption vs. what physical counts actually
+    found, per ingredient, over the window. See
+    reservation.ingredient_reconciliation_report — this is the general-
+    ingredient counterpart to /unli/reconciliation/pending, which already
+    does the same expected-vs-actual comparison for unlimited-refill
+    streams specifically."""
+    return ingredient_reconciliation_report(c, days)
 
 
 @app.get("/console/reports/sales", tags=["console"])

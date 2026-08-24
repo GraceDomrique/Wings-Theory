@@ -142,15 +142,23 @@ function combosCard(combos) {
           title: 'No reliable pairings found',
           description: `Enough orders were analysed (${combos.transactionCount}), but no pair cleared the lift and support thresholds. That is a result, not a gap.`,
         })
-        : Table({
-          columns: [
-            { key: 'pair', label: 'Pair', render: (c) => `${c.itemA} + ${c.itemB}` },
-            { key: 'lift', label: 'Lift', render: (c) => h('span', { class: 'mono t-sm' }, c.lift === null ? nodata('n/a') : `${c.lift.toFixed(2)}×`), sortValue: (c) => c.lift },
-            { key: 'conf', label: 'Confidence', render: (c) => h('span', { class: 'mono t-sm' }, pct(c.confidence === null ? null : c.confidence * 100, 'n/a', 0)) },
-            { key: 'price', label: 'Combo price', render: (c) => h('span', { class: 'mono t-sm' }, money(c.suggestedComboPrice, 'not priced')) },
-          ],
-          rows: combos.combos,
-        }));
+        : h('div', {},
+          Table({
+            columns: [
+              { key: 'pair', label: 'Pair', render: (c) => `${c.itemA} + ${c.itemB}` },
+              { key: 'lift', label: 'Lift', render: (c) => h('span', { class: 'mono t-sm' }, c.lift === null ? nodata('n/a') : `${c.lift.toFixed(2)}×`), sortValue: (c) => c.lift },
+              { key: 'conf', label: 'Confidence', render: (c) => h('span', { class: 'mono t-sm' }, pct(c.confidence === null ? null : c.confidence * 100, 'n/a', 0)) },
+              // "Suggested price (estimate)", not "Combo price": this is a
+              // flat discount off menu list prices, not a cost/margin
+              // calculation, and most ingredients' unit_cost is itself
+              // still unverified — see combos.comboPriceBasis below.
+              { key: 'price', label: 'Suggested price (estimate)', render: (c) => h('span', { class: 'mono t-sm' }, money(c.suggestedComboPrice, 'not priced')) },
+            ],
+            rows: combos.combos,
+          }),
+          combos.comboPriceBasis
+            ? h('div', { class: 'hint', style: { marginTop: '8px' } }, combos.comboPriceBasis)
+            : null));
 }
 
 function valuationCard(valuation) {

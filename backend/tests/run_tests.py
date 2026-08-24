@@ -30,7 +30,8 @@ from wt.forecasting import (                                        # noqa: E402
     evaluate_demand_model, ingredient_depletion, menu_item_demand, menu_item_demand_prophet,
 )
 from wt.reservation import (                                        # noqa: E402
-    availability_for_menu_item, commit_order, receive_stock, record_count, record_wastage,
+    availability_for_menu_item, commit_order, ingredient_reconciliation_report, receive_stock,
+    record_count, record_wastage,
     release_order, reserve_order, void_after_commit,
 )
 from wt.resolver import expand_recipe, order_requirements, validate_recipe   # noqa: E402
@@ -813,6 +814,72 @@ class TestRecordWastage(Base):
         flagged = detect_anomalies(self.conn)
         self.assertEqual(len(flagged), 1)
         self.assertEqual(flagged[0]["ingredient_name"], "Wings")
+
+
+class TestIngredientReconciliation(Base):
+    """ingredient_reconciliation_report — the general-ingredient
+    counterpart to unli's three-stage reconciliation: recipe/wastage
+    consumption vs. what physical counts actually found, over a window.
+    Not a new deduction mechanism — a read-only rollup of stock_ledger
+    rows record_count/record_wastage/receive_stock already write."""
+
+    def setUp(self):
+        super().setUp()
+        self.ing = add_ingredient(self.conn, "Rice", on_hand=1000.0, pack=1000)
+
+    def test_aggregates_consumption_receiving_and_count_variance(self):
+        record_wastage(self.conn, self.ing, 100.0, note="dropped a tray")
+        receive_stock(self.conn, self.ing, purchase_qty=0.5, lot_no="LOT-1")  # +500g (pack=1000)
+        # on hand is now 1000 - 100 + 500 = 1400; count finds 1350 -> -50 variance
+        record_count(self.conn, self.ing, actual_base=1350.0)
+
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertEqual(item["consumed_base"], 100.0)
+        self.assertEqual(item["received_base"], 500.0)
+        self.assertEqual(item["count_variance_base"], -50.0)
+        self.assertEqual(item["count_events"], 1)
+        self.assertTrue(item["has_count_data"])
+        # |−50| / 100 = 0.5, well past the 0.10 flag ratio
+        self.assertEqual(item["variance_ratio"], 0.5)
+        self.assertTrue(item["flagged"])
+
+    def test_small_variance_relative_to_consumption_is_not_flagged(self):
+        record_wastage(self.conn, self.ing, 500.0)
+        # on hand 500; count finds 495 -> -5 variance, 5/500 = 1% << 10% threshold
+        record_count(self.conn, self.ing, actual_base=495.0)
+
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertEqual(item["variance_ratio"], 0.01)
+        self.assertFalse(item["flagged"])
+
+    def test_no_physical_count_in_window_is_no_data_not_zero_variance(self):
+        record_wastage(self.conn, self.ing, 200.0)
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertEqual(item["count_events"], 0)
+        self.assertFalse(item["has_count_data"])
+        self.assertIsNone(item["variance_ratio"])
+        self.assertFalse(item["flagged"])
+
+    def test_flagged_items_sort_first(self):
+        other = add_ingredient(self.conn, "Cornstarch", on_hand=1000.0, pack=1000)
+        record_wastage(self.conn, self.ing, 500.0)
+        record_count(self.conn, self.ing, actual_base=250.0)  # 50% variance, flagged
+        record_wastage(self.conn, other, 500.0)
+        record_count(self.conn, other, actual_base=498.0)  # 0.4% variance, not flagged
+
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        flagged_names = [x["name"] for x in report["items"] if x["flagged"]]
+        self.assertIn("Rice", flagged_names)
+        self.assertNotIn("Cornstarch", flagged_names)
+        self.assertEqual(report["items"][0]["name"], "Rice")
+
+    def test_ingredients_with_no_ledger_activity_in_window_are_absent(self):
+        untouched = add_ingredient(self.conn, "Untouched Herb", on_hand=100.0, pack=100)
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        self.assertNotIn(untouched, [x["ingredient_id"] for x in report["items"]])
 
 
 # ===========================================================================
@@ -2841,6 +2908,12 @@ class TestAssociations(Base):
         # appear as either side of a combo
         for x in result["combos"]:
             self.assertNotIn("Unrelated Item", (x["item_a"], x["item_b"]))
+        # 2026-08 audit: this figure is a flat discount off menu list
+        # prices, not a cost/margin calculation -- the response must say
+        # so plainly rather than let the console show a bare currency
+        # figure that could read as a verified profit number.
+        self.assertIn("List price only", result["combo_price_basis"])
+        self.assertIn("Not a margin or profit calculation", result["combo_price_basis"])
 
     def test_model_details_reports_real_params_and_counts(self):
         recipe = add_recipe(self.conn, "R7", [])
@@ -6600,7 +6673,8 @@ def main() -> int:
     suite = unittest.TestSuite(
         loader.loadTestsFromTestCase(t) for t in (
             TestUnits, TestSchemaConstraints, TestResolver, TestMenuGate,
-            TestReservation, TestReceiveStock, TestRecordCount, TestRecordWastage, TestUnliOrders, TestConcurrency, TestFEFO,
+            TestReservation, TestReceiveStock, TestRecordCount, TestRecordWastage,
+            TestIngredientReconciliation, TestUnliOrders, TestConcurrency, TestFEFO,
             TestFEFODepletion, TestTimezoneHardening, TestUnliReconciliation, TestUnliRecalibration,
             TestConsumptionAnomaly, TestReorderPoint, TestUnliRBAC,
             TestUnliSession, TestRefillPieces, TestRefillSequence, TestRefillInventory,
