@@ -32,8 +32,9 @@ from .forecasting import (
     evaluate_demand_model, ingredient_depletion, menu_item_demand, menu_item_demand_prophet,
 )
 from .reservation import (
-    availability_for_menu_item, commit_order, ingredient_reconciliation_report, receive_stock,
-    record_count, record_usage, record_wastage, release_order, reserve_order, void_after_commit,
+    availability_for_menu_item, commit_order, ingredient_reconciliation_report,
+    inventory_valuation, receive_stock, record_count, record_usage, record_wastage,
+    release_order, reserve_order, void_after_commit,
 )
 from .resolver import expand_recipe, recipe_cost, validate_recipe
 from .units import format_base, normalise_label, to_base
@@ -1604,6 +1605,168 @@ def sales_summary(
         "by_item": by_item,
         "by_day": by_day,
         "recent_orders": recent,
+    }
+
+
+@app.get("/reports/valuation", tags=["console"])
+def reports_valuation(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """2026-08 audit: the console's Reports page and Inventory On Hand page
+    both already had a fully-wired client waiting on this exact endpoint,
+    falling back to a labeled "not available" state in the meantime. See
+    reservation.inventory_valuation — only unit_cost_status='verified'
+    ingredients are summed."""
+    return inventory_valuation(c)
+
+
+@app.get("/dashboard/summary", tags=["console"])
+def dashboard_summary(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """2026-08 audit: the console's Today page (the first thing anyone sees)
+    was fully built and waiting on this one aggregation endpoint -- until
+    now it rendered a permanent "sample figures, not your real numbers"
+    banner rather than ever showing a fabricated number as real, which is
+    the correct failure mode but not the goal. This composes entirely from
+    functions/queries every other endpoint already uses (ingredient_depletion,
+    _annotate_batch_expiry, v_menu_item_availability, inventory_valuation,
+    verification.list_queue, menu_item_demand_prophet) -- it derives
+    nothing new, only aggregates five already-authoritative sources into
+    the one shaped payload static/assets/console/js/lib/api/dashboard.js
+    documents."""
+    # ---- expiry (same query/annotation expiry_monitor uses) ----
+    raw_batches = rows(c.execute(
+        """
+        SELECT b.id, b.lot_no, b.qty_base, b.received_at, b.expires_at, b.expiry_status,
+               i.id AS ingredient_id, i.name AS ingredient_name, i.base_unit,
+               i.expiry_mode, i.shelf_life_days
+          FROM fefo_batch b JOIN ingredient i ON i.id = b.ingredient_id
+         WHERE b.state = 'open' AND b.qty_base > 0
+           AND (b.expires_at IS NOT NULL OR i.expiry_mode = 'shelf_life_estimate')
+        """
+    ))
+    batches = [a for a in (_annotate_batch_expiry(b) for b in raw_batches) if a is not None]
+    batches.sort(key=lambda x: x["days_to_expiry"])
+    expired = [b for b in batches if b["expired"]]
+    expiring_soon = [b for b in batches if not b["expired"] and b["days_to_expiry"] <= 7]
+
+    def expiry_severity(days: int) -> str:
+        if days <= 2: return "crit"
+        if days <= 7: return "warn"
+        if days <= 30: return "info"
+        return "good"
+
+    def expiry_label(days: int) -> str:
+        if days < 0: return "expired"
+        if days < 1: return "today"
+        return f"{days}d"
+
+    # ---- below reorder point (same source Replenishment reads) ----
+    depletion = ingredient_depletion(c, 30)
+    below_rop = sum(1 for d in depletion if d["below_reorder_point"])
+
+    # ---- unsellable menu items (same view /pos/menu reads) ----
+    menu_avail = rows(c.execute(
+        "SELECT name, sellable, block_reason FROM v_menu_item_availability"
+    ))
+    unsellable = [m for m in menu_avail if not m["sellable"]]
+
+    # ---- stock value (shared with GET /reports/valuation) ----
+    valuation = inventory_valuation(c)
+
+    # ---- verification queue preview (same source the Verification page reads) ----
+    verify_all = verification.list_queue(c)["items"]
+
+    # ---- kpis, fixed order: soonest-to-hurt first ----
+    kpis = [
+        {"key": "expired", "value": len(expired), "display": None, "label": "Expired batches",
+         "foot": "discard or credit today", "severity": "crit" if expired else "good",
+         "icon": "⏱", "route": "expiry"},
+        {"key": "expiringSoon", "value": len(expiring_soon), "display": None, "label": "Expiring ≤7 days",
+         "foot": "use first, FEFO order", "severity": "warn" if expiring_soon else "good",
+         "icon": "◔", "route": "expiry"},
+        {"key": "belowReorderPoint", "value": below_rop, "display": None, "label": "Below reorder point",
+         "foot": "every item has a buffer" if not below_rop else "restock before the next delivery",
+         "severity": "crit" if below_rop else "good", "icon": "✓" if not below_rop else "⚠",
+         "route": "intel"},
+        {"key": "unsellable", "value": len(unsellable), "display": None, "label": "Menu item unsellable",
+         "foot": "missing ingredient stock" if unsellable else "every item can be sold",
+         "severity": "warn" if unsellable else "good", "icon": "⨯" if unsellable else "✓",
+         "route": "menu"},
+        {"key": "stockValue", "value": valuation["total_value"],
+         "display": f"₱{valuation['total_value']/1000:.1f}k" if valuation["total_value"] >= 1000
+                     else f"₱{valuation['total_value']:.0f}",
+         "label": "Stock on hand", "foot": f"{valuation['priced_items']} of {valuation['total_items']} items priced",
+         "severity": "info", "icon": "₱", "route": "inventory"},
+    ]
+
+    # ---- action-required alerts, most urgent first, capped ----
+    alerts = []
+    for b in expired[:4]:
+        alerts.append({"severity": "crit", "headline": f"{b['ingredient_name']} — expired {abs(b['days_to_expiry'])}d ago",
+                        "detail": f"{b['qty_base']:g} {b['base_unit']} on hand", "route": "expiry"})
+    for b in [x for x in expiring_soon if x["days_to_expiry"] >= 0][:3]:
+        alerts.append({"severity": expiry_severity(b["days_to_expiry"]),
+                        "headline": f"{b['ingredient_name']} — {expiry_label(b['days_to_expiry'])}",
+                        "detail": f"{b['qty_base']:g} {b['base_unit']} on hand", "route": "expiry"})
+    for m in unsellable[:3]:
+        alerts.append({"severity": "warn", "headline": f"{m['name']} unsellable",
+                        "detail": f"Missing: {m['block_reason']}" if m["block_reason"] else "Missing ingredient stock",
+                        "route": "menu"})
+    order = {"crit": 0, "warn": 1, "info": 2, "good": 3, "flat": 4}
+    alerts.sort(key=lambda a: order.get(a["severity"], 5))
+    alerts = alerts[:8]
+
+    # ---- forecast preview: the single highest-recent-volume POS-visible item ----
+    top_item = c.execute(
+        """
+        SELECT m.id, m.name, SUM(ol.qty) AS qty_sold
+          FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
+          JOIN menu_item m ON m.id = ol.menu_item_id
+         WHERE o.status != 'void' AND m.pos_visible = 1
+           AND o.created_at >= ?
+         GROUP BY m.id ORDER BY qty_sold DESC LIMIT 1
+        """,
+        (timeutil.utc_bound_n_manila_days_ago(30),),
+    ).fetchone()
+    if top_item is None:
+        forecast_preview = {"insufficientData": True, "daysOfHistory": 0, "requiredDays": 7,
+                             "labels": [], "values": [], "note": "No completed orders yet."}
+    else:
+        max_order = c.execute("SELECT MAX(id) AS m FROM customer_order").fetchone()["m"] or 0
+        key = (str(db.db_path()), top_item["id"], 7, 90, max_order)
+        fc = _forecast_cache.get_or_compute(
+            key, lambda: menu_item_demand_prophet(c, top_item["id"], 7, 90)
+        )
+        if fc.get("insufficient_data"):
+            forecast_preview = {
+                "insufficientData": True, "daysOfHistory": fc.get("active_days", 0),
+                "requiredDays": fc.get("required_days", 7), "labels": [], "values": [],
+                "note": f"Prophet needs {fc.get('required_days', 7)}+ days of real sales per menu item. "
+                        f"The closest item ({top_item['name']}) has {fc.get('active_days', 0)} days on file.",
+            }
+        else:
+            forecast_preview = {
+                "insufficientData": False, "daysOfHistory": None, "requiredDays": 7,
+                "labels": [f["date"] for f in fc["forecast"]],
+                "values": [f["qty"] for f in fc["forecast"]],
+                "note": f"{top_item['name']} — next 7 days",
+            }
+
+    return {
+        "kpis": kpis,
+        "alerts": alerts,
+        "forecastPreview": forecast_preview,
+        "expiryPreview": [
+            {"name": b["ingredient_name"], "qty": f"{b['qty_base']:g} {b['base_unit']}",
+             "label": expiry_label(b["days_to_expiry"]), "severity": expiry_severity(b["days_to_expiry"])}
+            for b in batches[:5]
+        ],
+        "verifyPreview": [
+            {"label": f"{i['entity_name']} — {i['field_label']}", "priority": i["priority"]}
+            for i in verify_all[:5]
+        ],
     }
 
 

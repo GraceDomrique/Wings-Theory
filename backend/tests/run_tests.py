@@ -33,8 +33,8 @@ from wt.forecasting import (                                        # noqa: E402
     evaluate_demand_model, ingredient_depletion, menu_item_demand, menu_item_demand_prophet,
 )
 from wt.reservation import (                                        # noqa: E402
-    availability_for_menu_item, commit_order, ingredient_reconciliation_report, receive_stock,
-    record_count, record_wastage,
+    availability_for_menu_item, commit_order, ingredient_reconciliation_report,
+    inventory_valuation, receive_stock, record_count, record_wastage,
     release_order, reserve_order, void_after_commit,
 )
 from wt.resolver import expand_recipe, order_requirements, validate_recipe   # noqa: E402
@@ -941,6 +941,39 @@ class TestIngredientReconciliation(Base):
         untouched = add_ingredient(self.conn, "Untouched Herb", on_hand=100.0, pack=100)
         report = ingredient_reconciliation_report(self.conn, days=30)
         self.assertNotIn(untouched, [x["ingredient_id"] for x in report["items"]])
+
+
+# ===========================================================================
+class TestInventoryValuation(Base):
+    """reservation.inventory_valuation — 2026-08 audit: GET /reports/valuation
+    and the Today dashboard's stock-value KPI were both fully wired
+    client-side but had no backend at all. Only unit_cost_status='verified'
+    ingredients may count toward the total — folding an unverified estimate
+    into the same total as a confirmed cost would present a partly-invented
+    number as real."""
+
+    def test_only_verified_costs_are_summed(self):
+        verified = add_ingredient(self.conn, "Verified Rice", on_hand=1000.0, cost=10.0)
+        unverified = add_ingredient(self.conn, "Unverified Sauce", on_hand=500.0, cost=999.0)
+        self.conn.execute(
+            "UPDATE ingredient SET unit_cost_status='needs_verification' WHERE id=?", (unverified,)
+        )
+        unset = add_ingredient(self.conn, "Unset Spice", on_hand=200.0, cost=5.0)
+        self.conn.execute("UPDATE ingredient SET unit_cost_status='unset' WHERE id=?", (unset,))
+
+        result = inventory_valuation(self.conn)
+        # 1000*10 = 10000 from the verified ingredient only; the unverified
+        # ingredient's 500*999 = 499500 must NOT appear in the total
+        self.assertEqual(result["total_value"], 10000.0)
+        self.assertEqual(result["priced_items"], 1)
+        self.assertGreaterEqual(result["total_items"], 3)
+
+    def test_zero_verified_ingredients_is_an_honest_zero_not_an_error(self):
+        add_ingredient(self.conn, "Some Ingredient", on_hand=1000.0, cost=50.0)
+        self.conn.execute("UPDATE ingredient SET unit_cost_status='needs_verification'")
+        result = inventory_valuation(self.conn)
+        self.assertEqual(result["total_value"], 0.0)
+        self.assertEqual(result["priced_items"], 0)
 
 
 # ===========================================================================
@@ -2688,6 +2721,95 @@ class TestMLResultCaching(unittest.TestCase):
             # consumption pass is still served from cache
             self.assertEqual(loss_spy.call_count, 2)
             self.assertEqual(consumption_spy.call_count, 1)
+
+
+class TestDashboardSummary(unittest.TestCase):
+    """2026-08 audit: static/assets/console/js/routes/today/Today.js (the
+    console's landing screen) and lib/api/dashboard.js were fully built and
+    waiting on GET /dashboard/summary -- until this test suite existed,
+    nothing served it, and Today permanently rendered fabricated sample
+    data behind a "not your real numbers" banner rather than ever lying
+    about it. These tests prove the real endpoint returns dashboard.js's
+    exact documented shape (camelCase field names, no adapter needed --
+    dashboard.js spreads the raw response directly) built from real data,
+    not a description of the contract."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def test_returns_the_exact_shape_dashboard_js_expects(self):
+        r = self.client.get("/dashboard/summary", headers=self.H_MGR)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        for key in ("kpis", "alerts", "forecastPreview", "expiryPreview", "verifyPreview"):
+            self.assertIn(key, body)
+        self.assertEqual(len(body["kpis"]), 5)
+        self.assertEqual([k["key"] for k in body["kpis"]],
+                          ["expired", "expiringSoon", "belowReorderPoint", "unsellable", "stockValue"])
+        for k in body["kpis"]:
+            for key in ("value", "display", "label", "foot", "severity", "icon", "route"):
+                self.assertIn(key, k)
+        fp = body["forecastPreview"]
+        for key in ("insufficientData", "daysOfHistory", "requiredDays", "labels", "values", "note"):
+            self.assertIn(key, fp)
+
+    def test_alerts_are_capped_and_sorted_worst_first(self):
+        r = self.client.get("/dashboard/summary", headers=self.H_MGR)
+        alerts = r.json()["alerts"]
+        self.assertLessEqual(len(alerts), 8)
+        order = {"crit": 0, "warn": 1, "info": 2, "good": 3, "flat": 4}
+        severities = [order.get(a["severity"], 5) for a in alerts]
+        self.assertEqual(severities, sorted(severities))
+
+    def test_stock_value_kpi_matches_the_shared_valuation_function(self):
+        r = self.client.get("/dashboard/summary", headers=self.H_MGR)
+        stock_kpi = next(k for k in r.json()["kpis"] if k["key"] == "stockValue")
+        valuation = self.client.get("/reports/valuation", headers=self.H_MGR).json()
+        self.assertEqual(stock_kpi["value"], valuation["total_value"])
+        self.assertIn(f"{valuation['priced_items']} of {valuation['total_items']} items priced",
+                       stock_kpi["foot"])
+
+    def test_requires_inventory_read(self):
+        r = self.client.get("/dashboard/summary", headers=self.H_CASH)
+        self.assertEqual(r.status_code, 403)
+        r = self.client.get("/reports/valuation", headers=self.H_CASH)
+        self.assertEqual(r.status_code, 403)
+
+    def test_second_dashboard_call_reuses_the_cached_forecast(self):
+        from wt import api as api_module
+        with patch.object(api_module, "menu_item_demand_prophet",
+                           wraps=api_module.menu_item_demand_prophet) as spy:
+            self.client.get("/dashboard/summary", headers=self.H_MGR)
+            self.client.get("/dashboard/summary", headers=self.H_MGR)
+            self.assertLessEqual(spy.call_count, 1)
 
 
 class TestPasswordSecurity(unittest.TestCase):
@@ -6994,7 +7116,7 @@ def main() -> int:
         loader.loadTestsFromTestCase(t) for t in (
             TestUnits, TestTTLCache, TestSchemaConstraints, TestResolver, TestMenuGate,
             TestReservation, TestReceiveStock, TestRecordCount, TestRecordWastage,
-            TestIngredientReconciliation, TestUnliOrders, TestConcurrency, TestFEFO,
+            TestIngredientReconciliation, TestInventoryValuation, TestUnliOrders, TestConcurrency, TestFEFO,
             TestFEFODepletion, TestTimezoneHardening, TestUnliReconciliation, TestUnliRecalibration,
             TestConsumptionAnomaly, TestReorderPoint, TestUnliRBAC,
             TestUnliSession, TestRefillPieces, TestRefillSequence, TestRefillInventory,
@@ -7004,7 +7126,7 @@ def main() -> int:
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
             TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestAdminAuditLog, TestRBAC,
-            TestLoginAudit, TestMLResultCaching, TestPasswordSecurity,
+            TestLoginAudit, TestMLResultCaching, TestDashboardSummary, TestPasswordSecurity,
             TestForecasting, TestAnomaly, TestAssociations,
             TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,

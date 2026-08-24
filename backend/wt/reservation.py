@@ -815,6 +815,33 @@ def ingredient_reconciliation_report(conn: sqlite3.Connection, days: int = 30) -
     }
 
 
+def inventory_valuation(conn: sqlite3.Connection) -> dict:
+    """Stock on hand valued only where unit_cost is a CONFIRMED figure
+    (unit_cost_status='verified') -- most ingredients still carry an
+    unverified estimate (see the owner-verification queue), and folding
+    those into the same total as confirmed costs would present a
+    partly-invented number as a real one. priced_items/total_items lets a
+    caller show exactly how much of the catalog this total actually
+    covers, the same "no data is not zero" discipline the console applies
+    everywhere else. Shared by GET /reports/valuation and the Today
+    dashboard's stock-value KPI so both ever compute this one way."""
+    row = conn.execute(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN unit_cost_status='verified'
+                             THEN on_hand_base * unit_cost END), 0) AS total_value,
+          SUM(CASE WHEN unit_cost_status='verified' THEN 1 ELSE 0 END) AS priced_items,
+          COUNT(*) AS total_items
+          FROM ingredient WHERE is_active=1
+        """
+    ).fetchone()
+    return {
+        "total_value": round(row["total_value"], 2),
+        "priced_items": row["priced_items"],
+        "total_items": row["total_items"],
+    }
+
+
 def record_usage(
     conn: sqlite3.Connection,
     ingredient_pk: int,
