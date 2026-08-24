@@ -46,6 +46,11 @@ export async function getQueue() {
       context: r.context ?? null,
       whyItMatters: r.why_it_matters || null,
       whatToCheck: r.what_to_check || null,
+      // Only meaningful for field==='fefo_batch.expires_at': the recorded
+      // date needing confirmation is ALSO already in the past. Two
+      // different questions ("is this date right" vs. "this batch is
+      // already expired") the queue used to conflate into one row.
+      alreadyExpired: !!r.already_expired,
     })),
     byPriority: out.by_priority || {},
     byField: out.by_field || {},

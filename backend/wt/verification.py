@@ -28,6 +28,7 @@ import datetime as _dt
 import math
 import sqlite3
 
+from . import timeutil
 from .db import write_tx
 from .errors import InvalidStateError, NotFoundError, ValidationError
 
@@ -196,12 +197,25 @@ def list_queue(conn: sqlite3.Connection) -> dict:
         "SELECT * FROM v_needs_verification ORDER BY field, entity_name"
     )]
     sub_recipe_ids = _sub_recipe_ids(conn)
+    today = timeutil.business_today_iso()
 
     items = []
     for r in raw:
         field = r["field"]
         copy = FIELD_COPY[field]
         group = GROUP_LABEL.get(field)
+        # 2026-08 audit finding: an open FEFO batch's expires_at can need
+        # verification (is this recorded date even correct?) AND already
+        # be in the past -- two different questions the queue was
+        # conflating into one "confirm this value" row with no way to
+        # tell them apart. already_expired says so explicitly, computed
+        # here (not stored) so it's never stale -- same principle as
+        # /console/expiry's own days_to_expiry.
+        r["already_expired"] = (
+            field == "fefo_batch.expires_at"
+            and r["current_value"] not in (None, "(none)")
+            and r["current_value"] < today
+        )
         if field == "recipe_line.qty_base":
             # entity_id here is the recipe's own recipe_id text (REC-####);
             # row_id is the recipe_line's own id. Split sauce/house-prep

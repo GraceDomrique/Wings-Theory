@@ -1,6 +1,7 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../ui/Card.js';
 import { Button } from '../ui/Button.js';
+import { Pill } from '../ui/Pill.js';
 import { Modal } from '../ui/Modal.js';
 import { toast, Loading } from '../ui/Feedback.js';
 import { stamp, str } from '../../lib/format.js';
@@ -67,7 +68,13 @@ export function VerificationItemCard({ item, onResolved }) {
 
   mount(card,
     CardHeader({
-      title: item.question,
+      title: h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' } },
+        item.question,
+        // A batch's recorded expiry date needing confirmation is a
+        // different question from that date already being in the past —
+        // this badge says the second is ALSO true, not that it replaces
+        // the first. See wt/verification.py's list_queue.
+        item.alreadyExpired ? Pill('crit', 'already past this date') : null),
       desc: h('div', { class: 'card-desc' },
         item.entityName,
         ' · currently ',

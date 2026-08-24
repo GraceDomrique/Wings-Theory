@@ -1345,6 +1345,34 @@ class TestVerificationWorkflow(unittest.TestCase):
         groups = {i["group_label"] for i in rl_items}
         self.assertEqual(groups, {"Sauce & house-prep recipes", "Menu recipes"})
 
+    def test_already_expired_open_batches_are_flagged_distinctly_in_the_queue(self):
+        # 2026-08 audit finding: a fefo_batch.expires_at row needing
+        # verification (is this recorded date even correct?) can ALSO
+        # already be in the past -- two different questions the queue
+        # used to conflate into one row. already_expired makes the
+        # distinction explicit without changing the queue's membership.
+        from wt.verification import list_queue
+        ing = self.conn.execute("SELECT id FROM ingredient WHERE is_active=1 LIMIT 1").fetchone()["id"]
+        past_id = self.conn.execute(
+            "INSERT INTO fefo_batch (ingredient_id, lot_no, qty_base, received_at, "
+            "expires_at, expiry_status, state) "
+            "VALUES (?, 'LOT-PAST', 10, datetime('now','-30 days'), "
+            "date('now','-5 days'), 'needs_verification', 'open')",
+            (ing,),
+        ).lastrowid
+        future_id = self.conn.execute(
+            "INSERT INTO fefo_batch (ingredient_id, lot_no, qty_base, received_at, "
+            "expires_at, expiry_status, state) "
+            "VALUES (?, 'LOT-FUTURE', 10, datetime('now'), "
+            "date('now','+30 days'), 'needs_verification', 'open')",
+            (ing,),
+        ).lastrowid
+
+        items = {i["row_id"]: i for i in list_queue(self.conn)["items"]
+                 if i["field"] == "fefo_batch.expires_at"}
+        self.assertTrue(items[past_id]["already_expired"])
+        self.assertFalse(items[future_id]["already_expired"])
+
     def test_confirming_an_ingredient_field_moves_it_out_of_the_queue_and_logs_it(self):
         from wt.verification import resolve, history_for, list_queue
         before = list_queue(self.conn)["count"]
