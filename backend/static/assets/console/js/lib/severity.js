@@ -45,7 +45,7 @@ export function severityFromDays(days) {
  * urgent tier — an ingredient with zero runway left) had no matching
  * case, it fell through to the same 'info'/neutral-blue default as an
  * unrecognized string, which also meant it failed the crit/warn filter
- * Reports.js's Attention Needed card uses to decide what counts as "low
+ * Today.js's Action Required panel uses to decide what counts as "low
  * stock." Confirmed against the live dev data: Rice was at risk='out'
  * (completely depleted) and rendered as a calm gray "no usage rate" pill,
  * invisible to the one report specifically built to surface it. Fixed by
@@ -61,6 +61,31 @@ export function severityFromRisk(risk) {
     case 'ok': return 'good';
     case 'idle': case 'no_data': return 'flat';
     default: return risk ? 'info' : 'flat';
+  }
+}
+
+/**
+ * The forward depletion engine's `status` field (wt/depletion.py's
+ * STATUS_ORDER = {"out":0, "critical":1, "at_risk":2, "healthy":3,
+ * "idle":4, "excess":5}) mapped to a display severity. A DIFFERENT
+ * vocabulary from severityFromRisk above: that one reads the backward
+ * trailing-ledger-rate engine (wt/forecasting.py's RISK_ORDER), this one
+ * reads the forward demand-model trajectory (wt/depletion.py) that powers
+ * Replenishment, the Today dashboard's "below reorder point" KPI, and the
+ * Ingredient Forecast page — the same three surfaces must never color the
+ * same ingredient differently, which is exactly what having two mapping
+ * functions guessing at each other's strings would risk.
+ * @param {string|null} status
+ * @returns {Severity}
+ */
+export function severityFromDepletionStatus(status) {
+  switch (status) {
+    case 'out': case 'critical': return 'crit';
+    case 'at_risk': return 'warn';
+    case 'healthy': return 'good';
+    case 'excess': return 'info';
+    case 'idle': return 'flat';
+    default: return status ? 'info' : 'flat';
   }
 }
 

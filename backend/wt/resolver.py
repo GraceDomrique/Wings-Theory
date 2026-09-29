@@ -71,6 +71,109 @@ def expand_recipe(conn: sqlite3.Connection, recipe_pk: int, multiplier: float = 
     ]
 
 
+def _sub_recipe_unit_leaves(conn: sqlite3.Connection, ingredient_id: int) -> dict[int, float]:
+    """Leaf ingredients per ONE base unit of an exploded sub-recipe.
+
+    v_recipe_leaf gives one whole batch (recipe.yield_qty of the produced
+    ingredient), so dividing by that yield is the same scaling the recursive
+    expansion view applies at every level -- see v_recipe_expansion's
+    `e.qty_base * child.qty_base / sub.yield_qty`. Reusing the view rather
+    than re-walking the graph here keeps the two from ever disagreeing.
+    """
+    sub = conn.execute(
+        "SELECT id, yield_qty FROM recipe WHERE produces_ingredient_id=? AND is_active=1",
+        (ingredient_id,),
+    ).fetchone()
+    if not sub or not sub["yield_qty"]:
+        return {}
+    return {
+        r["ingredient_id"]: r["qty_base"] / sub["yield_qty"]
+        for r in conn.execute(
+            "SELECT ingredient_id, qty_base FROM v_recipe_leaf WHERE recipe_id=?", (sub["id"],)
+        )
+    }
+
+
+def _parse_flavour_note(note: str | None) -> list[str]:
+    """"Flavor: Korean BBQ Sauce" / "Flavors: Soy Garlic Sauce, Teriyaki Sauce"
+    -> the picked names, in slot order. This is the exact shape pos.html's
+    flavorNote() writes; anything else parses to nothing and the recipe's own
+    default stands, which is the safe direction to fail."""
+    if not note:
+        return []
+    low = note.lower()
+    if not (low.startswith("flavor:") or low.startswith("flavors:")
+            or low.startswith("flavour:") or low.startswith("flavours:")):
+        return []
+    body = note.split(":", 1)[1]
+    return [p.strip() for p in body.split(",") if p.strip()]
+
+
+def flavour_substitutions(conn: sqlite3.Connection, order_pk: int) -> dict[int, float]:
+    """Net base-unit correction for wing flavours the cashier actually chose.
+
+    Wing Rack, Wings Platter and the Sulit Deal each carry a
+    FLAVOUR_PLACEHOLDER recipe line (mapping.py): the BOM cannot name a
+    flavour because the customer picks it at the till, so the line was seeded
+    pointing at Classic Buffalo Sauce with the note that "the POS overrides
+    per order once flavour selection exists". Flavour selection now exists --
+    pos.html prompts for it and stores the picks on order_line.note -- but
+    nothing consumed them, so an order of twelve Korean BBQ wings deducted
+    Classic Buffalo's gochujang-free ingredients and left nine of the fourteen
+    sauces reading as never used.
+
+    Returns a signed delta per ingredient to apply on top of the plain
+    recipe expansion: the placeholder sauce's components come back out, the
+    chosen sauce's go in, at the same gram weight the slot specifies. An
+    unrecognised or absent pick changes nothing.
+    """
+    delta: dict[int, float] = {}
+    lines = conn.execute(
+        """
+        SELECT ol.qty, ol.note, m.recipe_id
+          FROM order_line ol JOIN menu_item m ON m.id = ol.menu_item_id
+         WHERE ol.order_id = ? AND ol.note IS NOT NULL AND m.recipe_id IS NOT NULL
+        """,
+        (order_pk,),
+    ).fetchall()
+    if not lines:
+        return delta
+
+    by_name = {
+        r["name"].lower(): r["id"]
+        for r in conn.execute(
+            "SELECT id, name FROM ingredient WHERE kind='sub_recipe' AND is_active=1"
+        )
+    }
+    unit_cache: dict[int, dict[int, float]] = {}
+
+    def unit_leaves(ing_id: int) -> dict[int, float]:
+        if ing_id not in unit_cache:
+            unit_cache[ing_id] = _sub_recipe_unit_leaves(conn, ing_id)
+        return unit_cache[ing_id]
+
+    for ln in lines:
+        picks = _parse_flavour_note(ln["note"])
+        if not picks:
+            continue
+        slots = conn.execute(
+            "SELECT ingredient_id, qty_base FROM recipe_line "
+            "WHERE recipe_id=? AND LOWER(display_label) LIKE '%flavor%' "
+            "ORDER BY sort_order, id",
+            (ln["recipe_id"],),
+        ).fetchall()
+        for slot, pick in zip(slots, picks):
+            chosen = by_name.get(pick.lower())
+            if chosen is None or chosen == slot["ingredient_id"]:
+                continue
+            grams = slot["qty_base"] * ln["qty"]
+            for ing_id, per_unit in unit_leaves(slot["ingredient_id"]).items():
+                delta[ing_id] = delta.get(ing_id, 0.0) - per_unit * grams
+            for ing_id, per_unit in unit_leaves(chosen).items():
+                delta[ing_id] = delta.get(ing_id, 0.0) + per_unit * grams
+    return delta
+
+
 def order_requirements(conn: sqlite3.Connection, order_pk: int) -> dict[int, float]:
     """Total base-unit requirement per ingredient for a whole order.
 
@@ -138,6 +241,20 @@ def order_requirements(conn: sqlite3.Connection, order_pk: int) -> dict[int, flo
         ).fetchall():
             qty = stream["lambda_value"] * heads * unli_qty
             need[stream["ingredient_id"]] = need.get(stream["ingredient_id"], 0.0) + qty
+
+    # The flavour the cashier actually picked, applied on top of the recipe's
+    # placeholder sauce. See flavour_substitutions() for why this is a signed
+    # correction rather than a different expansion: the availability gate, the
+    # capacity view and this function all read v_recipe_leaf, and only the
+    # per-order note can say which of the fourteen sauces this ticket wants.
+    for ingredient_id, d in flavour_substitutions(conn, order_pk).items():
+        merged = need.get(ingredient_id, 0.0) + d
+        # Floating-point residue on a line that cancels to nothing must not
+        # become a 1e-13 g reservation — reservation.qty_base has a > 0 CHECK.
+        if merged > 1e-9:
+            need[ingredient_id] = merged
+        else:
+            need.pop(ingredient_id, None)
 
     return need
 

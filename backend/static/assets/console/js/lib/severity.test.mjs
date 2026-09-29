@@ -9,7 +9,7 @@
 // matching case, it silently fell through to 'info' instead of 'crit' --
 // confirmed against the live dev database, where "Rice" was at risk='out'
 // and rendered as a calm gray "no usage rate" pill on the Inventory page,
-// and was silently excluded from the Attention Needed report's crit/warn
+// and was silently excluded from the Action Required panel's crit/warn
 // filter. This test pins the real six-value vocabulary so a future rename
 // on either side (wt/forecasting.py's RISK_ORDER or this switch) fails loud
 // instead of silently downgrading the single most urgent inventory state.

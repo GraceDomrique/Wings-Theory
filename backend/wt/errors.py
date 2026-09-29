@@ -82,6 +82,18 @@ class ValidationError(WTError):
     http_status = 422
 
 
+class PasswordChangeRequiredError(WTError):
+    """The account is flagged must_change_password=1 (fresh seed or an admin
+    reset) and is trying to reach a capability-gated endpoint before setting
+    its own password. Deliberately distinct from PermissionError_ (403 with
+    a different `code`) so a client can special-case this into "set a new
+    password" UI instead of a generic "not allowed" message. /auth/login and
+    /auth/change_password never go through needs(), so this can never block
+    the one action that clears it."""
+    code = "password_change_required"
+    http_status = 403
+
+
 class AuthenticationError(WTError):
     """The caller could not be identified at all — no token, expired token,
     malformed token, bad signature.

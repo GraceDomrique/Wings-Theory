@@ -51,10 +51,23 @@ export async function getQueue() {
       // different questions ("is this date right" vs. "this batch is
       // already expired") the queue used to conflate into one row.
       alreadyExpired: !!r.already_expired,
+      // True iff an admin has already looked at this exact value and
+      // explicitly chosen "Keep estimate" — see wt/verification.py's
+      // list_queue() doc comment for why this is safe to compute without a
+      // new status column. This is a DIFFERENT fact from currentValue/
+      // priority: it says whether a human has already made a decision on
+      // this row, not what the underlying value is.
+      reviewed: !!r.reviewed,
     })),
     byPriority: out.by_priority || {},
     byField: out.by_field || {},
     count: out.count || 0,
+    // The badge/summary total should read as "still needs a decision", not
+    // "every estimate that has ever existed" — needsDecision excludes rows
+    // already reviewed-and-kept; reviewedEstimates is that same count the
+    // other way, so the two numbers always add up to `count`.
+    needsDecision: out.needs_decision ?? (out.count || 0),
+    reviewedEstimates: out.reviewed_estimates || 0,
   };
 }
 

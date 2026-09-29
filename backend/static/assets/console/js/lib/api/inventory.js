@@ -32,7 +32,6 @@ function toIngredient(r, depletion) {
     pk: r.id,
     name: r.name,
     category: CATEGORY[r.category] || r.category,
-    onHandQty: r.pack_size ? r.on_hand_base / (r.pack_size * (r.yield_factor || 1)) : null,
     onHandUnit: r.purchase_unit,
     onHandBaseQty: r.on_hand_base,
     availableBaseQty: r.available_base,
@@ -55,6 +54,30 @@ function toIngredient(r, depletion) {
     blockReason: r.block_reason || null,
     unverifiedCount: r.unverified_count || 0,
     inventoryType: r.inventory_type,
+    purchaseUnit: r.purchase_unit || null,
+    packSize: r.pack_size ?? null,
+    yieldFactor: r.yield_factor ?? null,
+    reorderPointBase: r.reorder_point_base ?? null,
+    // Supplier was previously dropped by this adapter, so the ingredient
+    // drawer rendered "not recorded" whether or not the record had one. It
+    // is carried through now. On the current catalog it is genuinely null
+    // for every ingredient — which the UI must be able to say honestly
+    // rather than by accident.
+    supplier: r.supplier || null,
+    supplierContact: r.supplier_contact || null,
+    storageLocation: r.storage_location || null,
+    expiryMode: r.expiry_mode || null,
+    shelfLifeDays: r.shelf_life_days ?? null,
+    priceStatus: r.price_status || null,
+    verificationStatus: r.verification_status || null,
+    packSizeStatus: r.pack_size_status || null,
+    yieldFactorStatus: r.yield_factor_status || null,
+    reservedBaseQty: r.reserved_base ?? null,
+    // The untouched record, for the one surface that needs every field
+    // (the ingredient drawer). Routes must keep reading the mapped names
+    // above; this is an escape hatch for a detail panel, not a licence to
+    // read raw column names throughout the console.
+    raw: r,
   };
 }
 

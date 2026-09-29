@@ -36,19 +36,31 @@
   loaded here, because its :root would repaint every other screen dark too.
 -->
 
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<!-- 2026-09 fix: Fraunces/Inter/JetBrains Mono used to be loaded live from
+     fonts.googleapis.com/fonts.gstatic.com, and Chart.js below used to load
+     from a CDN too — both silently broken on this system's actual
+     deployment target (LAN-only, no internet reachability at all; see
+     wt/auth.py's own threat-model docstring and start_server.ps1's
+     no-WAN-dependency design). Every font file (16 woff2, one per weight/
+     unicode-range subset Google's own CSS split them into) and the Chart.js
+     4.4.4 UMD bundle below are now vendored under /assets — same bytes,
+     same version, no network call outside this server.
+     /assets/fonts/fonts.css, not a console-only copy: pos.html and kds.html
+     already had this exact same link (to a file that never existed at that
+     path — a second silent 404, this one pre-existing and unrelated to the
+     CDN issue above), so the vendored file goes where they already expect
+     it, same shared-asset pattern as brand.css/design-system.css. -->
+<link rel="stylesheet" href="/assets/fonts/fonts.css">
 
 <link rel="stylesheet" href="/assets/brand.css">
 <link rel="stylesheet" href="/assets/console/styles/tokens.css">
 <link rel="stylesheet" href="/assets/console/styles/app.css">
 <link rel="stylesheet" href="/assets/console/styles/login-brand.css">
 
-<!-- Chart.js 4.4.4 — the same library and version the approved prototype uses,
-     so chart styling carries over rather than being re-derived. Loaded before
-     the app so components/charts/base.js can rely on the global. -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<!-- Chart.js 4.4.4, vendored locally — see the fonts comment above for why.
+     Loaded before the app so components/charts/base.js can rely on the
+     global. -->
+<script src="/assets/vendor/chart.umd.min.js"></script>
 <!-- Same brand intro POS/KDS use — defines window.WingsIntro. A classic
      script (not a module), so it runs synchronously during parse, before
      app.js (a deferred module) ever executes. -->

@@ -74,7 +74,8 @@ export function Login({ onSuccess, expired = false }) {
   // Arriving cold plays the branded sequence, same rule POS/KDS use: the
   // landing page's own LOGIN button already ran it once and hands off with
   // ?intro=done, so it is never shown twice back to back.
-  if (window.WingsIntro && new URLSearchParams(location.search).get('intro') !== 'done') {
+  if (window.WingsIntro && typeof window.WingsIntro.play === 'function' &&
+      new URLSearchParams(location.search).get('intro') !== 'done') {
     window.WingsIntro.play();
   }
 

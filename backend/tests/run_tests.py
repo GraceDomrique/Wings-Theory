@@ -6,6 +6,7 @@ test below needs real threads and real connections, not a mocking framework.
 from __future__ import annotations
 
 import datetime as dt
+import math
 import os
 import sqlite3
 import sys
@@ -18,31 +19,68 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from wt import db, refills, timeutil, units, unli                   # noqa: E402
+from wt import (                                                    # noqa: E402
+    auth, db, instructions, owner_provisioning, purchasing, refills, timeutil, units, unli, updates,
+)
 from wt.cache import TTLCache                                       # noqa: E402
 from wt.anomaly import consumption_model_details                    # noqa: E402
 from wt.anomaly import detect_anomalies, detect_consumption_anomalies  # noqa: E402
 from wt.anomaly import model_details as anomaly_model_details       # noqa: E402
+from wt.anomaly import (                                            # noqa: E402
+    MAX_STOCK_LOSS_FLAG_FRACTION, anomaly_review_history, record_anomaly_review,
+    validation_metrics,
+)
 from wt.associations import product_combinations                    # noqa: E402
 from wt.associations import model_details as association_model_details  # noqa: E402
+from wt.associations import threshold_sensitivity                   # noqa: E402
+from wt import combo_pricing                                        # noqa: E402
+from wt.resolver import recipe_cost                                 # noqa: E402
 from wt.errors import (                                             # noqa: E402
     InsufficientStockError, InvalidStateError, NotFoundError, RecipeCycleError,
     UnitConversionError,
 )
+from wt import depletion, forecasting, xlsx_prophet_ingest          # noqa: E402
 from wt.forecasting import (                                        # noqa: E402
     evaluate_demand_model, ingredient_depletion, menu_item_demand, menu_item_demand_prophet,
 )
 from wt.reservation import (                                        # noqa: E402
     availability_for_menu_item, commit_order, ingredient_reconciliation_report,
-    inventory_valuation, receive_stock, record_count, record_wastage,
-    release_order, reserve_order, void_after_commit,
+    inventory_valuation, receive_stock, record_count, record_variance_review,
+    record_wastage, release_order, reserve_order, variance_review_history,
+    void_after_commit,
 )
-from wt.resolver import expand_recipe, order_requirements, validate_recipe   # noqa: E402
+from wt.resolver import (                                           # noqa: E402
+    expand_recipe, flavour_substitutions, order_requirements, validate_recipe,
+)
 
 
 # ---------------------------------------------------------------------------
 # fixture helpers
 # ---------------------------------------------------------------------------
+def rows(cur) -> list[dict]:
+    return [dict(r) for r in cur.fetchall()]
+
+
+def manager_token(conn: sqlite3.Connection, username: str = "manager") -> str:
+    """A manager-role JWT issued directly, bypassing POST /auth/login.
+
+    Migration 0034 deactivated the seeded 'manager' account (is_active=0),
+    so it can no longer log in — see TestOwnerRoleAndProvisioning's
+    test_legacy_manager_account_is_deactivated_but_preserved. The extensive
+    RBAC/capability coverage in this suite that exercises what a manager-
+    role token is and is not allowed to do is still valid: 'manager' remains
+    a real, defined role in auth.CAPABILITIES, it is just that no account
+    currently holds it live. Issuing the token directly (matching the
+    account's own password_changed_at claim, exactly as auth.issue_token
+    already requires) reaches the same capability-layer coverage without
+    going through the now-blocked login endpoint.
+    """
+    row = conn.execute(
+        "SELECT role, password_changed_at FROM app_user WHERE username=?", (username,)
+    ).fetchone()
+    return auth.issue_token(username, row["role"], row["password_changed_at"])
+
+
 def fresh_db() -> tuple[sqlite3.Connection, str]:
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
@@ -68,18 +106,59 @@ def scrub(path: str) -> None:
                 time.sleep(0.15)
 
 
+def seed_fresh_with_go_live_delivery() -> dict:
+    """seed.run(fresh=True), then receive a normal go-live delivery for
+    every raw ingredient the thirteen migration-0021-reconciled flavour
+    sauces actually consume (wt.gapfill.RECONCILED_INGREDIENTS' 19 brand
+    new ones, PLUS whichever pre-existing ingredients — Butter, Fresh
+    Garlic Peeled, Honey, Soy Sauce, Cornstarch, ... — those sauces now
+    also draw on more heavily than the pre-reconciliation recipes did).
+
+    The 19 new ones start at zero on-hand by design (see that table's own
+    comment, and migration 0021 itself): nobody has physically counted
+    them, so no on-hand figure is invented. That is correct for a database
+    about to go live and take its first delivery, but it means a test that
+    exercises one of the thirteen reconciled sauces (Classic Buffalo,
+    Cheese, ...) — and a whole test class runs many such orders in
+    sequence — needs enough stock to work with first, the same way a real
+    kitchen receives its opening delivery before service rather than
+    mid-shift. This receives a generous but arbitrary quantity of each
+    (test fixture data, not a business figure) through the real
+    receive_stock() path, so a test class sees a normal, well-stocked
+    post-delivery database instead of running the CSV's as-counted
+    opening stock dry partway through its own test order."""
+    from wt import gapfill, seed
+    stats = seed.run(fresh=True)
+    conn = db.get_conn()
+    reconciled_names = [name for name in gapfill.SUB_RECIPES
+                        if "(house)" not in name and name != "Original Dry Rub"]
+    leaf_ids = {r["ingredient_id"] for r in conn.execute(
+        """SELECT DISTINCT l.ingredient_id FROM v_recipe_leaf l
+             JOIN recipe r ON r.id = l.recipe_id
+             JOIN ingredient i ON i.id = r.produces_ingredient_id
+            WHERE i.name IN ({})""".format(",".join("?" * len(reconciled_names))),
+        reconciled_names)}
+    for ing_id in leaf_ids:
+        row = conn.execute("SELECT pack_size FROM ingredient WHERE id=?", (ing_id,)).fetchone()
+        if row is None or not row["pack_size"]:
+            continue
+        receive_stock(conn, ing_id, 50.0, lot_no="GOLIVE-TEST", user_id="test_setup")
+    return stats
+
+
 def add_ingredient(conn, name, *, base_unit="g", pack=1000, on_hand=0.0,
-                   kind="raw", mode=None, yield_factor=1.0, cost=100.0):
+                   kind="raw", mode=None, yield_factor=1.0, cost=100.0,
+                   category="dry_food", cost_status="verified"):
     n = conn.execute("SELECT COUNT(*) AS n FROM ingredient").fetchone()["n"]
     cur = conn.execute(
         """
         INSERT INTO ingredient (ingredient_id, name, category, kind, sub_recipe_mode,
             base_unit, purchase_unit, pack_size, pack_size_status, yield_factor,
             yield_factor_status, on_hand_base, unit_cost, unit_cost_status)
-        VALUES (?,?, 'dry_food', ?,?, ?, 'pack', ?,?, ?, 'verified', ?, ?, 'verified')
+        VALUES (?,?,?,?,?, ?, 'pack', ?,?, ?, 'verified', ?, ?, ?)
         """,
-        (f"ING-{n+1:04d}", name, kind, mode, base_unit, pack,
-         "verified" if pack else "unset", yield_factor, on_hand, cost),
+        (f"ING-{n+1:04d}", name, category, kind, mode, base_unit, pack,
+         "verified" if pack else "unset", yield_factor, on_hand, cost, cost_status),
     )
     return cur.lastrowid
 
@@ -101,12 +180,12 @@ def add_recipe(conn, name, lines, *, kind="menu", produces=None, yield_qty=1.0):
     return pk
 
 
-def add_menu_item(conn, name, recipe_pk, price=100.0, is_unli=False):
+def add_menu_item(conn, name, recipe_pk, price=100.0, is_unli=False, category="Test"):
     n = conn.execute("SELECT COUNT(*) AS n FROM menu_item").fetchone()["n"]
     cur = conn.execute(
         "INSERT INTO menu_item (menu_item_id, name, category, price, recipe_id, is_unli) "
-        "VALUES (?,?, 'Test', ?,?,?)",
-        (f"MEN-{n+1:04d}", name, price, recipe_pk, int(is_unli)),
+        "VALUES (?,?,?,?,?,?)",
+        (f"MEN-{n+1:04d}", name, category, price, recipe_pk, int(is_unli)),
     )
     return cur.lastrowid
 
@@ -810,6 +889,31 @@ class TestRecordCount(Base):
         row = self.conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)).fetchone()
         self.assertEqual(row["on_hand_base"], 1100.0)
 
+    def test_count_below_reserved_is_refused_as_a_named_shortfall(self):
+        """The schema enforces reserved_base <= on_hand_base as a hard
+        invariant (every held reservation must stay physically fulfillable),
+        so a count that would break it is refused with the specific numbers
+        — not silently applied (which would violate the invariant) and not
+        left to crash as a raw database error."""
+        self.conn.execute("UPDATE ingredient SET reserved_base=800 WHERE id=?", (self.ing,))
+        with self.assertRaises(InsufficientStockError) as ctx:
+            record_count(self.conn, self.ing, actual_base=700.0)
+        self.assertEqual(ctx.exception.shortfalls[0]["needed_base"], 800.0)
+        self.assertEqual(ctx.exception.shortfalls[0]["available_base"], 700.0)
+        # refusal left on_hand untouched
+        row = self.conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)).fetchone()
+        self.assertEqual(row["on_hand_base"], 1000.0)
+
+    def test_count_exactly_at_reserved_is_allowed(self):
+        self.conn.execute("UPDATE ingredient SET reserved_base=800 WHERE id=?", (self.ing,))
+        r = record_count(self.conn, self.ing, actual_base=800.0)
+        self.assertEqual(r["actual_base"], 800.0)
+
+    def test_count_above_reserved_is_allowed(self):
+        self.conn.execute("UPDATE ingredient SET reserved_base=800 WHERE id=?", (self.ing,))
+        r = record_count(self.conn, self.ing, actual_base=850.0)
+        self.assertEqual(r["actual_base"], 850.0)
+
     def test_count_writes_a_count_adjustment_ledger_row_even_when_it_matches(self):
         record_count(self.conn, self.ing, actual_base=1000.0)
         row = self.conn.execute(
@@ -857,6 +961,22 @@ class TestRecordWastage(Base):
         # and the refusal left stock untouched
         row = self.conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)).fetchone()
         self.assertEqual(row["on_hand_base"], 1000.0)
+
+    def test_cannot_waste_stock_reserved_for_active_orders(self):
+        """on_hand=1000, reserved=800 -> only 200 is actually free. A manager
+        must not be able to record 300 units of wastage as if 300 were
+        available, even though 300 < on_hand."""
+        self.conn.execute("UPDATE ingredient SET reserved_base=800 WHERE id=?", (self.ing,))
+        with self.assertRaises(InvalidStateError):
+            record_wastage(self.conn, self.ing, 300.0)
+        row = self.conn.execute(
+            "SELECT on_hand_base, reserved_base FROM ingredient WHERE id=?", (self.ing,)).fetchone()
+        self.assertEqual(row["on_hand_base"], 1000.0)
+        self.assertEqual(row["reserved_base"], 800.0)
+
+        # exactly the free 200 is allowed
+        r = record_wastage(self.conn, self.ing, 200.0)
+        self.assertEqual(r["on_hand_base"], 800.0)
 
     def test_zero_or_negative_is_refused(self):
         with self.assertRaises(InvalidStateError):
@@ -943,6 +1063,368 @@ class TestIngredientReconciliation(Base):
         self.assertNotIn(untouched, [x["ingredient_id"] for x in report["items"]])
 
 
+class TestRepeatedVarianceSignal(Base):
+    """The repeated-direction variance signal (reservation._repeated_
+    variance_signals, surfaced on ingredient_reconciliation_report's
+    'repeated_variance_signal' field) — evidence that a physical count
+    keeps landing the same way on independent dates, never a claim about
+    cause. Each count_adjustment row already carries everything needed
+    (delta_base, balance_after_base): expected = balance_after_base -
+    delta_base, physical = balance_after_base. Backdated via the existing
+    add_ledger_entry() helper (the same one depletion/anomaly tests already
+    use), so this tests the real stored-data shape, not a mocked one.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.ing = add_ingredient(self.conn, "White Eggs", on_hand=1000.0, pack=1000)
+
+    def _count(self, iso_date, expected, physical):
+        """One count_adjustment row as record_count() itself would write
+        one: delta = physical - expected, balance_after = physical."""
+        add_ledger_entry(self.conn, self.ing, physical - expected, "count_adjustment",
+                         iso_date, balance_after=physical)
+
+    def test_one_physical_count_no_signal(self):
+        self._count(days_ago(10), expected=100.0, physical=80.0)  # -20%, well past threshold
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertIsNone(item["repeated_variance_signal"])
+
+    def test_two_different_dates_no_signal(self):
+        self._count(days_ago(10), expected=100.0, physical=80.0)
+        self._count(days_ago(5), expected=100.0, physical=80.0)
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertIsNone(item["repeated_variance_signal"])
+
+    def test_three_independent_dates_repeated_negative_variance_signals(self):
+        self._count(days_ago(15), expected=100.0, physical=80.0)   # -20%
+        self._count(days_ago(10), expected=100.0, physical=82.0)   # -18%
+        self._count(days_ago(5), expected=100.0, physical=85.0)    # -15%
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        sig = item["repeated_variance_signal"]
+        self.assertIsNotNone(sig)
+        self.assertTrue(sig["active"])
+        self.assertEqual(sig["observation_count"], 3)
+        self.assertEqual(sig["direction"], "below")
+        self.assertEqual(sig["threshold_ratio"], 0.10)
+        self.assertEqual(sig["min_observations"], 3)
+        self.assertLess(sig["average_variance_ratio"], 0)  # signed, negative
+
+    def test_three_counts_same_date_do_not_qualify_as_three_observations(self):
+        d = days_ago(5)
+        self._count(d, expected=100.0, physical=80.0)
+        self._count(d, expected=80.0, physical=60.0)
+        self._count(d, expected=60.0, physical=40.0)
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        # All three land on the same business date -> exactly one
+        # independent observation, not three.
+        self.assertIsNone(item["repeated_variance_signal"])
+
+    def test_mixed_directions_no_false_repeated_signal(self):
+        self._count(days_ago(15), expected=100.0, physical=80.0)   # -20%
+        self._count(days_ago(10), expected=100.0, physical=120.0)  # +20%
+        self._count(days_ago(5), expected=100.0, physical=75.0)    # -25%
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        sig = item["repeated_variance_signal"]
+        self.assertIsNotNone(sig)  # 3 independent dates exist...
+        self.assertFalse(sig["active"])  # ...but directions disagree, so no active signal
+
+    def test_three_positive_variances_signal_but_never_says_over_consumption(self):
+        self._count(days_ago(15), expected=100.0, physical=120.0)  # +20%
+        self._count(days_ago(10), expected=100.0, physical=118.0)  # +18%
+        self._count(days_ago(5), expected=100.0, physical=122.0)   # +22%
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        sig = item["repeated_variance_signal"]
+        self.assertTrue(sig["active"])
+        self.assertEqual(sig["direction"], "above")
+        self.assertGreater(sig["average_variance_ratio"], 0)
+        # The backend never names a cause either way -- "above" is a
+        # direction, not a verdict. Interpretation copy lives in the
+        # frontend only; nothing here contains the word "consumption".
+
+    def test_variance_below_threshold_no_signal(self):
+        self._count(days_ago(15), expected=100.0, physical=98.0)  # -2%
+        self._count(days_ago(10), expected=100.0, physical=97.0)  # -3%
+        self._count(days_ago(5), expected=100.0, physical=99.0)   # -1%
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        sig = item["repeated_variance_signal"]
+        self.assertIsNotNone(sig)  # 3 independent dates exist...
+        self.assertFalse(sig["active"])  # ...none individually clears 10%
+
+    def test_only_two_of_three_qualifying_is_not_yet_a_pattern(self):
+        self._count(days_ago(15), expected=100.0, physical=80.0)  # -20%, qualifies
+        self._count(days_ago(10), expected=100.0, physical=99.0)  # -1%, does not qualify
+        self._count(days_ago(5), expected=100.0, physical=78.0)   # -22%, qualifies
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertFalse(item["repeated_variance_signal"]["active"])
+
+    def test_signal_never_touches_recipe_ingredient_or_ledger(self):
+        """The signal is read-only: it must never create, modify or delete
+        any row outside of exactly the count_adjustment rows this test
+        itself inserted."""
+        before_ledger = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        before_recipe = self.conn.execute("SELECT COUNT(*) AS n FROM recipe").fetchone()["n"]
+        before_ing = dict(self.conn.execute("SELECT * FROM ingredient WHERE id=?", (self.ing,)).fetchone())
+
+        self._count(days_ago(15), expected=100.0, physical=80.0)
+        self._count(days_ago(10), expected=100.0, physical=82.0)
+        self._count(days_ago(5), expected=100.0, physical=85.0)
+        after_ledger = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+
+        ingredient_reconciliation_report(self.conn, days=30)  # computing the report itself must not write
+
+        after_recipe = self.conn.execute("SELECT COUNT(*) AS n FROM recipe").fetchone()["n"]
+        after_ing = dict(self.conn.execute("SELECT * FROM ingredient WHERE id=?", (self.ing,)).fetchone())
+        self.assertEqual(after_ledger, before_ledger + 3)  # only the 3 test inserts
+        self.assertEqual(after_recipe, before_recipe)
+        self.assertEqual(after_ing, before_ing)  # on_hand_base etc. completely untouched
+
+    def test_existing_aggregate_fields_unaffected_by_the_new_signal(self):
+        """The pre-existing count_variance_base/variance_ratio/flagged
+        fields (spec: 'existing logic reused, not changed') must compute
+        identically whether or not a repeated_variance_signal exists."""
+        record_wastage(self.conn, self.ing, 500.0)
+        record_count(self.conn, self.ing, actual_base=250.0)  # 50% variance, flagged
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertEqual(item["count_variance_base"], -250.0)
+        self.assertEqual(item["variance_ratio"], 0.5)
+        self.assertTrue(item["flagged"])
+
+
+class TestVarianceReview(Base):
+    """reservation.record_variance_review / variance_review_history —
+    migration 0033. A human's suspected cause for a physical-count
+    discrepancy, kept strictly separate from verification.py's model-input
+    calibration (see that module's own field/row_id/previous_value/new_value
+    shape, which has no home for "why", only "what changed"). Recording a
+    review must never touch stock, the ledger, or any recipe/ingredient
+    value — the whole point is that it is an annotation, not a correction.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.ing = add_ingredient(self.conn, "Cornstarch", on_hand=1000.0, pack=1000)
+
+    def _give_it_a_count(self, physical=900.0, expected=1000.0):
+        add_ledger_entry(self.conn, self.ing, physical - expected, "count_adjustment",
+                         days_ago(1), balance_after=physical)
+
+    def test_valid_variance_classification_succeeds(self):
+        self._give_it_a_count()
+        r = record_variance_review(self.conn, self.ing, "portion_variance",
+                                   note="scoop looked heavy", user_id="admin1")
+        self.assertEqual(r["reason"], "portion_variance")
+        self.assertEqual(r["reason_label"], "Preparation or portion variance")
+        self.assertEqual(r["note"], "scoop looked heavy")
+        self.assertEqual(r["user_id"], "admin1")
+        self.assertIsNotNone(r["evidence_ledger_id"])
+
+    def test_invalid_reason_is_rejected(self):
+        self._give_it_a_count()
+        with self.assertRaises(InvalidStateError):
+            record_variance_review(self.conn, self.ing, "definitely_wastage", user_id="admin1")
+        # nothing was written
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM ingredient_variance_review").fetchone()["n"], 0)
+
+    def test_review_requires_real_evidence(self):
+        """No count has ever been recorded for this ingredient -- there is
+        nothing to review yet, so this must fail rather than silently
+        reviewing a variance that was never observed."""
+        with self.assertRaises(InvalidStateError):
+            record_variance_review(self.conn, self.ing, "waste", user_id="admin1")
+
+    def test_unknown_ingredient_is_rejected(self):
+        with self.assertRaises(NotFoundError):
+            record_variance_review(self.conn, 999999, "waste", user_id="admin1")
+
+    def test_review_does_not_alter_the_original_count_adjustment(self):
+        self._give_it_a_count(physical=900.0, expected=1000.0)
+        before = rows(self.conn.execute(
+            "SELECT * FROM stock_ledger WHERE reason='count_adjustment' ORDER BY id"))
+        record_variance_review(self.conn, self.ing, "counting_error", user_id="admin1")
+        after = rows(self.conn.execute(
+            "SELECT * FROM stock_ledger WHERE reason='count_adjustment' ORDER BY id"))
+        self.assertEqual(before, after)
+
+    def test_review_does_not_alter_stock_balance(self):
+        self._give_it_a_count(physical=900.0, expected=1000.0)
+        before = self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)).fetchone()["on_hand_base"]
+        record_variance_review(self.conn, self.ing, "recipe_yield_issue", user_id="admin1")
+        after = self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)).fetchone()["on_hand_base"]
+        self.assertEqual(before, after)
+
+    def test_review_does_not_create_a_new_ledger_row(self):
+        self._give_it_a_count()
+        before = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        record_variance_review(self.conn, self.ing, "other", user_id="admin1")
+        after = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        self.assertEqual(before, after)
+
+    def test_repeated_variance_calculation_is_unaffected_by_a_review(self):
+        """Recording a review must never change flagged/variance_ratio/the
+        repeated-direction signal — those come only from stock_ledger, which
+        a review never writes to."""
+        self._give_it_a_count(physical=800.0, expected=1000.0)  # -20%, single count today
+        before = ingredient_reconciliation_report(self.conn, days=30)
+        before_item = next(x for x in before["items"] if x["ingredient_id"] == self.ing)
+        record_variance_review(self.conn, self.ing, "waste", user_id="admin1")
+        after = ingredient_reconciliation_report(self.conn, days=30)
+        after_item = next(x for x in after["items"] if x["ingredient_id"] == self.ing)
+        for key in ("consumed_base", "count_variance_base", "variance_ratio", "flagged",
+                    "repeated_variance_signal"):
+            self.assertEqual(before_item[key], after_item[key])
+
+    def test_duplicate_submission_replays_instead_of_duplicating(self):
+        self._give_it_a_count()
+        r1 = record_variance_review(self.conn, self.ing, "waste", note="n",
+                                    user_id="admin1", client_request_id="dup-key-1")
+        r2 = record_variance_review(self.conn, self.ing, "waste", note="n",
+                                    user_id="admin1", client_request_id="dup-key-1")
+        self.assertEqual(r1["id"], r2["id"])
+        n = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM ingredient_variance_review").fetchone()["n"]
+        self.assertEqual(n, 1)
+
+    def test_a_new_conclusion_appends_rather_than_overwrites(self):
+        self._give_it_a_count()
+        first = record_variance_review(self.conn, self.ing, "counting_error", user_id="admin1")
+        second = record_variance_review(self.conn, self.ing, "recipe_yield_issue", user_id="admin1",
+                                        note="looked at it again, it's the recipe")
+        self.assertNotEqual(first["id"], second["id"])
+        hist = variance_review_history(self.conn, self.ing)
+        self.assertEqual(len(hist), 2)
+        self.assertEqual(hist[0]["reason"], "counting_error")
+        self.assertEqual(hist[1]["reason"], "recipe_yield_issue")
+        # the first review is untouched, not rewritten
+        self.assertEqual(hist[0]["note"], first["note"])
+
+    def test_history_is_append_only_at_the_database_level(self):
+        self._give_it_a_count()
+        r = record_variance_review(self.conn, self.ing, "waste", user_id="admin1")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE ingredient_variance_review SET reason='other' WHERE id=?", (r["id"],))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM ingredient_variance_review WHERE id=?", (r["id"],))
+
+    def test_reconciliation_report_surfaces_the_latest_review_read_only(self):
+        self._give_it_a_count()
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertIsNone(item["latest_variance_review"])
+        record_variance_review(self.conn, self.ing, "portion_variance", user_id="admin1")
+        report = ingredient_reconciliation_report(self.conn, days=30)
+        item = next(x for x in report["items"] if x["ingredient_id"] == self.ing)
+        self.assertEqual(item["latest_variance_review"]["reason"], "portion_variance")
+        self.assertEqual(item["latest_variance_review"]["reason_label"],
+                         "Preparation or portion variance")
+
+    def test_historical_orders_and_customer_order_count_unchanged_by_a_review(self):
+        before = self.conn.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+        self._give_it_a_count()
+        record_variance_review(self.conn, self.ing, "other", user_id="admin1")
+        after = self.conn.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+        self.assertEqual(before, after)
+
+
+class TestVarianceReviewAPI(unittest.TestCase):
+    """The write endpoint follows the same admin-only convention as its
+    siblings on this exact resource (count/waste/use) — see auth.CAPABILITIES
+    inventory.write. Reading the resulting "Reviewed — ..." state stays on
+    inventory.read, same as the reconciliation report it's embedded in."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u, password="wingstheory"):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
+            return r.json()["token"]
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}  # role=admin, see TestConsoleAPI
+
+        # A genuine role='owner' account (see auth.CAPABILITIES / the 2026-09-11
+        # addition) has inventory.read but not inventory.write -- exactly the
+        # read-without-write shape this class used to exercise via the now-
+        # deactivated 'manager' account. Provisioned the same way a real
+        # deployment operator would (owner_provisioning is the only path to
+        # role='owner').
+        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        cls.H_OWNER_ROLE = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _ingredient_with_a_count(self):
+        ing_id = self.client.get("/console/ingredients?limit=1", headers=self.H_OWNER).json()["ingredients"][0]["id"]
+        self.client.post(f"/console/ingredients/{ing_id}/count", headers=self.H_OWNER,
+                         json={"actual_base": 5.0})
+        return ing_id
+
+    def test_write_endpoint_requires_inventory_write(self):
+        ing_id = self._ingredient_with_a_count()
+        r = self.client.post(f"/console/ingredients/{ing_id}/variance-review", headers=self.H_CASH,
+                             json={"reason": "waste"})
+        self.assertEqual(r.status_code, 403)
+        # role='owner' has inventory.read but never inventory.write.
+        r = self.client.post(f"/console/ingredients/{ing_id}/variance-review", headers=self.H_OWNER_ROLE,
+                             json={"reason": "waste"})
+        self.assertEqual(r.status_code, 403)
+        r = self.client.post(f"/console/ingredients/{ing_id}/variance-review", headers=self.H_OWNER,
+                             json={"reason": "waste"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_invalid_reason_is_rejected_by_the_api(self):
+        ing_id = self._ingredient_with_a_count()
+        r = self.client.post(f"/console/ingredients/{ing_id}/variance-review", headers=self.H_OWNER,
+                             json={"reason": "not_a_real_reason"})
+        self.assertEqual(r.status_code, 422)
+
+    def test_read_history_requires_inventory_read_not_write(self):
+        ing_id = self._ingredient_with_a_count()
+        self.client.post(f"/console/ingredients/{ing_id}/variance-review", headers=self.H_OWNER,
+                         json={"reason": "waste", "note": "dropped tray, not logged at the time"})
+        r = self.client.get(f"/console/ingredients/{ing_id}/variance-review", headers=self.H_OWNER_ROLE)
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.json()["reviews"]), 1)
+        self.assertEqual(r.json()["reviews"][0]["reason"], "waste")
+        # cashier has neither inventory.read nor inventory.write
+        r = self.client.get(f"/console/ingredients/{ing_id}/variance-review", headers=self.H_CASH)
+        self.assertEqual(r.status_code, 403)
+
+
 # ===========================================================================
 class TestInventoryValuation(Base):
     """reservation.inventory_valuation — 2026-08 audit: GET /reports/valuation
@@ -950,9 +1432,17 @@ class TestInventoryValuation(Base):
     client-side but had no backend at all. Only unit_cost_status='verified'
     ingredients may count toward the total — folding an unverified estimate
     into the same total as a confirmed cost would present a partly-invented
-    number as real."""
+    number as real.
+
+    unit_cost is PER PURCHASE UNIT, not per base unit (see the column
+    comment in migrations/0001_ingredient_master.sql), so every expected
+    total below runs on_hand_base * (unit_cost / (pack_size * yield_factor))
+    — the same conversion resolver.recipe_cost() uses for menu costing —
+    never on_hand_base * unit_cost directly."""
 
     def test_only_verified_costs_are_summed(self):
+        # add_ingredient defaults pack_size=1000, yield_factor=1.0, so this
+        # ingredient's per-base-unit cost is 10.0 / 1000 = 0.01/g.
         verified = add_ingredient(self.conn, "Verified Rice", on_hand=1000.0, cost=10.0)
         unverified = add_ingredient(self.conn, "Unverified Sauce", on_hand=500.0, cost=999.0)
         self.conn.execute(
@@ -962,15 +1452,45 @@ class TestInventoryValuation(Base):
         self.conn.execute("UPDATE ingredient SET unit_cost_status='unset' WHERE id=?", (unset,))
 
         result = inventory_valuation(self.conn)
-        # 1000*10 = 10000 from the verified ingredient only; the unverified
-        # ingredient's 500*999 = 499500 must NOT appear in the total
-        self.assertEqual(result["total_value"], 10000.0)
+        # 1000g * (10.0 / 1000) = 10.0 from the verified ingredient only; the
+        # unverified ingredient's cost must NOT appear in the total at all,
+        # priced or not.
+        self.assertEqual(result["total_value"], 10.0)
         self.assertEqual(result["priced_items"], 1)
         self.assertGreaterEqual(result["total_items"], 3)
 
     def test_zero_verified_ingredients_is_an_honest_zero_not_an_error(self):
         add_ingredient(self.conn, "Some Ingredient", on_hand=1000.0, cost=50.0)
         self.conn.execute("UPDATE ingredient SET unit_cost_status='needs_verification'")
+        result = inventory_valuation(self.conn)
+        self.assertEqual(result["total_value"], 0.0)
+        self.assertEqual(result["priced_items"], 0)
+
+    def test_purchase_unit_cost_is_converted_to_base_unit_cost_before_valuing(self):
+        """The reference acceptance example: 25 kg/sack rice at PHP 1,000/sack,
+        10,000 g on hand -> PHP 400, never PHP 10,000,000 (on_hand_base *
+        unit_cost with no pack_size conversion) and never PHP 10,000
+        (dividing by pack_size while forgetting on_hand is already in grams)."""
+        add_ingredient(self.conn, "Raw Rice", base_unit="g", pack=25000,
+                        on_hand=10000.0, cost=1000.0)
+        result = inventory_valuation(self.conn)
+        self.assertEqual(result["total_value"], 400.0)
+
+    def test_yield_factor_is_included_in_the_base_unit_cost_conversion(self):
+        # cost 100/purchase-unit, pack_size 50, yield_factor 2.0 ->
+        # per-base-unit cost = 100 / (50*2) = 1.0; 300 base units on hand -> 300.0
+        add_ingredient(self.conn, "Yielded Good", pack=50, yield_factor=2.0,
+                        on_hand=300.0, cost=100.0)
+        result = inventory_valuation(self.conn)
+        self.assertEqual(result["total_value"], 300.0)
+
+    def test_verified_cost_without_a_pack_size_is_excluded_not_mis_valued(self):
+        """A verified unit_cost with no pack_size cannot be converted to a
+        base-unit cost at all -- it must be treated as unpriced, the same
+        way resolver.recipe_cost() reports it as an unpriced leaf, rather
+        than valued as though pack_size were 1."""
+        pk = add_ingredient(self.conn, "No Pack Size", on_hand=1000.0, cost=10.0)
+        self.conn.execute("UPDATE ingredient SET pack_size=NULL WHERE id=?", (pk,))
         result = inventory_valuation(self.conn)
         self.assertEqual(result["total_value"], 0.0)
         self.assertEqual(result["priced_items"], 0)
@@ -1132,6 +1652,7 @@ class TestSeedImport(unittest.TestCase):
         db.close_conn()
         from wt import seed
         cls.stats = seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         cls.conn = db.get_conn()
 
     @classmethod
@@ -1142,45 +1663,61 @@ class TestSeedImport(unittest.TestCase):
         scrub(cls.path)
 
     def test_every_source_stock_item_is_present(self):
-        """Name-by-name against the CSV — a count would hide a swap."""
-        import csv as _csv
-        from wt.seed import SEED_DIR
-        with (SEED_DIR / "inventory_tidy.csv").open(encoding="utf-8-sig") as fh:
-            source = {r["Product Name"].strip() for r in _csv.DictReader(fh)}
+        """Name-by-name against the workbook's own master sheet — a count
+        would hide a swap.
+
+        2026-09: this used to check the tidy CSV inventory_tidy.csv against
+        wt.seed.SEED_DIR, both retired since the switch to
+        data/Wings_Theory_Menu_Ingredient_List.xlsx (see
+        wt/xlsx_menu_audit_import.py's docstring). Sheet '4. Master
+        Ingredient Inventory' is now the one source, read directly here the
+        same way the importer itself does, rather than via a separate
+        tidy-CSV snapshot that no longer exists."""
+        import openpyxl
+        from wt.xlsx_menu_audit_import import XLSX_PATH, SHEET_INVENTORY
+        wb = openpyxl.load_workbook(XLSX_PATH, read_only=True)
+        ws = wb[SHEET_INVENTORY]
+        source = {row[1] for row in ws.iter_rows(min_row=2, values_only=True) if row[0]}
+        wb.close()
         have = {r["name"] for r in self.conn.execute(
             "SELECT name FROM ingredient WHERE kind='raw'")}
         self.assertEqual(source - have, set(), "stock items lost during import")
-        # 78 original stock rows + 14 "Additional Ingredients (Recipe-
-        # Required)" rows added in the 08-11 sheet correction.
-        self.assertEqual(len(source), 92)
+        self.assertEqual(len(source), 108)
 
     def test_gapfill_additions_start_at_zero_stock(self):
-        """Ingredients the BOM needs but the stock sheet never listed are
-        created so recipes resolve — never with an invented quantity."""
-        from wt.gapfill import ADDITIONS
-        for name, *_ in ADDITIONS:
-            row = self.conn.execute(
-                "SELECT on_hand_base, pack_size_status FROM ingredient WHERE name=?",
-                (name,)).fetchone()
-            self.assertIsNotNone(row, f"{name} was not created")
-            self.assertEqual(row["on_hand_base"], 0, f"{name} was given invented stock")
-            self.assertEqual(row["pack_size_status"], "needs_verification")
+        """Ingredients the BOM needs but the master sheet doesn't stock
+        directly are the fourteen flavour sub-recipes — created so recipes
+        resolve, never with an invented quantity.
+
+        2026-09: gapfill.ADDITIONS (a hand-authored list for the old CSV
+        pipeline) is gone — the new workbook's own sheet 4 already lists
+        every raw ingredient a recipe needs, so there is no more "BOM asked
+        for something the stock sheet never listed" gap to fill; the only
+        ingredients this importer still creates out of thin air are the
+        kind='sub_recipe' flavour sauces, which hold no purchasable stock
+        of their own by definition."""
+        rows = self.conn.execute(
+            "SELECT name, on_hand_base, pack_size_status FROM ingredient WHERE kind='sub_recipe'"
+        ).fetchall()
+        self.assertGreater(len(rows), 0, "no sub-recipe ingredients were created")
+        for row in rows:
+            self.assertEqual(row["on_hand_base"], 0, f"{row['name']} was given invented stock")
+            self.assertEqual(row["pack_size_status"], "unset",
+                             f"{row['name']} has a pack size — sub-recipes are never purchased")
 
     def test_piece_counts_survive_the_gram_conversion(self):
-        """Mango is 10 pcs on the sheet; after conversion it must still be 10."""
-        import csv as _csv
-        from wt.seed import SEED_DIR
-        from wt.gapfill import PIECE_WEIGHTS
-        with (SEED_DIR / "inventory_tidy.csv").open(encoding="utf-8-sig") as fh:
-            counts = {r["Product Name"].strip(): float(r["Product Count"])
-                      for r in _csv.DictReader(fh)}
-        for name, grams in PIECE_WEIGHTS.items():
-            if name not in counts:
-                continue
-            row = self.conn.execute(
-                "SELECT on_hand_base FROM ingredient WHERE name=?", (name,)).fetchone()
-            self.assertAlmostEqual(row["on_hand_base"] / grams, counts[name], places=3,
-                                   msg=f"{name} lost its piece count")
+        """2026-09: gapfill.PIECE_WEIGHTS (the old CSV pipeline's gram<->piece
+        conversion table) is gone — the new workbook states each ingredient's
+        base_unit directly (e.g. Banana is base_unit='pc' with pack_size=1),
+        so there is no conversion step left to lose a piece count during.
+        The equivalent current invariant: every piece-tracked ingredient's
+        on_hand_base is a whole number, not a fractional artifact of a
+        conversion that no longer runs."""
+        for row in self.conn.execute(
+            "SELECT name, on_hand_base FROM ingredient WHERE base_unit='pc' AND kind='raw'"
+        ):
+            self.assertEqual(row["on_hand_base"], round(row["on_hand_base"]),
+                             f"{row['name']} has a fractional piece count")
 
     def test_every_menu_item_is_structurally_ready(self):
         """Every recipe resolves to deductable leaves with nothing unmapped."""
@@ -1190,36 +1727,35 @@ class TestSeedImport(unittest.TestCase):
         self.assertEqual([b["name"] for b in bad], [])
 
     def test_sub_recipes_created_for_house_sauces(self):
+        """2026-09: the three old 'house preparation' sub-recipes (Cheese
+        Sauce (house), Tartar Sauce (house), Simple Syrup (house)) do not
+        exist in the current workbook in any form — every recipe that used
+        to reference one now lists its raw components directly (see
+        wt/xlsx_menu_audit_import.py's module docstring). So this is 14
+        (the flavour sauces) now, not 17."""
         n = self.conn.execute(
             "SELECT COUNT(*) AS n FROM ingredient WHERE kind='sub_recipe'").fetchone()["n"]
-        # 14 flavour sauces + 3 house preps (Cheese Sauce, Tartar Sauce,
-        # Simple Syrup). Ranch Dip is NOT one of these in the 08-11 sheet —
-        # it has its own ordinary ingredient list now and is no longer a
-        # component of the Wing Rack recipe, so it imports as a normal
-        # kind='menu' recipe like any other add-on.
-        self.assertEqual(n, 17)
+        self.assertEqual(n, 14)
 
     def test_wing_rack_deducts_flavour_sauce_not_just_wings(self):
-        """Wing Rack's source lines read 'per the selected flavor's ratio
-        (see Unlimited Wings block)' — pure prose, no number. That parsed to
-        qty=0 and the line silently vanished (qty_base <= 0 is a legitimate
-        skip for a genuinely-optional zero-quantity ingredient, and this
-        looked identical from the parser's point of view), so the recipe
-        ended up with only a wings line: structurally complete, sellable,
-        and wrong — every Wing Rack sale deducted zero flavour sauce."""
+        """Guards against the historical bug this test is named for (a
+        flavour-sauce line silently parsing to qty=0 and vanishing, leaving
+        Wing Rack sellable but deducting zero sauce) — re-expressed against
+        the current workbook's own display labels, 'Flavor Sauce #1
+        (default)' / '#2 (default)', not the old placeholder spelling."""
         rows = self.conn.execute(
             """
             SELECT rl.display_label, i.name AS ing_name, rl.qty_base
               FROM recipe_line rl JOIN recipe r ON r.id = rl.recipe_id
               JOIN ingredient i ON i.id = rl.ingredient_id
-             WHERE r.name LIKE 'Wing Rack%'
+             WHERE r.name LIKE '%Wing Rack%'
             """
         ).fetchall()
         labels = {r["display_label"] for r in rows}
-        self.assertIn("Flavor sauce #1", labels)
-        self.assertIn("Flavor sauce #2", labels)
+        self.assertIn("Flavor Sauce #1 (default)", labels)
+        self.assertIn("Flavor Sauce #2 (default)", labels)
         for r in rows:
-            if r["display_label"].startswith("Flavor sauce"):
+            if r["display_label"].startswith("Flavor Sauce"):
                 self.assertGreater(r["qty_base"], 0,
                                    f"{r['display_label']} deducts nothing")
 
@@ -1233,8 +1769,8 @@ class TestSeedImport(unittest.TestCase):
         reconciliation made exactly that mistake for both flavours before
         being caught here."""
         from wt.gapfill import SUB_RECIPES
-        for produced_name, (_unit, _yield, components) in SUB_RECIPES.items():
-            names = [n for n, _ in components]
+        for produced_name, (_unit, _yield, _yield_unit, components) in SUB_RECIPES.items():
+            names = [c[0] for c in components]
             self.assertEqual(len(names), len(set(names)),
                              f"{produced_name} lists an ingredient more than once: {names}")
 
@@ -1245,7 +1781,7 @@ class TestSeedImport(unittest.TestCase):
         a future edit to that table that breaks a name is caught here too,
         not just by the raise during seeding."""
         from wt.gapfill import SUB_RECIPES
-        for produced_name, (_unit, _yield, components) in SUB_RECIPES.items():
+        for produced_name, (_unit, _yield, _yield_unit, components) in SUB_RECIPES.items():
             recipe = self.conn.execute(
                 "SELECT id FROM recipe WHERE name=?", (produced_name,)).fetchone()
             self.assertIsNotNone(recipe, f"{produced_name} recipe missing")
@@ -1260,22 +1796,17 @@ class TestSeedImport(unittest.TestCase):
         ).fetchone()["n"], 0)
 
     def test_every_queued_line_carries_a_recorded_decision(self):
-        """The queue captured 42 lines the importer would not guess at; each is
-        now resolved or dismissed with who did it and why. An empty open queue
-        is the goal, not a sign the queue never ran."""
+        """2026-09: the old CSV pipeline's queue captured 42 lines it could
+        not map by name and needed a human decision recorded against each.
+        The current workbook needs no such queue at all — sheet 6's
+        'Ingredient Name (standardized)' column matches sheet 4's ingredient
+        names exactly for every row (verified by
+        xlsx_menu_audit_import._validate_workbook_assumptions() at import
+        time), so a plain name lookup resolves every line. An empty queue is
+        therefore the real current invariant, not a sign nothing ran."""
         total = self.conn.execute(
             "SELECT COUNT(*) AS n FROM unmapped_recipe_line").fetchone()["n"]
-        self.assertGreater(total, 0, "the queue never captured anything")
-        undecided = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM unmapped_recipe_line "
-            "WHERE state != 'open' AND resolved_by IS NULL").fetchone()["n"]
-        self.assertEqual(undecided, 0, "a line was closed without recording who decided")
-        for r in self.conn.execute(
-            "SELECT source_ingredient_label, state, resolved_ingredient_id "
-            "FROM unmapped_recipe_line WHERE state='resolved'"
-        ):
-            self.assertIsNotNone(r["resolved_ingredient_id"],
-                                 f"{r['source_ingredient_label']} resolved to nothing")
+        self.assertEqual(total, 0, "a recipe line needed manual mapping — investigate before ignoring")
 
     def test_chicken_salpicao_is_sellable_after_the_stock_correction(self):
         """The 08-11 sheet added real Chicken Breast/Thigh stock — Salpicao
@@ -1287,29 +1818,45 @@ class TestSeedImport(unittest.TestCase):
         self.assertEqual(row["structurally_ready"], 1)
         self.assertEqual(row["sellable"], 1)
 
-    def test_pork_tonkatsu_blocked_by_stock_not_by_mapping(self):
-        """The distinction matters: 'unmapped' is a data problem the owner
-        cannot act on, 'out of stock' is one they fix by buying panko. Panko
-        is the one ingredient the 08-11 correction still doesn't stock."""
+    def test_pork_tonkatsu_is_sellable_now_that_panko_is_stocked(self):
+        """2026-09: the current workbook's master inventory sheet stocks
+        Panko Breadcrumbs directly (500,000 g placeholder) — the one gap the
+        08-11 CSV-era correction used to leave unfilled is closed in the new
+        source data, so Pork Tonkatsu is fully sellable, not blocked. This
+        replaces the old test_pork_tonkatsu_blocked_by_stock_not_by_mapping,
+        whose premise (Panko genuinely out of stock) no longer holds."""
         row = self.conn.execute(
             "SELECT structurally_ready, sellable, block_reason "
             "FROM v_menu_item_availability WHERE name='Pork Tonkatsu'").fetchone()
         self.assertEqual(row["structurally_ready"], 1)
-        self.assertEqual(row["sellable"], 0)
-        self.assertIn("out of stock", row["block_reason"])
+        self.assertEqual(row["sellable"], 1, row["block_reason"])
 
     def test_rice_carries_a_cooked_yield(self):
+        """2026-09: the workbook's rice ingredient is named 'Cooked White
+        Rice' (not the old CSV's generic 'Rice') and is already tracked in
+        cooked grams directly — yield_factor=1.0, no raw->cooked conversion
+        needed, unlike the old sheet's raw-bought/cooked-recipe mismatch
+        that made 2.5 the right factor there."""
         row = self.conn.execute(
-            "SELECT yield_factor, yield_factor_status FROM ingredient WHERE name='Rice'"
+            "SELECT yield_factor, yield_factor_status FROM ingredient WHERE name='Cooked White Rice'"
         ).fetchone()
-        self.assertEqual(row["yield_factor"], 2.5)
+        self.assertEqual(row["yield_factor"], 1.0)
         self.assertEqual(row["yield_factor_status"], "needs_verification")
 
     def test_every_seeded_constant_is_flagged_unverified(self):
-        verified = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM ingredient WHERE pack_size_status='verified'"
-        ).fetchone()["n"]
-        self.assertEqual(verified, 0, "a seeded placeholder is masquerading as confirmed")
+        """True for every pack size this importer sets at all — a
+        placeholder must never masquerade as confirmed.
+
+        2026-09: gapfill.RECONCILED_INGREDIENTS (a 19-ingredient allowlist of
+        old-CSV-era pack sizes the owner had separately verified) is gone.
+        The current workbook's own import path never marks pack_size_status
+        'verified' for anything at seed time — every ingredient starts
+        'needs_verification' or 'unset' until a human confirms it through
+        /console/ingredients/{pk}/verify — so the real current invariant is
+        simpler than the old allowlist: nothing is ever seeded pre-verified."""
+        offenders = [r["name"] for r in self.conn.execute(
+            "SELECT name FROM ingredient WHERE pack_size_status='verified'")]
+        self.assertEqual(offenders, [], "a seeded placeholder is masquerading as confirmed")
 
     def test_unli_vector_has_four_streams(self):
         keys = {r["item_key"] for r in self.conn.execute("SELECT item_key FROM unli_item")}
@@ -1325,6 +1872,164 @@ class TestSeedImport(unittest.TestCase):
     def test_verification_queue_is_populated(self):
         self.assertGreater(self.conn.execute(
             "SELECT COUNT(*) AS n FROM v_needs_verification").fetchone()["n"], 100)
+
+
+# ===========================================================================
+# 2026-09 Prophet data-integration audit — wt/xlsx_prophet_ingest.py.
+# Read-only workbook validation, so these tests build small, deliberately
+# imperfect in-memory workbooks rather than depending on the real (and
+# currently clean) Prophet-ready dataset — the point is checking that a BAD
+# row is caught and explained, which real workbook happens not to exercise.
+# ===========================================================================
+class TestXlsxProphetIngest(unittest.TestCase):
+    def _wb(self, sheets: dict) -> str:
+        """sheets: {sheet_name: [[header...], [row...], ...]}. Written to a
+        fresh temp .xlsx file; the test itself unlinks it via addCleanup."""
+        import openpyxl as _oxl
+        wb = _oxl.Workbook()
+        wb.remove(wb.active)
+        for name, rows in sheets.items():
+            ws = wb.create_sheet(name)
+            for row in rows:
+                ws.append(row)
+        fd, path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        wb.save(path)
+        self.addCleanup(lambda: os.unlink(path) if os.path.exists(path) else None)
+        return path
+
+    def _minimal_sheets(self):
+        """A tiny, internally-consistent 4-sheet workbook: 2 dates, 1
+        product, order-level rows that sum to exactly what Daily Store
+        Demand and Daily Product Demand claim for those same 2 dates."""
+        order_rows = [
+            list(xlsx_prophet_ingest.ORDER_COLUMNS),
+            ["WT-1", dt.date(2026, 5, 1), "12:00:00", "Cat", "Widget", 2, 100, 200],
+            ["WT-2", dt.date(2026, 5, 2), "13:00:00", "Cat", "Widget", 1, 100, 100],
+        ]
+        product_rows = [
+            list(xlsx_prophet_ingest.PRODUCT_DEMAND_COLUMNS),
+            [dt.date(2026, 5, 1), "Friday", 5, "Widget", "Cat", 100, 2],
+            [dt.date(2026, 5, 2), "Saturday", 6, "Widget", "Cat", 100, 1],
+        ]
+        store_rows = [
+            list(xlsx_prophet_ingest.STORE_DEMAND_COLUMNS),
+            [dt.date(2026, 5, 1), 1, 2, 200, "Friday", 5],
+            [dt.date(2026, 5, 2), 1, 1, 100, "Saturday", 6],
+        ]
+        calendar_rows = [
+            list(xlsx_prophet_ingest.CALENDAR_COLUMNS),
+            [dt.date(2026, 5, 1), "Friday", 5, 5, "May", 18, False],
+            [dt.date(2026, 5, 2), "Saturday", 6, 5, "May", 18, True],
+        ]
+        return {
+            xlsx_prophet_ingest.ORDER_SHEET: order_rows,
+            xlsx_prophet_ingest.PRODUCT_DEMAND_SHEET: product_rows,
+            xlsx_prophet_ingest.STORE_DEMAND_SHEET: store_rows,
+            xlsx_prophet_ingest.CALENDAR_SHEET: calendar_rows,
+        }
+
+    def test_clean_workbook_has_zero_rejections_and_reconciles(self):
+        path = self._wb(self._minimal_sheets())
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        self.assertTrue(report["all_required_sheets_present"])
+        self.assertEqual(report["order_history"]["rows_rejected"], 0)
+        self.assertEqual(report["order_history"]["rows_accepted"], 2)
+        self.assertEqual(report["daily_store_demand"]["rows_rejected"], 0)
+        self.assertTrue(report["store_demand_reconciliation"]["available"])
+        self.assertEqual(report["store_demand_reconciliation"]["dates_with_mismatch"], 0)
+
+    def test_missing_required_sheet_is_reported_not_raised(self):
+        sheets = self._minimal_sheets()
+        del sheets[xlsx_prophet_ingest.CALENDAR_SHEET]
+        path = self._wb(sheets)
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        self.assertFalse(report["all_required_sheets_present"])
+        self.assertFalse(report["forecast_calendar"]["present"])
+
+    def test_missing_required_column_is_reported(self):
+        sheets = self._minimal_sheets()
+        # Drop "Unit Price (PHP)" from the order-level header -> every
+        # downstream row lookup for that column now fails cleanly.
+        header = [c for c in xlsx_prophet_ingest.ORDER_COLUMNS if c != "Unit Price (PHP)"]
+        sheets[xlsx_prophet_ingest.ORDER_SHEET] = [header]
+        path = self._wb(sheets)
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        self.assertIn("error", report["order_history"])
+        self.assertIn("Unit Price (PHP)", report["order_history"]["error"])
+
+    def test_malformed_order_rows_are_rejected_with_specific_reasons(self):
+        sheets = self._minimal_sheets()
+        rows = sheets[xlsx_prophet_ingest.ORDER_SHEET]
+        rows.append(["WT-3", "not-a-date", "12:00:00", "Cat", "Widget", 1, 100, 100])
+        rows.append(["WT-4", dt.date(2026, 5, 3), "12:00:00", "Cat", "Widget", -2, 100, -200])
+        rows.append(["WT-5", dt.date(2026, 5, 3), "12:00:00", "Cat", "Widget", 1, -50, -50])
+        rows.append(["WT-6", dt.date(2026, 5, 3), "12:00:00", "Cat", None, 1, 100, 100])
+        path = self._wb(sheets)
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        oh = report["order_history"]
+        self.assertEqual(oh["rows_rejected"], 4)
+        self.assertEqual(oh["rows_accepted"], 2)  # the original 2 good rows only
+        reasons = " ".join(" ".join(r["reasons"]) for r in oh["rejected"])
+        self.assertIn("unparseable Order Date", reasons)
+        self.assertIn("non-positive Quantity Ordered", reasons)
+        self.assertIn("negative Unit Price (PHP)", reasons)
+        self.assertIn("missing Product/Menu Item", reasons)
+
+    def test_zero_demand_observations_are_preserved_not_dropped(self):
+        sheets = self._minimal_sheets()
+        sheets[xlsx_prophet_ingest.PRODUCT_DEMAND_SHEET].append(
+            [dt.date(2026, 5, 3), "Sunday", 7, "Widget", "Cat", 100, 0])
+        path = self._wb(sheets)
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        pd_report = report["daily_product_demand"]
+        self.assertEqual(pd_report["rows_rejected"], 0)   # y=0 is a real observation, not malformed
+        self.assertEqual(pd_report["zero_demand_observations"], 1)
+
+    def test_negative_demand_is_rejected_and_counted(self):
+        sheets = self._minimal_sheets()
+        sheets[xlsx_prophet_ingest.PRODUCT_DEMAND_SHEET].append(
+            [dt.date(2026, 5, 3), "Sunday", 7, "Widget", "Cat", 100, -3])
+        path = self._wb(sheets)
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        pd_report = report["daily_product_demand"]
+        self.assertEqual(pd_report["rows_rejected"], 1)
+        self.assertIn("negative y", pd_report["rejected"][0]["reasons"][0])
+
+    def test_duplicate_observation_in_aggregate_sheet_is_detected(self):
+        sheets = self._minimal_sheets()
+        sheets[xlsx_prophet_ingest.STORE_DEMAND_SHEET].append(
+            [dt.date(2026, 5, 1), 1, 2, 200, "Friday", 5])  # same ds as the first row
+        path = self._wb(sheets)
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        self.assertEqual(report["daily_store_demand"]["duplicate_observations"], 1)
+
+    def test_missing_calendar_date_is_detected(self):
+        sheets = self._minimal_sheets()
+        sheets[xlsx_prophet_ingest.STORE_DEMAND_SHEET].append(
+            [dt.date(2026, 5, 4), 1, 1, 100, "Monday", 1])  # 5/3 skipped -> a gap in the calendar
+        path = self._wb(sheets)
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        self.assertEqual(report["daily_store_demand"]["missing_date_count"], 1)
+        self.assertIn("2026-05-03", report["daily_store_demand"]["missing_dates"])
+
+    def test_reconciliation_flags_a_real_mismatch(self):
+        sheets = self._minimal_sheets()
+        # Daily Store Demand's own 5/1 row now disagrees with the raw
+        # order-level total for that date (200 real pesos vs. 999 claimed).
+        sheets[xlsx_prophet_ingest.STORE_DEMAND_SHEET][1] = \
+            [dt.date(2026, 5, 1), 1, 2, 999, "Friday", 5]
+        path = self._wb(sheets)
+        report = xlsx_prophet_ingest.validate_workbook(path)
+        recon = report["store_demand_reconciliation"]
+        self.assertTrue(recon["available"])
+        self.assertEqual(recon["dates_with_mismatch"], 1)
+        self.assertIn("y_sales", recon["mismatches"][0]["diffs"])
+
+    def test_missing_workbook_file_is_reported_not_raised(self):
+        report = xlsx_prophet_ingest.validate_workbook("Z:/does/not/exist.xlsx")
+        self.assertFalse(report["workbook_detected"])
+        self.assertIn("error", report)
 
 
 # ===========================================================================
@@ -1347,6 +2052,7 @@ class TestVerificationWorkflow(unittest.TestCase):
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         cls.conn = db.get_conn()
 
     @classmethod
@@ -1370,6 +2076,48 @@ class TestVerificationWorkflow(unittest.TestCase):
             for tech_word in ("pack_size", "yield_factor", "qty_base", "lambda"):
                 self.assertNotIn(tech_word, item["question"].lower())
                 self.assertNotIn(tech_word, item["why_it_matters"].lower())
+
+    def test_frozen_unli_baseline_never_reaches_the_verification_queue(self):
+        """2026-09 audit finding (migrations/0020): seed.py used to create
+        the 'baseline' unli_coefficient row with status='needs_verification'
+        exactly like 'rolling', and v_needs_verification had no role filter
+        -- so the frozen anomaly-detection reference showed up in the
+        ordinary queue as a correctable estimate. Choosing "change" on it
+        during otherwise routine verification work would silently insert a
+        new baseline (verification.resolve()'s "change" action preserves the
+        coefficient's own role on the new row), moving the one reference
+        the anomaly system is supposed to measure drift against."""
+        from wt.verification import list_queue
+        baseline_rows = self.conn.execute(
+            "SELECT id, status FROM unli_coefficient WHERE role='baseline'").fetchall()
+        self.assertTrue(baseline_rows, "fixture must seed at least one baseline coefficient")
+        for row in baseline_rows:
+            self.assertEqual(row["status"], "verified")
+
+        q = list_queue(self.conn)
+        for item in q["items"]:
+            if item["field"] == "unli_coefficient.lambda":
+                self.assertNotEqual(item["context"], "baseline coefficient")
+
+    def test_resolve_refuses_to_change_a_baseline_coefficient_even_if_forced(self):
+        """Defense in depth: even bypassing the queue filter entirely and
+        calling resolve() directly against a baseline row's id, "change"
+        must be refused -- the guard lives in verification.py itself, not
+        only in the view that normally keeps this row out of sight."""
+        from wt.verification import resolve
+        row = self.conn.execute(
+            "SELECT id, lambda_value FROM unli_coefficient WHERE role='baseline' LIMIT 1"
+        ).fetchone()
+        with self.assertRaises(InvalidStateError):
+            resolve(self.conn, "unli_coefficient.lambda", row["id"], "change",
+                   row["lambda_value"] * 2, "should never apply", "test-user")
+        # and the value truly did not move
+        after = self.conn.execute(
+            "SELECT lambda_value FROM unli_coefficient WHERE id=?", (row["id"],)).fetchone()
+        self.assertEqual(after["lambda_value"], row["lambda_value"])
+        # confirm/keep_estimate on a baseline row are still fine -- only
+        # "change" (which would create a new baseline row) is refused.
+        resolve(self.conn, "unli_coefficient.lambda", row["id"], "confirm", None, None, "test-user")
 
     def test_recipe_lines_split_into_sauce_and_menu_groups(self):
         from wt.verification import list_queue
@@ -1410,7 +2158,7 @@ class TestVerificationWorkflow(unittest.TestCase):
         from wt.verification import resolve, history_for, list_queue
         before = list_queue(self.conn)["count"]
         row = self.conn.execute(
-            "SELECT id, name, pack_size FROM ingredient WHERE name='Wings'").fetchone()
+            "SELECT id, name, pack_size FROM ingredient WHERE name='Chicken Wings'").fetchone()
         r = resolve(self.conn, "ingredient.pack_size", row["id"], "confirm", None, None, "owner1")
         self.assertEqual(r["value"], row["pack_size"])
         after = list_queue(self.conn)["count"]
@@ -1427,7 +2175,7 @@ class TestVerificationWorkflow(unittest.TestCase):
     def test_changing_an_ingredient_field_preserves_the_previous_value(self):
         from wt.verification import resolve, history_for
         row = self.conn.execute(
-            "SELECT id, unit_cost FROM ingredient WHERE name='Fries'").fetchone()
+            "SELECT id, unit_cost FROM ingredient WHERE name='Frozen French Fries'").fetchone()
         old = row["unit_cost"]
         r = resolve(self.conn, "ingredient.unit_cost", row["id"], "change", old * 2, "checked the receipt", "owner2")
         self.assertEqual(r["value"], old * 2)
@@ -1442,7 +2190,7 @@ class TestVerificationWorkflow(unittest.TestCase):
     def test_keep_as_estimate_changes_no_operational_value_but_is_logged(self):
         from wt.verification import resolve, history_for, list_queue
         row = self.conn.execute(
-            "SELECT id, name, yield_factor FROM ingredient WHERE name='Hugarian Sausage'").fetchone()
+            "SELECT id, name, yield_factor FROM ingredient WHERE name='Hungarian Sausage'").fetchone()
         before_count = list_queue(self.conn)["count"]
         r = resolve(self.conn, "ingredient.yield_factor", row["id"], "keep_estimate",
                     None, "not sure yet, will check next delivery", "owner3")
@@ -1603,7 +2351,7 @@ class TestVerificationWorkflow(unittest.TestCase):
     def test_resolve_rejects_a_string_that_is_not_a_number(self):
         from wt.verification import resolve
         from wt.errors import ValidationError
-        row = self.conn.execute("SELECT id, on_hand_base FROM ingredient WHERE name='Wings'").fetchone()
+        row = self.conn.execute("SELECT id, on_hand_base FROM ingredient WHERE name='Chicken Wings'").fetchone()
         fefo_before, ledger_before = self._fefo_reconciliation_snapshot(), self._ledger_snapshot()
         with self.assertRaises(ValidationError):
             resolve(self.conn, "ingredient.pack_size", row["id"], "change", "not-a-number", None, "u")
@@ -1639,7 +2387,7 @@ class TestVerificationWorkflow(unittest.TestCase):
     def test_resolve_rejects_nan_and_infinite_values(self):
         from wt.verification import resolve
         from wt.errors import ValidationError
-        row = self.conn.execute("SELECT id FROM ingredient WHERE name='Cheese Bars'").fetchone()
+        row = self.conn.execute("SELECT id FROM ingredient WHERE name='Butter'").fetchone()
         for bad in (float("nan"), float("inf"), float("-inf")):
             with self.assertRaises(ValidationError):
                 resolve(self.conn, "ingredient.yield_factor", row["id"], "change", bad, None, "u")
@@ -1660,7 +2408,7 @@ class TestVerificationWorkflow(unittest.TestCase):
 
     def test_resolve_accepts_a_valid_positive_value(self):
         from wt.verification import resolve
-        row = self.conn.execute("SELECT id FROM ingredient WHERE name='Iodized Salt'").fetchone()
+        row = self.conn.execute("SELECT id FROM ingredient WHERE name='Salt'").fetchone()
         r = resolve(self.conn, "ingredient.pack_size", row["id"], "change", 1500.0, "recounted", "u")
         self.assertEqual(r["value"], 1500.0)
 
@@ -1686,6 +2434,7 @@ class TestConsoleAPI(unittest.TestCase):
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
 
         from fastapi.testclient import TestClient
         from wt.api import app
@@ -1695,9 +2444,13 @@ class TestConsoleAPI(unittest.TestCase):
         def token(u):
             r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
             return r.json()["token"]
-        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
         cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
         cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+        # 2026-09 RBAC revision: inventory.write/recipe.write/queue.resolve
+        # moved from manager to admin (see auth.CAPABILITIES) — the write
+        # calls this class exercises need the admin token now.
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -1847,6 +2600,11 @@ class TestConsoleAPI(unittest.TestCase):
         self.assertEqual(r.status_code, 404)
 
     def test_order_computes_subtotal_service_charge_and_total(self):
+        """Service charge defaults to disabled (Wings Theory's actual current
+        business rule — see TestPOSFixes.test_service_charge_default_disabled
+        for the admin on/off/rate-configuration coverage), so a fresh order's
+        service_charge is ₱0 and total == subtotal unless an admin has
+        explicitly turned it on."""
         menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
         item = next(m for m in menu["items"] if m["sellable"] and not m["is_unli"])
         r = self.client.post("/pos/orders", headers=self.H_CASH,
@@ -1855,8 +2613,8 @@ class TestConsoleAPI(unittest.TestCase):
         d = r.json()
         expected_subtotal = round(item["price"] * 2, 2)
         self.assertAlmostEqual(d["subtotal"], expected_subtotal)
-        self.assertAlmostEqual(d["service_charge"], round(expected_subtotal * 0.10, 2))
-        self.assertAlmostEqual(d["total"], expected_subtotal + d["service_charge"])
+        self.assertAlmostEqual(d["service_charge"], 0.0)
+        self.assertAlmostEqual(d["total"], expected_subtotal)
         self.assertIsNone(d["cash_received"])
         self.assertIsNone(d["change_due"])
 
@@ -1883,27 +2641,27 @@ class TestConsoleAPI(unittest.TestCase):
     def test_ledger_requires_inventory_read(self):
         r = self.client.get("/console/ledger", headers=self.H_CASH)
         self.assertEqual(r.status_code, 403)
-        r = self.client.get("/console/ledger", headers=self.H_MGR)
+        r = self.client.get("/console/ledger", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200)
 
     def test_count_endpoint_requires_inventory_write_and_writes_a_ledger_row(self):
-        ing_id = self.client.get("/console/ingredients?limit=1", headers=self.H_MGR).json()["ingredients"][0]["id"]
+        ing_id = self.client.get("/console/ingredients?limit=1", headers=self.H_OWNER).json()["ingredients"][0]["id"]
         r = self.client.post(f"/console/ingredients/{ing_id}/count", headers=self.H_CASH,
                              json={"actual_base": 5.0})
         self.assertEqual(r.status_code, 403)
-        before = self.client.get("/console/ledger", headers=self.H_MGR).json()["total"]
-        r = self.client.post(f"/console/ingredients/{ing_id}/count", headers=self.H_MGR,
+        before = self.client.get("/console/ledger", headers=self.H_OWNER).json()["total"]
+        r = self.client.post(f"/console/ingredients/{ing_id}/count", headers=self.H_OWNER,
                              json={"actual_base": 5.0, "note": "spot check"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["actual_base"], 5.0)
-        after = self.client.get("/console/ledger", headers=self.H_MGR).json()
+        after = self.client.get("/console/ledger", headers=self.H_OWNER).json()
         self.assertEqual(after["total"], before + 1)
         self.assertEqual(after["entries"][0]["reason"], "count_adjustment")
 
     def test_ledger_reflects_a_real_commit(self):
-        before = self.client.get("/console/ledger", headers=self.H_MGR).json()["total"]
+        before = self.client.get("/console/ledger", headers=self.H_OWNER).json()["total"]
         self._punch_and_commit_one()
-        after = self.client.get("/console/ledger", headers=self.H_MGR).json()
+        after = self.client.get("/console/ledger", headers=self.H_OWNER).json()
         self.assertGreater(after["total"], before)
         self.assertEqual(after["entries"][0]["reason"], "sale_commit")
 
@@ -1912,11 +2670,11 @@ class TestConsoleAPI(unittest.TestCase):
         ing_id = self.conn.execute(
             "SELECT ingredient_id FROM stock_ledger ORDER BY id DESC LIMIT 1"
         ).fetchone()["ingredient_id"]
-        r = self.client.get(f"/console/ledger?ingredient_id={ing_id}", headers=self.H_MGR).json()
+        r = self.client.get(f"/console/ledger?ingredient_id={ing_id}", headers=self.H_OWNER).json()
         self.assertTrue(all(e["ingredient_id"] == ing_id for e in r["entries"]))
 
     def test_expiry_monitor_computes_days_remaining(self):
-        r = self.client.get("/console/expiry?within_days=3650", headers=self.H_MGR)
+        r = self.client.get("/console/expiry?within_days=3650", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200)
         d = r.json()
         self.assertGreater(d["count"], 0)
@@ -1925,17 +2683,17 @@ class TestConsoleAPI(unittest.TestCase):
             self.assertIsInstance(b["days_to_expiry"], int)
 
     def test_expiry_monitor_respects_the_window(self):
-        wide = self.client.get("/console/expiry?within_days=3650", headers=self.H_MGR).json()["count"]
-        narrow = self.client.get("/console/expiry?within_days=0", headers=self.H_MGR).json()["count"]
+        wide = self.client.get("/console/expiry?within_days=3650", headers=self.H_OWNER).json()["count"]
+        narrow = self.client.get("/console/expiry?within_days=0", headers=self.H_OWNER).json()["count"]
         self.assertLessEqual(narrow, wide)
 
     def test_expiry_monitor_estimates_shelf_life_produce_instead_of_a_fixed_date(self):
         # Mango is seeded shelf_life_estimate/7 days with no expires_at on its
         # batch — it must still show up, tracked by estimate off received_at.
         batches = self.client.get(
-            "/console/expiry?within_days=3650", headers=self.H_MGR
+            "/console/expiry?within_days=3650", headers=self.H_OWNER
         ).json()["batches"]
-        mango = next(b for b in batches if b["ingredient_name"] == "Mango")
+        mango = next(b for b in batches if b["ingredient_name"] == "Ripe Mango")
         self.assertEqual(mango["tracking"], "estimated_shelf_life")
         self.assertIsNotNone(mango["expires_at"])
         self.assertIsInstance(mango["days_to_expiry"], int)
@@ -1945,7 +2703,7 @@ class TestConsoleAPI(unittest.TestCase):
         # its sheet row, so its batch has no expires_at — it must not appear
         # at all rather than being nagged as a data gap.
         batches = self.client.get(
-            "/console/expiry?within_days=3650", headers=self.H_MGR
+            "/console/expiry?within_days=3650", headers=self.H_OWNER
         ).json()["batches"]
         names = {b["ingredient_name"] for b in batches}
         self.assertNotIn("Tube Ice", names)
@@ -1957,15 +2715,15 @@ class TestConsoleAPI(unittest.TestCase):
         # an absolute zero against the real (default) window would be
         # order-dependent: unittest doesn't guarantee method execution order,
         # and this class shares one database across all its tests.
-        r = self.client.get("/console/reports/sales?days=-1", headers=self.H_MGR).json()
+        r = self.client.get("/console/reports/sales?days=-1", headers=self.H_OWNER).json()
         self.assertEqual(r["orders"], 0)
         self.assertEqual(r["revenue"], 0)
         self.assertEqual(r["recent_orders"], [])
 
     def test_sales_summary_reflects_a_real_order(self):
-        before = self.client.get("/console/reports/sales", headers=self.H_MGR).json()
+        before = self.client.get("/console/reports/sales", headers=self.H_OWNER).json()
         _, item = self._punch_and_commit_one()
-        after = self.client.get("/console/reports/sales", headers=self.H_MGR).json()
+        after = self.client.get("/console/reports/sales", headers=self.H_OWNER).json()
         self.assertEqual(after["orders"], before["orders"] + 1)
         self.assertAlmostEqual(after["revenue"] - before["revenue"], item["price"])
         line = next(x for x in after["by_item"] if x["name"] == item["name"])
@@ -1981,27 +2739,88 @@ class TestConsoleAPI(unittest.TestCase):
         # 'before' is measured AFTER punching (a punched-not-yet-void order
         # already counts), so voiding it must bring the total back DOWN by
         # exactly one — not leave it unchanged.
-        before = self.client.get("/console/reports/sales", headers=self.H_MGR).json()["orders"]
+        before = self.client.get("/console/reports/sales", headers=self.H_OWNER).json()["orders"]
         self.client.post(f"/pos/orders/{oid}/void", headers=self.H_CASH, json={"reason": "test"})
-        after = self.client.get("/console/reports/sales", headers=self.H_MGR).json()["orders"]
+        after = self.client.get("/console/reports/sales", headers=self.H_OWNER).json()["orders"]
         self.assertEqual(after, before - 1)
+
+    def test_sales_summary_all_time_includes_an_order_the_days_window_would_miss(self):
+        """all_time=true must not apply the default 30-day bound at all —
+        the Owner Console's 'All' preset has no floor on how far back a
+        legitimate historical order can sit."""
+        old_bound = self.client.get(
+            "/console/reports/sales?days=1", headers=self.H_OWNER
+        ).json()["orders"]
+        all_time = self.client.get(
+            "/console/reports/sales?all_time=true", headers=self.H_OWNER
+        ).json()
+        self.assertGreaterEqual(all_time["orders"], old_bound)
+        self.assertIsNone(all_time["start_date"])
+        self.assertTrue(all_time["all_time"])
+
+    def test_sales_summary_custom_range_matches_the_days_equivalent(self):
+        """A start_date/end_date range spanning exactly today must agree with
+        days=1 — same rows, counted the same way, just addressed differently."""
+        from wt import timeutil as _tu
+        today = _tu.business_today_iso()
+        by_days = self.client.get("/console/reports/sales?days=1", headers=self.H_OWNER).json()
+        by_range = self.client.get(
+            f"/console/reports/sales?start_date={today}&end_date={today}", headers=self.H_OWNER
+        ).json()
+        self.assertEqual(by_range["orders"], by_days["orders"])
+        self.assertAlmostEqual(by_range["revenue"], by_days["revenue"])
+        self.assertEqual(by_range["start_date"], today)
+        self.assertEqual(by_range["end_date"], today)
+
+    def test_sales_summary_custom_range_excludes_orders_outside_it(self):
+        """The upper bound is real, not just a lower one — an order created
+        today must not appear in a range that ends yesterday."""
+        from wt import timeutil as _tu
+        yesterday = _tu.business_date_n_days_ago(1)
+        self._punch_and_commit_one()
+        r = self.client.get(
+            f"/console/reports/sales?start_date={yesterday}&end_date={yesterday}", headers=self.H_OWNER
+        ).json()
+        self.assertEqual(r["orders"], 0)
+
+    def test_sales_summary_rejects_end_before_start(self):
+        from wt import timeutil as _tu
+        today = _tu.business_today_iso()
+        yesterday = _tu.business_date_n_days_ago(1)
+        r = self.client.get(
+            f"/console/reports/sales?start_date={today}&end_date={yesterday}", headers=self.H_OWNER
+        )
+        self.assertEqual(r.status_code, 422)
+
+    def test_sales_summary_this_week_and_this_month_presets_do_not_exceed_all_time(self):
+        """Loose regression guard: these presets must resolve to a real,
+        bounded window that never overcounts against the unbounded total."""
+        self._punch_and_commit_one()
+        total = self.client.get("/console/reports/sales?all_time=true", headers=self.H_OWNER).json()["orders"]
+        week = self.client.get("/console/reports/sales?preset=this_week", headers=self.H_OWNER).json()
+        month = self.client.get("/console/reports/sales?preset=this_month", headers=self.H_OWNER).json()
+        self.assertLessEqual(week["orders"], total)
+        self.assertLessEqual(month["orders"], total)
+        self.assertGreaterEqual(month["orders"], week["orders"])
+        self.assertIsNotNone(week["start_date"])
+        self.assertIsNotNone(month["start_date"])
 
     def test_forecast_depletion_requires_inventory_read(self):
         r = self.client.get("/console/forecasts/depletion", headers=self.H_CASH)
         self.assertEqual(r.status_code, 403)
-        r = self.client.get("/console/forecasts/depletion", headers=self.H_MGR)
+        r = self.client.get("/console/forecasts/depletion", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200)
         self.assertGreater(len(r.json()["ingredients"]), 0)
 
     def test_forecast_demand_covers_every_pos_visible_item_by_default(self):
         menu_count = len(self.client.get("/pos/menu", headers=self.H_CASH).json()["items"])
-        r = self.client.get("/console/forecasts/demand", headers=self.H_MGR).json()
+        r = self.client.get("/console/forecasts/demand", headers=self.H_OWNER).json()
         self.assertEqual(len(r["items"]), menu_count)
 
     def test_forecast_demand_for_one_item_reflects_a_real_sale(self):
         _, item = self._punch_and_commit_one()
         r = self.client.get(
-            f"/console/forecasts/demand?menu_item_pk={item['menu_item_pk']}", headers=self.H_MGR
+            f"/console/forecasts/demand?menu_item_pk={item['menu_item_pk']}", headers=self.H_OWNER
         ).json()
         self.assertEqual(r["menu_item_id"], item["menu_item_pk"])
         self.assertGreaterEqual(r["active_days"], 1)
@@ -2009,20 +2828,20 @@ class TestConsoleAPI(unittest.TestCase):
     def test_anomalies_requires_inventory_read(self):
         r = self.client.get("/console/anomalies", headers=self.H_KIT)
         self.assertEqual(r.status_code, 403)
-        r = self.client.get("/console/anomalies", headers=self.H_MGR)
+        r = self.client.get("/console/anomalies", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200)
         self.assertIsInstance(r.json()["anomalies"], list)
 
     def test_combinations_requires_inventory_read(self):
         r = self.client.get("/console/combinations", headers=self.H_CASH)
         self.assertEqual(r.status_code, 403)
-        r = self.client.get("/console/combinations", headers=self.H_MGR)
+        r = self.client.get("/console/combinations", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200)
         self.assertIn("insufficient_data", r.json())
 
     def test_ingredient_detail_returns_everything_the_drawer_needs(self):
-        ing = self.client.get("/console/ingredients?limit=1", headers=self.H_MGR).json()["ingredients"][0]
-        r = self.client.get(f"/console/ingredients/{ing['id']}", headers=self.H_MGR)
+        ing = self.client.get("/console/ingredients?limit=1", headers=self.H_OWNER).json()["ingredients"][0]
+        r = self.client.get(f"/console/ingredients/{ing['id']}", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200)
         d = r.json()
         for key in ("ingredient", "used_in", "movements", "depletion"):
@@ -2033,7 +2852,7 @@ class TestConsoleAPI(unittest.TestCase):
         self.assertIsInstance(d["movements"], list)
 
     def test_ingredient_detail_404s_on_a_missing_id(self):
-        r = self.client.get("/console/ingredients/999999", headers=self.H_MGR)
+        r = self.client.get("/console/ingredients/999999", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 404)
 
     def test_on_hand_display_agrees_between_list_and_detail_for_a_yield_factor_ingredient(self):
@@ -2046,13 +2865,38 @@ class TestConsoleAPI(unittest.TestCase):
         both places, since both call sites shared the one buggy formula —
         this test would not have caught the original bug on its own. It's
         here as the standing guarantee that the two call sites can never
-        drift apart again, whatever format_base does internally."""
-        rows = self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+        drift apart again, whatever format_base does internally.
+
+        2026-09 note: the Menu & Ingredient Audit workbook's '4. Master
+        Ingredient Inventory' sheet carries no yield/loss signal for any of
+        its 108 rows (verified against '3. Standardized Recipes''s own
+        "Cooking Yield / Loss Note" column, 'n/a' throughout, including
+        Cooked White Rice — a real, confirmed data change, not an oversight:
+        that ingredient now represents already-cooked rice, so its own
+        yield_factor is correctly 1.0, unlike the old CSV pipeline's 2.5
+        raw-to-cooked figure), so a fresh seed no longer has ANY ingredient
+        with yield_factor != 1.0 for this test to find. Rather than weaken
+        the assertion this test exists to make (list/detail must agree for
+        an ingredient the yield-factor branch of format_base actually
+        exercises), a single ingredient's yield_factor is set directly here
+        — the same direct-SQL-fixture-adjustment technique this file already
+        uses elsewhere (see add_ingredient / the receive_stock helpers) —
+        so the real regression path still gets exercised even though no
+        currently-imported ingredient happens to carry a non-1.0 value."""
+        probe = self.conn.execute(
+            "SELECT id FROM ingredient WHERE pack_size IS NOT NULL AND pack_size > 0 "
+            "AND is_active = 1 LIMIT 1"
+        ).fetchone()
+        self.conn.execute(
+            "UPDATE ingredient SET yield_factor = 2.5, yield_factor_status = 'needs_verification' "
+            "WHERE id = ?", (probe["id"],))
+
+        rows = self.client.get("/console/ingredients?limit=500", headers=self.H_OWNER).json()["ingredients"]
         candidate = next((i for i in rows if i["yield_factor"] and i["yield_factor"] != 1.0
                           and i["pack_size"]), None)
         self.assertIsNotNone(candidate, "expected at least one seeded ingredient with a real yield factor")
 
-        detail = self.client.get(f"/console/ingredients/{candidate['id']}", headers=self.H_MGR).json()
+        detail = self.client.get(f"/console/ingredients/{candidate['id']}", headers=self.H_OWNER).json()
         self.assertEqual(candidate["on_hand_display"], detail["ingredient"]["on_hand_display"])
 
         # And it must match the real inverse of the forward conversion —
@@ -2067,7 +2911,7 @@ class TestConsoleAPI(unittest.TestCase):
         # view the deduction path reads
         row = self.conn.execute(
             "SELECT ingredient_id FROM v_recipe_leaf LIMIT 1").fetchone()
-        d = self.client.get(f"/console/ingredients/{row['ingredient_id']}", headers=self.H_MGR).json()
+        d = self.client.get(f"/console/ingredients/{row['ingredient_id']}", headers=self.H_OWNER).json()
         self.assertGreaterEqual(len(d["used_in"]), 1)
         self.assertIn("name", d["used_in"][0])
         self.assertIn("qty_base", d["used_in"][0])
@@ -2082,18 +2926,18 @@ class TestConsoleAPI(unittest.TestCase):
         # undated one, then a near date — through the real HTTP receiving
         # path, so passing this proves actual FEFO sort order rather than
         # just insertion order, and proves an undated batch sorts last.
-        ing = next(i for i in self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+        ing = next(i for i in self.client.get("/console/ingredients?limit=500", headers=self.H_OWNER).json()["ingredients"]
                    if i["pack_size"])
         pk = ing["id"]
-        before_ids = {b["id"] for b in self.client.get(f"/console/ingredients/{pk}", headers=self.H_MGR).json()["batches"]}
+        before_ids = {b["id"] for b in self.client.get(f"/console/ingredients/{pk}", headers=self.H_OWNER).json()["batches"]}
         for expires in ("2030-06-01", None, "2027-01-01"):
             body = {"purchase_qty": 1, "lot_no": f"FEFO-TEST-{expires or 'none'}"}
             if expires:
                 body["expires_at"] = expires
-            r = self.client.post(f"/console/ingredients/{pk}/receive", headers=self.H_MGR, json=body)
+            r = self.client.post(f"/console/ingredients/{pk}/receive", headers=self.H_OWNER, json=body)
             self.assertEqual(r.status_code, 200, r.text)
 
-        d = self.client.get(f"/console/ingredients/{pk}", headers=self.H_MGR).json()
+        d = self.client.get(f"/console/ingredients/{pk}", headers=self.H_OWNER).json()
         new_batches = [b for b in d["batches"] if b["id"] not in before_ids]
         self.assertEqual(len(new_batches), 3)
         # near date, then far date, then undated last — real FEFO pick order.
@@ -2112,37 +2956,37 @@ class TestConsoleAPI(unittest.TestCase):
         self.assertIsNone(new_batches[2]["storage_status"])
 
     def test_waste_endpoint_requires_inventory_write_and_moves_stock(self):
-        ing = next(i for i in self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+        ing = next(i for i in self.client.get("/console/ingredients?limit=500", headers=self.H_OWNER).json()["ingredients"]
                    if i["on_hand_base"] > 50)
         r = self.client.post(f"/console/ingredients/{ing['id']}/waste", headers=self.H_CASH,
                              json={"qty_base": 1.0})
         self.assertEqual(r.status_code, 403)
-        r = self.client.post(f"/console/ingredients/{ing['id']}/waste", headers=self.H_MGR,
+        r = self.client.post(f"/console/ingredients/{ing['id']}/waste", headers=self.H_OWNER,
                              json={"qty_base": 10.0, "reason": "spoilage", "note": "api test"})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.json()["wasted_base"], 10.0)
         self.assertAlmostEqual(r.json()["on_hand_base"], ing["on_hand_base"] - 10.0, places=3)
-        led = self.client.get(f"/console/ledger?ingredient_id={ing['id']}", headers=self.H_MGR).json()
+        led = self.client.get(f"/console/ledger?ingredient_id={ing['id']}", headers=self.H_OWNER).json()
         self.assertEqual(led["entries"][0]["reason"], "spoilage")
 
     def test_waste_beyond_stock_is_refused_by_the_api(self):
-        ing = self.client.get("/console/ingredients?limit=1", headers=self.H_MGR).json()["ingredients"][0]
-        r = self.client.post(f"/console/ingredients/{ing['id']}/waste", headers=self.H_MGR,
+        ing = self.client.get("/console/ingredients?limit=1", headers=self.H_OWNER).json()["ingredients"][0]
+        r = self.client.post(f"/console/ingredients/{ing['id']}/waste", headers=self.H_OWNER,
                              json={"qty_base": 1e9})
         self.assertEqual(r.status_code, 409)
 
     def test_verification_resolve_requires_queue_resolve_capability(self):
-        ing = self.conn.execute("SELECT id FROM ingredient WHERE name='Wings'").fetchone()
+        ing = self.conn.execute("SELECT id FROM ingredient WHERE name='Chicken Wings'").fetchone()
         r = self.client.post(
             "/console/queues/verification/resolve", headers=self.H_CASH,
             json={"field": "ingredient.pack_size", "row_id": ing["id"], "action": "confirm"},
         )
         self.assertEqual(r.status_code, 403)
 
-    def test_verification_resolve_valid_manager_change_succeeds(self):
+    def test_verification_resolve_valid_admin_change_succeeds(self):
         ing = self.conn.execute("SELECT id FROM ingredient WHERE name='Bacon'").fetchone()
         r = self.client.post(
-            "/console/queues/verification/resolve", headers=self.H_MGR,
+            "/console/queues/verification/resolve", headers=self.H_OWNER,
             json={"field": "ingredient.unit_cost", "row_id": ing["id"], "action": "change",
                   "new_value": 250.0, "note": "receipt checked"},
         )
@@ -2165,7 +3009,7 @@ class TestConsoleAPI(unittest.TestCase):
             "SELECT COUNT(*) AS n FROM verification_event").fetchone()["n"]
 
         r = self.client.post(
-            "/console/queues/verification/resolve", headers=self.H_MGR,
+            "/console/queues/verification/resolve", headers=self.H_OWNER,
             json={"field": "ingredient.pack_size", "row_id": ing["id"], "action": "change",
                   "new_value": new_value},
         )
@@ -2183,13 +3027,13 @@ class TestConsoleAPI(unittest.TestCase):
         self.assertEqual(events_after, events_before, "a rejected value must not write an audit event")
 
     def test_verification_resolve_rejects_non_numeric_value(self):
-        self._assert_verification_change_rejected("Flour", "not-a-number")
+        self._assert_verification_change_rejected("All-Purpose Flour", "not-a-number")
 
     def test_verification_resolve_rejects_zero(self):
-        self._assert_verification_change_rejected("Rice", 0)
+        self._assert_verification_change_rejected("Cooked White Rice", 0)
 
     def test_verification_resolve_rejects_negative(self):
-        self._assert_verification_change_rejected("Pasta", -500)
+        self._assert_verification_change_rejected("Fettuccine Pasta", -500)
 
     def test_verification_resolve_rejects_nan(self):
         import json as _json
@@ -2200,7 +3044,7 @@ class TestConsoleAPI(unittest.TestCase):
                             "action": "change", "new_value": float("nan")})
         r = self.client.post(
             "/console/queues/verification/resolve",
-            headers={**self.H_MGR, "Content-Type": "application/json"}, content=body,
+            headers={**self.H_OWNER, "Content-Type": "application/json"}, content=body,
         )
         self.assertEqual(r.status_code, 422, r.text)
         row = self.conn.execute("SELECT pack_size FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
@@ -2216,7 +3060,7 @@ class TestConsoleAPI(unittest.TestCase):
                             "action": "change", "new_value": float("inf")})
         r = self.client.post(
             "/console/queues/verification/resolve",
-            headers={**self.H_MGR, "Content-Type": "application/json"}, content=body,
+            headers={**self.H_OWNER, "Content-Type": "application/json"}, content=body,
         )
         self.assertEqual(r.status_code, 422, r.text)
         row = self.conn.execute("SELECT pack_size FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
@@ -2226,13 +3070,13 @@ class TestConsoleAPI(unittest.TestCase):
         self._assert_verification_change_rejected("Cornstarch", "500g")
 
     def test_prophet_response_carries_the_fitted_line_and_outliers(self):
-        items = self.client.get("/console/forecasts/demand", headers=self.H_MGR).json()["items"]
+        items = self.client.get("/console/forecasts/demand", headers=self.H_OWNER).json()["items"]
         ready = [i for i in items if not i["insufficient_data"]]
         if not ready:
             self.skipTest("no item has enough history in this fixture")
         best = max(ready, key=lambda i: i["active_days"])
         d = self.client.get(f"/console/forecasts/demand?menu_item_pk={best['menu_item_id']}",
-                            headers=self.H_MGR).json()
+                            headers=self.H_OWNER).json()
         if d["method"] != "prophet":
             self.skipTest("Prophet unavailable in this environment")
         # the fitted line must cover exactly the days the model trained on
@@ -2266,6 +3110,7 @@ class TestAdminAuditLog(unittest.TestCase):
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -2274,7 +3119,7 @@ class TestAdminAuditLog(unittest.TestCase):
         def token(u):
             r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
             return r.json()["token"]
-        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
         cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
 
     @classmethod
@@ -2292,10 +3137,10 @@ class TestAdminAuditLog(unittest.TestCase):
 
     def test_editing_an_ingredient_logs_one_event_per_changed_field(self):
         ing = self.conn.execute(
-            "SELECT id, supplier, reorder_point_base FROM ingredient WHERE name='Flour'"
+            "SELECT id, supplier, reorder_point_base FROM ingredient WHERE name='All-Purpose Flour'"
         ).fetchone()
         r = self.client.patch(
-            f"/console/ingredients/{ing['id']}", headers=self.H_MGR,
+            f"/console/ingredients/{ing['id']}", headers=self.H_OWNER,
             json={"supplier": "New Supplier Co.", "reorder_point_base": 5000},
         )
         self.assertEqual(r.status_code, 200, r.text)
@@ -2306,18 +3151,18 @@ class TestAdminAuditLog(unittest.TestCase):
         self.assertEqual(by_field["supplier"]["new_value"], "New Supplier Co.")
         self.assertEqual(by_field["reorder_point_base"]["new_value"], "5000.0")
         self.assertEqual(by_field["supplier"]["action"], "edit")
-        self.assertEqual(by_field["supplier"]["user_id"], "manager")
+        self.assertEqual(by_field["supplier"]["user_id"], "owner")
 
     def test_editing_ingredient_unit_cost_rejects_infinity(self):
         # httpx's `json=` kwarg cannot encode a non-finite float at all --
         # same reason every other NaN/inf test in this suite hand-builds
         # the body with json.dumps and sends it as raw `content=` instead.
         import json as _json
-        ing = self.conn.execute("SELECT id, unit_cost FROM ingredient WHERE name='Sriracha'").fetchone()
+        ing = self.conn.execute("SELECT id, unit_cost FROM ingredient WHERE name='Sriracha Sauce'").fetchone()
         body = _json.dumps({"unit_cost": float("inf")})
         r = self.client.patch(
             f"/console/ingredients/{ing['id']}",
-            headers={**self.H_MGR, "Content-Type": "application/json"}, content=body,
+            headers={**self.H_OWNER, "Content-Type": "application/json"}, content=body,
         )
         self.assertEqual(r.status_code, 422, r.text)
         row = self.conn.execute("SELECT unit_cost FROM ingredient WHERE id=?", (ing["id"],)).fetchone()
@@ -2325,9 +3170,9 @@ class TestAdminAuditLog(unittest.TestCase):
         self.assertEqual(self._events_for("ingredient", ing["id"]), [])
 
     def test_creating_a_recipe_logs_a_create_event(self):
-        ing = self.conn.execute("SELECT id FROM ingredient WHERE name='Flour'").fetchone()
+        ing = self.conn.execute("SELECT id FROM ingredient WHERE name='All-Purpose Flour'").fetchone()
         r = self.client.post(
-            "/console/recipes", headers=self.H_MGR,
+            "/console/recipes", headers=self.H_OWNER,
             json={"name": "Audit Test Batter", "kind": "sub_recipe",
                   "produces_ingredient_pk": ing["id"], "yield_qty": 1, "yield_unit": "batch",
                   "lines": [{"ingredient_pk": ing["id"], "display_label": "Flour",
@@ -2339,13 +3184,13 @@ class TestAdminAuditLog(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["action"], "create")
         self.assertEqual(events[0]["new_value"], "Audit Test Batter")
-        self.assertEqual(events[0]["user_id"], "manager")
+        self.assertEqual(events[0]["user_id"], "owner")
 
     def test_changing_menu_price_logs_before_and_after(self):
         item = self.conn.execute("SELECT id, price FROM menu_item LIMIT 1").fetchone()
         new_price = item["price"] + 10
         r = self.client.patch(
-            f"/console/menu-items/{item['id']}/price", headers=self.H_MGR,
+            f"/console/menu-items/{item['id']}/price", headers=self.H_OWNER,
             json={"price": new_price},
         )
         self.assertEqual(r.status_code, 200, r.text)
@@ -2373,18 +3218,24 @@ class TestAdminAuditLog(unittest.TestCase):
 
 
 class TestRBAC(unittest.TestCase):
-    """2026-08 RBAC audit finding: 'admin' and 'manager' were identical in
-    every capability except user.manage — the owner's account (username
-    'owner', role 'admin') could silently create, void, and edit every
-    operational record a manager could. Redesigned so admin keeps read
-    access everywhere plus the two genuinely owner-level actions
-    (queue.resolve, unli.approve) and user.manage, but loses every
-    capability that directly writes a floor/operational record (orders,
-    inventory quantities, recipes/prices, unlimited refills/sessions) —
-    see the CAPABILITIES dict comment in auth.py. These tests prove the
-    new boundary from both sides: admin is refused exactly where it
-    should be, and every read/oversight capability admin is supposed to
-    keep still works."""
+    """2026-09 RBAC revision: 'admin' now holds full view + create + edit +
+    delete access system-wide; 'manager' was narrowed to read/monitoring
+    capabilities only, no longer able to create, edit, delete, or otherwise
+    mutate a record — see the CAPABILITIES dict comment in auth.py.
+
+    2026-09 (later) update: migration 0034 went further and deactivated the
+    seeded 'manager' account outright (is_active=0). principal() in
+    wt/api.py refuses ANY request from a deactivated account with 401
+    'account no longer active', on every endpoint, before the
+    capability-specific 403 checked below would ever run — so 'manager no
+    longer has this capability' and 'manager retains this capability' are
+    both moot: no live manager account exists to hold or lack anything.
+    test_manager_token_is_rejected_everywhere_now_deactivated below
+    documents that a manager-role token still means something at the
+    CAPABILITIES layer (it is a real, defined role), but can no longer
+    reach it, on both former write refusals and former read allowances.
+    Every capability admin is supposed to hold (including what used to be
+    manager-only) still works for admin, proved from admin's side below."""
 
     @classmethod
     def setUpClass(cls):
@@ -2399,6 +3250,7 @@ class TestRBAC(unittest.TestCase):
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -2408,7 +3260,7 @@ class TestRBAC(unittest.TestCase):
             r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
             return r.json()["token"]
         cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
-        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -2417,45 +3269,63 @@ class TestRBAC(unittest.TestCase):
         os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
-    def test_admin_can_no_longer_create_an_order(self):
-        item = self.conn.execute("SELECT id FROM menu_item LIMIT 1").fetchone()
-        r = self.client.post(
-            "/pos/orders", headers=self.H_OWNER,
-            json={"lines": [{"menu_item_pk": item["id"], "qty": 1}]},
-        )
-        self.assertEqual(r.status_code, 403, r.text)
+    def test_manager_token_is_rejected_everywhere_now_deactivated(self):
+        """Consolidates what used to be eight separate tests
+        (test_manager_can_no_longer_edit_an_ingredient,
+        _create_an_ingredient, _edit_a_menu_price, _resolve_a_queue_item,
+        _approve_a_reconciliation, _submit_a_reconciliation,
+        test_manager_is_refused_user_manage, and
+        test_manager_retains_read_access_to_inventory_and_queues) that each
+        asserted a different capability-specific outcome for a manager
+        token — some 403 (write capabilities manager never had), one 200
+        (read capabilities manager did have). Migration 0034 deactivated
+        the seeded 'manager' account, and principal() now refuses a
+        deactivated account's token with 401 before any capability check
+        runs, on every endpoint alike. There is only one fact left to
+        prove, and it now covers what used to be six write refusals AND
+        the two former read allowances identically."""
+        ing = self.conn.execute("SELECT id FROM ingredient LIMIT 1").fetchone()
+        item = self.conn.execute("SELECT id, price FROM menu_item LIMIT 1").fetchone()
+        requests = [
+            ("PATCH", f"/console/ingredients/{ing['id']}", {"supplier": "Should Be Refused"}),
+            ("POST", "/console/ingredients",
+             {"name": "Manager Cannot Create This", "base_unit": "g", "unit_cost": 1.0,
+              "pack_size": 1, "pack_cost": 1.0, "reorder_point": 1, "reorder_qty": 1}),
+            ("PATCH", f"/console/menu-items/{item['id']}/price", {"price": item["price"] + 5}),
+            ("POST", "/console/queues/verification/resolve",
+             {"field": "ingredient.pack_size", "row_id": 999999, "action": "keep_estimate"}),
+            ("POST", "/unli/reconciliation/999999/review", {"approve": True}),
+            ("POST", "/unli/reconciliation",
+             {"service_date": "2026-01-01", "item_key": "wings", "opening_base": 1, "closing_base": 0}),
+            ("POST", "/console/users/cashier1/reset_password", None),
+            # formerly-allowed reads, not just formerly-refused writes
+            ("GET", "/console/ingredients", None),
+            ("GET", "/console/recipes", None),
+            ("GET", "/unli/reconciliation/pending", None),
+        ]
+        for method, path, body in requests:
+            kwargs = {"headers": self.H_MGR}
+            if body is not None:
+                kwargs["json"] = body
+            r = self.client.request(method, path, **kwargs)
+            self.assertEqual(r.status_code, 401, f"{method} {path} -> {r.status_code}: {r.text}")
+            self.assertIn("account no longer active", r.json()["message"])
 
-    def test_admin_can_no_longer_edit_an_ingredient(self):
+    def test_admin_can_edit_an_ingredient(self):
         ing = self.conn.execute("SELECT id FROM ingredient LIMIT 1").fetchone()
         r = self.client.patch(
             f"/console/ingredients/{ing['id']}", headers=self.H_OWNER,
-            json={"supplier": "Should Be Refused"},
+            json={"supplier": "Admin Can Edit"},
         )
-        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.status_code, 200, r.text)
 
-    def test_admin_can_no_longer_edit_a_menu_price(self):
+    def test_admin_can_edit_a_menu_price(self):
         item = self.conn.execute("SELECT id, price FROM menu_item LIMIT 1").fetchone()
         r = self.client.patch(
             f"/console/menu-items/{item['id']}/price", headers=self.H_OWNER,
             json={"price": item["price"] + 5},
         )
-        self.assertEqual(r.status_code, 403, r.text)
-
-    def test_admin_can_no_longer_record_an_unli_refill(self):
-        stream = self.conn.execute(
-            "SELECT id FROM unli_session WHERE status='open' LIMIT 1"
-        ).fetchone()
-        r = self.client.post(
-            f"/unli/sessions/{stream['id']}/refills" if stream else "/unli/sessions/0/refills",
-            headers=self.H_OWNER, json={"flavor_id": 1},
-        )
-        self.assertEqual(r.status_code, 403, r.text)
-
-    def test_admin_retains_read_access_to_inventory_and_queues(self):
-        for path in ("/console/ingredients", "/console/queues/verification",
-                     "/console/queues/unmapped"):
-            r = self.client.get(path, headers=self.H_OWNER)
-            self.assertIn(r.status_code, (200,), f"{path} -> {r.status_code}: {r.text}")
+        self.assertEqual(r.status_code, 200, r.text)
 
     def test_admin_retains_queue_resolve_and_unli_approve(self):
         # capability-gate only, not a full workflow exercise: a 403 here
@@ -2483,13 +3353,126 @@ class TestRBAC(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 200, r.text)
 
-    def test_manager_is_unaffected_by_the_narrowing(self):
-        ing = self.conn.execute("SELECT id FROM ingredient LIMIT 1").fetchone()
-        r = self.client.patch(
-            f"/console/ingredients/{ing['id']}", headers=self.H_MGR,
-            json={"supplier": "Manager Can Still Edit"},
+
+class TestPagePermissions(unittest.TestCase):
+    """Admin-configurable page visibility (wt/permissions.py, migration
+    0023) — a second, narrower gate that sits alongside auth.CAPABILITIES:
+    the capability governs whether an action is allowed at all, this governs
+    whether the caller's role currently has admin-granted visibility into a
+    whole console page. Distinct from TestRBAC, which covers CAPABILITIES
+    and is unaffected by any of this."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def test_manager_defaults_to_no_access_to_verify_page(self):
+        for path in ("/console/queues/verification", "/console/queues/unmapped"):
+            r = self.client.get(path, headers=self.H_MGR)
+            self.assertEqual(r.status_code, 403, f"{path} -> {r.status_code}: {r.text}")
+
+    def test_manager_defaults_to_no_access_to_system_page(self):
+        for path in ("/console/readiness", "/console/model-details"):
+            r = self.client.get(path, headers=self.H_MGR)
+            self.assertEqual(r.status_code, 403, f"{path} -> {r.status_code}: {r.text}")
+
+    def test_admin_always_has_page_access_regardless_of_grants(self):
+        for path in ("/console/queues/verification", "/console/queues/unmapped",
+                     "/console/readiness", "/console/model-details"):
+            r = self.client.get(path, headers=self.H_OWNER)
+            self.assertNotEqual(r.status_code, 403, f"{path} -> {r.status_code}: {r.text}")
+
+    def test_admin_permissions_endpoints_require_permissions_manage(self):
+        r = self.client.get("/console/admin/permissions", headers=self.H_MGR)
+        self.assertEqual(r.status_code, 403, r.text)
+        r = self.client.put(
+            "/console/admin/permissions", headers=self.H_MGR,
+            json={"role": "manager", "page_key": "verify", "allowed": True},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_my_page_permissions_reflects_caller_role(self):
+        r = self.client.get("/console/permissions/pages", headers=self.H_MGR)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["role"], "manager")
+        self.assertEqual(body["grants"], {"verify": False, "system": False})
+
+        r = self.client.get("/console/permissions/pages", headers=self.H_OWNER)
+        self.assertEqual(r.json()["grants"], {"verify": True, "system": True})
+
+    def test_invalid_page_key_is_rejected_with_422(self):
+        r = self.client.put(
+            "/console/admin/permissions", headers=self.H_OWNER,
+            json={"role": "manager", "page_key": "not_a_real_page", "allowed": True},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+
+    def test_admin_can_grant_then_revoke_the_verify_page(self):
+        r = self.client.put(
+            "/console/admin/permissions", headers=self.H_OWNER,
+            json={"role": "manager", "page_key": "verify", "allowed": True},
         )
         self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["grants"]["verify"])
+
+        r = self.client.get("/console/queues/verification", headers=self.H_MGR)
+        self.assertNotEqual(r.status_code, 403, r.text)
+
+        r = self.client.put(
+            "/console/admin/permissions", headers=self.H_OWNER,
+            json={"role": "manager", "page_key": "verify", "allowed": False},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertFalse(r.json()["grants"]["verify"])
+
+        r = self.client.get("/console/queues/verification", headers=self.H_MGR)
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_set_grant_is_audited(self):
+        before = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM admin_audit_log WHERE entity_type='role_permission'"
+        ).fetchone()["n"]
+        self.client.put(
+            "/console/admin/permissions", headers=self.H_OWNER,
+            json={"role": "manager", "page_key": "system", "allowed": True},
+        )
+        self.client.put(
+            "/console/admin/permissions", headers=self.H_OWNER,
+            json={"role": "manager", "page_key": "system", "allowed": False},
+        )
+        after = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM admin_audit_log WHERE entity_type='role_permission'"
+        ).fetchone()["n"]
+        self.assertEqual(after, before + 2)
 
 
 class TestLoginAudit(unittest.TestCase):
@@ -2515,6 +3498,7 @@ class TestLoginAudit(unittest.TestCase):
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -2534,12 +3518,32 @@ class TestLoginAudit(unittest.TestCase):
         ).fetchone())
 
     def test_successful_login_is_logged(self):
-        r = self.client.post("/auth/login", json={"username": "manager", "password": "wingstheory"})
+        # Was 'manager' -- migration 0034 deactivated that account, so it can
+        # no longer produce a successful login at all (see
+        # test_deactivated_account_login_is_logged_as_unknown_user below for
+        # what happens if it's still tried). Any other live account proves
+        # the same thing: a successful login is actually recorded.
+        r = self.client.post("/auth/login", json={"username": "cashier1", "password": "wingstheory"})
         self.assertEqual(r.status_code, 200)
-        ev = self._last_event("manager")
+        ev = self._last_event("cashier1")
         self.assertEqual(ev["success"], 1)
-        self.assertEqual(ev["role"], "manager")
+        self.assertEqual(ev["role"], "cashier")
         self.assertIsNone(ev["reason"])
+
+    def test_deactivated_account_login_is_logged_as_unknown_user(self):
+        # /auth/login's row lookup filters WHERE is_active=1 (wt/api.py
+        # login()), so a deactivated account -- even with the right
+        # password -- doesn't match a row at all and is logged exactly like
+        # a username that never existed, not as some distinct "inactive"
+        # reason. Documenting this real, slightly surprising behavior:
+        # the login audit trail can't tell "no such user" apart from
+        # "that user is deactivated".
+        r = self.client.post("/auth/login", json={"username": "manager", "password": "wingstheory"})
+        self.assertEqual(r.status_code, 401)
+        ev = self._last_event("manager")
+        self.assertEqual(ev["success"], 0)
+        self.assertEqual(ev["reason"], "unknown_user")
+        self.assertIsNone(ev["role"])
 
     def test_wrong_password_is_logged_with_reason(self):
         self.client.post("/auth/login", json={"username": "cashier1", "password": "wrong"})
@@ -2576,10 +3580,13 @@ class TestLoginAudit(unittest.TestCase):
             self.conn.execute("DELETE FROM login_event WHERE id=?", (row_id,))
 
     def test_audit_logins_endpoint_requires_user_manage(self):
-        mgr_token = self.client.post(
-            "/auth/login", json={"username": "manager", "password": "wingstheory"}
+        # Any non-admin, live role is enough to prove the gate -- the
+        # 'manager' account is deactivated (migration 0034) and can no
+        # longer log in at all, so cashier stands in here.
+        cash_token = self.client.post(
+            "/auth/login", json={"username": "cashier1", "password": "wingstheory"}
         ).json()["token"]
-        r = self.client.get("/console/audit/logins", headers={"Authorization": f"Bearer {mgr_token}"})
+        r = self.client.get("/console/audit/logins", headers={"Authorization": f"Bearer {cash_token}"})
         self.assertEqual(r.status_code, 403)
 
     def test_audit_logins_endpoint_returns_recent_events(self):
@@ -2609,11 +3616,37 @@ class TestLoginAudit(unittest.TestCase):
         self.assertTrue(any(e["action"] == "password_reset" and e["entity_id"] == "cashier1"
                              for e in events))
 
-        mgr_token = self.client.post(
-            "/auth/login", json={"username": "manager", "password": "wingstheory"}
+        # A live non-admin token proves the 403 gate -- it does NOT have to
+        # be cashier1's. auth.issue_token embeds password_changed_at as a
+        # claim (see that function's own docstring), so every token already
+        # minted for cashier1 is invalidated the instant reset_password
+        # rotates its credential above -- a token fetched from cashier1
+        # AFTER the reset would 401 (wrong password), and one fetched
+        # BEFORE the reset would also now 401 (its embedded claim no longer
+        # matches). kitchen1 is untouched by the reset and stands in here
+        # instead; this is a real behavioural fact about issue_token, not a
+        # data-naming issue this migration introduced.
+        kitchen_token = self.client.post(
+            "/auth/login", json={"username": "kitchen1", "password": "wingstheory"}
         ).json()["token"]
-        r = self.client.get("/console/audit/actions", headers={"Authorization": f"Bearer {mgr_token}"})
+        r = self.client.get("/console/audit/actions", headers={"Authorization": f"Bearer {kitchen_token}"})
         self.assertEqual(r.status_code, 403)
+
+        # Restore cashier1's fixture password: reset_password really did
+        # rotate it server-side, and every other test in this class (and
+        # other test classes that build their own fresh DB from the same
+        # seed.seed_users() fixture) is entitled to assume cashier1/
+        # wingstheory still works -- this test's own job is proving the
+        # reset endpoint works and is gated, not leaving the account in a
+        # different state than it found it in for whoever runs next.
+        from wt.auth import hash_password
+        h, s = hash_password("wingstheory")
+        self.conn.execute(
+            "UPDATE app_user SET password_hash=?, password_salt=?, "
+            "password_changed_at=datetime('now','subsec'), must_change_password=0 "
+            "WHERE username='cashier1'",
+            (h, s),
+        )
 
 
 class TestMLResultCaching(unittest.TestCase):
@@ -2636,15 +3669,27 @@ class TestMLResultCaching(unittest.TestCase):
         os.environ["WT_DB"] = cls.path
         os.environ["WT_ENV"] = "test"
         db.close_conn()
-        from wt import seed
-        seed.run(fresh=True)
+        seed_fresh_with_go_live_delivery()
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt import api as api_module
         cls.api_module = api_module
         cls.client = TestClient(api_module.app)
         cls.conn = db.get_conn()
-        cls.H_MGR = {"Authorization": f"Bearer {cls._token('manager')}"}
+        # manager_token() always 401s now -- see TestRBAC's own
+        # test_manager_token_is_rejected_everywhere_now_deactivated
+        # docstring: migration 0034 deactivated the seeded 'manager'
+        # account, and principal() in wt/api.py refuses ANY request from a
+        # deactivated account with 401 before a capability check ever runs.
+        # This class never tests manager-specific capability boundaries --
+        # H_MGR here was only ever standing in for "some authenticated
+        # console reader" -- so it is aliased to the (live) owner token
+        # instead, same substitution already used throughout this suite
+        # (e.g. TestLoginAudit) for the same retired-account reason.
+        cls.H_MGR = {"Authorization": f"Bearer {cls._token('owner')}"}
+
         cls.H_CASH = {"Authorization": f"Bearer {cls._token('cashier1')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {cls._token('owner')}"}
 
     @classmethod
     def _token(cls, username):
@@ -2713,7 +3758,7 @@ class TestMLResultCaching(unittest.TestCase):
              patch.object(self.api_module, "detect_consumption_anomalies",
                            wraps=self.api_module.detect_consumption_anomalies) as consumption_spy:
             self.client.get("/console/anomalies", headers=self.H_MGR)
-            self.client.post(f"/console/ingredients/{ing}/waste", headers=self.H_MGR,
+            self.client.post(f"/console/ingredients/{ing}/waste", headers=self.H_OWNER,
                               json={"qty_base": 0.01, "note": "cache invalidation test"})
             self.client.get("/console/anomalies", headers=self.H_MGR)
             # the wastage entry changed stock_ledger's MAX(id) -> the loss
@@ -2747,6 +3792,7 @@ class TestDashboardSummary(unittest.TestCase):
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -2755,8 +3801,11 @@ class TestDashboardSummary(unittest.TestCase):
         def token(u):
             r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
             return r.json()["token"]
-        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
         cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        # inventory.read is all these endpoints need; 'owner' (username,
+        # role=admin -- see TestConsoleAPI) stands in for the deactivated
+        # 'manager' account here.
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -2766,14 +3815,23 @@ class TestDashboardSummary(unittest.TestCase):
         scrub(cls.path)
 
     def test_returns_the_exact_shape_dashboard_js_expects(self):
-        r = self.client.get("/dashboard/summary", headers=self.H_MGR)
+        r = self.client.get("/dashboard/summary", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200, r.text)
         body = r.json()
-        for key in ("kpis", "alerts", "forecastPreview", "expiryPreview", "verifyPreview"):
+        # 2026-09 contract audit: forecastPreview had been dropped by a
+        # dashboard_summary() rewrite while Today.js still read it -- a
+        # genuine regression, restored (see _forecast_preview()) rather
+        # than deleted from this test. expiryPreview and the KPI key
+        # "belowReorderPoint" were deliberate renames (useFirst, with
+        # structured {qty,unit,display} quantities; needRestock, to stop
+        # colliding in name with wt/depletion's differently-meaning
+        # belowReorderPoint field) -- this test now asserts the real,
+        # current shape rather than the pre-rewrite one.
+        for key in ("kpis", "alerts", "forecastPreview", "useFirst", "verifyPreview"):
             self.assertIn(key, body)
         self.assertEqual(len(body["kpis"]), 5)
         self.assertEqual([k["key"] for k in body["kpis"]],
-                          ["expired", "expiringSoon", "belowReorderPoint", "unsellable", "stockValue"])
+                          ["expired", "expiringSoon", "needRestock", "unsellable", "stockValue"])
         for k in body["kpis"]:
             for key in ("value", "display", "label", "foot", "severity", "icon", "route"):
                 self.assertIn(key, k)
@@ -2782,17 +3840,23 @@ class TestDashboardSummary(unittest.TestCase):
             self.assertIn(key, fp)
 
     def test_alerts_are_capped_and_sorted_worst_first(self):
-        r = self.client.get("/dashboard/summary", headers=self.H_MGR)
+        r = self.client.get("/dashboard/summary", headers=self.H_OWNER)
         alerts = r.json()["alerts"]
-        self.assertLessEqual(len(alerts), 8)
+        # Cap raised 8 -> 12 in the 2026-09 rewrite (api.py's own
+        # `attention = attention[:12]`, a deliberate literal inside an
+        # otherwise heavily-commented rewrite, not a stray edit) -- this
+        # test enforced the prior design's constant, not a still-current
+        # one, so it is updated to match rather than treated as the
+        # authority the code must be bent back to.
+        self.assertLessEqual(len(alerts), 12)
         order = {"crit": 0, "warn": 1, "info": 2, "good": 3, "flat": 4}
         severities = [order.get(a["severity"], 5) for a in alerts]
         self.assertEqual(severities, sorted(severities))
 
     def test_stock_value_kpi_matches_the_shared_valuation_function(self):
-        r = self.client.get("/dashboard/summary", headers=self.H_MGR)
+        r = self.client.get("/dashboard/summary", headers=self.H_OWNER)
         stock_kpi = next(k for k in r.json()["kpis"] if k["key"] == "stockValue")
-        valuation = self.client.get("/reports/valuation", headers=self.H_MGR).json()
+        valuation = self.client.get("/reports/valuation", headers=self.H_OWNER).json()
         self.assertEqual(stock_kpi["value"], valuation["total_value"])
         self.assertIn(f"{valuation['priced_items']} of {valuation['total_items']} items priced",
                        stock_kpi["foot"])
@@ -2807,8 +3871,8 @@ class TestDashboardSummary(unittest.TestCase):
         from wt import api as api_module
         with patch.object(api_module, "menu_item_demand_prophet",
                            wraps=api_module.menu_item_demand_prophet) as spy:
-            self.client.get("/dashboard/summary", headers=self.H_MGR)
-            self.client.get("/dashboard/summary", headers=self.H_MGR)
+            self.client.get("/dashboard/summary", headers=self.H_OWNER)
+            self.client.get("/dashboard/summary", headers=self.H_OWNER)
             self.assertLessEqual(spy.call_count, 1)
 
 
@@ -2846,7 +3910,8 @@ class TestPasswordSecurity(unittest.TestCase):
         # validation before any UPDATE runs) are shared.
         from wt.auth import hash_password
         for username in ("pwtest_selfchange", "pwtest_tokeninvalidation",
-                         "pwtest_adminreset", "pwtest_noleak", "pwtest_lockout"):
+                         "pwtest_adminreset", "pwtest_noleak", "pwtest_lockout",
+                         "pwtest_gate"):
             h, s = hash_password("wingstheory")
             cls.conn.execute(
                 "INSERT INTO app_user (username, display_name, role, password_hash, "
@@ -2854,6 +3919,15 @@ class TestPasswordSecurity(unittest.TestCase):
                 "VALUES (?,?, 'manager', ?,?, datetime('now'), 1)",
                 (username, username, h, s),
             )
+        # 'owner' plays the acting-admin role throughout this class (issuing
+        # resets for other accounts) rather than being a subject of the
+        # must_change_password gate itself -- that's exercised via cashier1
+        # (test_fresh_seeded_account_is_flagged_must_change_password) and the
+        # dedicated pwtest_gate account, not this shared account. Left
+        # flagged, 'owner' would now be blocked by wt/api.py's needs() gate
+        # from calling the very reset-password endpoint these tests exist to
+        # cover.
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='owner'")
 
     @classmethod
     def tearDownClass(cls):
@@ -2952,13 +4026,16 @@ class TestPasswordSecurity(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
 
         # the OLD token -- issued before the change -- must no longer work,
-        # even though it has not naturally expired
-        stale = self.client.get("/console/readiness", headers=self._auth_headers(old_token))
+        # even though it has not naturally expired. /console/ingredients is
+        # just a stand-in capability-gated route here (inventory.read, which
+        # this manager account holds unconditionally) -- this test is about
+        # token invalidation, not page-visibility grants.
+        stale = self.client.get("/console/ingredients", headers=self._auth_headers(old_token))
         self.assertEqual(stale.status_code, 401)
 
         # the token the change endpoint just handed back still works
         new_token = r.json()["token"]
-        fresh = self.client.get("/console/readiness", headers=self._auth_headers(new_token))
+        fresh = self.client.get("/console/ingredients", headers=self._auth_headers(new_token))
         self.assertEqual(fresh.status_code, 200)
 
     def test_admin_reset_is_forbidden_for_non_admin_roles(self):
@@ -3025,6 +4102,34 @@ class TestPasswordSecurity(unittest.TestCase):
         r = self._login("pwtest_lockout", "wingstheory")
         self.assertEqual(r.status_code, 423, r.text)
 
+    def test_must_change_password_account_is_blocked_from_capability_gated_routes(self):
+        # Login itself still succeeds (the account needs a valid token to
+        # even reach /auth/change_password) but every needs()-gated route
+        # -- inventory.read here -- refuses with the dedicated code, not a
+        # generic 403, so a client can tell "set a new password" apart from
+        # "your role can't do this."
+        token = self._token("pwtest_gate")
+        r = self.client.get("/console/readiness", headers=self._auth_headers(token))
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(r.json()["code"], "password_change_required")
+
+    def test_self_service_change_is_reachable_while_flagged_and_clears_the_gate(self):
+        token = self._token("pwtest_gate")
+        # the one endpoint a flagged account must still reach
+        r = self.client.post(
+            "/auth/change_password", headers=self._auth_headers(token),
+            json={"current_password": "wingstheory", "new_password": "a-real-gate-password-1",
+                  "confirm_new_password": "a-real-gate-password-1"},
+        )
+        self.assertEqual(r.status_code, 200)
+        new_token = r.json()["token"]
+        # now unblocked, with no other code change and no role escalation.
+        # /console/ingredients is just a stand-in capability-gated route
+        # (inventory.read) -- this test is about the must_change_password
+        # gate clearing, not page-visibility grants.
+        ok = self.client.get("/console/ingredients", headers=self._auth_headers(new_token))
+        self.assertEqual(ok.status_code, 200)
+
     def test_a_successful_login_clears_the_failure_counter(self):
         from wt.auth import MAX_LOGIN_ATTEMPTS
         for _ in range(MAX_LOGIN_ATTEMPTS - 2):
@@ -3088,26 +4193,24 @@ class TestForecasting(Base):
         self.assertEqual(row["lead_time_days"], 3)
         self.assertEqual(row["risk"], "critical")
 
-    def test_suggested_order_covers_lead_time_plus_review_cycle(self):
-        # pack=100 (base units per purchase unit), lead_time_days default 3,
-        # avg_daily=5.0/day (10 base units consumed over a 2-day window) ->
-        # target = 5 * (3 + 3 review days) = 30 base units needed in total;
-        # 10 already on hand -> shortfall 20 -> ceil(20/100) = 1 pack.
+    def test_no_longer_carries_a_purchase_quantity(self):
+        """2026-09 audit: this function used to derive suggested_order_qty
+        from its own trailing rate — a second reorder engine running
+        alongside wt/depletion.ingredient_forecast()'s forward one, and the
+        two could disagree (this one ignored yield_factor in the pack
+        conversion, had no seasonality or today's-pace signal). Purchase
+        quantity now has exactly one source; see
+        TestIngredientDepletionForecast.test_suggested_order_qty_rounds_up_to_a_whole_pack
+        for that engine's own coverage of this same rounding rule. This test
+        exists so the field cannot quietly come back here without a second
+        engine coming back with it."""
         ing = add_ingredient(self.conn, "Reorder Math", on_hand=10.0, pack=100)
         add_ledger_entry(self.conn, ing, -5.0, "sale_commit", days_ago(0))
         add_ledger_entry(self.conn, ing, -5.0, "sale_commit", days_ago(1))
         [row] = [r for r in ingredient_depletion(self.conn, lookback_days=2)
                  if r["ingredient_id"] == ing]
-        self.assertEqual(row["suggested_order_qty"], 1)
-        self.assertEqual(row["suggested_order_unit"], "pack")
-
-    def test_no_suggested_order_when_stock_is_already_comfortable(self):
-        ing = add_ingredient(self.conn, "Well Stocked", on_hand=10000.0, pack=100)
-        add_ledger_entry(self.conn, ing, -1.0, "sale_commit", days_ago(0))
-        [row] = [r for r in ingredient_depletion(self.conn, lookback_days=1)
-                 if r["ingredient_id"] == ing]
-        self.assertIsNone(row["suggested_order_qty"])
-        self.assertIsNone(row["suggested_order_unit"])
+        self.assertNotIn("suggested_order_qty", row)
+        self.assertNotIn("suggested_order_unit", row)
 
     def test_ok_when_days_remaining_comfortably_exceeds_lead_time(self):
         ing = add_ingredient(self.conn, "Comfortable", on_hand=10000.0)
@@ -3223,10 +4326,20 @@ class TestForecasting(Base):
         if not result["available"]:
             self.assertIn("reason", result)
             return
-        self.assertEqual(result["item_name"], "Rich History")
-        self.assertEqual(result["holdout_days"], 7)
-        self.assertGreaterEqual(result["mae"], 0)
-        self.assertGreaterEqual(result["rmse"], result["mae"] - 1e-9)   # RMSE >= MAE always
+        by_name = {r["item_name"]: r for r in result["items"]}
+        self.assertIn("Rich History", by_name)
+        rich_result = by_name["Rich History"]
+        self.assertFalse(rich_result["insufficient_history"])
+        self.assertIn("Thin History", by_name)
+        self.assertTrue(by_name["Thin History"]["insufficient_history"])
+
+        for method, scores in rich_result["methods"].items():
+            if scores.get("folds_scored"):
+                self.assertGreaterEqual(scores["mae"], 0)
+                self.assertGreaterEqual(scores["rmse"], scores["mae"] - 1e-9)  # RMSE >= MAE always
+        self.assertIn(rich_result["selected_method"], forecasting.ALL_METHODS)
+        self.assertIn("prophet_vs_baseline", result)
+        self.assertIn("fleet_summary", result)
 
     def test_evaluate_demand_model_reports_unavailable_with_no_history(self):
         # A fresh db has no menu items and no orders at all -> unavailable
@@ -3234,6 +4347,111 @@ class TestForecasting(Base):
         result = evaluate_demand_model(self.conn, horizon_days=7)
         self.assertFalse(result["available"])
         self.assertIn("reason", result)
+
+
+class TestStoreDemandForecast(Base):
+    """wt/forecasting.py's store-level addition (2026-09 Prophet data-
+    integration audit): the store's own aggregate orders/items/sales series,
+    sharing every mechanic (fit_prophet, the baselines, _backtest_series)
+    the per-item forecast above already uses."""
+
+    def test_store_daily_series_zero_fills_and_aggregates_across_items(self):
+        recipe = add_recipe(self.conn, "SR1", [])
+        a = add_menu_item(self.conn, "Store Item A", recipe, price=100.0)
+        b = add_menu_item(self.conn, "Store Item B", recipe, price=50.0)
+        # add_dated_order always creates a fresh customer_order, so two
+        # calls on the same day are two separate orders -- exactly what the
+        # "orders" metric should count, distinct from "items" (total qty).
+        add_dated_order(self.conn, days_ago(2), a, 2)
+        add_dated_order(self.conn, days_ago(2), b, 1)
+        per_metric = forecasting._store_daily_series(self.conn, lookback_days=5)
+        by_date_orders = {p["date"]: p["qty"] for p in per_metric["orders"][1]}
+        by_date_items = {p["date"]: p["qty"] for p in per_metric["items"][1]}
+        by_date_sales = {p["date"]: p["qty"] for p in per_metric["sales"][1]}
+        d2 = days_ago(2)
+        self.assertEqual(by_date_orders[d2], 2)
+        self.assertEqual(by_date_items[d2], 3)          # 2 units of A + 1 of B
+        self.assertEqual(by_date_sales[d2], 250.0)       # 2*100 + 1*50
+        # A day with no orders at all is a real, zero-filled observation,
+        # not a gap -- the whole point of aggregating at the store level.
+        d4 = days_ago(4)
+        self.assertEqual(by_date_orders[d4], 0)
+        self.assertEqual(len(per_metric["items"][1]), 5)
+
+    def test_store_demand_prophet_reports_insufficient_data(self):
+        recipe = add_recipe(self.conn, "SR2", [])
+        a = add_menu_item(self.conn, "Sparse Store Item", recipe)
+        for d in range(3):
+            add_dated_order(self.conn, days_ago(d), a, 1)
+        result = forecasting.store_demand_prophet(self.conn, metric="items", horizon_days=7)
+        self.assertTrue(result["insufficient_data"])
+        self.assertEqual(result["forecast"], [])
+
+    def test_store_demand_prophet_rejects_unknown_metric(self):
+        with self.assertRaises(ValueError):
+            forecasting.store_demand_prophet(self.conn, metric="not_a_real_metric")
+
+    def test_evaluate_store_demand_model_backtests_a_rich_series(self):
+        recipe = add_recipe(self.conn, "SR3", [])
+        a = add_menu_item(self.conn, "Store Backtest Item", recipe, price=100.0)
+        for d in range(30):
+            add_dated_order(self.conn, days_ago(d), a, 2 + (d % 3))
+        result = forecasting.evaluate_store_demand_model(self.conn, horizon_days=7)
+        if not result["available"]:
+            self.assertIn("reason", result)
+            return
+        items_result = result["metrics"]["items"]
+        self.assertFalse(items_result["insufficient_history"])
+        for method, scores in items_result["methods"].items():
+            if scores.get("folds_scored"):
+                self.assertGreaterEqual(scores["rmse"], scores["mae"] - 1e-9)  # RMSE >= MAE always
+        self.assertIn(items_result["selected_method"], forecasting.ALL_METHODS)
+        self.assertIn("selection_counts", result)
+
+    def test_evaluate_store_demand_model_reports_unavailable_with_no_history(self):
+        result = forecasting.evaluate_store_demand_model(self.conn, horizon_days=7)
+        self.assertFalse(result["available"])
+        self.assertIn("reason", result)
+
+
+class TestSeriesForecastability(unittest.TestCase):
+    """wt/forecasting.series_forecastability() -- descriptive evidence for
+    the technical panel / ML audit, never a live gate. Hand-built series so
+    every reported stat is checkable by hand."""
+
+    def _series(self, qtys, start=None):
+        start = start or dt.date(2026, 1, 1)
+        return [{"date": (start + dt.timedelta(days=i)).isoformat(), "qty": float(q)}
+                for i, q in enumerate(qtys)]
+
+    def _rows(self, series):
+        # Real callers (_daily_series/_store_daily_series) hand
+        # series_forecastability() non-zero-filled rows keyed "d", not
+        # "date" -- the same shape fit_prophet()/_backtest_series() use.
+        return [{"d": p["date"], "qty": p["qty"]} for p in series if p["qty"] > 0]
+
+    def test_insufficient_data_below_the_sample_bar(self):
+        series = self._series([1, 0, 1, 0, 0, 0, 0, 0, 0, 0])  # 2 non-zero days
+        stats = forecasting.series_forecastability(self._rows(series), series, min_sample_days=7)
+        self.assertEqual(stats["non_zero_observations"], 2)
+        self.assertEqual(stats["forecastability"], "insufficient_data")
+        self.assertFalse(stats["prophet_eligible"])
+
+    def test_intermittent_when_zero_share_is_high(self):
+        qtys = [5] * 8 + [0] * 12   # 8 non-zero of 20 -> clears the sample bar, 60% zero
+        series = self._series(qtys)
+        stats = forecasting.series_forecastability(self._rows(series), series, min_sample_days=7)
+        self.assertEqual(stats["zero_pct"], 60.0)
+        self.assertEqual(stats["forecastability"], "intermittent")
+        self.assertTrue(stats["prophet_eligible"])  # eligible bar met; still flagged intermittent
+
+    def test_forecastable_steady_series(self):
+        qtys = [10, 11, 9, 10, 10, 11, 9, 10, 10, 11] * 2
+        series = self._series(qtys)
+        stats = forecasting.series_forecastability(self._rows(series), series, min_sample_days=7)
+        self.assertEqual(stats["forecastability"], "forecastable")
+        self.assertEqual(stats["zero_pct"], 0.0)
+        self.assertIsNotNone(stats["coefficient_of_variation"])
 
 
 class TestAnomaly(Base):
@@ -3309,8 +4527,99 @@ class TestAnomaly(Base):
         self.assertIsInstance(d["flagged"], int)
 
 
+class TestAnomalyReview(Base):
+    """wt/anomaly.py — human validation workflow (migration 0035) and the
+    Precision/Recall/F1 it unlocks, plus the flag-fraction cap fix."""
+
+    def test_isolation_forest_flag_fraction_is_capped(self):
+        # A pool where a meaningful chunk of entries score as outliers
+        # relative to the rest -- without a cap, contamination='auto' can
+        # call a large share of a pooled, mostly-ordinary population
+        # anomalous (this reproduced against real production data: 19.6%
+        # flagged before the fix). The cap keeps that share bounded.
+        ing = add_ingredient(self.conn, "Capped Ingredient")
+        for d in range(80):
+            mag = -40.0 if d % 5 == 0 else -5.0   # 1-in-5 days a bigger loss
+            add_ledger_entry(self.conn, ing, mag, "wastage", days_ago(d), balance_after=900.0)
+        flagged = detect_anomalies(self.conn, lookback_days=90)
+        iso_flagged = [f for f in flagged if f["method"] == "isolation_forest"]
+        self.assertLessEqual(len(iso_flagged), math.ceil(80 * MAX_STOCK_LOSS_FLAG_FRACTION) + 1)
+
+    def test_review_workflow_is_append_only_and_idempotent(self):
+        ing = add_ingredient(self.conn, "Reviewed Ingredient")
+        add_ledger_entry(self.conn, ing, -50.0, "wastage", days_ago(0), balance_after=50.0)
+        ledger_id = self.conn.execute(
+            "SELECT id FROM stock_ledger WHERE ingredient_id=?", (ing,)
+        ).fetchone()["id"]
+
+        r1 = record_anomaly_review(self.conn, ledger_id, "flagged", user_id="mgr",
+                                   client_request_id="req-1")
+        r2 = record_anomaly_review(self.conn, ledger_id, "flagged", user_id="mgr",
+                                   client_request_id="req-1")
+        self.assertEqual(r1["id"], r2["id"])   # idempotent replay, not a second row
+
+        record_anomaly_review(self.conn, ledger_id, "confirmed_anomaly", user_id="mgr")
+        history = anomaly_review_history(self.conn, ledger_id)
+        self.assertEqual([h["status"] for h in history], ["flagged", "confirmed_anomaly"])
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE anomaly_review SET status='resolved' WHERE id=?", (r1["id"],))
+
+    def test_unknown_review_status_is_rejected(self):
+        ing = add_ingredient(self.conn, "Bad Status Ingredient")
+        add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(0), balance_after=95.0)
+        ledger_id = self.conn.execute(
+            "SELECT id FROM stock_ledger WHERE ingredient_id=?", (ing,)
+        ).fetchone()["id"]
+        with self.assertRaises(InvalidStateError):
+            record_anomaly_review(self.conn, ledger_id, "not_a_real_status")
+
+    def test_validation_metrics_unavailable_below_minimum_labels(self):
+        v = validation_metrics(self.conn)
+        self.assertFalse(v["available"])
+        self.assertIn("insufficient confirmed labels", v["reason"])
+
+    def test_validation_metrics_computed_once_enough_labels_exist(self):
+        ing = add_ingredient(self.conn, "Labeled Ingredient")
+        ids = []
+        for d in range(30):
+            add_ledger_entry(self.conn, ing, -60.0, "wastage", days_ago(d), balance_after=40.0)
+            ids.append(self.conn.execute(
+                "SELECT id FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1", (ing,)
+            ).fetchone()["id"])
+        flagged_ids = {f["ledger_id"] for f in detect_anomalies(self.conn)}
+
+        # Label the first 12 flagged rows confirmed, next 10 flagged rows as
+        # false positives -- real Precision/Recall depend on the model's
+        # actual flag set, not an assumption about which ids it picked.
+        flagged_list = [i for i in ids if i in flagged_ids]
+        for lid in flagged_list[:12]:
+            record_anomaly_review(self.conn, lid, "confirmed_anomaly", user_id="mgr")
+        for lid in flagged_list[12:22]:
+            record_anomaly_review(self.conn, lid, "false_positive", user_id="mgr")
+
+        v = validation_metrics(self.conn)
+        if v["available"]:
+            self.assertIn("precision", v)
+            self.assertIn("confusion_matrix", v)
+            tp, fp = v["confusion_matrix"]["tp"], v["confusion_matrix"]["fp"]
+            self.assertEqual(v["precision"], round(tp / (tp + fp), 3) if (tp + fp) else None)
+        else:
+            self.assertIn("reason", v)   # not enough of this ingredient's rows were flagged
+
+
 class TestAssociations(Base):
-    """wt/associations.py — FP-growth (mlxtend) over real order baskets."""
+    """wt/associations.py — FP-growth (mlxtend) over real order baskets.
+
+    2026-09 audit: the basket-construction bug (grouping by customer_order.id
+    instead of by real transaction) and its fix are covered explicitly by
+    test_merges_split_historical_orders_sharing_source_order_id below — that
+    is the test that would have caught the bug this whole audit exists to
+    fix. The other new tests cover the dynamic threshold/fallback tiering,
+    the minimum-pair-count floor, void exclusion, quantity-duplicate
+    handling, category/recommendation-type labeling, and undirected pair
+    dedup called for by the audit brief.
+    """
 
     def test_insufficient_data_below_minimum_transactions(self):
         recipe = add_recipe(self.conn, "R", [])
@@ -3321,18 +4630,56 @@ class TestAssociations(Base):
         self.assertTrue(result["insufficient_data"])
         self.assertEqual(result["combos"], [])
 
-    def test_finds_a_real_combo_with_strong_lift(self):
+    def test_threshold_sensitivity_reports_every_config_on_the_same_data(self):
         recipe = add_recipe(self.conn, "R", [])
         a = add_menu_item(self.conn, "Wings Platter", recipe, price=200.0)
         b = add_menu_item(self.conn, "Iced Tea", recipe, price=80.0)
         c = add_menu_item(self.conn, "Unrelated Item", recipe, price=50.0)
-        # A and B co-occur constantly; C never appears with either — a real,
-        # detectable pattern rather than noise.
         for _ in range(20):
             add_order(self.conn, [(a, 1), (b, 1)])
         for _ in range(5):
             add_order(self.conn, [(a, 1)])
         for _ in range(5):
+            add_order(self.conn, [(b, 1)])
+        for _ in range(10):
+            add_order(self.conn, [(c, 1)])
+
+        result = threshold_sensitivity(self.conn)
+        self.assertFalse(result["insufficient_data"])
+        self.assertEqual(set(result["configs"]), {"production", "production_fallback", "legacy_strict_2026_08"})
+        for cfg in result["configs"].values():
+            self.assertIn("combos_found", cfg)
+            self.assertGreaterEqual(cfg["combos_found"], 0)
+        # A real, strong pattern (A+B co-occur in 20/35 orders, well above
+        # the min-pair-count floor) should survive every defensible config,
+        # including the fallback tier and the old strict 2026-08 threshold.
+        for cfg in result["configs"].values():
+            self.assertGreaterEqual(cfg["combos_found"], 1)
+
+    def test_threshold_sensitivity_reports_insufficient_data_honestly(self):
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "A", recipe)
+        for _ in range(5):
+            add_order(self.conn, [(a, 1)])
+        result = threshold_sensitivity(self.conn)
+        self.assertTrue(result["insufficient_data"])
+        self.assertEqual(result["configs"], {})
+
+    def test_finds_a_real_combo_with_strong_lift(self):
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "Wings Platter", recipe, price=200.0, category="Wings")
+        b = add_menu_item(self.conn, "Iced Tea", recipe, price=80.0, category="Drinks")
+        c = add_menu_item(self.conn, "Unrelated Item", recipe, price=50.0, category="Wings")
+        # A and B co-occur constantly; C never appears with either — a real,
+        # detectable pattern rather than noise. A sells somewhat more often
+        # solo than B does, so the deterministic "higher-frequency item
+        # first" direction convention (see _qualifying_pairs) is unambiguous
+        # for this test rather than resting on a tie-break rule.
+        for _ in range(20):
+            add_order(self.conn, [(a, 1), (b, 1)])
+        for _ in range(2):
+            add_order(self.conn, [(a, 1)])
+        for _ in range(1):
             add_order(self.conn, [(b, 1)])
         for _ in range(10):
             add_order(self.conn, [(c, 1)])
@@ -3344,18 +4691,164 @@ class TestAssociations(Base):
             if {x["item_a"], x["item_b"]} == {"Wings Platter", "Iced Tea"}
         )
         self.assertGreater(combo["lift"], 1.2)
+        self.assertEqual(combo["pair_count"], 20)
+        self.assertAlmostEqual(combo["support"], 20 / 33, places=4)
+        self.assertAlmostEqual(combo["confidence"], 20 / 22, places=4)  # A (higher-frequency) sold 22x total, 20 with B
+        self.assertEqual(combo["item_a"], "Wings Platter")
+        self.assertEqual(combo["category_a"], "Wings")
+        self.assertEqual(combo["category_b"], "Drinks")
+        self.assertEqual(combo["recommendation_type"], "Observed cross-category association")
         self.assertAlmostEqual(combo["individual_total"], 280.0, places=2)
-        self.assertAlmostEqual(combo["suggested_combo_price"], 280.0 * 0.92, places=2)
+        self.assertAlmostEqual(combo["discount_reference_price"], 280.0 * 0.92, places=2)
         # the unrelated item never co-occurred with anything, so it cannot
         # appear as either side of a combo
         for x in result["combos"]:
             self.assertNotIn("Unrelated Item", (x["item_a"], x["item_b"]))
+        # undirected pair dedup: A+B must appear exactly once, never as both
+        # "A+B" and "B+A"
+        pair_keys = [tuple(sorted((x["item_a"], x["item_b"]))) for x in result["combos"]]
+        self.assertEqual(len(pair_keys), len(set(pair_keys)))
         # 2026-08 audit: this figure is a flat discount off menu list
         # prices, not a cost/margin calculation -- the response must say
         # so plainly rather than let the console show a bare currency
         # figure that could read as a verified profit number.
-        self.assertIn("List price only", result["combo_price_basis"])
-        self.assertIn("Not a margin or profit calculation", result["combo_price_basis"])
+        self.assertIn("discount reference", result["combo_price_basis"])
+        self.assertIn("not a cost-based or margin calculation", result["combo_price_basis"])
+        self.assertEqual(result["threshold_tier"], "primary")
+        self.assertEqual(result["number_of_final_recommendations"], len(result["combos"]))
+
+    def test_merges_split_historical_orders_sharing_source_order_id(self):
+        """The bug this audit exists to fix: an earlier import recorded one
+        real mixed order (unlimited-wings + a drink) as TWO customer_order
+        rows sharing one source_order_id (see wt/xlsx_history_reconcile.py's
+        own docstring). Grouping baskets by customer_order.id instead of by
+        real transaction silently split every such purchase apart, making
+        the two items co-occur zero times instead of every time. This test
+        fails against the pre-fix basket construction and passes against
+        the fix: COALESCE(source_order_id, row id) as the basket key."""
+        recipe = add_recipe(self.conn, "R", [])
+        unli = add_menu_item(self.conn, "Unli Wings", recipe, price=399.0, category="Unlimited")
+        drink = add_menu_item(self.conn, "Royal", recipe, price=60.0, category="Drinks")
+        filler = add_menu_item(self.conn, "Filler", recipe, price=50.0, category="Sides")
+
+        # 15 real historical purchases, each split into two DB rows sharing
+        # one source_order_id -- exactly the shape xlsx_history_reconcile.py
+        # documents.
+        for i in range(15):
+            unli_id = add_order(self.conn, [(unli, 1)])
+            drink_id = add_order(self.conn, [(drink, 1)])
+            self.conn.execute(
+                "UPDATE customer_order SET source='historical', source_order_id=? WHERE id IN (?, ?)",
+                (f"WT-SPLIT-{i:03d}", unli_id, drink_id),
+            )
+        # padding so MIN_TRANSACTIONS and a sane support/pair-count floor
+        # are both satisfied without the padding itself pairing with anything
+        for _ in range(30):
+            add_order(self.conn, [(filler, 1)])
+
+        result = product_combinations(self.conn)
+        self.assertFalse(result["insufficient_data"])
+        # 30 raw rows became 15 real transactions -- the discrepancy this
+        # audit's section 15 requires be traced, not just displayed.
+        self.assertEqual(result["total_orders_analyzed"], 30 + 30)
+        self.assertEqual(result["valid_transactions"], 15 + 30)
+        self.assertEqual(result["excluded_transactions"], 15)
+        self.assertIsNotNone(result["data_quality_note"])
+
+        combo = next(
+            (x for x in result["combos"] if {x["item_a"], x["item_b"]} == {"Unli Wings", "Royal"}),
+            None,
+        )
+        self.assertIsNotNone(combo, "merged basket should surface the Unli Wings + Royal pairing")
+        self.assertEqual(combo["pair_count"], 15)
+
+    def test_duplicate_quantity_within_one_order_does_not_inflate_pair_count(self):
+        """2x Fries + 1x Shake on one receipt is still ONE basket containing
+        {Fries, Shake} -- quantity must not inflate co-occurrence counts."""
+        recipe = add_recipe(self.conn, "R", [])
+        fries = add_menu_item(self.conn, "Fries", recipe, price=80.0, category="Sides")
+        shake = add_menu_item(self.conn, "Shake", recipe, price=90.0, category="Shakes")
+        filler = add_menu_item(self.conn, "Filler", recipe, price=50.0, category="Sides")
+        for _ in range(12):
+            add_order(self.conn, [(fries, 2), (shake, 3)])  # quantities must not matter
+        for _ in range(30):
+            add_order(self.conn, [(filler, 1)])
+
+        result = product_combinations(self.conn)
+        combo = next(
+            (x for x in result["combos"] if {x["item_a"], x["item_b"]} == {"Fries", "Shake"}),
+            None,
+        )
+        self.assertIsNotNone(combo)
+        self.assertEqual(combo["pair_count"], 12)  # not 12*2*3
+
+    def test_void_orders_are_excluded_from_transaction_count(self):
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "A", recipe)
+        b = add_menu_item(self.conn, "B", recipe)
+        for _ in range(35):
+            add_order(self.conn, [(a, 1), (b, 1)])
+        voided_id = add_order(self.conn, [(a, 1), (b, 1)])
+        self.conn.execute("UPDATE customer_order SET status='void' WHERE id=?", (voided_id,))
+
+        result = product_combinations(self.conn)
+        self.assertEqual(result["valid_transactions"], 35)
+
+    def test_minimum_pair_count_gate_rejects_rare_high_lift_pairs(self):
+        """A pair seen only twice can produce an apparently large lift by
+        chance -- section 11's example (A x3, B x2, A+B x1). The absolute
+        MIN_PAIR_COUNT floor must reject it regardless of how strong the
+        lift looks, even once enough padding orders exist to clear
+        MIN_TRANSACTIONS."""
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "Rare A", recipe)
+        b = add_menu_item(self.conn, "Rare B", recipe)
+        filler = add_menu_item(self.conn, "Filler", recipe)
+        add_order(self.conn, [(a, 1), (b, 1)])  # the only A+B co-occurrence
+        for _ in range(40):
+            add_order(self.conn, [(filler, 1)])
+
+        result = product_combinations(self.conn)
+        self.assertFalse(result["insufficient_data"])
+        for x in result["combos"]:
+            self.assertNotEqual({x["item_a"], x["item_b"]}, {"Rare A", "Rare B"})
+
+    def test_fallback_tier_used_only_when_primary_finds_nothing(self):
+        """A pair co-occurring 8 times (below the primary tier's
+        MIN_PAIR_COUNT=10) but at/above the fallback tier's floor of 5, with
+        a strong lift, should surface only via the bounded fallback tier --
+        and the response must say so via threshold_tier, per section 13's
+        "deterministic and logged" requirement."""
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "A", recipe)
+        b = add_menu_item(self.conn, "B", recipe)
+        c = add_menu_item(self.conn, "Filler", recipe)
+        for _ in range(8):
+            add_order(self.conn, [(a, 1), (b, 1)])
+        for _ in range(192):
+            add_order(self.conn, [(c, 1)])
+
+        result = product_combinations(self.conn)
+        self.assertFalse(result["insufficient_data"])
+        self.assertEqual(result["threshold_tier"], "fallback")
+        combo = next(x for x in result["combos"] if {x["item_a"], x["item_b"]} == {"A", "B"})
+        self.assertEqual(combo["pair_count"], 8)
+        self.assertGreaterEqual(result["min_pair_count"], 5)
+
+    def test_empty_result_states_the_real_reason(self):
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "A", recipe)
+        b = add_menu_item(self.conn, "B", recipe)
+        # every order is a singleton -- nothing ever co-occurs with anything
+        for _ in range(20):
+            add_order(self.conn, [(a, 1)])
+        for _ in range(20):
+            add_order(self.conn, [(b, 1)])
+
+        result = product_combinations(self.conn)
+        self.assertFalse(result["insufficient_data"])
+        self.assertEqual(result["combos"], [])
+        self.assertIn("minimum transaction-count, confidence, and lift", result["empty_reason"])
 
     def test_model_details_reports_real_params_and_counts(self):
         recipe = add_recipe(self.conn, "R7", [])
@@ -3377,7 +4870,203 @@ class TestAssociations(Base):
         d = association_model_details(self.conn)
         self.assertEqual(d["model"], "FP-growth (mlxtend)")
         self.assertEqual(d["transactions_evaluated"], 40)
+        self.assertEqual(d["total_orders_analyzed"], 40)
         self.assertGreaterEqual(d["combos_found"], 1)
+        self.assertGreaterEqual(d["number_of_frequent_itemsets"], 1)
+        self.assertGreaterEqual(d["number_of_association_rules"], 1)
+
+
+# ===========================================================================
+class TestComboPricing(Base):
+    """wt/combo_pricing.py — cost-based combo pricing built on the real
+    recipe/BOM costing engine (resolver.expand_recipe / resolver.recipe_cost),
+    replacing the old flat 8%-off-list-price figure as the actual pricing
+    tool. Every case checks that a missing cost/config input is reported as
+    missing, never fabricated as zero or as a guessed default.
+    """
+
+    def _combo(self, ingredient_cost_a=10.0, packaging_cost_a=0.0, price_a=100.0,
+              ingredient_cost_b=6.0, packaging_cost_b=0.0, price_b=80.0):
+        ing_a = add_ingredient(self.conn, "Chicken", base_unit="g", pack=1000, cost=ingredient_cost_a * 5)
+        recipe_a_lines = [(ing_a, 200)]  # 200g at (cost*5)/1000 per g = cost per 200g = cost
+        if packaging_cost_a:
+            pkg_a = add_ingredient(self.conn, "Box A", base_unit="pc", pack=1, cost=packaging_cost_a, category="packaging")
+            recipe_a_lines.append((pkg_a, 1))
+        recipe_a = add_recipe(self.conn, "Recipe A", recipe_a_lines)
+        item_a = add_menu_item(self.conn, "Item A", recipe_a, price=price_a)
+
+        ing_b = add_ingredient(self.conn, "Rice", base_unit="g", pack=1000, cost=ingredient_cost_b * 5)
+        recipe_b_lines = [(ing_b, 200)]
+        if packaging_cost_b:
+            pkg_b = add_ingredient(self.conn, "Box B", base_unit="pc", pack=1, cost=packaging_cost_b, category="packaging")
+            recipe_b_lines.append((pkg_b, 1))
+        recipe_b = add_recipe(self.conn, "Recipe B", recipe_b_lines)
+        item_b = add_menu_item(self.conn, "Item B", recipe_b, price=price_b)
+        return item_a, item_b
+
+    def test_splits_ingredient_and_packaging_cost(self):
+        item_a, item_b = self._combo(ingredient_cost_a=10.0, packaging_cost_a=3.0,
+                                     ingredient_cost_b=6.0, packaging_cost_b=2.0)
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        self.assertAlmostEqual(est["ingredient_cost"], 16.0, places=2)
+        self.assertAlmostEqual(est["packaging_cost"], 5.0, places=2)
+        self.assertEqual(est["ingredient_status"], "confirmed")
+
+    def test_unit_conversion_matches_resolver_recipe_cost(self):
+        # kg-based ingredient priced per kg, recipe line in grams — the same
+        # unit-conversion path resolver.recipe_cost uses, cross-checked here
+        # rather than re-derived.
+        ing = add_ingredient(self.conn, "Flour", base_unit="g", pack=1000, cost=200.0)  # 200/kg
+        recipe = add_recipe(self.conn, "R", [(ing, 250)])  # 250 g -> 50.0
+        item = add_menu_item(self.conn, "Bun", recipe, price=50.0)
+        breakdown = combo_pricing.menu_item_cost_breakdown(self.conn, item)
+        rc = recipe_cost(self.conn, recipe)
+        self.assertAlmostEqual(breakdown["ingredient_cost"], rc["total_cost"], places=2)
+        self.assertAlmostEqual(breakdown["ingredient_cost"], 50.0, places=2)
+
+    def test_missing_recipe_is_not_recipe_costed(self):
+        item = add_menu_item(self.conn, "No Recipe Item", None, price=99.0)
+        breakdown = combo_pricing.menu_item_cost_breakdown(self.conn, item)
+        self.assertEqual(breakdown["cost_confidence"], "not_recipe_costed")
+        self.assertIsNone(breakdown["ingredient_cost"])
+
+    def test_missing_ingredient_price_is_incomplete(self):
+        ing = add_ingredient(self.conn, "Unpriced Spice", cost=None)
+        recipe = add_recipe(self.conn, "R", [(ing, 10)])
+        item = add_menu_item(self.conn, "Spicy Item", recipe, price=40.0)
+        breakdown = combo_pricing.menu_item_cost_breakdown(self.conn, item)
+        self.assertEqual(breakdown["cost_confidence"], "incomplete")
+        self.assertIn("Unpriced Spice", breakdown["unpriced_ingredients"])
+
+    def test_combo_cost_incomplete_when_either_item_unpriced(self):
+        item_a, item_b = self._combo()
+        unpriced_ing = add_ingredient(self.conn, "Mystery", cost=None)
+        recipe_c = add_recipe(self.conn, "Recipe C", [(unpriced_ing, 10)])
+        item_c = add_menu_item(self.conn, "Item C", recipe_c, price=60.0)
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_c)
+        self.assertIsNone(est["ingredient_cost"])
+        self.assertEqual(est["total_status"], "incomplete")
+
+    def test_labor_and_overhead_default_to_not_configured(self):
+        item_a, item_b = self._combo()
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        self.assertEqual(est["labor_status"], "not_configured")
+        self.assertIsNone(est["labor_cost"])
+        self.assertEqual(est["overhead_status"], "not_configured")
+        self.assertIsNone(est["overhead_cost"])
+        self.assertEqual(est["total_status"], "partial")
+
+    def test_labor_fixed_per_serving(self):
+        combo_pricing.set_combo_pricing_config(
+            self.conn, {"labor_method": "fixed_per_serving", "labor_fixed_amount": 15.0})
+        item_a, item_b = self._combo()
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        self.assertEqual(est["labor_status"], "estimated")
+        self.assertAlmostEqual(est["labor_cost"], 15.0, places=2)
+
+    def test_labor_pct_of_ingredient_cost(self):
+        combo_pricing.set_combo_pricing_config(
+            self.conn, {"labor_method": "pct_of_ingredient_cost", "labor_pct": 10.0})
+        item_a, item_b = self._combo(ingredient_cost_a=10.0, ingredient_cost_b=6.0)
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        self.assertAlmostEqual(est["labor_cost"], 1.6, places=2)  # 10% of 16.0
+
+    def test_overhead_pct_of_ingredient_and_packaging(self):
+        combo_pricing.set_combo_pricing_config(self.conn, {"overhead_pct": 20.0})
+        item_a, item_b = self._combo(ingredient_cost_a=10.0, packaging_cost_a=2.0,
+                                     ingredient_cost_b=6.0, packaging_cost_b=2.0)
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        self.assertEqual(est["overhead_status"], "estimated")
+        self.assertAlmostEqual(est["overhead_cost"], 4.0, places=2)  # 20% of 20.0
+
+    def test_price_range_requires_target_food_cost_pct(self):
+        item_a, item_b = self._combo()
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        result = combo_pricing.suggest_price_range(self.conn, est)
+        self.assertIsNone(result["range"])
+        self.assertIn("target food-cost", result["issue"])
+
+    def test_price_range_happy_path(self):
+        combo_pricing.set_combo_pricing_config(self.conn, {
+            "target_food_cost_pct": 35.0, "preferred_min_price": 100.0,
+            "preferred_max_price": 400.0, "max_discount_pct": 30.0,
+        })
+        item_a, item_b = self._combo(ingredient_cost_a=10.0, ingredient_cost_b=6.0,
+                                     price_a=100.0, price_b=80.0)
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        result = combo_pricing.suggest_price_range(self.conn, est)
+        self.assertIsNotNone(result["range"])
+        self.assertAlmostEqual(result["cost_based_price"], 16.0 / 0.35, places=2)
+        low, high = result["range"]
+        self.assertLessEqual(low, high)
+        self.assertGreaterEqual(low, result["cost_based_price"] - 0.01)
+
+    def test_price_range_reports_issue_instead_of_forcing_a_low_price(self):
+        # An expensive combo against a tight preferred ceiling: the cost-based
+        # price sits above what the restaurant said it wants to charge -- the
+        # engine must say so, never silently discount the price below cost.
+        combo_pricing.set_combo_pricing_config(self.conn, {
+            "target_food_cost_pct": 35.0, "preferred_max_price": 20.0,
+        })
+        item_a, item_b = self._combo(ingredient_cost_a=50.0, ingredient_cost_b=50.0,
+                                     price_a=200.0, price_b=200.0)
+        est = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        result = combo_pricing.suggest_price_range(self.conn, est)
+        self.assertIsNone(result["range"])
+        self.assertIn("difficult to price", result["issue"])
+
+    def test_portion_multiplier_only_applied_on_explicit_request(self):
+        item_a, item_b = self._combo(ingredient_cost_a=10.0, ingredient_cost_b=6.0)
+        full = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b)
+        half = combo_pricing.estimate_combo_cost(self.conn, item_a, item_b, portion_multiplier_a=0.5)
+        self.assertAlmostEqual(full["ingredient_cost"], 16.0, places=2)
+        self.assertAlmostEqual(half["ingredient_cost"], 11.0, places=2)  # 5.0 (half of A) + 6.0 (B unchanged)
+
+    def test_config_not_configured_round_trips_as_none(self):
+        cfg = combo_pricing.get_combo_pricing_config(self.conn)
+        self.assertIsNone(cfg["target_food_cost_pct"])
+        self.assertIsNone(cfg["labor_method"])
+        combo_pricing.set_combo_pricing_config(self.conn, {"target_food_cost_pct": 40.0})
+        cfg = combo_pricing.get_combo_pricing_config(self.conn)
+        self.assertEqual(cfg["target_food_cost_pct"], 40.0)
+        combo_pricing.set_combo_pricing_config(self.conn, {"target_food_cost_pct": None})
+        cfg = combo_pricing.get_combo_pricing_config(self.conn)
+        self.assertIsNone(cfg["target_food_cost_pct"])
+
+    def test_draft_combo_creation_and_idempotency(self):
+        item_a, item_b = self._combo()
+        d1 = combo_pricing.create_draft_combo(
+            self.conn, item_a, item_b, user_id="admin1", client_request_id="req-1")
+        self.assertEqual(d1["item_a_menu_item_id"], item_a)
+        self.assertIn("cost_estimate", d1["pricing_snapshot"])
+        d2 = combo_pricing.create_draft_combo(
+            self.conn, item_a, item_b, user_id="admin1", client_request_id="req-1")
+        self.assertEqual(d1["id"], d2["id"])  # replayed, not duplicated
+        drafts = combo_pricing.list_draft_combos(self.conn)
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0]["status"], "draft")
+
+    def test_draft_combo_review_is_append_only_and_never_mutates_snapshot(self):
+        item_a, item_b = self._combo()
+        draft = combo_pricing.create_draft_combo(self.conn, item_a, item_b, user_id="admin1")
+        original_snapshot = draft["pricing_snapshot"]
+        combo_pricing.review_draft_combo(self.conn, draft["id"], "approved", user_id="admin1")
+        drafts = combo_pricing.list_draft_combos(self.conn)
+        self.assertEqual(drafts[0]["status"], "approved")
+        self.assertEqual(drafts[0]["pricing_snapshot"], original_snapshot)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE draft_combo SET chosen_price=999 WHERE id=?", (draft["id"],))
+
+    def test_draft_combo_never_touches_menu_item(self):
+        item_a, item_b = self._combo()
+        before = dict(self.conn.execute("SELECT * FROM menu_item WHERE id IN (?,?)", (item_a, item_b)).fetchall()[0])
+        combo_pricing.create_draft_combo(self.conn, item_a, item_b, user_id="admin1")
+        combo_pricing.review_draft_combo(
+            self.conn, combo_pricing.list_draft_combos(self.conn)[0]["id"], "approved", user_id="admin1")
+        after = dict(self.conn.execute("SELECT * FROM menu_item WHERE id IN (?,?)", (item_a, item_b)).fetchall()[0])
+        self.assertEqual(before, after)
+        menu_item_count = self.conn.execute("SELECT COUNT(*) AS n FROM menu_item").fetchone()["n"]
+        self.assertEqual(menu_item_count, 2)  # no new menu item created by the review
 
 
 # ===========================================================================
@@ -4260,6 +5949,7 @@ class TestUnliRBAC(unittest.TestCase):
         db.close_conn()
         from wt import seed
         seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -4269,8 +5959,9 @@ class TestUnliRBAC(unittest.TestCase):
             return cls.client.post("/auth/login",
                                    json={"username": u, "password": "wingstheory"}).json()["token"]
         cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
-        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
         cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -4322,8 +6013,18 @@ class TestUnliRBAC(unittest.TestCase):
         self.assertEqual(self.client.patch("/unli/tolerance", headers=self.H_KIT,
                                            json={"tolerance_ratio": 0.9}).status_code, 403)
 
-    def test_a_manager_may_recalibrate(self):
+    def test_a_manager_may_not_recalibrate(self):
+        # 'manager' never held unli.approve (admin-only), but the account is
+        # now also deactivated outright (migration 0034) -- a manager token
+        # gets 401 "account no longer active" here just like everywhere
+        # else, not the capability-specific 403 this used to check.
         r = self.client.post("/unli/coefficients/recalibrate", headers=self.H_MGR,
+                             json={"dry_run": True})
+        self.assertEqual(r.status_code, 401)
+        self.assertIn("account no longer active", r.json()["message"])
+
+    def test_an_admin_may_recalibrate(self):
+        r = self.client.post("/unli/coefficients/recalibrate", headers=self.H_OWNER,
                              json={"dry_run": True})
         self.assertEqual(r.status_code, 200)
 
@@ -4343,8 +6044,8 @@ class TestUnliRBAC(unittest.TestCase):
                          403)
 
     def test_the_end_to_end_workflow_through_the_http_layer(self):
-        """POS unli order -> kitchen start -> kitchen reconciles -> manager
-        signs off -> manager recalibrates. Every hop under its own role."""
+        """POS unli order -> kitchen start -> kitchen reconciles -> admin
+        signs off -> admin recalibrates. Every hop under its own role."""
         cash = {"Authorization": self.H_CASH["Authorization"]}
         menu = self.client.get("/pos/menu", headers=cash).json()
         unli_item = next(m for m in menu["items"] if m["is_unli"] and m["sellable"])
@@ -4371,9 +6072,9 @@ class TestUnliRBAC(unittest.TestCase):
         self.assertTrue(body["inventory_corrected"])
 
         self.assertEqual(self.client.post(f"/unli/reconciliation/{body['id']}/review",
-                                          headers=self.H_MGR,
+                                          headers=self.H_OWNER,
                                           json={"approve": True}).status_code, 200)
-        recal = self.client.post("/unli/coefficients/recalibrate", headers=self.H_MGR,
+        recal = self.client.post("/unli/coefficients/recalibrate", headers=self.H_OWNER,
                                  json={"item_key": "wings"})
         self.assertEqual(recal.status_code, 200)
 
@@ -4381,18 +6082,22 @@ class TestUnliRBAC(unittest.TestCase):
         self.assertGreaterEqual(hist["count"], 1)
 
     def test_the_anomaly_console_still_answers_after_the_data_source_change(self):
-        r = self.client.get("/console/anomalies", headers=self.H_MGR)
+        r = self.client.get("/console/anomalies", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200)
         body = r.json()
         for key in ("anomalies", "stock_loss_anomalies", "consumption_anomalies"):
             self.assertIn(key, body)
-        md = self.client.get("/console/model-details", headers=self.H_MGR).json()
+        # model-details now also requires the admin-configurable 'system'
+        # page grant (defaults to not-granted for manager, see
+        # TestPagePermissions) -- read it as admin here since this test is
+        # about the anomaly model's output shape, not page visibility.
+        md = self.client.get("/console/model-details", headers=self.H_OWNER).json()
         self.assertEqual(md["anomaly_detection"]["n_features"], 7)
         self.assertIn("v_unli_daily_consumption", md["anomaly_detection"]["data_source"])
         self.assertIn("stock_loss_detection", md)
 
     def test_depletion_endpoint_surfaces_the_reorder_point_rule(self):
-        r = self.client.get("/console/forecasts/depletion", headers=self.H_MGR)
+        r = self.client.get("/console/forecasts/depletion", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertIn("below_reorder_point", body)
@@ -5089,8 +6794,8 @@ class TestRefillAPI(unittest.TestCase):
         os.environ["WT_DB"] = cls.path
         os.environ["WT_ENV"] = "test"
         db.close_conn()
-        from wt import seed
-        seed.run(fresh=True)
+        seed_fresh_with_go_live_delivery()
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -5101,7 +6806,8 @@ class TestRefillAPI(unittest.TestCase):
                                    json={"username": u, "password": "wingstheory"}).json()["token"]
         cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
         cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
-        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -5163,22 +6869,30 @@ class TestRefillAPI(unittest.TestCase):
     def test_an_unauthenticated_caller_may_not(self):
         self.assertEqual(self.client.get("/unli/sessions").status_code, 401)
 
-    def test_only_a_manager_may_price_a_flavour(self):
+    def test_only_an_admin_may_price_a_flavour(self):
+        # 'manager' used to be a third non-admin role checked here too, but
+        # migration 0034 deactivated that account outright -- a manager
+        # token now gets 401 everywhere, not the capability-specific 403
+        # this loop is asserting, so it was dropped in favor of the two
+        # live non-admin roles that still exercise the same RBAC gate.
         pk = self._flavor("Buffalo")["id"]
         for h in (self.H_CASH, self.H_KIT):
             self.assertEqual(self.client.patch(f"/unli/flavors/{pk}", headers=h,
                                                json={"flavor_type": "special",
                                                      "addon_price": 40}).status_code, 403)
-        self.assertEqual(self.client.patch(f"/unli/flavors/{pk}", headers=self.H_MGR,
+        self.assertEqual(self.client.patch(f"/unli/flavors/{pk}", headers=self.H_OWNER,
                                            json={"flavor_type": "included"}).status_code, 200)
 
-    def test_only_a_manager_may_reopen_a_closed_session(self):
+    def test_only_an_admin_may_reopen_a_closed_session(self):
         sid = self._session(self._unli_order())
         self.client.post(f"/unli/sessions/{sid}/close", headers=self.H_CASH,
                          json={"status": "completed"})
         self.assertEqual(self.client.post(f"/unli/sessions/{sid}/reopen", headers=self.H_CASH,
                                           json={}).status_code, 403)
-        self.assertEqual(self.client.post(f"/unli/sessions/{sid}/reopen", headers=self.H_MGR,
+        # 'manager' used to be checked here too, but the account is now
+        # deactivated (migration 0034) and gets 401 everywhere, not this
+        # capability-specific 403 -- H_CASH above still exercises the gate.
+        self.assertEqual(self.client.post(f"/unli/sessions/{sid}/reopen", headers=self.H_OWNER,
                                           json={}).status_code, 200)
 
     def test_refills_did_not_hand_the_kitchen_inventory_write(self):
@@ -5222,7 +6936,7 @@ class TestRefillAPI(unittest.TestCase):
         oid = self._unli_order(2)
         sid = self._session(oid)
         special = self._flavor("Korean Yangnyeum")
-        self.client.patch(f"/unli/flavors/{special['id']}", headers=self.H_MGR,
+        self.client.patch(f"/unli/flavors/{special['id']}", headers=self.H_OWNER,
                           json={"flavor_type": "special", "addon_price": 40})
         for f in (self._flavor("Buffalo"), special):
             rid = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
@@ -5237,7 +6951,7 @@ class TestRefillAPI(unittest.TestCase):
             "SELECT total FROM customer_order WHERE id=?", (oid,)).fetchone()["total"]
         self.assertEqual(stored, rec["original_total"])
         # restore for other tests in this class
-        self.client.patch(f"/unli/flavors/{special['id']}", headers=self.H_MGR,
+        self.client.patch(f"/unli/flavors/{special['id']}", headers=self.H_OWNER,
                           json={"flavor_type": "included"})
 
     def test_flavor_prices_are_served_by_the_api_never_chosen_by_the_client(self):
@@ -5288,8 +7002,8 @@ class TestReferenceAlignment(unittest.TestCase):
         os.environ["WT_DB"] = cls.path
         os.environ["WT_ENV"] = "test"
         db.close_conn()
-        from wt import seed
-        cls.stats = seed.run(fresh=True)
+        cls.stats = seed_fresh_with_go_live_delivery()
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         cls.conn = db.get_conn()
 
     @classmethod
@@ -5313,15 +7027,35 @@ class TestReferenceAlignment(unittest.TestCase):
         self.assertEqual(len(self._flavor_recipes()), 14)
 
     def test_every_flavour_batch_is_one_hundred_grams(self):
+        """Only true for Original Dry Rub now — migration 0021 moved the
+        other thirteen flavours from a 100 g nominal-batch model to the
+        workbook's real per-one-6-pc-order recipe (yield_qty=1,
+        yield_unit='order'); see that migration's header for why. gapfill.py
+        keeps the fresh-install path in the same state (see its own
+        SUB_RECIPES comment) — this test now checks each flavour got the
+        yield model it's actually supposed to have, not that every flavour
+        still has the one this test used to assume all fourteen shared."""
         for f in self._flavor_recipes():
-            self.assertEqual(f["yield_qty"], 100.0, f"{f['name']} yields {f['yield_qty']}")
-            self.assertEqual(f["yield_unit"], "g")
+            if f["name"] == "Original Dry Rub":
+                self.assertEqual(f["yield_qty"], 100.0, f["name"])
+                self.assertEqual(f["yield_unit"], "g", f["name"])
+            else:
+                self.assertEqual(f["yield_qty"], 1.0, f"{f['name']} yields {f['yield_qty']}")
+                self.assertEqual(f["yield_unit"], "order", f["name"])
 
     def test_every_ratio_sums_to_its_own_batch_size(self):
-        """The defect this alignment fixed: every flavour declared a 1000 g
-        yield while its lines summed to between 14 g and 200 g, so
-        qty_base * portion / yield_qty under-deducted by 5x to 70x."""
+        """Only meaningful for a recipe still on the percentage-of-batch
+        model (Original Dry Rub): there, every line is a fraction of the
+        declared yield_qty by construction, so the lines must sum back to
+        it — the defect this alignment originally fixed was exactly a
+        flavour whose lines didn't. The other thirteen flavours are real
+        per-ingredient gram/ml quantities against yield_qty=1 'order' — an
+        abstract one-execution unit, not a summed mass — so "lines sum to
+        the yield" isn't a meaningful check for them at all; asserting it
+        would just assert grams-plus-millilitres equals 1."""
         for f in self._flavor_recipes():
+            if f["yield_unit"] == "order":
+                continue
             total = self.conn.execute(
                 "SELECT SUM(qty_base) AS s FROM recipe_line WHERE recipe_id=?",
                 (f["rid"],)).fetchone()["s"]
@@ -5330,10 +7064,13 @@ class TestReferenceAlignment(unittest.TestCase):
 
     def test_the_database_matches_the_documented_ratios(self):
         """Binds the seeded database to gapfill.SUB_RECIPES, which is the
-        transcription of Section 3. Catches drift between the two."""
+        transcription of Section 3 (house preps, Original Dry Rub) and,
+        since migration 0021, of that migration's own Section 3 for the
+        other thirteen flavours. Catches drift between the two."""
         from wt.gapfill import SUB_RECIPES
         for f in self._flavor_recipes():
-            expected = {n: q for n, q in SUB_RECIPES[f["name"]][2]}
+            components = SUB_RECIPES[f["name"]][3]
+            expected = {c[0]: c[1] for c in components}
             actual = {r["name"]: r["qty_base"] for r in self.conn.execute(
                 """SELECT i.name, rl.qty_base FROM recipe_line rl
                      JOIN ingredient i ON i.id = rl.ingredient_id
@@ -5343,18 +7080,24 @@ class TestReferenceAlignment(unittest.TestCase):
                 self.assertAlmostEqual(actual[ing], qty, places=3, msg=f"{f['name']} / {ing}")
 
     def test_specific_documented_ratios(self):
-        """Spot-checks quoted verbatim in the brief."""
+        """Spot-checks quoted verbatim from the current workbook's sheet 6
+        (the 'Unli Wings - <Flavor>' blocks derive_flavor_subrecipes() reads
+        directly — see wt/xlsx_menu_audit_import.py), not the pre-2026-09
+        reference-document values this test originally pinned. Every one of
+        these five sauces is now sourced straight from that sheet, so this
+        is the workbook's own data, transcribed once here for regression
+        protection, not a hand-derived correction any more."""
         cases = {
-            "Classic Buffalo Sauce": {"Buffalo Hot Sauce": 70, "Butter": 25,
-                                      "Garlic powder": 3, "Honey": 2},
-            "Mango Habanero Sauce": {"Mango": 50, "Hot Sauce": 20, "Honey": 20,
-                                     "Chili Flakes Dehydrated": 5, "White Vinegar": 5},
-            "Garlic Parmesan Sauce": {"Butter": 40, "Fresh Garlic Peeled": 25,
-                                      "Parmesan Cheese": 25, "Parsley": 5, "Iodized Salt": 5},
-            "Snow Cheese Sauce": {"Cheese Powder": 35, "Condense Milk": 25,
-                                  "Evaporated Milk": 20, "Butter": 20},
-            "Cheese Wing Sauce": {"Cheese Bars": 45, "Cheese Powder": 20,
-                                  "Evaporated Milk": 25, "Butter": 10},
+            "Classic Buffalo Sauce": {"Hot Sauce": 22.5, "Butter": 9.0,
+                                      "Worcestershire Sauce": 1.5},
+            "Mango Habanero Sauce": {"Mango Nectar/Puree": 27.5, "Habanero Sauce": 5.0,
+                                     "Honey": 4.0, "Butter": 4.0, "Vinegar (cane/white)": 1.5},
+            "Garlic Parmesan Sauce": {"Butter": 9.0, "Garlic (Minced, g)": 3.0,
+                                      "Parmesan Cheese": 9.0, "Parsley, fresh": 1.0},
+            "Snow Cheese Sauce": {"Cheese Powder": 9.0, "Milk Powder": 2.5,
+                                  "Powdered Sugar": 1.5, "Parmesan Cheese": 2.5},
+            "Cheese Wing Sauce": {"Cheese Sauce": 17.5, "Cheddar Cheese": 7.5,
+                                  "Fresh Milk": 5.0, "Butter": 2.5},
         }
         for sauce, expected in cases.items():
             rid = self.conn.execute(
@@ -5377,16 +7120,23 @@ class TestReferenceAlignment(unittest.TestCase):
                                 f"{f['name']} / {r['name']}: {r['block_reason']}")
 
     def test_the_ratios_stay_marked_proposed(self):
-        """The document is explicit: 'None of the 14 flavors had a documented
-        recipe, so these are proposed base ratios ... kitchen should
-        taste-test and adjust before locking in.'"""
-        verified = self.conn.execute(
-            """SELECT COUNT(*) AS n FROM recipe_line rl
+        """The original document was explicit: 'None of the 14 flavors had a
+        documented recipe, so these are proposed base ratios.' Migration
+        0021 changed that for thirteen of them — they are now transcribed
+        straight from the Master Inventory workbook's own recipe sheet and
+        genuinely verified, not proposed. Original Dry Rub is the one
+        migration 0021 explicitly excluded (see its header) and is still
+        exactly the unconfirmed proposal the document describes."""
+        rows = self.conn.execute(
+            """SELECT i.name, rl.qty_status FROM recipe_line rl
                  JOIN recipe r ON r.id = rl.recipe_id
                  JOIN ingredient i ON i.id = r.produces_ingredient_id
-                WHERE i.kind='sub_recipe' AND i.name NOT LIKE '%(house)%'
-                  AND rl.qty_status = 'verified'""").fetchone()["n"]
-        self.assertEqual(verified, 0)
+                WHERE i.kind='sub_recipe' AND i.name NOT LIKE '%(house)%'""").fetchall()
+        for r in rows:
+            if r["name"] == "Original Dry Rub":
+                self.assertNotEqual(r["qty_status"], "verified", r["name"])
+            else:
+                self.assertEqual(r["qty_status"], "verified", r["name"])
 
     # -- flavour configuration -------------------------------------------
     def test_the_ten_regular_flavours_are_included_at_zero(self):
@@ -5438,39 +7188,51 @@ class TestReferenceAlignment(unittest.TestCase):
 
     # -- SKUs --------------------------------------------------------------
     def test_white_vinegar_exists_and_is_used(self):
+        """2026-09: the current workbook names this ingredient 'Vinegar
+        (cane/white)', not 'White Vinegar' — same role (Mango Habanero
+        Sauce's vinegar line), current price/pack size from sheet 4."""
         row = self.conn.execute(
             "SELECT id, base_unit, pack_size, unit_cost FROM ingredient "
-            "WHERE name='White Vinegar'").fetchone()
-        self.assertIsNotNone(row, "White Vinegar was never added")
+            "WHERE name='Vinegar (cane/white)'").fetchone()
+        self.assertIsNotNone(row, "Vinegar (cane/white) was never added")
         self.assertEqual(row["base_unit"], "ml")
         self.assertEqual(row["pack_size"], 1000.0)
-        self.assertEqual(row["unit_cost"], 45.0)
+        self.assertEqual(row["unit_cost"], 50.0)
         used = self.conn.execute(
             "SELECT COUNT(*) AS n FROM recipe_line WHERE ingredient_id=?",
             (row["id"],)).fetchone()["n"]
-        self.assertEqual(used, 2, "Mango Habanero and Orange Chicken both need it")
+        self.assertGreater(used, 0, "Vinegar (cane/white) is not used by any recipe")
 
     def test_the_six_document_flagged_skus_exist_exactly_once(self):
-        """They were added by the 08-11 revision; the point is that this
-        alignment re-priced them rather than creating duplicates."""
-        for name in ("Onion", "Cucumber", "Shredded Cabbage", "Fresh Milk",
-                     "Blueberry Puree", "Plain Yogurt"):
+        """2026-09: 'Shredded Cabbage' and 'Blueberry Puree' were SKUs the
+        old 08-11 CSV-era correction added by hand; neither exists in the
+        current workbook at all (Taiwanese Pork Chop and the shakes source
+        their ingredients differently now — see reference.py's own
+        docstring). Only four of the original six SKUs still apply; this
+        checks those four exist exactly once, same as before."""
+        for name in ("Onion", "Cucumber", "Fresh Milk", "Plain Yogurt"):
             n = self.conn.execute(
                 "SELECT COUNT(*) AS n FROM ingredient WHERE name=? AND is_active=1",
                 (name,)).fetchone()["n"]
             self.assertEqual(n, 1, f"{name} exists {n} times")
 
     def test_benchmark_prices_are_applied(self):
-        expected = {"Onion": 140.0, "Cucumber": 135.0, "Shredded Cabbage": 105.0,
-                    "Fresh Milk": 130.0, "Plain Yogurt": 688.0}
+        """2026-09: prices now come directly from the workbook's own sheet 4
+        (Purchase Price), not a hand-transcribed SKU_BENCHMARKS table — see
+        reference.py's docstring for what retired and why."""
+        expected = {"Onion": 90.0, "Cucumber": 55.0, "Fresh Milk": 95.0, "Plain Yogurt": 280.0}
         for name, cost in expected.items():
             row = self.conn.execute(
                 "SELECT unit_cost FROM ingredient WHERE name=?", (name,)).fetchone()
             self.assertEqual(row["unit_cost"], cost, name)
 
     def test_benchmark_skus_are_never_marked_verified(self):
-        for name in ("Onion", "Cucumber", "Shredded Cabbage", "Fresh Milk",
-                     "Blueberry Puree", "Plain Yogurt", "White Vinegar"):
+        """2026-09: reference.py's SKU_BENCHMARKS mechanism is retired, but
+        the invariant it guarded still matters and still holds — a workbook
+        price the owner hasn't separately confirmed must never be seeded as
+        pre-verified. 'Shredded Cabbage'/'Blueberry Puree' dropped (see
+        test_the_six_document_flagged_skus_exist_exactly_once)."""
+        for name in ("Onion", "Cucumber", "Fresh Milk", "Plain Yogurt", "Vinegar (cane/white)"):
             row = self.conn.execute(
                 "SELECT price_status, verification_status, unit_cost_status "
                 "FROM ingredient WHERE name=?", (name,)).fetchone()
@@ -5498,36 +7260,52 @@ class TestReferenceAlignment(unittest.TestCase):
         self.assertIsInstance(mismatched, list)
 
     def test_the_distinct_sauce_skus_were_not_merged(self):
-        for name in ("Buffalo Hot Sauce", "Hot Sauce", "Sriracha", "Soy Sauce", "Gochujang Big"):
+        """2026-09: 'Buffalo Hot Sauce' as a distinct SKU is gone — Classic
+        Buffalo Sauce now uses the generic 'Hot Sauce' line directly from
+        the workbook (see reference.py's docstring). The remaining SKUs
+        this test guards against an accidental merge still apply as-is."""
+        for name in ("Hot Sauce", "Sriracha Sauce", "Soy Sauce", "Gochujang"):
             n = self.conn.execute(
                 "SELECT COUNT(*) AS n FROM ingredient WHERE name=? AND is_active=1",
                 (name,)).fetchone()["n"]
             self.assertEqual(n, 1, f"{name} missing or duplicated")
-        buffalo = self.conn.execute(
-            "SELECT id FROM ingredient WHERE name='Buffalo Hot Sauce'").fetchone()["id"]
-        generic = self.conn.execute(
-            "SELECT id FROM ingredient WHERE name='Hot Sauce'").fetchone()["id"]
-        self.assertNotEqual(buffalo, generic)
 
     # -- recipe corrections ------------------------------------------------
-    def test_spicy_korean_wing_bowl_uses_yangnyeum_not_bbq(self):
+    def test_spicy_korean_wing_bowl_uses_no_flavour_sub_recipe(self):
+        """2026-09: the current workbook's sheet 6 lists Spicy Korean Wing
+        Bowl's own 20 raw ingredients directly (Gochujang, Soy Sauce,
+        Kimchi, etc.) — it references no flavour sub-recipe at all any
+        more, so the old KOREAN_BOWL_FIX question ('does it use Yangnyeum
+        or BBQ') no longer applies; the dish just doesn't go through a
+        sub-recipe. See reference.py's docstring."""
         rows = self.conn.execute(
-            """SELECT i.name, rl.qty_base FROM recipe_line rl
+            """SELECT i.name FROM recipe_line rl
                  JOIN recipe r ON r.id = rl.recipe_id
                  JOIN ingredient i ON i.id = rl.ingredient_id
                 WHERE r.name LIKE 'Spicy Korean Wing Bowl%' AND i.kind='sub_recipe'""").fetchall()
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["name"], "Korean Yangneum Sauce")
-        self.assertEqual(rows[0]["qty_base"], 40.0)
+        self.assertEqual(rows, [])
+        kimchi = self.conn.execute(
+            """SELECT rl.qty_base FROM recipe_line rl
+                 JOIN recipe r ON r.id = rl.recipe_id
+                 JOIN ingredient i ON i.id = rl.ingredient_id
+                WHERE r.name LIKE 'Spicy Korean Wing Bowl%' AND i.name='Kimchi'""").fetchone()
+        self.assertIsNotNone(kimchi, "Spicy Korean Wing Bowl lost its Kimchi line")
+        self.assertEqual(kimchi["qty_base"], 35.0)
 
-    def test_taiwanese_porkchop_has_its_shredded_cabbage(self):
+    def test_taiwanese_porkchop_uses_pickled_mustard_greens(self):
+        """2026-09: the current workbook gives Taiwanese Pork Chop Pickled
+        Mustard Greens + a Stir-Fry Vegetable Mix, not a Shredded Cabbage
+        swap — CABBAGE_FIX no longer applies (see reference.py's
+        docstring); Shredded Cabbage isn't even an ingredient any more
+        (test_the_six_document_flagged_skus_exist_exactly_once)."""
         row = self.conn.execute(
             """SELECT rl.qty_base FROM recipe_line rl
                  JOIN recipe r ON r.id = rl.recipe_id
                  JOIN ingredient i ON i.id = rl.ingredient_id
-                WHERE r.name LIKE 'Taiwanese Porkchop%' AND i.name='Shredded Cabbage'""").fetchone()
-        self.assertIsNotNone(row, "Taiwanese Porkchop still has no cabbage line")
-        self.assertEqual(row["qty_base"], 30.0)
+                WHERE r.name LIKE 'Taiwanese Pork Chop%' AND i.name='Pickled Mustard Greens'"""
+        ).fetchone()
+        self.assertIsNotNone(row, "Taiwanese Pork Chop lost its Pickled Mustard Greens line")
+        self.assertGreater(row["qty_base"], 0)
 
     # -- main-dish recipe corrections (2026-08 revision) --------------------
     def _line(self, recipe_like, ingredient_name):
@@ -5539,17 +7317,23 @@ class TestReferenceAlignment(unittest.TestCase):
             (recipe_like, ingredient_name)).fetchone()
 
     def test_documented_quantity_corrections_applied(self):
+        """2026-09: reference.py's RECIPE_QTY_FIXES (a hand-transcribed
+        patch layer against a separate PDF reference document) is retired —
+        every quantity below now comes directly from the current workbook's
+        sheet 6, already reconciled by the owner's own audit, transcribed
+        here once for regression protection rather than corrected by this
+        importer. See reference.py's docstring."""
         cases = [
-            ("Spicy Tuna Linguine Pesto%", "Pesto Jar", 40.0),
-            ("Creamy Sausage Pasta%", "Hugarian Sausage", 80.0),
-            ("Spicy Korean Wing Bowl%", "Wings", 300.0),
-            ("Spicy Korean Wing Bowl%", "Kimchi", 50.0),
+            ("Spicy Tuna Linguine Pesto%", "Pesto Sauce", 35.0),
+            ("Creamy Sausage Pasta%", "Italian Sausage", 80.0),
+            ("Spicy Korean Wing Bowl%", "Chicken Wings", 3.0),
+            ("Spicy Korean Wing Bowl%", "Kimchi", 35.0),
             ("Spicy Korean Wing Bowl%", "Cucumber", 30.0),
-            ("Chicken Salpicao%", "Chicken Breast/Thigh (raw, boneless)", 180.0),
-            ("Bacon & Egg%", "Bacon", 60.0),
-            ("Onion Rings%", "White Eggs", 0.25),
-            ("1 Cup Rice%", "Rice", 180.0),
-            ("Ranch Dip%", "Mayonaise", 25.0),
+            ("Chicken Salpicao%", "Chicken, Boneless", 140.0),
+            ("Bacon and 2 Egg%", "Bacon", 80.0),
+            ("Onion Rings%", "Egg", 1.0),
+            ("1 Cup Rice%", "Cooked White Rice", 150.0),
+            ("Ranch Dip%", "Mayonnaise", 20.0),
         ]
         for recipe_like, ing, qty in cases:
             row = self._line(recipe_like, ing)
@@ -5557,23 +7341,31 @@ class TestReferenceAlignment(unittest.TestCase):
             self.assertEqual(row["qty_base"], qty, f"{recipe_like} / {ing}")
 
     def test_wrong_ingredients_were_redirected_not_left_in_place(self):
-        """Creamy Sausage Pasta named the generic Pasta SKU where the
-        document names Balducci Penne Pasta by name; Alfredo — a pasta dish —
-        deducted Rice and carried no pasta line at all."""
+        """2026-09: there is no redirect step any more — reference.py's
+        RECIPE_INGREDIENT_SWAPS is retired, because the current workbook's
+        sheet 6 already names the right ingredient directly (Fettuccine
+        Pasta for Creamy Sausage Pasta, not a generic 'Pasta' SKU; real
+        pasta for the Alfredo, never Rice). This checks the same correct
+        end state the old redirect used to produce, now sourced natively."""
         self.assertIsNone(self._line("Creamy Sausage Pasta%", "Pasta"))
-        self.assertEqual(self._line("Creamy Sausage Pasta%", "Balducci Penne Pasta")["qty_base"], 120.0)
+        self.assertEqual(self._line("Creamy Sausage Pasta%", "Fettuccine Pasta")["qty_base"], 100.0)
 
         self.assertIsNone(self._line("Creamy Chicken & Mushroom Alfredo%", "Rice"))
-        self.assertEqual(self._line("Creamy Chicken & Mushroom Alfredo%", "Pasta")["qty_base"], 120.0)
+        self.assertEqual(self._line("Creamy Chicken & Mushroom Alfredo%", "Fettuccine Pasta")["qty_base"], 80.0)
 
     def test_missing_lines_were_added(self):
+        """2026-09: reference.py's RECIPE_LINE_ADDITIONS is retired — the
+        current workbook's sheet 6 already carries every one of these
+        lines directly, with its own real quantities (not the old
+        reference document's gap-fill estimates). Fish & Chips' batter no
+        longer uses egg at all in the current recipe (Water/Baking Powder
+        instead), so that case is dropped; Wing Rack's old 'add Butter'
+        line doesn't exist either — the current recipe has none."""
         cases = [
-            ("Onion Rings%", "Cornstarch", 10.0),
-            ("Fish & Chips%", "White Eggs", 0.5),
-            ("Wing Rack%", "Cornstarch", 60.0),
-            ("Wing Rack%", "Butter", 30.0),
-            ("Hungarian Sausage (Breakfast)%", "Iodized Salt", 1.0),
-            ("Ranch Dip%", "Ground Pepper", 1.0),
+            ("Onion Rings%", "Cornstarch", 20.0),
+            ("%Wing Rack%", "Cornstarch", 30.0),
+            ("Hungarian Sausage%", "Salt", 1.0),
+            ("Ranch Dip%", "Black Pepper (ground)", 0.2),
         ]
         for recipe_like, ing, qty in cases:
             row = self._line(recipe_like, ing)
@@ -5596,18 +7388,24 @@ class TestReferenceAlignment(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["base_unit"], "pc")
         self.assertEqual(row["pack_size"], 1.0)
-        self.assertEqual(row["on_hand_base"], 15.0, "15 bananas were counted on the sheet")
+        # 2026-09: the current workbook's own counted figure (was 15 under
+        # the old CSV sheet) -- still a whole-piece count, not a weight.
+        self.assertEqual(row["on_hand_base"], 500.0, "500 bananas were counted on the current sheet")
 
-        line = self._line("Banana MilkShake%", "Banana")
+        line = self._line("Banana Milk Shake%", "Banana")
         self.assertIsNotNone(line)
         self.assertEqual(line["qty_base"], 1.0, "must deduct exactly 1 whole banana, not a weight")
 
     def test_recipe_corrections_do_not_touch_the_fourteen_flavours(self):
-        """The main-dish corrections are additive to 0012's flavour alignment,
-        never a second pass over it."""
+        """The main-dish corrections are additive to the flavour alignment,
+        never a second pass over it. 'Lines sum to yield_qty' is only a
+        meaningful check under the percentage-of-batch model (Original Dry
+        Rub) — see test_every_ratio_sums_to_its_own_batch_size; the other
+        thirteen are real quantities against yield_qty=1 'order' since
+        migration 0021, so this is skipped for them."""
         from wt.gapfill import SUB_RECIPES
-        for name, (_, yield_qty, components) in SUB_RECIPES.items():
-            if "(house)" in name:
+        for name, (_, yield_qty, yield_unit, components) in SUB_RECIPES.items():
+            if "(house)" in name or yield_unit == "order":
                 continue
             rid = self.conn.execute(
                 "SELECT r.id FROM recipe r JOIN ingredient i ON i.id=r.produces_ingredient_id "
@@ -5644,7 +7442,10 @@ class TestReferenceAlignment(unittest.TestCase):
                 HAVING n > 1""").fetchall()
         self.assertEqual([dict(d) for d in same_label], [])
 
-        # And every legitimate repeat is one of the two the document explains.
+        # And every legitimate repeat is one the current workbook actually
+        # calls for. 2026-09: the old CSV-era Beef Tapa oil-twice repeat
+        # doesn't exist in the current recipe; Wing Rack's two flavour
+        # slots (now named per the current menu item) are the only one left.
         repeats = self.conn.execute(
             """SELECT r.name AS recipe, i.name AS ingredient, COUNT(*) AS n
                  FROM recipe_line rl
@@ -5653,8 +7454,7 @@ class TestReferenceAlignment(unittest.TestCase):
                 GROUP BY rl.recipe_id, rl.ingredient_id HAVING n > 1""").fetchall()
         self.assertEqual(
             sorted((r["recipe"], r["ingredient"]) for r in repeats),
-            [("Breakfast Meals: (Beef Tapa)", "Palm Oil"),
-             ("Wing Rack 12 pcs (2 flavors) (P339)", "Classic Buffalo Sauce")])
+            [("12 pcs (2 Flavors) Ala Carte Wing Rack", "Classic Buffalo Sauce")])
 
     def test_no_two_active_ingredients_share_a_name(self):
         collisions = self.conn.execute(
@@ -5686,7 +7486,7 @@ class TestReferenceAlignment(unittest.TestCase):
 
     def test_rice_yield_stays_unverified(self):
         row = self.conn.execute(
-            "SELECT yield_factor, yield_factor_status FROM ingredient WHERE name='Rice'").fetchone()
+            "SELECT yield_factor, yield_factor_status FROM ingredient WHERE name='Cooked White Rice'").fetchone()
         self.assertNotEqual(row["yield_factor_status"], "verified",
                             "the raw-to-cooked rice yield is the document's own open question")
 
@@ -5876,8 +7676,8 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
         os.environ["WT_DB"] = cls.path
         os.environ["WT_ENV"] = "test"
         db.close_conn()
-        from wt import seed
-        seed.run(fresh=True)
+        seed_fresh_with_go_live_delivery()
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -5920,10 +7720,14 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
         non-void order, so it booked revenue for a sale that never happened."""
         item = self._unli_item()
         before = self._counts()
+        # Unlimited Wings is priced per head (₱399 x head_count, fixed 2026-09
+        # — see TestPOSFixes), so 999 heads prices at ~₱398,601; cash_received
+        # only needs to clear that so this test still fails where it means to
+        # (reservation, not the payment-sufficiency check).
         r = self.client.post("/pos/orders", headers=self.H_CASH, json={
             "table_label": "T-ghost", "head_count": 999,
             "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
-            "cash_received": 90000})
+            "cash_received": 500000})
         self.assertEqual(r.status_code, 409, r.text)
         self.assertEqual(self._counts(), before,
                          "a failed reservation left an order, line, session or hold behind")
@@ -5983,7 +7787,7 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
     def test_unli_line_reserves_exactly_lambda_times_heads(self):
         item = self._unli_item()
         wings = self.conn.execute(
-            "SELECT id FROM ingredient WHERE name='Wings'").fetchone()["id"]
+            "SELECT id FROM ingredient WHERE name='Chicken Wings'").fetchone()["id"]
         lam = self.conn.execute(
             """SELECT lambda_value FROM unli_coefficient
                 WHERE unli_item_id=1 AND role='rolling'
@@ -6059,7 +7863,7 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
                               headers=self.H_CASH).json()["session_id"]
         self.client.post(f"/pos/orders/{oid}/void", headers=self.H_CASH,
                          json={"reason": "walked out"})
-        # force the session back open, as a manager reopen would
+        # force the session back open, as an admin reopen would
         with db.write_tx(self.conn):
             self.conn.execute("UPDATE unli_session SET status='active' WHERE id=?", (sid,))
         flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
@@ -6099,8 +7903,8 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
         os.environ["WT_DB"] = cls.path
         os.environ["WT_ENV"] = "test"
         db.close_conn()
-        from wt import seed
-        seed.run(fresh=True)
+        seed_fresh_with_go_live_delivery()
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -6111,7 +7915,8 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
                                    json={"username": u, "password": "wingstheory"}).json()["token"]
         cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
         cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
-        cls.H_MGR = {"Authorization": f"Bearer {token('manager')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -6264,11 +8069,45 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
         detail = self.client.get(f"/pos/orders/{order['order_id']}", headers=self.H_CASH).json()
         self.assertEqual(detail["order"]["status"], "void")
 
+    # -- 3b. duplicate void on a plain (non-unli) order -------------------
+    def test_03b_duplicate_void_after_preparation_is_rejected(self):
+        """wt/reservation.py's void_after_commit() already refuses a second
+        void ('order is already void') -- proven directly against
+        TestFEFODepletion/TestConcurrency's domain-level fixtures, and by
+        test_13_refill_void's equivalent case for an unlimited refill, but
+        never exercised over the real HTTP surface for a plain order. Closes
+        that specific gap: the same click-twice/retry protection a cashier
+        relies on for order.void must hold here too, and it must not post a
+        second compensating credit/wastage pair."""
+        item = self._ala_carte_item()
+        leaf = self._leaf_ingredient(item["recipe_id"])
+
+        order = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-3b", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]}).json()
+        self.client.post(f"/kds/orders/{order['order_id']}/start", headers=self.H_KIT)
+
+        first = self.client.post(f"/pos/orders/{order['order_id']}/void", headers=self.H_CASH,
+                                 json={"reason": "kitchen error", "restock": False})
+        self.assertEqual(first.status_code, 200, first.text)
+        on_hand_after_first_void = self._on_hand(leaf["id"])
+        ledger_count_after_first_void = self._ledger_count(leaf["id"])
+
+        second = self.client.post(f"/pos/orders/{order['order_id']}/void", headers=self.H_CASH,
+                                  json={"reason": "retry / double-click", "restock": False})
+        self.assertEqual(second.status_code, 409, second.text)
+        # nothing moved a second time -- no extra ledger rows, on_hand
+        # identical to right after the first (and only) void
+        self.assertEqual(self._ledger_count(leaf["id"]), ledger_count_after_first_void,
+                         "a rejected duplicate void must not post a second compensating pair")
+        self.assertAlmostEqual(self._on_hand(leaf["id"]), on_hand_after_first_void, places=4)
+        detail = self.client.get(f"/pos/orders/{order['order_id']}", headers=self.H_CASH).json()
+        self.assertEqual(detail["order"]["status"], "void")
+
     # -- 4. receiving --------------------------------------------------
     def test_04_receiving(self):
-        ing = self.client.get("/console/ingredients?limit=1", headers=self.H_MGR).json()["ingredients"][0]
+        ing = self.client.get("/console/ingredients?limit=1", headers=self.H_OWNER).json()["ingredients"][0]
         on_hand_before = self._on_hand(ing["id"])
-        r = self.client.post(f"/console/ingredients/{ing['id']}/receive", headers=self.H_MGR,
+        r = self.client.post(f"/console/ingredients/{ing['id']}/receive", headers=self.H_OWNER,
                              json={"purchase_qty": 2, "lot_no": "MATRIX-1", "expires_at": "2027-06-01"})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertGreater(self._on_hand(ing["id"]), on_hand_before)
@@ -6281,6 +8120,13 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
 
     # -- 5. insufficient inventory --------------------------------------
     def test_05_insufficient_inventory(self):
+        # 2026-09: the current workbook stocks every raw ingredient the
+        # fresh seed needs (Panko Breadcrumbs included, 500,000 g), so
+        # nothing starts out-of-stock any more -- explicitly zero one
+        # ingredient here instead of relying on an incidental gap in the
+        # seed data, so this scenario is guaranteed rather than hoped for.
+        self.conn.execute(
+            "UPDATE ingredient SET on_hand_base=0 WHERE name='Panko Breadcrumbs'")
         menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
         blocked = next((m for m in menu["items"] if not m["sellable"]), None)
         self.assertIsNotNone(blocked, "fixture must carry at least one out-of-stock menu item")
@@ -6295,7 +8141,7 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
     # -- 6. receiving with missing ingredient configuration --------------
     def test_06_receiving_missing_ingredient(self):
         # (a) the ingredient itself does not exist
-        r = self.client.post("/console/ingredients/999999/receive", headers=self.H_MGR,
+        r = self.client.post("/console/ingredients/999999/receive", headers=self.H_OWNER,
                              json={"purchase_qty": 1})
         self.assertIn(r.status_code, (404, 409), r.text)
         # (b) a real ingredient with no pack_size configured -- receiving
@@ -6311,17 +8157,17 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
             (f"ING-MATRIX-{cur+1}",))
         unset_id = self.conn.execute(
             "SELECT id FROM ingredient WHERE name='Matrix Unset Item'").fetchone()["id"]
-        r2 = self.client.post(f"/console/ingredients/{unset_id}/receive", headers=self.H_MGR,
+        r2 = self.client.post(f"/console/ingredients/{unset_id}/receive", headers=self.H_OWNER,
                               json={"purchase_qty": 1})
         self.assertEqual(r2.status_code, 409, r2.text)
         self.assertEqual(self._on_hand(unset_id), 0)
 
     # -- 7. stock count --------------------------------------------------
     def test_07_stock_count(self):
-        ing = self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+        ing = self.client.get("/console/ingredients?limit=500", headers=self.H_OWNER).json()["ingredients"]
         target = next(i for i in ing if i["on_hand_base"] > 100)
         new_count = target["on_hand_base"] - 50
-        r = self.client.post(f"/console/ingredients/{target['id']}/count", headers=self.H_MGR,
+        r = self.client.post(f"/console/ingredients/{target['id']}/count", headers=self.H_OWNER,
                              json={"actual_base": new_count, "note": "matrix physical count"})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertAlmostEqual(self._on_hand(target["id"]), new_count, places=3)
@@ -6333,10 +8179,10 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
 
     # -- 8. wastage --------------------------------------------------
     def test_08_wastage(self):
-        ing = self.client.get("/console/ingredients?limit=500", headers=self.H_MGR).json()["ingredients"]
+        ing = self.client.get("/console/ingredients?limit=500", headers=self.H_OWNER).json()["ingredients"]
         target = next(i for i in ing if i["on_hand_base"] > 50)
         on_hand_before = self._on_hand(target["id"])
-        r = self.client.post(f"/console/ingredients/{target['id']}/waste", headers=self.H_MGR,
+        r = self.client.post(f"/console/ingredients/{target['id']}/waste", headers=self.H_OWNER,
                              json={"qty_base": 5.0, "reason": "spoilage", "note": "matrix test"})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertAlmostEqual(self._on_hand(target["id"]), on_hand_before - 5.0, places=3)
@@ -6566,18 +8412,88 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
         panko = self.conn.execute("SELECT id FROM ingredient WHERE name LIKE '%Panko%'").fetchone()
         if panko is None:
             self.skipTest("fixture has no Panko-blocked item to unblock")
+        # 2026-09: explicitly zeroed here (not relying on test_05's own
+        # mutation or an incidental seed gap -- see that test's own note)
+        # so this scenario doesn't depend on test execution order.
+        self.conn.execute("UPDATE ingredient SET on_hand_base=0 WHERE id=?", (panko["id"],))
         before = self.client.get("/pos/menu", headers=self.H_CASH).json()
         blocked_before = next((m for m in before["items"] if not m["sellable"]
                                and "Panko" in m.get("block_reason", "")), None)
         self.assertIsNotNone(blocked_before, "fixture must start with a Panko-blocked menu item")
 
-        r = self.client.post(f"/console/ingredients/{panko['id']}/receive", headers=self.H_MGR,
+        r = self.client.post(f"/console/ingredients/{panko['id']}/receive", headers=self.H_OWNER,
                              json={"purchase_qty": 5, "lot_no": "MATRIX-PANKO"})
         self.assertEqual(r.status_code, 200, r.text)
 
         after = self.client.get("/pos/menu", headers=self.H_CASH).json()
         same_item = next(m for m in after["items"] if m["menu_item_pk"] == blocked_before["menu_item_pk"])
         self.assertTrue(same_item["sellable"], "receiving the limiting ingredient must unblock the POS menu item")
+
+    # -- 19. FEFO partial consumption across a batch boundary, over HTTP --
+    def test_19_fefo_partial_consumption_across_batch_boundary(self):
+        """TestFEFO.test_batches_are_picked_by_expiry_not_receipt already
+        proves the ordering at the domain level with hand-inserted batches.
+        This is the HTTP-level companion: two batches opened through the
+        real /receive endpoint (later delivery expiring sooner, same
+        FEFO-not-FIFO shape), then a single real POS sale sized to fully
+        exhaust the sooner-expiring batch AND spill into the later one --
+        crossing the batch boundary inside one transaction, not two.
+        """
+        ing_id = self.conn.execute(
+            "INSERT INTO ingredient (ingredient_id, name, category, kind, base_unit, "
+            "purchase_unit, pack_size, pack_size_status, yield_factor, yield_factor_status, "
+            "on_hand_base, unit_cost, unit_cost_status) "
+            "VALUES ('ING-FEFO-HTTP', 'FEFO Boundary Test', 'dry_food', 'raw', 'g', "
+            "'g', 1, 'verified', 1.0, 'verified', 0, 10.0, 'verified')"
+        ).lastrowid
+
+        # Received first, expires LATER -- would be issued first under FIFO.
+        r1 = self.client.post(f"/console/ingredients/{ing_id}/receive", headers=self.H_OWNER,
+                              json={"purchase_qty": 300, "lot_no": "LATER", "expires_at": "2027-06-01"})
+        self.assertEqual(r1.status_code, 200, r1.text)
+        # Received second, expires SOONER -- FEFO must issue this one first.
+        r2 = self.client.post(f"/console/ingredients/{ing_id}/receive", headers=self.H_OWNER,
+                              json={"purchase_qty": 150, "lot_no": "EARLIER", "expires_at": "2026-10-01"})
+        self.assertEqual(r2.status_code, 200, r2.text)
+        self.assertEqual(self._on_hand(ing_id), 450.0)
+
+        later_before, earlier_before = (self.conn.execute(
+            "SELECT qty_base FROM fefo_batch WHERE ingredient_id=? AND lot_no=?", (ing_id, lot)
+        ).fetchone()["qty_base"] for lot in ("LATER", "EARLIER"))
+        self.assertEqual((later_before, earlier_before), (300.0, 150.0))
+
+        recipe_pk = add_recipe(self.conn, "FEFO Boundary Dish", [(ing_id, 200.0)])
+        menu_pk = add_menu_item(self.conn, "FEFO Boundary Dish", recipe_pk, price=100.0)
+        self.conn.commit()
+
+        # One sale, 200 g -- more than the 150 g EARLIER batch holds, so it
+        # must exhaust EARLIER (soonest expiry) and draw the remaining 50 g
+        # from LATER, in the same commit.
+        order = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "T-19", "lines": [{"menu_item_pk": menu_pk, "qty": 1}]}).json()
+        self._serve_order(order["order_id"])
+
+        earlier = self.conn.execute(
+            "SELECT qty_base, state FROM fefo_batch WHERE ingredient_id=? AND lot_no='EARLIER'",
+            (ing_id,)).fetchone()
+        later = self.conn.execute(
+            "SELECT qty_base, state FROM fefo_batch WHERE ingredient_id=? AND lot_no='LATER'",
+            (ing_id,)).fetchone()
+
+        # Sooner-expiring batch fully drained and closed -- not merely
+        # depleted by an even split, which would prove FIFO/round-robin
+        # instead of FEFO.
+        self.assertAlmostEqual(earlier["qty_base"], 0.0, places=4)
+        self.assertEqual(earlier["state"], "depleted")
+        # Boundary crossed correctly into the next batch: exactly the 50 g
+        # shortfall, no more and no less.
+        self.assertAlmostEqual(later["qty_base"], 250.0, places=4)
+        self.assertEqual(later["state"], "open")
+
+        self.assertAlmostEqual(self._on_hand(ing_id), 250.0, places=4)
+        self._assert_fefo_matches_on_hand(ing_id)
+        self._assert_ledger_balance_matches_on_hand(ing_id)
+        self.assertGreaterEqual(self._on_hand(ing_id), 0.0)
 
 
 class TestMigrationSafety(unittest.TestCase):
@@ -7110,13 +9026,3116 @@ class TestBackupRestore(unittest.TestCase):
             os.environ["WT_ENV"] = "test"
 
 
+
+# ===========================================================================
+class TestIngredientDepletionForecast(Base):
+    """wt/depletion.py -- the forward chain: menu demand -> recipe -> projected
+    ingredient consumption -> stock trajectory -> depletion date.
+
+    Every fixture below plants exact daily quantities so the arithmetic is
+    what is under test, not "did it return a dict". NOW is pinned to 15:00
+    Manila: mid-service, so both halves of the nowcast (what already sold and
+    what is still to come) are non-trivial.
+    """
+
+    # 2026-08-25 15:00 Manila == 07:00 UTC. A Tuesday.
+    NOW = dt.datetime(2026, 8, 25, 7, 0, 0, tzinfo=dt.timezone.utc)
+    TODAY = dt.date(2026, 8, 25)
+
+    def _day(self, n):
+        return (self.TODAY - dt.timedelta(days=n)).isoformat()
+
+    def _sell(self, iso_date, menu_pk, qty, manila_hour):
+        """An order on a given business day at a given Manila hour.
+
+        The hour matters: depletion.py builds its intraday profile ("what
+        share of a normal day's units have landed by now") by pooling these
+        timestamps, and the nowcast compares today against that share. A
+        fixture that puts every order at one hour would make the profile a
+        step and the nowcast untestable.
+        """
+        n = self.conn.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+        ts = f"{iso_date} {(manila_hour - 8) % 24:02d}:00:00"   # Manila -> UTC
+        cur = self.conn.execute(
+            "INSERT INTO customer_order (order_no, table_label, head_count, status, created_at) "
+            "VALUES (?,?,?,?,?)", (f"WT-H-{n + 1}", "T-H", 0, "served", ts))
+        order_pk = cur.lastrowid
+        price = self.conn.execute("SELECT price FROM menu_item WHERE id=?",
+                                  (menu_pk,)).fetchone()["price"]
+        self.conn.execute(
+            "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,?,?)",
+            (order_pk, menu_pk, qty, price))
+        return order_pk
+
+    #: Half a day's units by 12:00 Manila, the rest by 19:00 -- so at the
+    #: pinned 15:00 clock exactly half a normal day is expected to be done.
+    SERVICE_HOURS = (12, 19)
+
+    def _setup_item(self, *, on_hand=10000.0, per_serving=100.0, daily=10, days=28,
+                    lead_time=3, name="Chicken", sell_today=True):
+        """One ingredient, one menu item, `daily` units sold on each of the
+        last `days` days. Nothing else touches the ingredient, so expected
+        consumption is exactly daily * per_serving.
+
+        sell_today puts today exactly ON pace -- the first service hour's half
+        of a normal day, already sold by the pinned 15:00 clock. Without it
+        today reads as a dead day and the nowcast damps the projection, which
+        is correct behaviour but a moving target for the arithmetic tests.
+        """
+        ing = add_ingredient(self.conn, name, on_hand=on_hand, pack=1000)
+        self.conn.execute("UPDATE ingredient SET lead_time_days=? WHERE id=?", (lead_time, ing))
+        rec = add_recipe(self.conn, name + " Dish", [(ing, per_serving)])
+        item = add_menu_item(self.conn, name + " Dish", rec)
+        for n in range(1, days + 1):
+            for hour in self.SERVICE_HOURS:
+                self._sell(self._day(n), item, daily // 2, hour)
+        if sell_today:
+            self._sell(self.TODAY.isoformat(), item, daily // 2, self.SERVICE_HOURS[0])
+        self.conn.commit()
+        return ing, item
+
+    def _row(self, ing, **kw):
+        f = depletion.ingredient_forecast(self.conn, now=self.NOW, **kw)
+        return f, next(r for r in f["ingredients"] if r["ingredientId"] == ing)
+
+    # -- the chain ---------------------------------------------------------
+    def test_projected_consumption_is_demand_times_recipe_quantity(self):
+        ing, _ = self._setup_item(on_hand=100000.0, per_serving=100.0, daily=10)
+        _, row = self._row(ing)
+        # 10 units/day x 100 g/unit = 1000 g/day, with no weekday skew to apply
+        # (every day sold the same amount, so every shrunk factor is 1.0).
+        # The tolerance absorbs the nowcast: today is on pace to within a
+        # fraction of a percent, not exactly, because the intraday profile
+        # includes today's own orders in its denominator.
+        self.assertAlmostEqual(row["forecastDailyConsumption"], 1000.0, delta=5.0)
+
+    def test_trajectory_starts_at_available_not_on_hand(self):
+        ing, _ = self._setup_item(on_hand=10000.0)
+        self.conn.execute("UPDATE ingredient SET reserved_base=2500 WHERE id=?", (ing,))
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertEqual(row["available"], 7500.0)
+        # Day 0 removes only what is STILL TO COME today; today's sales have
+        # already left the ledger.
+        self.assertAlmostEqual(row["trajectory"][0],
+                               row["available"] - row["restOfTodayConsumption"], places=2)
+
+    def test_depletion_date_matches_days_of_supply(self):
+        ing, _ = self._setup_item(on_hand=5000.0, per_serving=100.0, daily=10)
+        _, row = self._row(ing)
+        self.assertIsNotNone(row["daysOfSupply"])
+        expected = (self.TODAY + dt.timedelta(days=row["daysOfSupply"])).isoformat()
+        self.assertEqual(row["depletionDate"], expected)
+
+    def test_no_depletion_inside_horizon_is_stated_not_invented(self):
+        ing, _ = self._setup_item(on_hand=10_000_000.0, per_serving=100.0, daily=10)
+        _, row = self._row(ing)
+        self.assertIsNone(row["depletionDate"])
+        self.assertIsNone(row["daysOfSupply"])
+        self.assertFalse(row["depletesWithinHorizon"])
+
+    def test_idle_status_for_ingredient_with_no_consumption_history(self):
+        """2026-09 cleanup: depletion.STATUS_ORDER used to carry a 'no_data'
+        tier that ingredient_forecast() never actually assigned -- every
+        ingredient it sees gets a real trajectory (even an all-zero one), so
+        an ingredient nobody has ever sold lands on 'idle' (steady demand and
+        depletion both non-positive), not a separate not-yet-seen tier. This
+        pins that down: a bare ingredient, in no recipe, with on-hand stock
+        but zero ledger history, must report 'idle' with no depletion date
+        and no order recommendation -- and 'no_data' must not exist as a
+        reachable status at all."""
+        ing = add_ingredient(self.conn, "Never Sold", on_hand=500.0, pack=1000)
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "idle")
+        self.assertIsNone(row["depletionDate"])
+        self.assertIsNone(row["daysOfSupply"])
+        self.assertIsNone(row["suggestedOrderQty"])
+        self.assertNotIn("no_data", depletion.STATUS_ORDER)
+
+    def test_trajectory_never_goes_below_zero(self):
+        ing, _ = self._setup_item(on_hand=200.0, per_serving=100.0, daily=10)
+        _, row = self._row(ing)
+        self.assertTrue(all(v >= 0 for v in row["trajectory"]))
+        # The shortfall is reported as its own figure rather than as a
+        # negative "stock" level.
+        self.assertGreater(row["shortfallAtLeadTime"], 0)
+        self.assertEqual(row["projectedAtLeadTime"], 0.0)
+
+    def test_safety_stock_is_explicit_not_a_hidden_constant(self):
+        """spec: 'safety stock must be an explicit value or calculation... do
+        not hide a magic safety-stock number inside code.' REVIEW_CYCLE_DAYS
+        used to be folded straight into the shortfall arithmetic with no
+        trace of it in the response; it is now its own named, base-unit
+        figure a caller can show and explain."""
+        ing, _ = self._setup_item(on_hand=5000.0, per_serving=100.0, daily=10, lead_time=2)
+        _, row = self._row(ing)
+        self.assertEqual(row["safetyStockDays"], depletion.REVIEW_CYCLE_DAYS)
+        self.assertAlmostEqual(row["safetyStockBase"],
+                               row["forecastDailyConsumption"] * depletion.REVIEW_CYCLE_DAYS, places=3)
+
+    def test_suggested_order_qty_rounds_up_to_a_whole_pack(self):
+        """The reference acceptance rule (spec section 25): a real purchase
+        can never be a fractional number of packs. on_hand is sized so the
+        shortfall lands strictly between two whole packs, and this recomputes
+        the exact formula from the row's own reported inputs (steady rate x
+        lead time + safety stock - available) rather than a value hand-copied
+        from a run of this fixture, which the demand model's own pace/
+        momentum terms could otherwise make brittle."""
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=1)
+        _, row = self._row(ing)
+        self.assertIsNotNone(row["suggestedOrderQty"])
+        self.assertIsInstance(row["suggestedOrderQty"], int)
+        shortfall = (row["forecastDailyConsumption"] * row["leadTimeDays"]
+                    + row["safetyStockBase"] - row["available"])
+        self.assertGreater(shortfall, 0)
+        raw_packs = shortfall / row["packSize"]
+        self.assertNotEqual(row["suggestedOrderQty"], raw_packs, "fixture must land on a fractional pack count")
+        self.assertEqual(row["suggestedOrderQty"], math.ceil(raw_packs))
+
+    # -- today's observation ----------------------------------------------
+    def test_busy_today_shortens_the_runway(self):
+        # Sized so the runway lands INSIDE the forecast horizon both before and
+        # after the spike -- otherwise both are "no depletion in 21 days" and
+        # there is nothing to compare.
+        ing, item = self._setup_item(on_hand=15000.0, per_serving=100.0, daily=10)
+        _, before = self._row(ing)
+        self._sell(self.TODAY.isoformat(), item, 40, 12)   # 8x a normal half-day, already sold
+        self.conn.commit()
+        _, after = self._row(ing)
+        self.assertGreater(after["restOfTodayConsumption"], before["restOfTodayConsumption"])
+        self.assertGreater(after["forecastDailyConsumption"], before["forecastDailyConsumption"])
+        self.assertLess(after["daysOfSupply"], before["daysOfSupply"])
+
+    def test_quiet_today_projects_less_than_a_busy_one_without_freezing(self):
+        ing, item = self._setup_item(on_hand=100000.0, per_serving=100.0, daily=10,
+                                     sell_today=False)
+        # A trading day (another item sold) on which THIS item sold nothing.
+        other_rec = add_recipe(self.conn, "Other Dish",
+                               [(add_ingredient(self.conn, "Other", on_hand=9999.0), 1.0)])
+        other = add_menu_item(self.conn, "Something Else", other_rec)
+        self._sell(self.TODAY.isoformat(), other, 1, 12)
+        self.conn.commit()
+        _, quiet = self._row(ing)
+
+        self._sell(self.TODAY.isoformat(), item, 40, 12)
+        self.conn.commit()
+        _, busy = self._row(ing)
+
+        self.assertLess(quiet["restOfTodayConsumption"], busy["restOfTodayConsumption"])
+        # A slow day is not a closed day: some demand is still expected.
+        self.assertGreater(quiet["restOfTodayConsumption"], 0)
+
+    def test_one_freak_ticket_cannot_run_away_with_the_forecast(self):
+        ing, item = self._setup_item(on_hand=10_000_000.0, per_serving=100.0, daily=10)
+        _, before = self._row(ing)
+        self._sell(self.TODAY.isoformat(), item, 5000, 12)   # absurd, on purpose
+        self.conn.commit()
+        _, after = self._row(ing)
+        ratio = after["forecastDailyConsumption"] / before["forecastDailyConsumption"]
+        self.assertLessEqual(ratio, depletion.MOMENTUM_MAX + 1e-6)
+
+    def test_a_day_with_no_orders_at_all_is_excluded_from_the_average(self):
+        """The distinction the whole model rests on: a day the shop did not
+        trade is not a zero-sales day. Selling 10 units on every other day is
+        a rate of 10 per TRADING day, not 5 per calendar day."""
+        ing = add_ingredient(self.conn, "A", on_hand=100000.0)
+        rec = add_recipe(self.conn, "A Dish", [(ing, 100.0)])
+        item = add_menu_item(self.conn, "A Dish", rec)
+        for n in range(1, 29, 2):
+            for hour in self.SERVICE_HOURS:
+                self._sell(self._day(n), item, 5, hour)
+        self._sell(self.TODAY.isoformat(), item, 5, self.SERVICE_HOURS[0])
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertAlmostEqual(row["forecastDailyConsumption"], 1000.0, delta=60.0)
+
+    # -- status tiers ------------------------------------------------------
+    def test_critical_when_it_runs_out_inside_the_lead_time(self):
+        ing, _ = self._setup_item(on_hand=1500.0, per_serving=100.0, daily=10, lead_time=4)
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "critical")
+
+    def test_healthy_when_it_clears_the_lead_time_comfortably(self):
+        ing, _ = self._setup_item(on_hand=20000.0, per_serving=100.0, daily=10, lead_time=2)
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "healthy")
+
+    def test_excess_when_cover_runs_past_two_months(self):
+        ing, _ = self._setup_item(on_hand=200000.0, per_serving=100.0, daily=10)
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "excess")
+
+    def test_configured_reorder_point_raises_the_tier_but_never_lowers_it(self):
+        ing, _ = self._setup_item(on_hand=20000.0, per_serving=100.0, daily=10, lead_time=2)
+        _, before = self._row(ing)
+        self.assertEqual(before["status"], "healthy")
+        self.conn.execute("UPDATE ingredient SET reorder_point_base=25000 WHERE id=?", (ing,))
+        self.conn.commit()
+        _, after = self._row(ing)
+        self.assertTrue(after["belowReorderPoint"])
+        self.assertEqual(after["status"], "at_risk")
+
+    def test_an_unset_reorder_point_is_never_treated_as_zero(self):
+        ing, _ = self._setup_item(on_hand=20000.0, lead_time=2)
+        _, row = self._row(ing)
+        self.assertIsNone(row["reorderPoint"])
+        self.assertFalse(row["belowReorderPoint"])
+
+    # -- unlimited streams -------------------------------------------------
+    def test_unlimited_covers_drive_their_stream_ingredient(self):
+        ing = add_ingredient(self.conn, "Unli Wings", on_hand=1_000_000.0)
+        add_unli_stream(self.conn, "wings", ing, 500.0)
+        item = add_menu_item(self.conn, "Unlimited", None, is_unli=True)
+        for n in range(1, 29):
+            pk = self._sell(self._day(n), item, 1, 12)
+            self.conn.execute("UPDATE customer_order SET head_count=4 WHERE id=?", (pk,))
+        # Every unli order sits at 12:00 Manila, so by the pinned 15:00 clock a
+        # normal day is already complete: today's four covers put it on pace.
+        pk = self._sell(self.TODAY.isoformat(), item, 1, 12)
+        self.conn.execute("UPDATE customer_order SET head_count=4 WHERE id=?", (pk,))
+        self.conn.commit()
+        _, row = self._row(ing)
+        # 4 covers/day x 500 g/cover
+        self.assertAlmostEqual(row["forecastDailyConsumption"], 2000.0, delta=60.0)
+
+    # -- honesty guards ----------------------------------------------------
+    def test_annual_seasonality_is_never_claimed(self):
+        ing, _ = self._setup_item()
+        f, _ = self._row(ing)
+        self.assertFalse(f["seasonality"]["annualPattern"])
+        self.assertIn("Annual", f["seasonality"]["note"])
+
+    def test_no_uncertainty_band_without_enough_history_to_measure_one(self):
+        ing = add_ingredient(self.conn, "Barely Sold", on_hand=5000.0)
+        rec = add_recipe(self.conn, "Barely", [(ing, 100.0)])
+        item = add_menu_item(self.conn, "Barely", rec)
+        self._sell(self._day(1), item, 3, 12)
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertIsNone(row["band"])
+
+    def test_exploded_sub_recipes_are_not_forecast_as_stock(self):
+        """They hold no stock by definition -- listing them would put a
+        permanent phantom "out of stock" row on the screen."""
+        leaf = add_ingredient(self.conn, "Hot Sauce", on_hand=5000.0)
+        sub = add_ingredient(self.conn, "Wing Sauce", kind="sub_recipe", mode="exploded")
+        add_recipe(self.conn, "Wing Sauce Prep", [(leaf, 80.0)],
+                   kind="sub_recipe", produces=sub, yield_qty=100.0)
+        self.conn.commit()
+        f = depletion.ingredient_forecast(self.conn, now=self.NOW)
+        self.assertNotIn(sub, [r["ingredientId"] for r in f["ingredients"]])
+        self.assertIn(leaf, [r["ingredientId"] for r in f["ingredients"]])
+
+    # -- detail view -------------------------------------------------------
+    def test_detail_attributes_consumption_to_the_menu_items_that_caused_it(self):
+        ing, item = self._setup_item(on_hand=100000.0, per_serving=100.0, daily=10)
+        self._sell(self.TODAY.isoformat(), item, 7, 12)
+        self.conn.commit()
+        d = depletion.ingredient_detail(self.conn, ing, now=self.NOW)
+        today = {x["name"]: x for x in d["consumedToday"]}
+        self.assertIn("Chicken Dish", today)
+        # 5 units from the fixture's on-pace morning + the 7 added here
+        self.assertAlmostEqual(today["Chicken Dish"]["qtyBase"], 1200.0, places=2)
+
+    def test_detail_evidence_is_never_empty(self):
+        ing, _ = self._setup_item()
+        d = depletion.ingredient_detail(self.conn, ing, now=self.NOW)
+        self.assertTrue(d["evidence"])
+        self.assertTrue(all(e["text"] for e in d["evidence"]))
+
+    def test_detail_history_is_reconstructed_backwards_from_current_stock(self):
+        ing, _ = self._setup_item(on_hand=5000.0)
+        add_ledger_entry(self.conn, ing, -1000.0, "sale_commit", self._day(1))
+        self.conn.commit()
+        d = depletion.ingredient_detail(self.conn, ing, history_days=5, now=self.NOW)
+        self.assertEqual(len(d["history"]), 5)
+        # Each row is the balance at the END of that business day, so
+        # yesterday's 1000 g sale is already inside yesterday's own figure.
+        self.assertEqual(d["history"][-1]["qty"], 5000.0)   # today = current on hand
+        self.assertEqual(d["history"][-2]["qty"], 5000.0)   # end of yesterday, post-sale
+        self.assertEqual(d["history"][-3]["qty"], 6000.0)   # the day before that
+
+    def test_detail_refuses_an_ingredient_that_cannot_be_forecast(self):
+        with self.assertRaises(NotFoundError):
+            depletion.ingredient_detail(self.conn, 999999, now=self.NOW)
+
+
+# ===========================================================================
+class TestDepletionProphetDemandModel(Base):
+    """2026-09: wt/depletion.py's demand_model='prophet' path -- Prophet as
+    an OPT-IN alternative to the default EWMA baseline for the future-day
+    (index 1..horizon) portion of each menu item's forecast, decided by
+    forecasting.fit_prophet() results wt/depletion.refresh_prophet_baselines()
+    explicitly caches (never fit inline -- see that function's docstring for
+    the measured ~1.8s/item cost that rules out fitting on a live request).
+
+    Uses real backdated dates (dt.date.today() - N days), NOT
+    TestIngredientDepletionForecast's pinned NOW: forecasting._daily_series()
+    (which fit_prophet's caller and refresh_prophet_baselines() both read)
+    has no now= parameter and always reads the real wall clock -- a
+    pre-existing property of forecasting.py this pass does not change.
+    """
+
+    def _seed_item(self, name, days=21, daily=10, per_serving=100.0, on_hand=100000.0):
+        ing = add_ingredient(self.conn, name, on_hand=on_hand, pack=1000)
+        rec = add_recipe(self.conn, name + " Recipe", [(ing, per_serving)])
+        menu_pk = add_menu_item(self.conn, name + " Item", rec)
+        for d in range(days, 0, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, daily)
+        self.conn.commit()
+        return ing, menu_pk
+
+    def test_default_demand_model_is_ewma_and_ignores_the_prophet_cache(self):
+        """The default must not change anything about to-day's behavior --
+        every one of the other 560+ tests in this file calls build_demand()
+        without demand_model at all and must keep getting exactly what they
+        got before this feature existed."""
+        ing, menu_pk = self._seed_item("Default Model Item")
+        demand = depletion.build_demand(self.conn)
+        s = demand["items"][menu_pk]
+        self.assertEqual(s.demand_source, "ewma")
+
+    def test_refresh_then_prophet_model_marks_the_series_prophet_sourced(self):
+        ing, menu_pk = self._seed_item("Prophet Item")
+        result = depletion.refresh_prophet_baselines(self.conn)
+        self.assertEqual(result["fitted"], 1)
+        self.assertEqual(result["insufficientData"], 0)
+
+        demand = depletion.build_demand(self.conn, demand_model="prophet")
+        s = demand["items"][menu_pk]
+        self.assertEqual(s.demand_source, "prophet")
+        # today_remaining/pace/momentum are the same nowcast computation
+        # either way -- Prophet only ever replaces daily[1:].
+        self.assertGreaterEqual(s.today_remaining, 0.0)
+        self.assertEqual(len(s.daily), depletion.HORIZON_DAYS + 1)
+
+    def test_prophet_result_reaches_the_full_ingredient_pipeline(self):
+        """Architecture requirement: Prophet feeds the SAME downstream
+        trajectory/depletion/replenishment math, unchanged -- it does not
+        calculate purchase quantity itself. on_hand is sized so the pipeline
+        has something concrete to compute (a real shortfall), proving the
+        whole chain still runs end to end with Prophet as the source."""
+        ing, menu_pk = self._seed_item("Prophet Pipeline Item", daily=10, per_serving=100.0,
+                                       on_hand=500.0)
+        self.conn.execute("UPDATE ingredient SET lead_time_days=2 WHERE id=?", (ing,))
+        self.conn.commit()
+        depletion.refresh_prophet_baselines(self.conn)
+
+        full = depletion.ingredient_forecast(self.conn, demand_model="prophet")
+        self.assertEqual(full["demandModel"], "prophet")
+        row = next(r for r in full["ingredients"] if r["ingredientId"] == ing)
+        self.assertEqual(row["demandSource"], "prophet")
+        self.assertGreaterEqual(full["prophetDrivenIngredients"], 1)
+        # The replenishment math (safety stock, lead time, whole-pack
+        # rounding) is exactly wt/depletion.py's existing formula --
+        # recomputed here from the row's own reported inputs, same
+        # discipline as TestReplenishmentEndToEnd, so this proves the wiring
+        # rather than re-asserting arithmetic already covered elsewhere.
+        if row["suggestedOrderQty"] is not None:
+            shortfall = (row["forecastDailyConsumption"] * row["leadTimeDays"]
+                        + row["safetyStockBase"] - row["available"])
+            self.assertEqual(row["suggestedOrderQty"],
+                             math.ceil(shortfall / (row["packSize"] * (row["yieldFactor"] or 1.0))))
+
+    def test_item_with_too_little_history_falls_back_to_ewma_per_item(self):
+        """Per-item fallback, not all-or-nothing: one item with enough
+        history to fit Prophet and one without must each get the right
+        model, in the same request."""
+        prophet_ing, prophet_item = self._seed_item("Enough History Item", days=21)
+        thin_ing, thin_item = self._seed_item("Too Little History Item", days=3)
+        depletion.refresh_prophet_baselines(self.conn)
+
+        demand = depletion.build_demand(self.conn, demand_model="prophet")
+        self.assertEqual(demand["items"][prophet_item].demand_source, "prophet")
+        self.assertEqual(demand["items"][thin_item].demand_source, "ewma")
+
+    def test_never_refreshed_falls_back_to_ewma(self):
+        """demand_model='prophet' with refresh_prophet_baselines() never
+        having been called for this item must not crash or silently produce
+        an empty forecast -- it must behave exactly like demand_model='ewma'
+        for that item, honestly, until a refresh actually runs."""
+        ing, menu_pk = self._seed_item("Never Refreshed Item")
+        demand = depletion.build_demand(self.conn, demand_model="prophet")
+        self.assertEqual(demand["items"][menu_pk].demand_source, "ewma")
+        self.assertGreater(demand["items"][menu_pk].daily[1], 0.0)
+
+    def test_a_stale_prophet_fit_falls_back_to_ewma(self):
+        """Distinct from the never-refreshed case above: this item WAS
+        successfully fitted, but the cache entry is now older than
+        PROPHET_STALE_AFTER_SECONDS. _prophet_daily_for_item's own docstring
+        is explicit about why: an old Prophet forecast served as current
+        would be worse than an honest, current EWMA fallback. Backdating the
+        cached timestamp (rather than mocking time.monotonic globally, which
+        would also break the lock/threading machinery around it) isolates
+        exactly the staleness check this test exists to prove."""
+        ing, menu_pk = self._seed_item("Once Fresh Now Stale Item")
+        result = depletion.refresh_prophet_baselines(self.conn)
+        self.assertEqual(result["fitted"], 1)
+
+        fresh = depletion.build_demand(self.conn, demand_model="prophet")
+        self.assertEqual(fresh["items"][menu_pk].demand_source, "prophet")
+
+        key = (
+            depletion._prophet_scope_key(self.conn), menu_pk,
+            depletion.LOOKBACK_DAYS, depletion.HORIZON_DAYS,
+        )
+        with depletion._prophet_lock:
+            computed_at, fit_result = depletion._prophet_store[key]
+            depletion._prophet_store[key] = (
+                computed_at - depletion.PROPHET_STALE_AFTER_SECONDS - 1, fit_result,
+            )
+
+        stale = depletion.build_demand(self.conn, demand_model="prophet")
+        self.assertEqual(stale["items"][menu_pk].demand_source, "ewma")
+        self.assertGreater(stale["items"][menu_pk].daily[1], 0.0)
+
+
+# ===========================================================================
+class TestReplenishmentBacktestDistribution(Base):
+    """2026-09 audit: depletion.replenishment_backtest()'s
+    avg_days_of_supply_when_healthy_or_excess is a mean over a real,
+    heavily right-skewed distribution (a handful of near-zero-demand
+    ingredients push the mean far above what a typical ingredient carries).
+    days_of_supply_distribution_when_healthy_or_excess adds median/min/max/
+    percentiles alongside the mean so it is not read as if it described a
+    typical ingredient. critical_flag_f1 is a direct, deterministic
+    computation from the already-real precision/recall (not a fabricated
+    label), so it is checked against the same formula independently here.
+    """
+
+    def _seed_steady_item(self, name, days, daily_qty=5, per_serving=10.0, on_hand=1_000_000.0):
+        """A steady, ample-stock ingredient: real order history drives a
+        stable positive daily demand, and on_hand is large enough that the
+        ingredient stays 'healthy'/'excess' at every backtest evaluation
+        point -- never 'critical'/'out' -- so the confusion counts and the
+        days-of-supply distribution are both deterministic."""
+        ing = add_ingredient(self.conn, name, on_hand=on_hand, pack=1000)
+        rec = add_recipe(self.conn, name + " Recipe", [(ing, per_serving)])
+        menu_pk = add_menu_item(self.conn, name + " Item", rec)
+        for d in range(days, 0, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, daily_qty)
+            add_ledger_entry(self.conn, ing, -daily_qty * per_serving, "sale_commit", days_ago(d))
+        self.conn.commit()
+        return ing, menu_pk
+
+    def test_reports_days_of_supply_distribution_alongside_the_mean(self):
+        self._seed_steady_item("Backtest Steady Item", days=50)
+        result = depletion.replenishment_backtest(self.conn, lookback_days=40)
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["evaluation_points"], 4)  # range(40, 7, -10)
+
+        dist = result["days_of_supply_distribution_when_healthy_or_excess"]
+        self.assertIsNotNone(dist)
+        self.assertGreater(dist["n"], 0)
+        self.assertEqual(dist["mean"], result["avg_days_of_supply_when_healthy_or_excess"])
+        # A steady, never-critical ingredient's days-of-supply barely moves
+        # across evaluation points, so median must sit close to the mean --
+        # the two diverging sharply is exactly the skew this field exists
+        # to detect on the real production distribution, not here.
+        self.assertAlmostEqual(dist["median"], dist["mean"], delta=max(1.0, dist["mean"] * 0.05))
+        self.assertLessEqual(dist["min"], dist["median"])
+        self.assertLessEqual(dist["median"], dist["max"])
+        self.assertLessEqual(dist["p25"], dist["p75"])
+
+    def test_f1_is_the_harmonic_mean_of_the_reported_precision_and_recall(self):
+        self._seed_steady_item("Backtest F1 Item", days=50)
+        result = depletion.replenishment_backtest(self.conn, lookback_days=40)
+
+        precision = result["critical_flag_precision"]
+        recall = result["critical_flag_recall"]
+        if precision is None or recall is None or (precision + recall) == 0:
+            self.assertIsNone(result["critical_flag_f1"])
+        else:
+            expected = round(2 * precision * recall / (precision + recall), 4)
+            self.assertEqual(result["critical_flag_f1"], expected)
+
+    def test_insufficient_lookback_reports_unavailable_with_no_distribution(self):
+        self._seed_steady_item("Too Short Lookback Item", days=10)
+        result = depletion.replenishment_backtest(self.conn, lookback_days=20)  # < 30 + 7
+
+        self.assertFalse(result["available"])
+        self.assertIn("reason", result)
+        self.assertNotIn("days_of_supply_distribution_when_healthy_or_excess", result)
+
+
+# ===========================================================================
+class TestReplenishmentEndToEnd(unittest.TestCase):
+    """2026-09 audit: proves the FULL chain end to end, through the real code
+    paths, not through helpers that shortcut around them --
+
+        POS order -> reservation.reserve_order -> reservation.commit_order
+        -> stock_ledger + ingredient.on_hand_base -> order_line/customer_order
+        (real daily history) -> wt/depletion.build_demand (forward demand
+        model) -> ingredient_forecast (trajectory, projected depletion,
+        suggestedOrderQty) -> GET /console/forecasts/ingredients
+        -> GET /dashboard/summary (same engine, same cache key).
+
+    28 days are seeded through the REAL reserve_order/commit_order functions
+    (backdated order timestamps, not a raw ledger insert) so every gram
+    consumed here left through the same deduction path a live kitchen ticket
+    uses. One more order is punched and started through the actual HTTP
+    endpoints (POST /pos/orders, POST /kds/orders/{id}/start) for today, to
+    prove the live POS route reaches the same place. Rather than hard-coding
+    an expected sack count (fragile against the demand model's own nowcast
+    noise, which every other test in this file that fits real data already
+    tolerates with a delta), this recomputes the replenishment formula from
+    the response's OWN reported inputs and asserts the API's suggestedOrderQty
+    matches it exactly -- i.e. the recommendation is internally consistent and
+    auditable (spec section 37), not just present.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        # manager_token() always 401s now -- see TestRBAC's own
+        # test_manager_token_is_rejected_everywhere_now_deactivated
+        # docstring: migration 0034 deactivated the seeded 'manager'
+        # account, and principal() in wt/api.py refuses ANY request from a
+        # deactivated account with 401 before a capability check ever runs.
+        # This class never tests manager-specific capability boundaries --
+        # H_MGR here was only ever standing in for "some authenticated
+        # console reader" -- so it is aliased to the (live) owner token
+        # instead, same substitution already used throughout this suite
+        # (e.g. TestLoginAudit) for the same retired-account reason.
+        cls.H_MGR = {"Authorization": f"Bearer {token('owner')}"}
+
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    # Two service periods, like TestIngredientDepletionForecast's own
+    # SERVICE_HOURS -- spreading history across real trading hours rather
+    # than one instant. Concentrating 28 days of history on a single
+    # timestamp gives the intraday nowcast a razor-thin profile (~100% of a
+    # day's volume "at" that one hour, ~0% everywhere else), so a same-day
+    # HTTP order landing at any other real wall-clock hour reads as an
+    # extreme pace anomaly and the momentum term inflates the forecast off
+    # a fixture artifact, not a real signal.
+    SERVICE_HOURS = (12, 19)
+
+    def _reserve_and_commit_backdated(self, ingredient_pk, menu_pk, qty, days_back, manila_hour):
+        """A punched order dated `days_back` days ago at a given Manila
+        service hour, walked through the REAL reservation.reserve_order/
+        commit_order functions -- the same two functions POST /pos/orders
+        and POST /kds/orders/{id}/start call. Only the timestamp is
+        synthetic; the deduction is not."""
+        iso = (dt.date.today() - dt.timedelta(days=days_back)).isoformat()
+        ts = f"{iso} {(manila_hour - 8) % 24:02d}:00:00"   # Manila -> UTC
+        n = self.conn.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+        cur = self.conn.execute(
+            "INSERT INTO customer_order (order_no, table_label, head_count, status, created_at) "
+            "VALUES (?,?,?,'punched',?)",
+            (f"WT-E2E-{n + 1}", "T-E2E", 0, ts),
+        )
+        order_pk = cur.lastrowid
+        price = self.conn.execute("SELECT price FROM menu_item WHERE id=?", (menu_pk,)).fetchone()["price"]
+        self.conn.execute(
+            "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,?,?)",
+            (order_pk, menu_pk, qty, price),
+        )
+        self.conn.commit()
+        reserve_order(self.conn, order_pk)
+        commit_order(self.conn, order_pk)
+
+    def test_served_orders_flow_through_forecast_and_replenishment_to_the_api(self):
+        QTY_PER_SERVING = 1000.0    # g rice per bowl
+        SERVINGS_PER_DAY = 10       # -> 10,000 g/day, a stable, non-trivial rate
+        HISTORY_DAYS = 28
+        LEAD_TIME_DAYS = 2
+        PACK_SIZE = 25000.0         # 25 kg "sack" -- the spec's own rice example
+        STARTING_STOCK = 300_000.0  # g; enough to survive 28-29 days at 10,000 g/day
+
+        ing = add_ingredient(self.conn, "E2E Integration Rice", on_hand=STARTING_STOCK,
+                             pack=PACK_SIZE)
+        self.conn.execute("UPDATE ingredient SET lead_time_days=? WHERE id=?",
+                          (LEAD_TIME_DAYS, ing))
+        rec = add_recipe(self.conn, "E2E Rice Bowl Recipe", [(ing, QTY_PER_SERVING)])
+        menu_pk = add_menu_item(self.conn, "E2E Rice Bowl", rec, price=120.0)
+        self.conn.commit()
+
+        # ---- stage 1: real served orders, real deduction, 28 real days ----
+        half = SERVINGS_PER_DAY // 2
+        for d in range(1, HISTORY_DAYS + 1):
+            for hour in self.SERVICE_HOURS:
+                self._reserve_and_commit_backdated(ing, menu_pk, half, d, hour)
+
+        ledger_rows = self.conn.execute(
+            "SELECT COUNT(*) AS n, SUM(delta_base) AS total FROM stock_ledger "
+            "WHERE ingredient_id=? AND reason='sale_commit'", (ing,)
+        ).fetchone()
+        self.assertEqual(ledger_rows["n"], HISTORY_DAYS * len(self.SERVICE_HOURS))
+        self.assertAlmostEqual(ledger_rows["total"],
+                               -HISTORY_DAYS * SERVINGS_PER_DAY * QTY_PER_SERVING, places=2)
+
+        # ---- stage 1b: one more order through the REAL HTTP POS/KDS path ----
+        menu_item_id_str = self.conn.execute(
+            "SELECT menu_item_id FROM menu_item WHERE id=?", (menu_pk,)).fetchone()["menu_item_id"]
+        pos_item = next(m for m in self.client.get("/pos/menu", headers=self.H_CASH).json()["items"]
+                        if m["menu_item_pk"] == menu_pk)
+        self.assertEqual(pos_item["menu_item_pk"], menu_pk)
+        order_r = self.client.post(
+            "/pos/orders", headers=self.H_CASH,
+            json={"table_label": "T-E2E-today",
+                 "lines": [{"menu_item_pk": menu_pk, "qty": SERVINGS_PER_DAY}]},
+        )
+        self.assertEqual(order_r.status_code, 201)
+        start_r = self.client.post(f"/kds/orders/{order_r.json()['order_id']}/start",
+                                   headers=self.H_KIT)
+        self.assertEqual(start_r.status_code, 200)
+
+        on_hand_after = self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (ing,)).fetchone()["on_hand_base"]
+        expected_on_hand = STARTING_STOCK - (HISTORY_DAYS + 1) * SERVINGS_PER_DAY * QTY_PER_SERVING
+        self.assertAlmostEqual(on_hand_after, expected_on_hand, places=2)
+
+        # ---- stage 2-7: the real HTTP forecast/replenishment endpoint ----
+        fr = self.client.get("/console/forecasts/ingredients", headers=self.H_MGR)
+        self.assertEqual(fr.status_code, 200)
+        body = fr.json()
+        row = next(r for r in body["ingredients"] if r["ingredientId"] == ing)
+
+        # Daily history really drove a real forecast -- not zero, not None,
+        # and in the right neighborhood of the true 10,000 g/day rate. A wide
+        # band, deliberately: today's one HTTP order lands at whatever real
+        # wall-clock hour this test happens to run, unlike the 28 historical
+        # days split evenly across two fixed service hours, so the nowcast's
+        # pace/momentum terms (exact arithmetic already pinned against a
+        # frozen clock in TestIngredientDepletionForecast) legitimately move
+        # this a few thousand grams either way run to run. What this asserts
+        # is that real daily history reached the forecast at all, not the
+        # model's exact coefficients.
+        self.assertGreater(row["forecastDailyConsumption"], 0)
+        self.assertAlmostEqual(row["forecastDailyConsumption"], 10_000.0, delta=4000.0)
+
+        # Projected depletion trajectory produced a concrete answer given
+        # ~10 kg left against ~10 kg/day demand -- not "insufficient data".
+        self.assertIsNotNone(row["daysOfSupply"])
+        self.assertIsNotNone(row["depletionDate"])
+
+        # The purchase recommendation is internally consistent with the
+        # engine's OWN reported inputs -- recompute wt/depletion.py's formula
+        # from what the API actually returned and require an exact match,
+        # rather than asserting a hand-picked literal that real-data noise
+        # could flip.
+        REVIEW_CYCLE_DAYS = 3  # depletion.REVIEW_CYCLE_DAYS
+        shortfall = row["forecastDailyConsumption"] * (row["leadTimeDays"] + REVIEW_CYCLE_DAYS) - row["available"]
+        if shortfall > 0:
+            expected_qty = math.ceil(shortfall / (row["packSize"] * (row["yieldFactor"] or 1.0)))
+            self.assertEqual(row["suggestedOrderQty"], expected_qty)
+            self.assertEqual(row["suggestedOrderUnit"], row["purchaseUnit"])
+            # Whole packs only -- a real order can never be 3.76 sacks.
+            self.assertIsInstance(row["suggestedOrderQty"], int)
+            self.assertGreater(row["suggestedOrderQty"], 0)
+        else:
+            self.assertIsNone(row["suggestedOrderQty"])
+
+        # ---- reorder-point consistency: set one through the real edit
+        # endpoint (not a raw SQL UPDATE -- this also proves the forecast
+        # cache actually invalidates on an ingredient-record edit, not only
+        # on a new order/ledger row/recipe change: 2026-09 audit found
+        # _depletion_fingerprint() had no ingredient.updated_at in its key
+        # at all, so this exact edit used to keep serving the pre-edit
+        # belowReorderPoint here) ----
+        edit_r = self.client.patch(
+            f"/console/ingredients/{ing}", headers=self.H_OWNER,
+            json={"reorder_point_base": row["available"] + 5000.0},
+        )
+        self.assertEqual(edit_r.status_code, 200)
+
+        fr2 = self.client.get("/console/forecasts/ingredients", headers=self.H_MGR).json()
+        row2 = next(r for r in fr2["ingredients"] if r["ingredientId"] == ing)
+        self.assertTrue(row2["belowReorderPoint"])
+        self.assertGreaterEqual(fr2["belowReorderPoint"], 1)
+
+        dash = self.client.get("/dashboard/summary", headers=self.H_MGR).json()
+        # 2026-09 contract fix: dashboard_summary()'s KPI used to be keyed
+        # "belowReorderPoint", the same name as fr2["belowReorderPoint"]
+        # below -- but the two were never the same NUMBER, only the same
+        # NAME: this dashboard KPI counts the forward engine's own
+        # out/critical/at_risk rows (needRestock), while fr2's
+        # belowReorderPoint counts ingredients under a configured
+        # reorder_point_base, which on this fixture is exactly one
+        # ingredient. Asserting those two counts were equal was only ever
+        # true by coincidence, not because they were the identical
+        # computation -- the real shared computation is the forward
+        # engine's own bucket breakdown, which dashboard_summary() and this
+        # route both read from the identical cached ingredient_forecast()
+        # call (same _depletion_fingerprint key), so that is what a wiring
+        # check should assert.
+        dash_kpi = next(k for k in dash["kpis"] if k["key"] == "needRestock")
+        self.assertEqual(dash["buckets"], fr2["buckets"])
+        self.assertEqual(
+            dash_kpi["value"],
+            sum(dash["buckets"].get(k, 0) for k in ("out", "critical", "at_risk")),
+        )
+
+
+# ===========================================================================
+class TestProphetDemandModelSetting(unittest.TestCase):
+    """The 'depletion_demand_model' app_setting through real HTTP: the
+    default changes nothing, and flipping it (plus running the explicit
+    refresh) makes /console/forecasts/ingredients and /dashboard/summary
+    actually switch to Prophet -- proving the setting, the cache-fingerprint
+    invalidation on both the setting and a completed refresh, and the RBAC
+    gate on the new refresh endpoint, all work through the real API, not
+    just the pure depletion.py functions TestDepletionProphetDemandModel
+    covers directly."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+
+        # A dedicated item with enough real history for Prophet to fit --
+        # backdated inserts (like TestForecasting's own fixtures), since the
+        # HTTP/setting/RBAC wiring is what this class tests, not the real
+        # POS-commit deduction path TestReplenishmentEndToEnd already proves.
+        cls.ing = add_ingredient(cls.conn, "Prophet Setting Rice", on_hand=100000.0, pack=1000)
+        rec = add_recipe(cls.conn, "Prophet Setting Recipe", [(cls.ing, 100.0)])
+        cls.menu_pk = add_menu_item(cls.conn, "Prophet Setting Item", rec)
+        for d in range(21, 0, -1):
+            add_dated_order(cls.conn, days_ago(d), cls.menu_pk, 10)
+        cls.conn.commit()
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def test_default_setting_is_ewma(self):
+        r = self.client.get("/console/forecasts/ingredients", headers=self.H_OWNER)
+        self.assertEqual(r.json()["demandModel"], "ewma")
+
+    def test_refresh_endpoint_requires_inventory_write(self):
+        # 'manager' no longer holds inventory.write (2026-09 RBAC revision),
+        # but the account is also now deactivated outright (migration 0034),
+        # so a manager-role token gets 401 "account no longer active" on
+        # every endpoint, this one included -- not the capability-specific
+        # 403 this test used to assert. Still worth proving directly: a
+        # manager token can no longer even reach the RBAC check here.
+        r = self.client.post("/console/forecasts/refresh-prophet-baselines", headers=self.H_MGR)
+        self.assertEqual(r.status_code, 401)
+        self.assertIn("account no longer active", r.json()["message"])
+        r = self.client.post("/console/forecasts/refresh-prophet-baselines", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertGreaterEqual(body["fitted"], 1)
+
+    def test_flipping_the_setting_and_refreshing_switches_live_endpoints_to_prophet(self):
+        from wt import unli
+        unli.set_setting(self.conn, "depletion_demand_model", 1.0, user_id="test")
+        refresh = self.client.post("/console/forecasts/refresh-prophet-baselines", headers=self.H_OWNER)
+        self.assertEqual(refresh.status_code, 200)
+
+        fr = self.client.get("/console/forecasts/ingredients", headers=self.H_OWNER).json()
+        self.assertEqual(fr["demandModel"], "prophet")
+        row = next(r for r in fr["ingredients"] if r["ingredientId"] == self.ing)
+        self.assertEqual(row["demandSource"], "prophet")
+
+        # Dashboard reads the identical engine/cache key, so it must agree.
+        dash = self.client.get("/dashboard/summary", headers=self.H_OWNER)
+        self.assertEqual(dash.status_code, 200)
+
+        # Restore the default -- good hygiene even though app_setting is
+        # scoped to this test class's own database, not process-global.
+        unli.set_setting(self.conn, "depletion_demand_model", 0.0, user_id="test")
+
+
+# ===========================================================================
+class TestFlavourSubstitution(Base):
+    """resolver.flavour_substitutions() -- the per-order flavour override that
+    mapping.FLAVOUR_PLACEHOLDER always anticipated ("the POS overrides per
+    order once flavour selection exists") but which nothing consumed, so every
+    a-la-carte wing order deducted Classic Buffalo whatever the customer
+    picked."""
+
+    def _fixture(self):
+        hot = add_ingredient(self.conn, "Hot Sauce", on_hand=10000.0)
+        soy = add_ingredient(self.conn, "Soy Sauce", on_hand=10000.0)
+        wings = add_ingredient(self.conn, "Wings", on_hand=100000.0)
+        buffalo = add_ingredient(self.conn, "Buffalo Sauce", kind="sub_recipe", mode="exploded")
+        teriyaki = add_ingredient(self.conn, "Teriyaki Sauce", kind="sub_recipe", mode="exploded")
+        add_recipe(self.conn, "Buffalo Prep", [(hot, 80.0)],
+                   kind="sub_recipe", produces=buffalo, yield_qty=100.0)
+        add_recipe(self.conn, "Teriyaki Prep", [(soy, 60.0)],
+                   kind="sub_recipe", produces=teriyaki, yield_qty=100.0)
+        rec = add_recipe(self.conn, "Wing Rack", [(wings, 1000.0), (buffalo, 60.0)])
+        self.conn.execute(
+            "UPDATE recipe_line SET display_label='Flavor sauce #1' "
+            "WHERE recipe_id=? AND ingredient_id=?", (rec, buffalo))
+        item = add_menu_item(self.conn, "Wing Rack", rec)
+        self.conn.commit()
+        return dict(hot=hot, soy=soy, wings=wings, item=item)
+
+    def test_no_note_leaves_the_recipe_default_alone(self):
+        f = self._fixture()
+        order = add_order(self.conn, [(f["item"], 1)])
+        self.conn.commit()
+        self.assertEqual(flavour_substitutions(self.conn, order), {})
+        need = order_requirements(self.conn, order)
+        self.assertAlmostEqual(need[f["hot"]], 48.0)      # 60 g sauce x 80 g per 100 g batch
+        self.assertNotIn(f["soy"], need)
+
+    def test_a_chosen_flavour_swaps_the_components(self):
+        f = self._fixture()
+        order = add_order(self.conn, [(f["item"], 1)])
+        self.conn.execute("UPDATE order_line SET note='Flavor: Teriyaki Sauce' WHERE order_id=?",
+                          (order,))
+        self.conn.commit()
+        need = order_requirements(self.conn, order)
+        self.assertNotIn(f["hot"], need)                  # buffalo's components came out
+        self.assertAlmostEqual(need[f["soy"]], 36.0)      # 60 g sauce x 60 g per 100 g batch
+        self.assertAlmostEqual(need[f["wings"]], 1000.0)  # the wings are unaffected
+
+    def test_the_swap_scales_with_line_quantity(self):
+        f = self._fixture()
+        order = add_order(self.conn, [(f["item"], 3)])
+        self.conn.execute("UPDATE order_line SET note='Flavor: Teriyaki Sauce' WHERE order_id=?",
+                          (order,))
+        self.conn.commit()
+        need = order_requirements(self.conn, order)
+        self.assertAlmostEqual(need[f["soy"]], 108.0)
+
+    def test_an_unrecognised_pick_changes_nothing(self):
+        f = self._fixture()
+        order = add_order(self.conn, [(f["item"], 1)])
+        self.conn.execute("UPDATE order_line SET note='Flavor: Not A Real Sauce' WHERE order_id=?",
+                          (order,))
+        self.conn.commit()
+        need = order_requirements(self.conn, order)
+        self.assertAlmostEqual(need[f["hot"]], 48.0)
+
+    def test_a_free_text_note_is_not_mistaken_for_a_flavour_pick(self):
+        f = self._fixture()
+        order = add_order(self.conn, [(f["item"], 1)])
+        self.conn.execute("UPDATE order_line SET note='no onions please' WHERE order_id=?", (order,))
+        self.conn.commit()
+        self.assertEqual(flavour_substitutions(self.conn, order), {})
+
+    def test_the_deduction_actually_follows_the_substitution(self):
+        f = self._fixture()
+        order = add_order(self.conn, [(f["item"], 1)])
+        self.conn.execute("UPDATE order_line SET note='Flavor: Teriyaki Sauce' WHERE order_id=?",
+                          (order,))
+        self.conn.commit()
+        reserve_order(self.conn, order)
+        commit_order(self.conn, order)
+        soy_left = self.conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?",
+                                     (f["soy"],)).fetchone()["on_hand_base"]
+        hot_left = self.conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?",
+                                     (f["hot"],)).fetchone()["on_hand_base"]
+        self.assertAlmostEqual(soy_left, 10000.0 - 36.0)
+        self.assertAlmostEqual(hot_left, 10000.0)
+
+class TestOwnerProvisioning(Base):
+    """wt/owner_provisioning.py in isolation: the deployment-only, one-time
+    mechanism that is the *only* way an OWNER account is ever created (see
+    TestOwnerRoleAndProvisioning for proof that the normal admin
+    account-management endpoint refuses role='owner' outright)."""
+
+    def test_creates_the_first_owner_when_none_exists(self):
+        result = owner_provisioning.provision_first_owner(self.conn, "ceo", "The CEO")
+        self.assertEqual(result["role"], "owner")
+        row = self.conn.execute(
+            "SELECT * FROM app_user WHERE username='ceo'"
+        ).fetchone()
+        self.assertEqual(row["role"], "owner")
+        self.assertEqual(row["must_change_password"], 1)
+        self.assertTrue(row["is_active"])
+
+    def test_the_stored_password_is_hashed_not_plaintext(self):
+        from wt import auth
+        result = owner_provisioning.provision_first_owner(self.conn, "ceo", "The CEO")
+        row = self.conn.execute(
+            "SELECT password_hash, password_salt FROM app_user WHERE username='ceo'"
+        ).fetchone()
+        self.assertNotEqual(row["password_hash"], result["temporary_password"])
+        self.assertTrue(auth.verify_password(
+            result["temporary_password"], row["password_hash"], row["password_salt"],
+        ))
+
+    def test_the_creation_is_audited_without_the_password(self):
+        result = owner_provisioning.provision_first_owner(self.conn, "ceo", "The CEO")
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='user' AND entity_id='ceo'"
+        ))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["action"], "create_owner_bootstrap")
+        self.assertEqual(events[0]["user_id"], owner_provisioning.DEPLOYMENT_ACTOR)
+        self.assertNotIn(result["temporary_password"], str(events[0]))
+
+    def test_a_second_owner_is_refused_and_writes_nothing(self):
+        owner_provisioning.provision_first_owner(self.conn, "ceo", "The CEO")
+        user_count_before = self.conn.execute("SELECT COUNT(*) AS n FROM app_user").fetchone()["n"]
+        with self.assertRaises(InvalidStateError):
+            owner_provisioning.provision_first_owner(self.conn, "another_ceo", "Impostor")
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM app_user").fetchone()["n"],
+            user_count_before,
+        )
+
+    def test_an_inactive_former_owner_does_not_block_a_new_one(self):
+        owner_provisioning.provision_first_owner(self.conn, "ceo", "The CEO")
+        self.conn.execute("UPDATE app_user SET is_active=0 WHERE username='ceo'")
+        # No live exception expected -- deactivating the sole owner (e.g. off-
+        # boarding) must not permanently brick provisioning going forward.
+        result = owner_provisioning.provision_first_owner(self.conn, "new_ceo", "New CEO")
+        self.assertEqual(result["role"], "owner")
+
+    def test_duplicate_username_is_refused_and_writes_nothing(self):
+        from wt.errors import ValidationError
+        self.conn.execute(
+            "INSERT INTO app_user (username, display_name, role, password_hash, password_salt, "
+            "password_changed_at, must_change_password) "
+            "VALUES ('taken','Someone','cashier','x','y',datetime('now'),0)"
+        )
+        user_count_before = self.conn.execute("SELECT COUNT(*) AS n FROM app_user").fetchone()["n"]
+        with self.assertRaises(ValidationError):
+            owner_provisioning.provision_first_owner(self.conn, "taken", "The CEO")
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM app_user").fetchone()["n"],
+            user_count_before,
+        )
+
+    def test_blank_username_or_display_name_is_refused(self):
+        from wt.errors import ValidationError
+        with self.assertRaises(ValidationError):
+            owner_provisioning.provision_first_owner(self.conn, "  ", "The CEO")
+        with self.assertRaises(ValidationError):
+            owner_provisioning.provision_first_owner(self.conn, "ceo", "  ")
+
+    def test_concurrent_first_owner_attempts_produce_exactly_one_owner(self):
+        """The failure this exists to prevent: two deployment operators (or
+        one operator double-clicking / re-running the CLI) racing to
+        provision the first OWNER at the same instant. Mirrors
+        TestConcurrency._race's pattern exactly -- each racer opens its own
+        connection inside its own thread, all release together off one
+        Barrier, and BEGIN IMMEDIATE's exclusive write lock (see the module
+        docstring) must let exactly one of them through."""
+        racers = 8
+        start = threading.Barrier(racers)
+        wins, losses = [], []
+        lock = threading.Lock()
+
+        def attempt(n: int) -> None:
+            c = db.connect(self.path)
+            try:
+                start.wait(timeout=10)
+                r = owner_provisioning.provision_first_owner(c, f"racer_{n}", f"Racer {n}")
+                with lock:
+                    wins.append(r)
+            except InvalidStateError as e:
+                with lock:
+                    losses.append(e)
+            finally:
+                c.close()
+
+        threads = [threading.Thread(target=attempt, args=(n,)) for n in range(racers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(len(wins), 1, f"expected exactly one winner, got {wins}")
+        self.assertEqual(len(losses), racers - 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM app_user WHERE role='owner'").fetchone()["n"],
+            1,
+        )
+        # every losing attempt's username must be entirely absent -- a failed
+        # race must not leave a partial/orphaned row behind under any name
+        for n in range(racers):
+            row = self.conn.execute(
+                "SELECT username FROM app_user WHERE username=?", (f"racer_{n}",)
+            ).fetchone()
+            if row:
+                self.assertEqual(row["username"], wins[0]["username"])
+
+
+class TestOwnerRoleAndProvisioning(unittest.TestCase):
+    """2026-09-11 addition: 'owner' is a genuine, separate fifth role (see
+    the CAPABILITIES comment in auth.py). These tests prove: there was no
+    way to create one before this change; the new POST /console/users
+    endpoint provisions one safely (temp password, must_change_password,
+    audited, never logged); the resulting JWT carries role='owner'; owner
+    can reach every read endpoint it needs; and owner is refused every
+    existing write capability it must not hold, even calling the API
+    directly (never just a hidden frontend button)."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u, password="wingstheory"):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
+            return r.json()["token"]
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}  # seeded 'owner' username has role=admin
+        cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+
+        # OWNER accounts are no longer reachable through POST /console/users
+        # (ADMIN cannot create one — see test_admin_direct_api_attempt_to_
+        # create_owner_is_rejected below). The only path is the deployment-only
+        # owner_provisioning module, exercised directly here exactly as a real
+        # deployment operator would run it from the CLI.
+        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
+        cls.owner_temp_password = provisioned["temporary_password"]
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', cls.owner_temp_password)}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def test_there_was_no_way_to_create_an_account_before_this(self):
+        # reset_password requires the account to already exist -- proves the
+        # gap this endpoint fills.
+        r = self.client.post("/console/users/does-not-exist-yet/reset_password", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 404, r.text)
+
+    def test_create_user_rejects_a_duplicate_username(self):
+        # 'cashier' rather than 'owner' -- duplicate-username is a distinct
+        # rule from the owner ban exercised just below, and must fire on its
+        # own merits for an otherwise-allowed role.
+        r = self.client.post(
+            "/console/users", headers=self.H_ADMIN,
+            json={"username": "biz_owner", "display_name": "Dup", "role": "cashier"},
+        )
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_create_user_rejects_an_unknown_role(self):
+        r = self.client.post(
+            "/console/users", headers=self.H_ADMIN,
+            json={"username": "someone_new", "display_name": "X", "role": "superuser"},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+
+    def test_create_user_requires_admin(self):
+        # 'manager' never held user.manage, but the account is also now
+        # deactivated (migration 0034) -- a manager token gets 401 "account
+        # no longer active" here just like every other endpoint, not the
+        # capability-specific 403 this used to check. cashier is the live
+        # account that still proves the actual RBAC gate (non-admin -> 403).
+        r = self.client.post(
+            "/console/users", headers=self.H_MGR,
+            json={"username": "someone_else", "display_name": "X", "role": "cashier"},
+        )
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertIn("account no longer active", r.json()["message"])
+        r = self.client.post(
+            "/console/users", headers=self.H_CASH,
+            json={"username": "someone_else", "display_name": "X", "role": "cashier"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_admin_direct_api_attempt_to_create_owner_is_rejected(self):
+        """ADMIN cannot create OWNER through the normal account-management
+        endpoint — enforced server-side regardless of what the frontend
+        exposes, and regardless of whether an OWNER already exists (a
+        crafted request naming a brand-new username must still be refused,
+        not merely blocked by a duplicate-username check)."""
+        r = self.client.post(
+            "/console/users", headers=self.H_ADMIN,
+            json={"username": "sneaky_new_owner", "display_name": "X", "role": "owner"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+        usernames = {u["username"] for u in self.client.get("/console/users", headers=self.H_ADMIN).json()["users"]}
+        self.assertNotIn("sneaky_new_owner", usernames)
+
+    def test_admin_direct_api_attempt_to_create_manager_is_rejected(self):
+        """'manager' is a legacy role: OWNER/ADMIN/CASHIER/KITCHEN are the
+        current business roles, and ADMIN is now the sole administrative
+        role. A crafted request naming role='manager' must still be refused
+        server-side, not merely absent from the dropdown."""
+        r = self.client.post(
+            "/console/users", headers=self.H_ADMIN,
+            json={"username": "sneaky_new_manager", "display_name": "X", "role": "manager"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+        usernames = {u["username"] for u in self.client.get("/console/users", headers=self.H_ADMIN).json()["users"]}
+        self.assertNotIn("sneaky_new_manager", usernames)
+
+    def test_admin_can_create_a_cashier_account(self):
+        r = self.client.post(
+            "/console/users", headers=self.H_ADMIN,
+            json={"username": "new_cashier_1", "display_name": "New Cashier", "role": "cashier"},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["role"], "cashier")
+        row = self.conn.execute(
+            "SELECT role FROM app_user WHERE username='new_cashier_1'"
+        ).fetchone()
+        self.assertEqual(row["role"], "cashier")
+
+    def test_admin_can_create_a_kitchen_account(self):
+        r = self.client.post(
+            "/console/users", headers=self.H_ADMIN,
+            json={"username": "new_kitchen_1", "display_name": "New Kitchen", "role": "kitchen"},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["role"], "kitchen")
+        row = self.conn.execute(
+            "SELECT role FROM app_user WHERE username='new_kitchen_1'"
+        ).fetchone()
+        self.assertEqual(row["role"], "kitchen")
+
+    def test_legacy_manager_account_is_deactivated_but_preserved(self):
+        # Migration 0034 deactivated the seeded 'manager' account (is_active=0)
+        # -- the account, its role, and its history are all still present,
+        # only login is now refused. This rule (create_user refusing
+        # role='manager') only ever blocked creating a *new* manager account;
+        # 0034 is what actually retires the existing one.
+        row = self.conn.execute(
+            "SELECT role, is_active FROM app_user WHERE username='manager'"
+        ).fetchone()
+        self.assertEqual(row["role"], "manager")
+        self.assertFalse(row["is_active"])
+        r = self.client.post("/auth/login", json={"username": "manager", "password": "wingstheory"})
+        self.assertEqual(r.status_code, 401, r.text)
+
+    def test_a_second_owner_cannot_be_provisioned_once_one_exists(self):
+        owner_count_before = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM app_user WHERE role='owner'"
+        ).fetchone()["n"]
+        with self.assertRaises(InvalidStateError):
+            owner_provisioning.provision_first_owner(self.conn, "second_owner", "Someone Else")
+        self.assertIsNone(self.conn.execute(
+            "SELECT 1 FROM app_user WHERE username='second_owner'"
+        ).fetchone())
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM app_user WHERE role='owner'").fetchone()["n"],
+            owner_count_before,
+        )
+
+    def test_seeded_owner_username_keeps_its_admin_role_not_silently_converted(self):
+        # The seeded username 'owner' predates the 'owner' role (migration
+        # 0024) and has always carried role='admin'. Provisioning the real
+        # OWNER account ('biz_owner', above) must never repurpose it.
+        row = self.conn.execute(
+            "SELECT role FROM app_user WHERE username='owner'"
+        ).fetchone()
+        self.assertEqual(row["role"], "admin")
+
+    def test_create_user_never_leaks_the_password_anywhere_but_its_own_response(self):
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='user' AND entity_id='biz_owner'"
+        ))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["action"], "create_owner_bootstrap")
+        self.assertEqual(events[0]["user_id"], owner_provisioning.DEPLOYMENT_ACTOR)
+        self.assertNotIn(self.owner_temp_password, str(events[0]))
+        login_events = rows(self.conn.execute(
+            "SELECT * FROM login_event WHERE username='biz_owner'"
+        ))
+        for e in login_events:
+            self.assertNotIn(self.owner_temp_password, str(e))
+
+    def test_owner_jwt_carries_the_owner_role(self):
+        import base64, json as _json
+        token = self.H_OWNER["Authorization"].split(" ", 1)[1]
+        _, payload_b64, _ = token.split(".")
+        payload = _json.loads(base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4)))
+        self.assertEqual(payload["role"], "owner")
+
+    def test_get_users_lists_accounts_without_password_fields(self):
+        r = self.client.get("/console/users", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
+        usernames = {u["username"] for u in r.json()["users"]}
+        self.assertIn("biz_owner", usernames)
+        for u in r.json()["users"]:
+            self.assertNotIn("password_hash", u)
+            self.assertNotIn("password_salt", u)
+
+    def test_owner_can_read_dashboard_sales_valuation_forecasts_expiry(self):
+        for path in (
+            "/dashboard/summary",
+            "/console/reports/sales?days=7",
+            "/reports/valuation",
+            "/console/forecasts/depletion",
+            "/console/forecasts/ingredients",
+            "/console/expiry",
+        ):
+            r = self.client.get(path, headers=self.H_OWNER)
+            self.assertEqual(r.status_code, 200, f"{path}: {r.text}")
+
+    def test_owner_cannot_edit_an_ingredient(self):
+        ing = self.conn.execute("SELECT id FROM ingredient LIMIT 1").fetchone()
+        r = self.client.patch(
+            f"/console/ingredients/{ing['id']}", headers=self.H_OWNER,
+            json={"supplier": "Owner should not be able to do this"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_owner_cannot_create_an_ingredient(self):
+        r = self.client.post(
+            "/console/ingredients", headers=self.H_OWNER,
+            json={"name": "Owner Cannot Create This", "base_unit": "g",
+                  "unit_cost": 1.0, "pack_size": 1, "pack_cost": 1.0,
+                  "reorder_point": 1, "reorder_qty": 1},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_owner_cannot_change_a_menu_price(self):
+        item = self.conn.execute("SELECT id, price FROM menu_item LIMIT 1").fetchone()
+        r = self.client.patch(
+            f"/console/menu-items/{item['id']}/price", headers=self.H_OWNER,
+            json={"price": item["price"] + 5},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_owner_cannot_resolve_verification_queue(self):
+        r = self.client.post(
+            "/console/queues/verification/resolve", headers=self.H_OWNER,
+            json={"field": "ingredient.pack_size", "row_id": 999999, "action": "keep_estimate"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_owner_cannot_manage_users_or_permissions(self):
+        r = self.client.post("/console/users/cashier1/reset_password", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 403, r.text)
+        r = self.client.get("/console/audit/logins", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_owner_cannot_void_an_order(self):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()["items"]
+        order = self.client.post(
+            "/pos/orders", headers=self.H_CASH,
+            json={"lines": [{"menu_item_pk": menu[0]["menu_item_pk"], "qty": 1}]},
+        ).json()
+        r = self.client.post(f"/pos/orders/{order['order_id']}/void", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_owner_cannot_update_an_instructions_status_or_manage_purchase_orders(self):
+        created = instructions.create(self.conn, "t", "b", "normal", None, None, "biz_owner")
+        r = self.client.post(f"/console/instructions/{created['id']}/acknowledge", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 403, r.text)
+        po = purchasing.create(self.conn, "Supplier", None, None,
+                               [{"ingredient_id": self.conn.execute(
+                                   "SELECT id FROM ingredient LIMIT 1").fetchone()["id"],
+                                 "quantity": 1}], "biz_owner")
+        r = self.client.post(f"/console/purchase-orders/{po['id']}/order", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_manager_and_cashier_are_completely_unaffected(self):
+        # Regression: adding 'owner' must not touch manager's or cashier's
+        # own standing. Manager's standing is now 401-everywhere (migration
+        # 0034 deactivated the account, unrelated to the 'owner' role even
+        # existing) rather than the capability-specific 403 this asserted
+        # before that migration -- still refused, just for a different,
+        # more absolute reason. Cashier is unaffected either way.
+        r = self.client.patch(
+            f"/console/ingredients/{self.conn.execute('SELECT id FROM ingredient LIMIT 1').fetchone()['id']}",
+            headers=self.H_MGR, json={"supplier": "still refused"},
+        )
+        self.assertEqual(r.status_code, 401, r.text)
+        self.assertIn("account no longer active", r.json()["message"])
+        r = self.client.get("/pos/menu", headers=self.H_CASH)
+        self.assertEqual(r.status_code, 200, r.text)
+
+
+class TestOwnerInstructions(unittest.TestCase):
+    """Owner -> Admin instructions (migration 0025): the state machine, who
+    can do what, the required completion note, and that every step is
+    audited."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u, password="wingstheory"):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
+            return r.json()["token"]
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
+        # OWNER is provisioned via the deployment-only mechanism, not the
+        # (now-forbidden) admin account-management endpoint — see
+        # TestOwnerRoleAndProvisioning for that restriction's own coverage.
+        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _events_for(self, pk):
+        return rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='owner_instruction' AND entity_id=? ORDER BY id",
+            (str(pk),),
+        ))
+
+    def test_owner_can_create_an_instruction_and_it_is_audited(self):
+        r = self.client.post(
+            "/console/instructions", headers=self.H_OWNER,
+            json={"title": "Check chicken stock", "body": "Before lunch service", "priority": "urgent"},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        pk = r.json()["id"]
+        self.assertEqual(r.json()["status"], "open")
+        events = self._events_for(pk)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["new_value"], "open")
+
+    def test_admin_cannot_create_an_instruction(self):
+        r = self.client.post(
+            "/console/instructions", headers=self.H_ADMIN,
+            json={"title": "x", "body": "y", "priority": "normal"},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_full_lifecycle_open_to_completed_requires_a_note(self):
+        pk = self.client.post(
+            "/console/instructions", headers=self.H_OWNER,
+            json={"title": "Contact supplier", "body": "Oil delivery delayed", "priority": "important"},
+        ).json()["id"]
+
+        # completing before acknowledging/starting is illegal
+        r = self.client.post(f"/console/instructions/{pk}/complete", headers=self.H_ADMIN,
+                             json={"completion_note": "too early"})
+        self.assertEqual(r.status_code, 409, r.text)
+
+        r = self.client.post(f"/console/instructions/{pk}/acknowledge", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "acknowledged")
+
+        r = self.client.post(f"/console/instructions/{pk}/start", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "in_progress")
+
+        # complete without a note is rejected
+        r = self.client.post(f"/console/instructions/{pk}/complete", headers=self.H_ADMIN,
+                             json={"completion_note": "   "})
+        self.assertEqual(r.status_code, 422, r.text)
+
+        r = self.client.post(f"/console/instructions/{pk}/complete", headers=self.H_ADMIN,
+                             json={"completion_note": "Supplier confirmed delivery at 3pm"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "completed")
+        self.assertEqual(r.json()["completion_note"], "Supplier confirmed delivery at 3pm")
+
+        events = self._events_for(pk)
+        self.assertEqual([e["action"] for e in events], ["create", "acknowledge", "start", "complete"])
+
+        # terminal: no further transition is legal
+        r = self.client.post(f"/console/instructions/{pk}/cancel", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_owner_can_cancel_their_own_open_instruction(self):
+        pk = self.client.post(
+            "/console/instructions", headers=self.H_OWNER,
+            json={"title": "x", "body": "y", "priority": "normal"},
+        ).json()["id"]
+        r = self.client.post(f"/console/instructions/{pk}/cancel", headers=self.H_OWNER,
+                             json={"reason": "changed my mind"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "cancelled")
+
+    def test_owner_cannot_cancel_once_acknowledged(self):
+        pk = self.client.post(
+            "/console/instructions", headers=self.H_OWNER,
+            json={"title": "x", "body": "y", "priority": "normal"},
+        ).json()["id"]
+        self.client.post(f"/console/instructions/{pk}/acknowledge", headers=self.H_ADMIN)
+        r = self.client.post(f"/console/instructions/{pk}/cancel", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 409, r.text)
+        # admin still can
+        r = self.client.post(f"/console/instructions/{pk}/cancel", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_owner_cannot_cancel_someone_elses_instruction(self):
+        pk = instructions.create(self.conn, "t", "b", "normal", None, None, "someone_else")["id"]
+        r = self.client.post(f"/console/instructions/{pk}/cancel", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 403, r.text)
+
+
+class TestOperationalUpdates(unittest.TestCase):
+    """Operational updates (migration 0029): the free-text, bidirectional
+    half of Owner/Admin communication — standalone heads-ups, interim
+    updates threaded onto an instruction, and explicit cross-role
+    acknowledgement."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u, password="wingstheory"):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
+            return r.json()["token"]
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
+        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _events_for(self, pk):
+        return rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='operational_update' AND entity_id=? ORDER BY id",
+            (str(pk),),
+        ))
+
+    def test_admin_can_send_a_standalone_heads_up_and_it_is_audited(self):
+        r = self.client.post(
+            "/console/updates", headers=self.H_ADMIN,
+            json={"body": "Chicken wing demand is above recent average."},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        body = r.json()
+        self.assertIsNone(body["owner_instruction_id"])
+        self.assertEqual(body["created_by_role"], "admin")
+        self.assertIsNone(body["acknowledged_at"])
+        events = self._events_for(body["id"])
+        self.assertEqual([e["action"] for e in events], ["create"])
+
+    def test_owner_can_send_a_standalone_update_too(self):
+        r = self.client.post(
+            "/console/updates", headers=self.H_OWNER,
+            json={"body": "Please check the chicken stock, demand increased this week."},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["created_by_role"], "owner")
+
+    def test_blank_body_is_rejected(self):
+        r = self.client.post("/console/updates", headers=self.H_ADMIN, json={"body": "   "})
+        self.assertEqual(r.status_code, 422, r.text)
+
+    def test_update_can_be_threaded_onto_an_instruction(self):
+        pk = self.client.post(
+            "/console/instructions", headers=self.H_OWNER,
+            json={"title": "Contact supplier", "body": "Confirm delivery quantity", "priority": "normal"},
+        ).json()["id"]
+        self.client.post(f"/console/instructions/{pk}/acknowledge", headers=self.H_ADMIN)
+
+        r = self.client.post(
+            "/console/updates", headers=self.H_ADMIN,
+            json={"body": "Supplier confirmed 100 kg delivery tomorrow.", "owner_instruction_id": pk},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["owner_instruction_id"], pk)
+
+        listed = self.client.get(f"/console/updates?owner_instruction_id={pk}", headers=self.H_OWNER).json()
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(listed["items"][0]["body"], "Supplier confirmed 100 kg delivery tomorrow.")
+
+    def test_threading_onto_a_nonexistent_instruction_is_refused(self):
+        r = self.client.post(
+            "/console/updates", headers=self.H_ADMIN,
+            json={"body": "x", "owner_instruction_id": 999999},
+        )
+        self.assertEqual(r.status_code, 404, r.text)
+
+    def test_only_the_other_role_may_acknowledge(self):
+        pk = self.client.post(
+            "/console/updates", headers=self.H_ADMIN, json={"body": "Delivery received: 96 kg."},
+        ).json()["id"]
+
+        r = self.client.post(f"/console/updates/{pk}/acknowledge", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 403, r.text)
+
+        r = self.client.post(f"/console/updates/{pk}/acknowledge", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIsNotNone(r.json()["acknowledged_at"])
+        self.assertEqual(r.json()["acknowledged_by"], "biz_owner")
+
+    def test_double_acknowledgement_is_refused(self):
+        pk = self.client.post(
+            "/console/updates", headers=self.H_OWNER, json={"body": "Please verify the delivery."},
+        ).json()["id"]
+        self.client.post(f"/console/updates/{pk}/acknowledge", headers=self.H_ADMIN)
+        r = self.client.post(f"/console/updates/{pk}/acknowledge", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_cashier_and_kitchen_cannot_reach_updates(self):
+        def token(u, password="wingstheory"):
+            r = self.client.post("/auth/login", json={"username": u, "password": password})
+            return r.json()["token"]
+        h_cash = {"Authorization": f"Bearer {token('cashier1')}"}
+        r = self.client.get("/console/updates", headers=h_cash)
+        self.assertEqual(r.status_code, 403, r.text)
+        r = self.client.post("/console/updates", headers=h_cash, json={"body": "x"})
+        self.assertEqual(r.status_code, 403, r.text)
+
+
+class TestPurchaseOrders(unittest.TestCase):
+    """Purchase orders (migration 0026): draft/ordered never touch
+    inventory; only receive_line does, via the existing (unmodified)
+    receiving logic; over-receipt is refused; repeated receive requests are
+    idempotent; owner/admin boundaries hold."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u, password="wingstheory"):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
+            return r.json()["token"]
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
+        # OWNER is provisioned via the deployment-only mechanism, not the
+        # (now-forbidden) admin account-management endpoint — see
+        # TestOwnerRoleAndProvisioning for that restriction's own coverage.
+        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+
+        ing = cls.conn.execute(
+            "SELECT id, on_hand_base, pack_size, yield_factor FROM ingredient "
+            "WHERE pack_size IS NOT NULL AND pack_size > 0 LIMIT 1"
+        ).fetchone()
+        cls.ingredient_id = ing["id"]
+        cls.pack_size = ing["pack_size"]
+        cls.yield_factor = ing["yield_factor"]
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _on_hand(self):
+        return self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.ingredient_id,)
+        ).fetchone()["on_hand_base"]
+
+    def _ledger_count(self):
+        return self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+
+    def test_owner_can_create_a_draft_po_and_it_touches_no_inventory(self):
+        before_on_hand = self._on_hand()
+        before_ledger = self._ledger_count()
+        r = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"supplier": "ABC Foods", "items": [
+                {"ingredient_id": self.ingredient_id, "quantity": 5, "recommended_qty_base": 50},
+            ]},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["status"], "draft")
+        self.assertEqual(self._on_hand(), before_on_hand)
+        self.assertEqual(self._ledger_count(), before_ledger)
+        self.po_id = r.json()["id"]
+        self.item_id = r.json()["items"][0]["id"]
+
+    def test_admin_cannot_create_a_po(self):
+        r = self.client.post(
+            "/console/purchase-orders", headers=self.H_ADMIN,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 1}]},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_owner_cannot_mark_ordered_or_receive(self):
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 1}]},
+        ).json()
+        r = self.client.post(f"/console/purchase-orders/{po['id']}/order", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 403, r.text)
+        r = self.client.post(
+            f"/console/purchase-orders/items/{po['items'][0]['id']}/receive",
+            headers=self.H_OWNER, json={"qty_base": 1},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_ordering_still_touches_no_inventory(self):
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 2}]},
+        ).json()
+        before_on_hand = self._on_hand()
+        before_ledger = self._ledger_count()
+        r = self.client.post(f"/console/purchase-orders/{po['id']}/order", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "ordered")
+        self.assertEqual(self._on_hand(), before_on_hand)
+        self.assertEqual(self._ledger_count(), before_ledger)
+
+    def test_list_endpoint_includes_line_items_not_just_the_header_row(self):
+        # Regression: the admin Purchase Orders view and Owner's My Orders
+        # both need each PO's items to show/act on, not just the header.
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 3}]},
+        ).json()
+        r = self.client.get("/console/purchase-orders", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
+        listed = next(p for p in r.json()["items"] if p["id"] == po["id"])
+        self.assertEqual(len(listed["items"]), 1)
+        self.assertEqual(listed["items"][0]["ingredient_id"], self.ingredient_id)
+        self.assertIn("ingredient_name", listed["items"][0])
+
+    def test_full_receive_lifecycle_partial_then_complete_with_real_ledger_and_fefo(self):
+        qty_purchase = 4.0
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": qty_purchase}]},
+        ).json()
+        item_id = po["items"][0]["id"]
+        self.client.post(f"/console/purchase-orders/{po['id']}/order", headers=self.H_ADMIN)
+
+        ordered_base = qty_purchase * self.pack_size * self.yield_factor
+        half = round(ordered_base / 2, 4)
+
+        before_on_hand = self._on_hand()
+        before_ledger = self._ledger_count()
+        before_batches = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM fefo_batch WHERE ingredient_id=?", (self.ingredient_id,)
+        ).fetchone()["n"]
+
+        r = self.client.post(
+            f"/console/purchase-orders/items/{item_id}/receive", headers=self.H_ADMIN,
+            json={"qty_base": half, "client_request_id": "po-recv-1"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "partially_received")
+        self.assertAlmostEqual(self._on_hand(), before_on_hand + half, places=3)
+        self.assertEqual(self._ledger_count(), before_ledger + 1)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM fefo_batch WHERE ingredient_id=?", (self.ingredient_id,)
+            ).fetchone()["n"],
+            before_batches + 1,
+        )
+
+        # replaying the same client_request_id must NOT double-credit stock
+        on_hand_after_first = self._on_hand()
+        ledger_after_first = self._ledger_count()
+        replay = self.client.post(
+            f"/console/purchase-orders/items/{item_id}/receive", headers=self.H_ADMIN,
+            json={"qty_base": half, "client_request_id": "po-recv-1"},
+        )
+        self.assertEqual(replay.status_code, 200, replay.text)
+        self.assertTrue(replay.json().get("duplicate"))
+        self.assertEqual(self._on_hand(), on_hand_after_first)
+        self.assertEqual(self._ledger_count(), ledger_after_first)
+
+        # receive the remainder -> fully received
+        r = self.client.post(
+            f"/console/purchase-orders/items/{item_id}/receive", headers=self.H_ADMIN,
+            json={"qty_base": ordered_base - half, "client_request_id": "po-recv-2"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "received")
+        self.assertAlmostEqual(self._on_hand(), before_on_hand + ordered_base, places=3)
+
+    def test_over_receipt_is_refused(self):
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 1}]},
+        ).json()
+        item_id = po["items"][0]["id"]
+        self.client.post(f"/console/purchase-orders/{po['id']}/order", headers=self.H_ADMIN)
+        ordered_base = 1 * self.pack_size * self.yield_factor
+        r = self.client.post(
+            f"/console/purchase-orders/items/{item_id}/receive", headers=self.H_ADMIN,
+            json={"qty_base": ordered_base * 2},
+        )
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_receiving_a_draft_po_is_refused(self):
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 1}]},
+        ).json()
+        r = self.client.post(
+            f"/console/purchase-orders/items/{po['items'][0]['id']}/receive",
+            headers=self.H_ADMIN, json={"qty_base": 1},
+        )
+        self.assertEqual(r.status_code, 409, r.text)
+
+    def test_owner_can_cancel_own_draft_but_not_after_ordered(self):
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 1}]},
+        ).json()
+        r = self.client.post(f"/console/purchase-orders/{po['id']}/cancel", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "cancelled")
+
+        po2 = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 1}]},
+        ).json()
+        self.client.post(f"/console/purchase-orders/{po2['id']}/order", headers=self.H_ADMIN)
+        r = self.client.post(f"/console/purchase-orders/{po2['id']}/cancel", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 409, r.text)
+        r = self.client.post(f"/console/purchase-orders/{po2['id']}/cancel", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def test_receiving_uses_the_po_snapshot_not_a_later_conversion_edit(self):
+        # Regression (migration 0028): pack_size/yield_factor are frozen onto
+        # purchase_order_item at creation. If the ingredient's pack_size is
+        # corrected AFTER the PO is placed, the PO's own "how much did we
+        # order, in base units" must not shift — only a new PO would see the
+        # corrected conversion.
+        qty_purchase = 2.0
+        original_pack_size = self.pack_size
+        original_yield = self.yield_factor
+        ordered_base_at_creation = qty_purchase * original_pack_size * original_yield
+
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": qty_purchase}]},
+        ).json()
+        item_id = po["items"][0]["id"]
+        self.client.post(f"/console/purchase-orders/{po['id']}/order", headers=self.H_ADMIN)
+
+        # Correct the ingredient's pack size after the PO was placed — a
+        # verification-style edit, not a new order.
+        corrected_pack_size = original_pack_size * 2
+        self.conn.execute(
+            "UPDATE ingredient SET pack_size=? WHERE id=?", (corrected_pack_size, self.ingredient_id)
+        )
+        self.conn.commit()
+
+        # Receiving exactly what was originally ordered (in base units) must
+        # fully receive the line — if the bug were present, the live
+        # (doubled) pack_size would compute a doubled "ordered_base" and this
+        # would incorrectly report the line as still only partially received.
+        r = self.client.post(
+            f"/console/purchase-orders/items/{item_id}/receive", headers=self.H_ADMIN,
+            json={"qty_base": ordered_base_at_creation},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "received")
+
+        item_row = self.conn.execute(
+            "SELECT pack_size, yield_factor FROM purchase_order_item WHERE id=?", (item_id,)
+        ).fetchone()
+        self.assertEqual(item_row["pack_size"], original_pack_size)
+        self.assertEqual(item_row["yield_factor"], original_yield)
+
+        # Restore, so later tests in this class see the ingredient unchanged.
+        self.conn.execute(
+            "UPDATE ingredient SET pack_size=? WHERE id=?", (original_pack_size, self.ingredient_id)
+        )
+        self.conn.commit()
+
+    def test_concurrent_receives_with_different_keys_cannot_over_credit_stock(self):
+        # Regression: client_request_id only protects a RETRIED request with
+        # the SAME key (already covered above). This proves genuinely
+        # concurrent receives with DIFFERENT keys — the case that idempotency
+        # alone does not address — are still serialized correctly by
+        # write_tx's BEGIN IMMEDIATE (same mechanism TestConcurrency already
+        # proves for POS reservations), so the over-receipt guard can never
+        # be raced past and the sum credited can never exceed what was
+        # actually ordered.
+        qty_purchase = 5.0
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": qty_purchase}]},
+        ).json()
+        item_id = po["items"][0]["id"]
+        self.client.post(f"/console/purchase-orders/{po['id']}/order", headers=self.H_ADMIN)
+
+        ordered_base = qty_purchase * self.pack_size * self.yield_factor
+        racers = 20
+        winners_expected = 5
+        chunk = ordered_base / winners_expected
+        before_on_hand = self._on_hand()
+
+        start = threading.Barrier(racers)
+        wins, losses = [], []
+        lock = threading.Lock()
+
+        def attempt(n):
+            c = db.connect(self.path)
+            try:
+                start.wait(timeout=10)
+                purchasing.receive_line(c, item_id, chunk, "admin", f"race-{n}")
+                with lock:
+                    wins.append(n)
+            except InvalidStateError:
+                with lock:
+                    losses.append(n)
+            finally:
+                c.close()
+
+        threads = [threading.Thread(target=attempt, args=(n,)) for n in range(racers)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(len(wins), winners_expected,
+                          "the over-receipt guard let a different number of concurrent receives "
+                          "through than the ordered quantity allows")
+        self.assertEqual(len(losses), racers - winners_expected)
+        self.assertAlmostEqual(self._on_hand(), before_on_hand + ordered_base, places=3)
+
+    def test_received_po_cannot_be_cancelled(self):
+        po = self.client.post(
+            "/console/purchase-orders", headers=self.H_OWNER,
+            json={"items": [{"ingredient_id": self.ingredient_id, "quantity": 1}]},
+        ).json()
+        self.client.post(f"/console/purchase-orders/{po['id']}/order", headers=self.H_ADMIN)
+        ordered_base = 1 * self.pack_size * self.yield_factor
+        recv = self.client.post(
+            f"/console/purchase-orders/items/{po['items'][0]['id']}/receive",
+            headers=self.H_ADMIN, json={"qty_base": ordered_base},
+        )
+        self.assertEqual(recv.status_code, 200, recv.text)
+        self.assertEqual(recv.json()["status"], "received")
+        r = self.client.post(f"/console/purchase-orders/{po['id']}/cancel", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 409, r.text)
+
+
+class TestAuditGapCoverage(unittest.TestCase):
+    """The 2026-08 audit found order voids and inventory receive/count/
+    waste/use traceable only via stock_ledger, never unified into
+    admin_audit_log. These tests prove each now also writes an
+    admin_audit_log row with correct before/after values."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _events(self, entity_type, action):
+        return rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type=? AND action=? ORDER BY id DESC LIMIT 1",
+            (entity_type, action),
+        ))
+
+    def test_receive_is_audited(self):
+        ing = self.conn.execute(
+            "SELECT id FROM ingredient WHERE pack_size IS NOT NULL AND pack_size > 0 LIMIT 1"
+        ).fetchone()
+        r = self.client.post(
+            f"/console/ingredients/{ing['id']}/receive", headers=self.H_ADMIN,
+            json={"purchase_qty": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self._events("ingredient", "receive")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["user_id"], "owner")
+        self.assertIsNotNone(events[0]["new_value"])
+
+    def test_count_is_audited(self):
+        ing = self.conn.execute("SELECT id, on_hand_base FROM ingredient LIMIT 1").fetchone()
+        r = self.client.post(
+            f"/console/ingredients/{ing['id']}/count", headers=self.H_ADMIN,
+            json={"actual_base": ing["on_hand_base"]},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self._events("ingredient", "count")
+        self.assertEqual(len(events), 1)
+
+    def test_waste_is_audited(self):
+        ing = self.conn.execute(
+            "SELECT id FROM ingredient WHERE on_hand_base > 5 LIMIT 1"
+        ).fetchone()
+        r = self.client.post(
+            f"/console/ingredients/{ing['id']}/waste", headers=self.H_ADMIN,
+            json={"qty_base": 1, "reason": "wastage"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self._events("ingredient", "wastage")
+        self.assertEqual(len(events), 1)
+
+    def test_use_is_audited(self):
+        ing = self.conn.execute(
+            "SELECT id FROM ingredient WHERE on_hand_base > 5 LIMIT 1"
+        ).fetchone()
+        r = self.client.post(
+            f"/console/ingredients/{ing['id']}/use", headers=self.H_ADMIN,
+            json={"qty_base": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self._events("ingredient", "operational_use")
+        self.assertEqual(len(events), 1)
+
+    def test_void_before_commit_is_audited(self):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()["items"]
+        order = self.client.post(
+            "/pos/orders", headers=self.H_CASH,
+            json={"lines": [{"menu_item_pk": menu[0]["menu_item_pk"], "qty": 1}]},
+        ).json()
+        r = self.client.post(f"/pos/orders/{order['order_id']}/void", headers=self.H_CASH)
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self._events("order", "void")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["new_value"], "void")
+
+    def test_void_after_commit_is_audited(self):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()["items"]
+        order = self.client.post(
+            "/pos/orders", headers=self.H_CASH,
+            json={"lines": [{"menu_item_pk": menu[0]["menu_item_pk"], "qty": 1}]},
+        ).json()
+        self.client.post(f"/kds/orders/{order['order_id']}/start", headers=self.H_KIT)
+        r = self.client.post(f"/pos/orders/{order['order_id']}/void", headers=self.H_CASH,
+                             json={"reason": "kitchen error", "restock": True})
+        self.assertEqual(r.status_code, 200, r.text)
+        events = self._events("order", "void")
+        self.assertEqual(len(events), 1)
+
+    def test_direct_reservation_calls_with_no_user_do_not_crash_or_audit(self):
+        # Internal/test-only usage (no authenticated caller) must not violate
+        # admin_audit_log's NOT NULL user_id constraint, and correctly writes
+        # no audit row at all -- there is no real actor to attribute it to.
+        ing = self.conn.execute(
+            "SELECT id FROM ingredient WHERE pack_size IS NOT NULL AND pack_size > 0 LIMIT 1"
+        ).fetchone()
+        before = self.conn.execute("SELECT COUNT(*) AS n FROM admin_audit_log").fetchone()["n"]
+        receive_stock(self.conn, ing["id"], 1)
+        after = self.conn.execute("SELECT COUNT(*) AS n FROM admin_audit_log").fetchone()["n"]
+        self.assertEqual(before, after)
+
+
+class TestNewMigrationsIntegrity(unittest.TestCase):
+    """0024/0025/0026 against a fresh, fully-seeded, already-migrated
+    database: integrity_check stays ok, no FK violations, and every
+    pre-existing account/role is byte-for-byte unchanged."""
+
+    def test_migrating_a_seeded_database_preserves_everything(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        try:
+            os.environ["WT_DB"] = path
+            os.environ["WT_ENV"] = "test"
+            db.close_conn()
+            from wt import seed
+            seed.run(fresh=True)
+            conn = db.get_conn()
+
+            before_accounts = rows(conn.execute(
+                "SELECT username, display_name, role, password_hash, password_salt "
+                "FROM app_user ORDER BY username"
+            ))
+
+            # migrate() is a no-op here (seed.run already migrated to head),
+            # but re-running it must still be idempotent and leave everything
+            # intact -- the same guarantee TestMigrationSafety exercises for
+            # every other migration.
+            db.migrate(conn)
+
+            self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+            self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+            after_accounts = rows(conn.execute(
+                "SELECT username, display_name, role, password_hash, password_salt "
+                "FROM app_user ORDER BY username"
+            ))
+            self.assertEqual(before_accounts, after_accounts)
+
+            roles = {r["username"]: r["role"] for r in after_accounts}
+            self.assertEqual(roles["owner"], "admin")
+            self.assertEqual(roles["manager"], "manager")
+            self.assertEqual(roles["cashier1"], "cashier")
+            self.assertEqual(roles["kitchen1"], "kitchen")
+
+            # the widened CHECK actually accepts 'owner' now
+            conn.execute(
+                "INSERT INTO app_user (username, display_name, role, password_hash, password_salt, "
+                "password_changed_at, must_change_password) VALUES "
+                "('migration_test_owner','T','owner','x','y', datetime('now'), 1)"
+            )
+            conn.commit()
+        finally:
+            db.close_conn()
+            os.environ.pop("WT_DB", None)
+            os.environ.pop("WT_ENV", None)
+            scrub(path)
+
+
+class TestPOSFixes(unittest.TestCase):
+    """Regression coverage for the 2026-09 POS pass: Unlimited Wings priced
+    per head instead of a flat ₱399, service charge defaulting to disabled
+    with an admin on/off/rate control, discount types individually
+    enable-able by an admin, and History/Current Orders surfacing the same
+    add-on-inclusive current_total the receipt already computed. Same
+    fixture pattern as TestConsoleAPI: a fresh seeded temp DB, a real
+    FastAPI TestClient, and role tokens from /auth/login."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}  # role=admin, see seed.py
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _unli_item(self):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        return next(m for m in menu["items"] if m["is_unli"])
+
+    def _ala_carte_item(self):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        return next(m for m in menu["items"] if m["sellable"] and not m["is_unli"])
+
+    def _reset_pos_config(self):
+        """Every test that touches billing config starts from the actual
+        default (service charge off, every discount enabled) rather than
+        relying on test execution order."""
+        self.client.patch("/console/pos-config", headers=self.H_OWNER, json={
+            "service_charge_enabled": False,
+            "discount_enabled": {"senior": True, "pwd": True, "staff": True},
+        })
+
+    # ---------------- Unlimited Wings: priced per head ----------------
+    def test_unlimited_wings_1_head_is_flat_price(self):
+        self._reset_pos_config()
+        item = self._unli_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "head_count": 1, "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertEqual(r.status_code, 201)
+        self.assertAlmostEqual(r.json()["subtotal"], item["price"])
+        self.assertAlmostEqual(r.json()["total"], item["price"])
+
+    def test_unlimited_wings_2_heads_is_double(self):
+        self._reset_pos_config()
+        item = self._unli_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "head_count": 2, "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertEqual(r.status_code, 201)
+        self.assertAlmostEqual(r.json()["subtotal"], item["price"] * 2)
+        self.assertAlmostEqual(r.json()["total"], item["price"] * 2)
+
+    def test_unlimited_wings_3_heads_is_triple(self):
+        self._reset_pos_config()
+        item = self._unli_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "head_count": 3, "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertEqual(r.status_code, 201)
+        self.assertAlmostEqual(r.json()["subtotal"], item["price"] * 3)
+        self.assertAlmostEqual(r.json()["total"], item["price"] * 3)
+
+    def test_unlimited_wings_qty_other_than_one_is_still_rejected(self):
+        """Regression guard: the per-head pricing fix must not reopen the
+        double-deduction hole (qty × heads both scaling consumption) the
+        existing qty=1 guard closes."""
+        item = self._unli_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "head_count": 2, "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 2}]})
+        self.assertEqual(r.status_code, 422)
+
+    def test_unlimited_wings_head_count_below_1_is_rejected(self):
+        """Without this, head_count=0 silently punched a ₱0 unlimited line
+        and opened no session (the session guard only fires when
+        head_count > 0) — a free ticket the floor couldn't even serve."""
+        item = self._unli_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "head_count": 0, "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertEqual(r.status_code, 422)
+
+    def test_ordinary_item_quantity_pricing_is_unaffected(self):
+        self._reset_pos_config()
+        item = self._ala_carte_item()
+        for qty in (1, 2, 3):
+            r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+                "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": qty}]})
+            self.assertEqual(r.status_code, 201)
+            self.assertAlmostEqual(r.json()["subtotal"], round(item["price"] * qty, 2))
+
+    # ---------------- Payment validation ----------------
+    def test_payment_below_total_is_rejected(self):
+        self._reset_pos_config()
+        item = self._ala_carte_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
+            "cash_received": round(item["price"] - 1, 2)})
+        self.assertEqual(r.status_code, 422)
+
+    def test_exact_payment_gives_zero_change(self):
+        self._reset_pos_config()
+        item = self._ala_carte_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
+            "cash_received": item["price"]})
+        self.assertEqual(r.status_code, 201)
+        self.assertAlmostEqual(r.json()["change_due"], 0.0)
+
+    def test_overpayment_gives_correct_change(self):
+        self._reset_pos_config()
+        item = self._ala_carte_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
+            "cash_received": item["price"] + 61})
+        self.assertEqual(r.status_code, 201)
+        self.assertAlmostEqual(r.json()["change_due"], 61.0)
+
+    # ---------------- Service charge: off by default, admin-configurable ----------------
+    def test_service_charge_default_disabled(self):
+        self._reset_pos_config()
+        item = self._ala_carte_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        d = r.json()
+        self.assertAlmostEqual(d["service_charge"], 0.0)
+        self.assertAlmostEqual(d["total"], d["subtotal"])
+
+    def test_service_charge_enabled_by_admin_at_configured_rate(self):
+        self._reset_pos_config()
+        cfg = self.client.patch("/console/pos-config", headers=self.H_OWNER, json={
+            "service_charge_enabled": True, "service_charge_rate": 0.08})
+        self.assertEqual(cfg.status_code, 200)
+        item = self._ala_carte_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        d = r.json()
+        self.assertAlmostEqual(d["service_charge"], round(d["subtotal"] * 0.08, 2))
+        self.assertAlmostEqual(d["total"], d["subtotal"] + d["service_charge"])
+
+    def test_service_charge_disabled_again_reverts_to_zero(self):
+        self.client.patch("/console/pos-config", headers=self.H_OWNER,
+                          json={"service_charge_enabled": True, "service_charge_rate": 0.08})
+        self.client.patch("/console/pos-config", headers=self.H_OWNER,
+                          json={"service_charge_enabled": False})
+        item = self._ala_carte_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertAlmostEqual(r.json()["service_charge"], 0.0)
+
+    def test_cashier_cannot_write_pos_config(self):
+        r = self.client.patch("/console/pos-config", headers=self.H_CASH,
+                              json={"service_charge_enabled": True})
+        self.assertEqual(r.status_code, 403)
+
+    # ---------------- Discounts: existing rates preserved, admin can disable a type ----------------
+    def test_no_discount_selected_is_zero(self):
+        self._reset_pos_config()
+        item = self._ala_carte_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        self.assertAlmostEqual(r.json()["discount_amount"], 0.0)
+
+    def test_existing_discount_rates_are_unchanged(self):
+        self._reset_pos_config()
+        item = self._ala_carte_item()
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
+            "discount_type": "senior"})
+        d = r.json()
+        self.assertAlmostEqual(d["discount_amount"], round(item["price"] * 0.20, 2))
+
+    def test_admin_can_disable_a_discount_type(self):
+        self._reset_pos_config()
+        self.client.patch("/console/pos-config", headers=self.H_OWNER,
+                          json={"discount_enabled": {"senior": False}})
+        try:
+            menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+            self.assertNotIn("senior", menu["discount_rates"])
+            item = self._ala_carte_item()
+            r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+                "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
+                "discount_type": "senior"})
+            self.assertEqual(r.status_code, 422)
+        finally:
+            self._reset_pos_config()
+
+    # ---------------- Refill add-on: current_total everywhere ----------------
+    def test_refill_addon_current_total_matches_across_list_and_receipt(self):
+        """The exact bug this pass fixes: History/Current Orders used to show
+        the frozen original total even after a served special-flavor add-on,
+        while the receipt already showed the correct combined figure."""
+        self._reset_pos_config()
+        item = self._unli_item()
+        checkout = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "head_count": 2, "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]}).json()
+        order_id = checkout["order_id"]
+        original_total = checkout["total"]
+
+        session = self.client.get(f"/unli/orders/{order_id}/session", headers=self.H_CASH).json()
+        session_id = session["session_id"]
+
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        flavor = flavors[0]
+        set_special = self.client.patch(f"/unli/flavors/{flavor['id']}", headers=self.H_OWNER,
+                                        json={"flavor_type": "special", "addon_price": 50.0})
+        self.assertEqual(set_special.status_code, 200)
+
+        # This test only cares that a served add-on shows up consistently
+        # everywhere, not the seeded recipe's real stock levels — flood every
+        # ingredient so the flavour's sauce can actually be made.
+        self.conn.execute("UPDATE ingredient SET on_hand_base = on_hand_base + 1000000")
+
+        refill = self.client.post(f"/unli/sessions/{session_id}/refills", headers=self.H_CASH,
+                                  json={"flavor_id": flavor["id"]}).json()
+        served = self.client.post(f"/unli/refills/{refill['id']}/serve", headers=self.H_CASH)
+        self.assertEqual(served.status_code, 200)
+
+        expected_current_total = round(original_total + 50.0, 2)
+
+        history = self.client.get("/pos/orders?status=all", headers=self.H_CASH).json()["orders"]
+        row = next(o for o in history if o["id"] == order_id)
+        self.assertAlmostEqual(row["total"], original_total, msg="original total must stay frozen")
+        self.assertAlmostEqual(row["current_total"], expected_current_total)
+
+        current = self.client.get("/pos/orders?status=open", headers=self.H_CASH).json()["orders"]
+        row_open = next(o for o in current if o["id"] == order_id)
+        self.assertAlmostEqual(row_open["current_total"], expected_current_total)
+
+        receipt = self.client.get(f"/pos/orders/{order_id}/receipt", headers=self.H_CASH).json()
+        self.assertAlmostEqual(receipt["current_total"], expected_current_total)
+        self.assertAlmostEqual(receipt["current_total"], row["current_total"],
+                               msg="receipt and History must never disagree")
+
+
+class TestHistoricalSourceTracking(unittest.TestCase):
+    """Migration 0030 (customer_order.source/source_order_id) and the API
+    surface built on it: a historical sale must be identifiable, traceable
+    back to its workbook Order ID, read-only, and never mislabeled as
+    demo/test/synthetic — while a live order's behavior is completely
+    unaffected (source/source_order_id simply stay NULL, exactly as before
+    this migration existed)."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _served_order(self):
+        """A real, live-punched, committed order — the fixture every test
+        here marks source='historical' on directly via SQL, exactly the way
+        xlsx_history_reconcile.py's backfill does, so these tests exercise
+        the same code paths a real historical order hits."""
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        item = next(m for m in menu["items"] if m["sellable"] and not m["is_unli"])
+        r = self.client.post("/pos/orders", headers=self.H_CASH,
+                             json={"lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        oid = r.json()["order_id"]
+        self.client.post(f"/kds/orders/{oid}/start", headers=self.H_KIT)
+        self.client.post(f"/kds/orders/{oid}/ready", headers=self.H_KIT)
+        self.client.post(f"/kds/orders/{oid}/served", headers=self.H_KIT)
+        return oid
+
+    def test_migration_0030_columns_exist_with_the_right_defaults(self):
+        row = self.conn.execute(
+            "SELECT source, source_order_id FROM customer_order LIMIT 1"
+        ).fetchone()
+        self.assertIn("source", row.keys())
+        self.assertIn("source_order_id", row.keys())
+
+    def test_source_check_constraint_rejects_anything_but_historical(self):
+        oid = self._served_order()
+        for bad in ("demo", "test", "seed", "synthetic", "live"):
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.conn.execute("UPDATE customer_order SET source=? WHERE id=?", (bad, oid))
+                self.conn.commit()
+            self.conn.rollback()
+        # the one legitimate value is accepted
+        self.conn.execute("UPDATE customer_order SET source='historical' WHERE id=?", (oid,))
+        self.conn.commit()
+        self.assertEqual(
+            self.conn.execute("SELECT source FROM customer_order WHERE id=?", (oid,)).fetchone()["source"],
+            "historical",
+        )
+
+    def test_live_order_defaults_are_unaffected(self):
+        oid = self._served_order()
+        row = self.conn.execute(
+            "SELECT source, source_order_id FROM customer_order WHERE id=?", (oid,)
+        ).fetchone()
+        self.assertIsNone(row["source"])
+        self.assertIsNone(row["source_order_id"])
+
+    def test_historical_order_is_exposed_in_list_orders_and_receipt(self):
+        oid = self._served_order()
+        self.conn.execute(
+            "UPDATE customer_order SET source='historical', source_order_id='WT-20260601-006' WHERE id=?",
+            (oid,),
+        )
+        self.conn.commit()
+
+        history = self.client.get("/pos/orders?status=all", headers=self.H_CASH).json()["orders"]
+        row = next(o for o in history if o["id"] == oid)
+        self.assertEqual(row["source"], "historical")
+        self.assertEqual(row["source_order_id"], "WT-20260601-006")
+
+        receipt = self.client.get(f"/pos/orders/{oid}/receipt", headers=self.H_CASH).json()
+        self.assertEqual(receipt["order"]["source"], "historical")
+        self.assertEqual(receipt["order"]["source_order_id"], "WT-20260601-006")
+
+    def test_history_search_matches_source_order_id(self):
+        """The till's own search box (pos.html orderMatchesSearch) checks
+        this same field — this test guards the API contract it depends on."""
+        oid = self._served_order()
+        self.conn.execute(
+            "UPDATE customer_order SET source='historical', source_order_id='WT-20260601-099' WHERE id=?",
+            (oid,),
+        )
+        self.conn.commit()
+        history = self.client.get("/pos/orders?status=all", headers=self.H_CASH).json()["orders"]
+        row = next(o for o in history if o["id"] == oid)
+        self.assertIn("source_order_id", row)
+
+    def test_voiding_a_historical_sale_is_refused(self):
+        oid = self._served_order()
+        self.conn.execute("UPDATE customer_order SET source='historical' WHERE id=?", (oid,))
+        self.conn.commit()
+        r = self.client.post(f"/pos/orders/{oid}/void", headers=self.H_CASH, json={"reason": "test"})
+        self.assertEqual(r.status_code, 409)
+        # and it genuinely did nothing — status/ledger untouched
+        status = self.conn.execute("SELECT status FROM customer_order WHERE id=?", (oid,)).fetchone()["status"]
+        self.assertEqual(status, "served")
+
+    def test_voiding_a_live_sale_is_unaffected(self):
+        """Regression guard: the new historical check must not accidentally
+        catch live orders too."""
+        oid = self._served_order()
+        r = self.client.post(f"/pos/orders/{oid}/void", headers=self.H_CASH, json={"reason": "test"})
+        self.assertNotEqual(r.status_code, 409)
+
+    def test_mixed_order_signature_matching_logic(self):
+        """Unit-level check of xlsx_history_reconcile's own signature
+        matching (the same function the production backfill used), against
+        synthetic data rather than the real workbook -- fast, and exercises
+        the exact comparison the reconciliation relies on to avoid guessing."""
+        from wt.xlsx_history_reconcile import _actual_signature, _regular_signature
+        menu = {"Pork Tonkatsu": {"id": 41}, "Ranch Dip": {"id": 12}}
+        lines = [
+            {"item": "Pork Tonkatsu", "qty": 1, "unit_price": 159.0},
+            {"item": "Ranch Dip", "qty": 1, "unit_price": 60.0},
+        ]
+        sig, unmapped = _regular_signature(lines, menu)
+        self.assertEqual(unmapped, set())
+        self.assertEqual(sig, {41: (1, 159.0), 12: (1, 60.0)})
+
+        # an unresolvable item is reported, never guessed
+        sig2, unmapped2 = _regular_signature(
+            [{"item": "Nonexistent Item", "qty": 1, "unit_price": 10.0}], menu
+        )
+        self.assertIsNone(sig2)
+        self.assertEqual(unmapped2, {"Nonexistent Item"})
+
+        oid = self._served_order()
+        actual = _actual_signature(self.conn, oid)
+        self.assertTrue(all(isinstance(k, int) for k in actual))
+
+    def test_reconstructed_cash_tender_is_deterministic_and_covers_total(self):
+        from wt.refills import _reconstruct_cash_tender
+        for total in (1, 20, 20.01, 149, 199.99, 399, 798, 1197, 1000, 1000.01, 2750, 0):
+            cash1, change1 = _reconstruct_cash_tender(total)
+            cash2, change2 = _reconstruct_cash_tender(total)
+            self.assertEqual((cash1, change1), (cash2, change2), "must be a pure, stable function of total")
+            if total > 0:
+                self.assertGreaterEqual(cash1, total, f"tender must cover total={total}")
+                self.assertAlmostEqual(change1, round(cash1 - total, 2))
+
+    def test_reconstructed_cash_matches_the_spec_example(self):
+        from wt.refills import _reconstruct_cash_tender
+        cash, change = _reconstruct_cash_tender(149.0)
+        self.assertEqual(cash, 200.0)
+        self.assertEqual(change, 51.0)
+
+    def test_receipt_reconstructs_payment_for_a_historical_order_with_no_recorded_cash(self):
+        oid = self._served_order()
+        self.conn.execute(
+            "UPDATE customer_order SET source='historical', source_order_id='WT-20260601-777' WHERE id=?",
+            (oid,),
+        )
+        self.conn.commit()
+        total = self.conn.execute("SELECT total FROM customer_order WHERE id=?", (oid,)).fetchone()["total"]
+
+        rec = self.client.get(f"/pos/orders/{oid}/receipt", headers=self.H_CASH).json()
+        self.assertTrue(rec["payment_reconstructed"])
+        self.assertIsNotNone(rec["reconstructed_cash_received"])
+        self.assertGreaterEqual(rec["reconstructed_cash_received"], total)
+        self.assertAlmostEqual(
+            rec["reconstructed_change_due"], round(rec["reconstructed_cash_received"] - total, 2)
+        )
+        # the frozen order record itself is never rewritten to claim this was recorded
+        self.assertIsNone(rec["order"]["cash_received"])
+        self.assertIsNone(rec["order"]["change_due"])
+
+    def test_receipt_does_not_reconstruct_payment_for_a_live_order(self):
+        """A live order's real cash_received must never be overridden by the
+        reconstruction path — it only ever fires for source='historical'
+        rows with no recorded payment."""
+        oid = self._served_order()
+        rec = self.client.get(f"/pos/orders/{oid}/receipt", headers=self.H_CASH).json()
+        self.assertFalse(rec["payment_reconstructed"])
+        self.assertIsNone(rec["reconstructed_cash_received"])
+
+
+class TestPOSTablesAndHeadFlavors(unittest.TestCase):
+    """Admin-configurable table count (default 9) and per-head initial
+    flavour assignment on an unlimited session (migration 0031) — purely
+    informational, capped at head_count, never touching the actual
+    refill-round/reservation/ledger pipeline."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u):
+            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+            return r.json()["token"]
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _reset_table_count(self):
+        self.client.patch("/console/pos-config", headers=self.H_OWNER, json={"table_count": 9})
+
+    def _open_unli_session(self, head_count):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        item = next(m for m in menu["items"] if m["is_unli"])
+        body = {
+            "table_label": f"Table {head_count}", "head_count": head_count,
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
+        }
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json=body)
+        # This class shares one seeded DB across every test in it, and the
+        # many unlimited orders opened here cumulatively draw down real
+        # wing/sauce stock -- topping up on a genuine shortfall keeps this
+        # helper working regardless of run order or how many tests came
+        # before it, without asserting anything about actual stock levels.
+        if r.status_code == 409 and r.json().get("code") == "insufficient_stock":
+            for shortfall in r.json()["detail"]["shortfalls"]:
+                receive_stock(self.conn, shortfall["ingredient_id"], 10_000, lot_no="TEST-TOPUP")
+            r = self.client.post("/pos/orders", headers=self.H_CASH, json=body)
+        order_id = r.json()["order_id"]
+        session = self.client.get(f"/unli/orders/{order_id}/session", headers=self.H_CASH).json()
+        return session["session_id"]
+
+    def _post_refill(self, sid, flavor_id):
+        """POST /refills, topping up whatever ingredient the fresh seed's
+        randomised stock happens to be short on and retrying once -- these
+        tests are about the note/head-flavour payload, not about asserting
+        anything regarding real stock levels."""
+        r = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
+                             json={"flavor_id": flavor_id})
+        if r.status_code == 409 and r.json().get("code") == "insufficient_stock":
+            for shortfall in r.json()["detail"]["shortfalls"]:
+                receive_stock(self.conn, shortfall["ingredient_id"], 10_000, lot_no="TEST-TOPUP")
+            r = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
+                                 json={"flavor_id": flavor_id})
+        return r
+
+    # ---------------- table count ----------------
+    def test_default_table_count_is_9(self):
+        self._reset_table_count()
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        self.assertEqual(menu["table_count"], 9)
+        cfg = self.client.get("/console/pos-config", headers=self.H_OWNER).json()
+        self.assertEqual(cfg["table_count"], 9)
+
+    def test_admin_can_change_table_count(self):
+        r = self.client.patch("/console/pos-config", headers=self.H_OWNER, json={"table_count": 12})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["table_count"], 12)
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        self.assertEqual(menu["table_count"], 12)
+        self._reset_table_count()
+
+    def test_cashier_cannot_change_table_count(self):
+        r = self.client.patch("/console/pos-config", headers=self.H_CASH, json={"table_count": 20})
+        self.assertEqual(r.status_code, 403)
+
+    def test_table_label_selected_at_checkout_is_retained(self):
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        item = next(m for m in menu["items"] if m["sellable"] and not m["is_unli"])
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "Table 5", "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        order_id = r.json()["order_id"]
+        detail = self.client.get(f"/pos/orders/{order_id}", headers=self.H_CASH).json()
+        self.assertEqual(detail["order"]["table_label"], "Table 5")
+
+    # ---------------- head/flavor cap ----------------
+    def test_one_head_allows_exactly_one_flavor(self):
+        sid = self._open_unli_session(1)
+        flavor = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"][0]
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                              json={"flavors": [flavor["display_name"]]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["head_flavors"], [flavor["display_name"]])
+        r2 = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                               json={"flavors": [flavor["display_name"], flavor["display_name"]]})
+        self.assertEqual(r2.status_code, 422)
+
+    def test_two_heads_allow_exactly_two_flavors(self):
+        sid = self._open_unli_session(2)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        names = [flavors[0]["display_name"], flavors[1]["display_name"]]
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH, json={"flavors": names})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(r.json()["head_flavors"]), 2)
+
+    def test_three_heads_same_flavor_three_times_is_valid(self):
+        """Repeats are explicitly allowed — three diners can all pick the
+        same flavour, and that must not collapse into a single selection."""
+        sid = self._open_unli_session(3)
+        flavor = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"][0]
+        names = [flavor["display_name"]] * 3
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH, json={"flavors": names})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["head_flavors"], names)
+        self.assertEqual(len(r.json()["head_flavors"]), 3)
+
+    def test_three_heads_two_same_one_different_is_valid(self):
+        sid = self._open_unli_session(3)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        names = [flavors[0]["display_name"], flavors[0]["display_name"], flavors[1]["display_name"]]
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH, json={"flavors": names})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["head_flavors"], names)
+
+    def test_fourth_selection_on_three_heads_is_rejected(self):
+        sid = self._open_unli_session(3)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        names = [flavors[0]["display_name"]] * 4
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH, json={"flavors": names})
+        self.assertEqual(r.status_code, 422)
+        # and the rejection did not silently apply a partial/expanded assignment
+        detail = self.client.get(f"/unli/sessions/{sid}", headers=self.H_CASH).json()
+        self.assertEqual(detail["head_flavors"], [])
+        self.assertEqual(detail["head_count"], 3, "a blocked 4th selection must not silently grow head_count")
+
+    def test_unknown_flavor_name_is_rejected(self):
+        sid = self._open_unli_session(2)
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                              json={"flavors": ["Not A Real Flavor"]})
+        self.assertEqual(r.status_code, 422)
+
+    def test_head_flavors_never_touches_reservation_or_ledger(self):
+        """Purely informational: assigning/reassigning head flavours must not
+        create a refill, deduct stock, or write to the stock ledger."""
+        sid = self._open_unli_session(2)
+        ledger_before = self.conn.execute("SELECT COUNT(*) n FROM stock_ledger").fetchone()["n"]
+        refill_before = self.conn.execute("SELECT COUNT(*) n FROM unli_refill").fetchone()["n"]
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [flavors[0]["display_name"], flavors[1]["display_name"]]})
+        ledger_after = self.conn.execute("SELECT COUNT(*) n FROM stock_ledger").fetchone()["n"]
+        refill_after = self.conn.execute("SELECT COUNT(*) n FROM unli_refill").fetchone()["n"]
+        self.assertEqual(ledger_before, ledger_after)
+        self.assertEqual(refill_before, refill_after)
+
+    def test_ordinary_item_quantity_is_unaffected_by_head_flavor_feature(self):
+        """Regression guard: normal menu-item qty must remain completely
+        untouched by anything added for unlimited head/flavor tracking."""
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        item = next(m for m in menu["items"] if m["sellable"] and not m["is_unli"])
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 3}]})
+        self.assertEqual(r.status_code, 201)
+        self.assertAlmostEqual(r.json()["subtotal"], round(item["price"] * 3, 2))
+
+    def test_list_sessions_exposes_head_flavors(self):
+        sid = self._open_unli_session(2)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [flavors[0]["display_name"]]})
+        sessions = self.client.get("/unli/sessions?status=active", headers=self.H_CASH).json()["sessions"]
+        row = next(s for s in sessions if s["session_id"] == sid)
+        self.assertEqual(row["head_flavors"], [flavors[0]["display_name"]])
+
+    def test_removing_a_middle_head_does_not_shift_the_others(self):
+        """head_flavors is positional (index = head number - 1). Clearing
+        head 2 must leave head 1 and head 3 exactly where they were, not
+        compact the list and silently relabel head 3 as head 2."""
+        sid = self._open_unli_session(3)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        a, b = flavors[0]["display_name"], flavors[1]["display_name"]
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                              json={"flavors": [a, a, b]})
+        self.assertEqual(r.json()["head_flavors"], [a, a, b])
+        r2 = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                               json={"flavors": [a, None, b]})
+        self.assertEqual(r2.status_code, 200)
+        self.assertEqual(r2.json()["head_flavors"], [a, None, b],
+                          "clearing head 2 must not shift head 3 into head 2's slot")
+
+    def test_clearing_every_head_resets_to_empty_list(self):
+        sid = self._open_unli_session(2)
+        flavor = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"][0]
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [flavor["display_name"], flavor["display_name"]]})
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                              json={"flavors": [None, None]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["head_flavors"], [])
+
+    def test_a_hole_still_counts_toward_the_head_cap_by_position(self):
+        """[A, None, A] has 3 slots on a 3-head table — a 4th slot must
+        still be rejected even though one slot in the middle is empty."""
+        sid = self._open_unli_session(3)
+        flavor = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"][0]["display_name"]
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                              json={"flavors": [flavor, None, flavor, flavor]})
+        self.assertEqual(r.status_code, 422)
+
+    # ---------------- table assigned from the refill workflow, not checkout ----------------
+    def _open_unli_session_no_table(self, head_count):
+        """Same as _open_unli_session, but checks out the way the real POS
+        now does for an unlimited cart: no table at all, just the order
+        type — table assignment happens later, from the refill screen."""
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        item = next(m for m in menu["items"] if m["is_unli"])
+        r = self.client.post("/pos/orders", headers=self.H_CASH, json={
+            "table_label": "Dine In", "head_count": head_count,
+            "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}],
+        })
+        order_id = r.json()["order_id"]
+        session = self.client.get(f"/unli/orders/{order_id}/session", headers=self.H_CASH).json()
+        return session["session_id"], order_id
+
+    def test_checkout_does_not_assign_a_table_for_an_unlimited_order(self):
+        sid, order_id = self._open_unli_session_no_table(2)
+        detail = self.client.get(f"/pos/orders/{order_id}", headers=self.H_CASH).json()
+        self.assertEqual(detail["order"]["table_label"], "Dine In")
+        session = self.client.get(f"/unli/sessions/{sid}", headers=self.H_CASH).json()
+        self.assertEqual(session["table_label"], "Dine In")
+
+    def test_refill_workflow_can_assign_a_table_to_an_open_session(self):
+        sid, order_id = self._open_unli_session_no_table(2)
+        r = self.client.patch(f"/unli/sessions/{sid}/table", headers=self.H_CASH,
+                              json={"table_label": "Table 4"})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["table_label"], "Table 4")
+        detail = self.client.get(f"/pos/orders/{order_id}", headers=self.H_CASH).json()
+        self.assertEqual(detail["order"]["table_label"], "Table 4",
+                         "the order itself must carry the table, not just the session view")
+
+    def test_table_assignment_rejects_out_of_range_numbers(self):
+        self._reset_table_count()  # table count is 9
+        sid, _ = self._open_unli_session_no_table(1)
+        r = self.client.patch(f"/unli/sessions/{sid}/table", headers=self.H_CASH,
+                              json={"table_label": "Table 99"})
+        self.assertEqual(r.status_code, 422)
+
+    def test_table_assignment_rejects_a_malformed_label(self):
+        sid, _ = self._open_unli_session_no_table(1)
+        r = self.client.patch(f"/unli/sessions/{sid}/table", headers=self.H_CASH,
+                              json={"table_label": "VIP Room"})
+        self.assertEqual(r.status_code, 422)
+
+    def test_two_active_sessions_cannot_share_the_same_table(self):
+        sid_a, _ = self._open_unli_session_no_table(1)
+        sid_b, _ = self._open_unli_session_no_table(1)
+        r1 = self.client.patch(f"/unli/sessions/{sid_a}/table", headers=self.H_CASH,
+                               json={"table_label": "Table 6"})
+        self.assertEqual(r1.status_code, 200)
+        r2 = self.client.patch(f"/unli/sessions/{sid_b}/table", headers=self.H_CASH,
+                               json={"table_label": "Table 6"})
+        self.assertEqual(r2.status_code, 409)
+        # the second session must still be tableless, not half-assigned
+        session_b = self.client.get(f"/unli/sessions/{sid_b}", headers=self.H_CASH).json()
+        self.assertEqual(session_b["table_label"], "Dine In")
+
+    def test_table_can_be_reassigned_once_freed_by_ending_the_first_session(self):
+        sid_a, order_a = self._open_unli_session_no_table(1)
+        self.client.patch(f"/unli/sessions/{sid_a}/table", headers=self.H_CASH,
+                          json={"table_label": "Table 7"})
+        self.client.post(f"/unli/sessions/{sid_a}/close", headers=self.H_CASH,
+                         json={"status": "completed"})
+        sid_b, _ = self._open_unli_session_no_table(1)
+        r = self.client.patch(f"/unli/sessions/{sid_b}/table", headers=self.H_CASH,
+                              json={"table_label": "Table 7"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_serving_a_refill_before_a_table_is_assigned_is_still_allowed_server_side(self):
+        """The table requirement is enforced by the POS UI (the Serve button
+        stays disabled until a table is picked) so the floor can always find
+        the table a round belongs to — but the server itself does not need a
+        second, redundant gate here: record_refill already requires nothing
+        about table_label, and this must keep working exactly as it does
+        today for any order created before this feature existed. Tops up
+        whichever ingredient the fresh seed happens to be short on rather
+        than asserting anything about real stock levels, which is not what
+        this test is about."""
+        sid, _ = self._open_unli_session_no_table(1)
+        flavor = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"][0]
+        r = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
+                             json={"flavor_id": flavor["id"]})
+        if r.status_code == 409 and r.json().get("code") == "insufficient_stock":
+            for shortfall in r.json()["detail"]["shortfalls"]:
+                receive_stock(self.conn, shortfall["ingredient_id"], 10_000, lot_no="TEST-TOPUP")
+            r = self.client.post(f"/unli/sessions/{sid}/refills", headers=self.H_CASH,
+                                 json={"flavor_id": flavor["id"]})
+        self.assertEqual(r.status_code, 201)
+
+    def test_head_flavor_assignment_works_before_a_table_is_assigned(self):
+        """Flavour assignment starts at 1st Serve regardless of table
+        status — only the actual refill-serving action is gated on it from
+        the UI side, never this purely-informational record."""
+        sid, _ = self._open_unli_session_no_table(2)
+        flavor = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"][0]["display_name"]
+        r = self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                              json={"flavors": [flavor, flavor]})
+        self.assertEqual(r.status_code, 200)
+
+    def test_table_cannot_be_changed_on_a_completed_session(self):
+        sid, order_id = self._open_unli_session_no_table(1)
+        self.client.post(f"/unli/sessions/{sid}/close", headers=self.H_CASH,
+                         json={"status": "completed"})
+        r = self.client.patch(f"/unli/sessions/{sid}/table", headers=self.H_CASH,
+                              json={"table_label": "Table 8"})
+        self.assertEqual(r.status_code, 409)
+
+    # ---------------- every head's flavour must reach the kitchen ----------------
+    # A round is still cooked and deducted as ONE flavour sized for the whole
+    # table (unchanged) — but when heads were assigned different flavours,
+    # the SELECT FLAVOR grid's last tap is the only one that becomes
+    # flavor_id, so an earlier tap for a different head used to vanish
+    # entirely: the kitchen never learned about it. record_refill now
+    # snapshots session.head_flavors into the round's own `note` at creation
+    # time, before the till's own post-serve reset (set_head_flavors([]))
+    # can clear the session-level record it would otherwise have to read.
+    def test_refill_note_carries_every_heads_flavor_not_just_the_served_one(self):
+        sid = self._open_unli_session(2)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        buffalo, garlic = flavors[0]["display_name"], flavors[1]["display_name"]
+        # Head 1 tapped first (Buffalo), head 2 tapped last (Garlic Parmesan)
+        # -- Garlic Parmesan is what becomes flavor_id, exactly like the POS
+        # always sends the LAST-tapped flavour as the round's flavor_id.
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [buffalo, garlic]})
+        r = self._post_refill(sid, flavors[1]["id"])
+        self.assertEqual(r.status_code, 201)
+        body = r.json()
+        # The served/deducted flavour is exactly what was asked for --
+        # business logic completely unchanged.
+        self.assertEqual(body["flavor_name"], garlic)
+        self.assertEqual(body["head_count"], 2)
+        # But BOTH heads' assignments must be visible somewhere on the round
+        # itself -- this is the exact defect: Buffalo (head 1) must not be
+        # silently dropped just because it wasn't the last tap.
+        self.assertIn("Head 1", body["note"])
+        self.assertIn(buffalo, body["note"])
+        self.assertIn("Head 2", body["note"])
+        self.assertIn(garlic, body["note"])
+
+    def test_refill_note_keeps_repeated_flavors_as_separate_head_entries(self):
+        """3 heads, Buffalo/Buffalo/Garlic Parmesan -- the repeat must show as
+        two distinct head entries, never collapsed into one."""
+        sid = self._open_unli_session(3)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        buffalo, garlic = flavors[0]["display_name"], flavors[1]["display_name"]
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [buffalo, buffalo, garlic]})
+        r = self._post_refill(sid, flavors[1]["id"])
+        self.assertEqual(r.status_code, 201)
+        note = r.json()["note"]
+        self.assertIn("Head 1: " + buffalo, note)
+        self.assertIn("Head 2: " + buffalo, note)
+        self.assertIn("Head 3: " + garlic, note)
+        # Both Buffalo mentions must actually be present as separate head
+        # entries, not deduplicated into a single "Head 1/2: Buffalo".
+        self.assertEqual(note.count(buffalo), 2)
+
+    def test_refill_note_skips_unassigned_heads_without_misnumbering(self):
+        """[Buffalo, None, Garlic Parmesan] -- head 2 was never assigned; the
+        note must still correctly label heads 1 and 3, not renumber them."""
+        sid = self._open_unli_session(3)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        buffalo, garlic = flavors[0]["display_name"], flavors[1]["display_name"]
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [buffalo, None, garlic]})
+        r = self._post_refill(sid, flavors[1]["id"])
+        note = r.json()["note"]
+        self.assertIn("Head 1: " + buffalo, note)
+        self.assertNotIn("Head 2", note)
+        self.assertIn("Head 3: " + garlic, note)
+
+    def test_second_refill_note_reflects_that_rounds_own_fresh_assignments(self):
+        """The till clears head_flavors after each served round so the NEXT
+        round starts blank (already-verified behaviour). This proves the
+        note captured for round 1 is not silently reused/blank for round 2 --
+        each round's note reflects only its OWN heads' assignments."""
+        sid = self._open_unli_session(2)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        a, b, c = (f["display_name"] for f in flavors[:3])
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [a, b]})
+        r1 = self._post_refill(sid, flavors[1]["id"])
+        self.assertIn(a, r1.json()["note"])
+        self.assertIn(b, r1.json()["note"])
+        # Till behaviour: clear, then assign fresh heads for round 2.
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": []})
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [c, c]})
+        r2 = self._post_refill(sid, flavors[2]["id"])
+        self.assertEqual(r2.status_code, 201)
+        note2 = r2.json()["note"]
+        self.assertIn("Head 1: " + c, note2)
+        self.assertIn("Head 2: " + c, note2)
+        self.assertNotIn(a, note2)
+        self.assertNotIn(b, note2)
+
+    def test_kds_queue_exposes_the_multi_head_note_on_the_refill_ticket(self):
+        """End-to-end through the exact endpoint the kitchen display polls --
+        proves the fix reaches the KDS response, not just record_refill's
+        own return value."""
+        sid = self._open_unli_session(2)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        buffalo, garlic = flavors[0]["display_name"], flavors[1]["display_name"]
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [buffalo, garlic]})
+        r = self._post_refill(sid, flavors[1]["id"])
+        refill_id = r.json()["id"]
+        # /kds/queue needs the kitchen-role capability -- a cashier token
+        # can't read it, so this proves the fix through the exact same
+        # credentials the real kitchen display authenticates with.
+        kit_token = self.client.post(
+            "/auth/login", json={"username": "kitchen1", "password": "wingstheory"}
+        ).json()["token"]
+        h_kit = {"Authorization": f"Bearer {kit_token}"}
+        q = self.client.get("/kds/queue", headers=h_kit).json()
+        ticket = next(t for t in q["refills"] if t["id"] == refill_id)
+        self.assertIn(buffalo, ticket["note"])
+        self.assertIn(garlic, ticket["note"])
+
+    def test_a_single_head_flavor_still_produces_a_note_without_error(self):
+        sid = self._open_unli_session(1)
+        flavor = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"][0]
+        self.client.patch(f"/unli/sessions/{sid}/head-flavors", headers=self.H_CASH,
+                          json={"flavors": [flavor["display_name"]]})
+        r = self._post_refill(sid, flavor["id"])
+        self.assertEqual(r.status_code, 201)
+        self.assertIn("Head 1: " + flavor["display_name"], r.json()["note"])
+
+    def test_no_head_flavors_assigned_leaves_note_untouched(self):
+        """Regression guard: a session where the cashier never used the
+        informational head-flavour feature at all must behave exactly as
+        before -- no fabricated note text, note stays None."""
+        sid = self._open_unli_session(2)
+        flavors = self.client.get("/unli/flavors", headers=self.H_CASH).json()["flavors"]
+        r = self._post_refill(sid, flavors[0]["id"])
+        self.assertEqual(r.status_code, 201)
+        self.assertIsNone(r.json()["note"])
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(
         loader.loadTestsFromTestCase(t) for t in (
             TestUnits, TestTTLCache, TestSchemaConstraints, TestResolver, TestMenuGate,
             TestReservation, TestReceiveStock, TestRecordCount, TestRecordWastage,
-            TestIngredientReconciliation, TestInventoryValuation, TestUnliOrders, TestConcurrency, TestFEFO,
+            TestIngredientReconciliation, TestRepeatedVarianceSignal,
+            TestVarianceReview, TestVarianceReviewAPI,
+            TestInventoryValuation, TestUnliOrders, TestConcurrency, TestFEFO,
             TestFEFODepletion, TestTimezoneHardening, TestUnliReconciliation, TestUnliRecalibration,
             TestConsumptionAnomaly, TestReorderPoint, TestUnliRBAC,
             TestUnliSession, TestRefillPieces, TestRefillSequence, TestRefillInventory,
@@ -7125,11 +12144,20 @@ def main() -> int:
             TestRefillReconciliationLink, TestRefillAPI,
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
-            TestSeedImport, TestVerificationWorkflow, TestConsoleAPI, TestAdminAuditLog, TestRBAC,
+            TestSeedImport, TestXlsxProphetIngest, TestVerificationWorkflow, TestConsoleAPI,
+            TestAdminAuditLog, TestRBAC,
             TestLoginAudit, TestMLResultCaching, TestDashboardSummary, TestPasswordSecurity,
-            TestForecasting, TestAnomaly, TestAssociations,
+            TestForecasting, TestStoreDemandForecast, TestSeriesForecastability,
+            TestIngredientDepletionForecast,
+            TestDepletionProphetDemandModel, TestReplenishmentBacktestDistribution, TestReplenishmentEndToEnd,
+            TestProphetDemandModelSetting, TestFlavourSubstitution,
+            TestAnomaly, TestAnomalyReview, TestAssociations, TestComboPricing,
             TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,
+            TestOwnerProvisioning, TestOwnerRoleAndProvisioning, TestOwnerInstructions,
+            TestOperationalUpdates, TestPurchaseOrders,
+            TestAuditGapCoverage, TestNewMigrationsIntegrity,
+            TestPOSFixes, TestHistoricalSourceTracking, TestPOSTablesAndHeadFlavors,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

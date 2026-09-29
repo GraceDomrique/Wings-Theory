@@ -34,7 +34,7 @@ a{color:inherit}
   background:
     linear-gradient(90deg, rgba(6,5,4,.98) 0%, rgba(8,7,5,.88) 32%, rgba(8,7,5,.48) 64%, rgba(8,7,5,.22) 100%),
     linear-gradient(0deg, rgba(8,7,5,.82), transparent 42%, rgba(8,7,5,.28)),
-    url("https://images.unsplash.com/photo-1608039755401-742074f0548d?auto=format&fit=crop&w=2200&q=88") center/cover no-repeat,
+    url("/img/landing-hero.jpg") center/cover no-repeat,
     var(--bg);
   filter:saturate(1.08) contrast(1.05);
   transform:scale(1.04);
@@ -159,14 +159,6 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
 .submit:active:not(:disabled){transform:translateY(0)}
 .submit:disabled{opacity:.6;cursor:default}
 
-.quick-access{margin-top:24px;padding-top:20px;border-top:1px solid rgba(255,255,255,.08)}
-.quick-label{font-size:10px;text-transform:uppercase;letter-spacing:.15em;color:var(--muted-2);margin-bottom:11px}
-.quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-.quick{text-align:left;padding:12px;border-radius:12px;border:1px solid var(--line-soft);
-  background:rgba(255,255,255,.025);color:#c0bbb3;transition:.2s;cursor:pointer}
-.quick:hover{background:rgba(255,160,28,.08);border-color:rgba(255,160,28,.25);color:#f3eee7}
-.quick b{display:block;font-size:11px}
-.quick span{display:block;color:var(--muted-2);font-size:10px;margin-top:4px}
 
 /* ---------- footer ---------- */
 .footer{position:relative;z-index:2;display:flex;flex-wrap:wrap;justify-content:space-between;
@@ -196,7 +188,7 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
   .food-photo{
     background:
       linear-gradient(180deg,rgba(7,6,5,.93) 0%,rgba(7,6,5,.78) 35%,rgba(7,6,5,.93) 100%),
-      url("https://images.unsplash.com/photo-1608039755401-742074f0548d?auto=format&fit=crop&w=1800&q=85") center/cover no-repeat,
+      url("/img/landing-hero.jpg") center/cover no-repeat,
       var(--bg);
   }
 }
@@ -208,7 +200,6 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
   .metrics{gap:18px}
   .learn-grid{grid-template-columns:1fr}
   .access{padding:21px;border-radius:20px}
-  .quick-grid{grid-template-columns:1fr}
   .footer{font-size:8px}
 }
 </style>
@@ -230,8 +221,8 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
 
   <main>
     <section class="hero">
-      <div class="eyebrow">Tested &middot; Tasted &middot; Perfected</div>
-      <h1>RUN THE<br><span class="accent">KITCHEN.</span></h1>
+      <div class="eyebrow">Flavor &middot; Science &middot; Perfection</div>
+      <h1>RUN THE BUSINESS.<br><span class="accent">KNOW WHAT'S NEXT.</span></h1>
       <p class="hero-copy">One operating layer for orders, recipes, ingredient usage, stock movement,
         replenishment decisions and kitchen execution. Built for speed behind the counter.</p>
       <button class="learn-link" id="learnBtn" aria-expanded="false">What's included &darr;</button>
@@ -285,15 +276,24 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
         <button class="submit" type="submit" id="loginBtn">Enter System &rarr;</button>
       </form>
 
-      <div class="quick-access">
-        <div class="quick-label">Quick access</div>
-        <div class="quick-grid">
-          <button class="quick" type="button" data-user="cashier1"><b>Cashier</b><span>POS terminal</span></button>
-          <button class="quick" type="button" data-user="kitchen1"><b>Kitchen Staff</b><span>Kitchen display</span></button>
-          <button class="quick" type="button" data-user="manager"><b>Manager</b><span>Operations console</span></button>
-          <button class="quick" type="button" data-user="owner"><b>Administrator</b><span>Full console</span></button>
+      <form id="pwChangeForm" autocomplete="off" style="display:none">
+        <p class="lead" style="margin:0 0 14px">This account still uses a temporary password. Choose your own before continuing.</p>
+        <div class="field">
+          <label for="pwNew">New password</label>
+          <div class="input-wrap">
+            <input id="pwNew" type="password" autocomplete="new-password" placeholder="New password" required>
+          </div>
         </div>
-      </div>
+        <div class="field">
+          <label for="pwConfirm">Confirm new password</label>
+          <div class="input-wrap">
+            <input id="pwConfirm" type="password" autocomplete="new-password" placeholder="Confirm new password" required>
+          </div>
+        </div>
+        <div id="pwChangeErr" role="alert"></div>
+        <button class="submit" type="submit" id="pwChangeBtn">Set password &amp; continue</button>
+      </form>
+
     </aside>
   </main>
 
@@ -326,8 +326,26 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
   var DEST = {
     admin:   { path: '/console', ns: 'wt_console_', app: 'Console' },
     manager: { path: '/console', ns: 'wt_console_', app: 'Console' },
+    owner:   { path: '/console', ns: 'wt_console_', app: 'Console' },
     cashier: { path: '/pos',     ns: 'wt_pos_',     app: 'POS Terminal' },
     kitchen: { path: '/kds',     ns: 'wt_kds_',     app: 'Kitchen Display' },
+  };
+
+  // Text only for the post-login boot screen (WingsIntro.boot) — role display
+  // name and the destination it announces. Kept separate from DEST above
+  // because admin and manager share a route and a destination but not a role
+  // label.
+  var ROLE_BOOT = {
+    // 'Operations Console', not 'Full Console': an administrator and a
+    // manager are entering the SAME application, and the boot screen naming
+    // it two different things was the loading experience contradicting
+    // itself depending on who signed in. The role line above it
+    // ("ACCESS GRANTED · ADMINISTRATOR") is what distinguishes them.
+    admin:   { roleLabel: 'Administrator', destLabel: 'Operations Console' },
+    manager: { roleLabel: 'Manager',       destLabel: 'Operations Console' },
+    owner:   { roleLabel: 'Owner',         destLabel: 'Owner Console' },
+    cashier: { roleLabel: 'Cashier',       destLabel: 'POS Terminal' },
+    kitchen: { roleLabel: 'Kitchen Staff', destLabel: 'Kitchen Display' },
   };
 
   function toast(msg) {
@@ -351,13 +369,18 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
     passToggle.setAttribute('aria-pressed', showing ? 'false' : 'true');
   });
 
+  // Deliberately does NOT distinguish "unknown username" from "wrong
+  // password" — the backend's own 401 body is the same "invalid
+  // credentials" string either way (wt/api.py's login()), so there is
+  // nothing here to leak even if this function tried to.
   function apiErrorMessage(body, status) {
+    if (status === 423) return 'Your account is temporarily locked. Try again later.';
+    if (status === 401) return 'Incorrect username or password.';
     if (body) {
       if (typeof body.message === 'string' && body.message) return body.message;
       if (typeof body.detail === 'string' && body.detail) return body.detail;
     }
-    if (status === 401) return 'Invalid username or password.';
-    return 'Could not reach the server.';
+    return 'Unable to connect to Wings Theory.';
   }
 
   /* ---------------- server status (top bar + access card) ---------------- */
@@ -371,7 +394,7 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
 
   /* ---------------- resume an existing session ---------------- */
   (function () {
-    var order = ['admin', 'manager', 'cashier', 'kitchen']; // most-privileged first
+    var order = ['admin', 'owner', 'manager', 'cashier', 'kitchen']; // most-privileged first
     for (var i = 0; i < order.length; i++) {
       var role = order[i], d = DEST[role];
       var token = localStorage.getItem(d.ns + 'token');
@@ -381,7 +404,7 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
         $('#resumeName').textContent = name;
         $('#resumeApp').textContent = d.app;
         $('#resume').classList.add('show');
-        $('#resumeBtn').onclick = function () { location.href = d.path + '?intro=done'; };
+        $('#resumeBtn').onclick = function () { location.href = d.path; };
         break;
       }
     }
@@ -395,22 +418,14 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
     this.textContent = open ? "Show less ↑" : "What's included ↓";
   });
 
-  /* ---------------- quick access: fills the username, never the password ---------------- */
-  document.querySelectorAll('.quick').forEach(function (btn) {
-    btn.addEventListener('click', function () {
-      $('#user').value = btn.dataset.user;
-      $('#pass').focus();
-      toast(btn.querySelector('b').textContent + ' account selected — enter your password.');
-    });
-  });
-
   /* ---------------- sign in ---------------- */
   var form = $('#loginForm'), loginBtn = $('#loginBtn'), err = $('#loginErr');
   form.addEventListener('submit', function (e) {
     e.preventDefault();
     var u = $('#user').value.trim(), p = $('#pass').value;
-    if (!u || !p) return;
     err.textContent = '';
+    if (!u) { err.textContent = 'Enter your username.'; $('#user').focus(); return; }
+    if (!p) { err.textContent = 'Enter your password.'; $('#pass').focus(); return; }
     loginBtn.disabled = true;
     loginBtn.textContent = 'Signing In…';
 
@@ -419,6 +434,13 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: u, password: p }),
     })
+      .catch(function () {
+        // fetch() itself rejected — no HTTP response at all, not a
+        // credentials problem. Thrown as a real Error so it skips the
+        // apiErrorMessage(body, status) branch entirely and always reads
+        // this exact sentence, regardless of the browser's own message.
+        throw new Error('Unable to connect to Wings Theory.');
+      })
       .then(function (r) {
         return r.json().catch(function () { return {}; }).then(function (body) {
           if (!r.ok) throw new Error(apiErrorMessage(body, r.status));
@@ -428,20 +450,77 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
       .then(function (body) {
         var dest = DEST[body.role];
         if (!dest) throw new Error("Role '" + body.role + "' has no assigned workspace.");
+        if (body.must_change_password) {
+          // The backend blocks every capability-gated route for this account
+          // until it changes its password (wt/api.py's needs()), and landing
+          // hands off straight into the destination app's shell with no
+          // login screen of its own in between — so this is the one place
+          // that hand-off can be interrupted to ask for a new password
+          // first, for every role.
+          pendingDest = dest;
+          pendingToken = body.token;
+          pendingRole = body.role;
+          pendingName = body.display_name;
+          pendingUsername = u;
+          form.style.display = 'none';
+          $('#pwChangeForm').style.display = '';
+          $('#pwNew').focus();
+          loginBtn.disabled = false;
+          loginBtn.textContent = 'Enter System →';
+          return;
+        }
         localStorage.setItem(dest.ns + 'token', body.token);
         localStorage.setItem(dest.ns + 'role', body.role);
         localStorage.setItem(dest.ns + 'name', body.display_name);
+        localStorage.setItem(dest.ns + 'username', u);
         // The brand hand-off plays only once we know sign-in actually
         // succeeded and where it's headed — failing fast on bad
         // credentials matters more than a cinematic wrong-password screen.
-        return WingsIntro.play().then(function () {
-          location.href = dest.path + '?intro=done';
+        return WingsIntro.boot(ROLE_BOOT[body.role]).then(function () {
+          location.href = dest.path;
         });
       })
       .catch(function (e) {
         err.textContent = e.message || 'Could not reach the server.';
         loginBtn.disabled = false;
         loginBtn.textContent = 'Enter System →';
+      });
+  });
+
+  /* ---------------- forced password change (temporary/reset password) ---------------- */
+  var pendingDest = null, pendingToken = null, pendingRole = null, pendingName = null, pendingUsername = null;
+  var pwForm = $('#pwChangeForm'), pwBtn = $('#pwChangeBtn'), pwErr = $('#pwChangeErr');
+  pwForm.addEventListener('submit', function (e) {
+    e.preventDefault();
+    var n = $('#pwNew').value, c = $('#pwConfirm').value;
+    pwErr.textContent = '';
+    if (n !== c) { pwErr.textContent = 'New password and confirmation do not match.'; return; }
+    pwBtn.disabled = true;
+    pwBtn.textContent = 'Setting password…';
+    fetch(API + '/auth/change_password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + pendingToken },
+      body: JSON.stringify({ current_password: $('#pass').value, new_password: n, confirm_new_password: c }),
+    })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (body) {
+          if (!r.ok) throw new Error(apiErrorMessage(body, r.status));
+          return body;
+        });
+      })
+      .then(function (body) {
+        localStorage.setItem(pendingDest.ns + 'token', body.token);
+        localStorage.setItem(pendingDest.ns + 'role', pendingRole);
+        localStorage.setItem(pendingDest.ns + 'name', pendingName);
+        localStorage.setItem(pendingDest.ns + 'username', pendingUsername);
+        return WingsIntro.boot(ROLE_BOOT[pendingRole]).then(function () {
+          location.href = pendingDest.path;
+        });
+      })
+      .catch(function (e) {
+        pwErr.textContent = e.message || 'Could not reach the server.';
+        pwBtn.disabled = false;
+        pwBtn.textContent = 'Set password & continue';
       });
   });
 

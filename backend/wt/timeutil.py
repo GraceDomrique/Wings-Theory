@@ -131,6 +131,40 @@ def business_date_n_days_ago(n: int, now: _dt.datetime | None = None) -> str:
     return (business_today(now) - _dt.timedelta(days=n)).isoformat()
 
 
+def utc_bound_for_manila_date(date_iso: str) -> str:
+    """The UTC timestamp string for Manila midnight on `date_iso`
+    (YYYY-MM-DD) -- the lower bound for "that Manila business day onward"
+    in a TIMESTAMP-valued column comparison. Pass the day AFTER the last day
+    you want included (`date.fromisoformat(x) + timedelta(days=1)`) to get
+    an exclusive upper bound for "through that day" instead -- same
+    Manila-midnight arithmetic utc_bound_n_manila_days_ago already uses for
+    its lower bound, just anchored on an explicit date rather than "N days
+    before today"."""
+    d = _dt.date.fromisoformat(date_iso)
+    manila_midnight = _dt.datetime.combine(d, _dt.time.min, tzinfo=MANILA_TZ)
+    return manila_midnight.astimezone(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def utc_bound_n_manila_months_ago(n_months: int, now: _dt.datetime | None = None) -> str:
+    """The exact UTC timestamp string for Manila midnight, N calendar
+    months before today's Manila business date, same day-of-month (clamped
+    to the target month's last day, e.g. Aug 31 - 3 months -> May 31, not
+    an overflowed June 1). Calendar-month arithmetic, not `n * 30 days` --
+    for a "last 3 months" rolling window (the POS terminal's visible order
+    history) that should track wall-clock months the way an operator reads
+    them, not drift against months of different lengths.
+    """
+    today = business_today(now)
+    total_months = today.year * 12 + (today.month - 1) - n_months
+    year, month0 = divmod(total_months, 12)
+    month = month0 + 1
+    import calendar
+    day = min(today.day, calendar.monthrange(year, month)[1])
+    anchor = _dt.date(year, month, day)
+    manila_midnight = _dt.datetime.combine(anchor, _dt.time.min, tzinfo=MANILA_TZ)
+    return manila_midnight.astimezone(_dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def utc_bound_n_manila_days_ago(n_days: int, now: _dt.datetime | None = None) -> str:
     """The exact UTC timestamp string for Manila midnight, N Manila
     calendar days before (and including) today -- for bounding a

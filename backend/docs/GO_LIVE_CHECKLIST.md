@@ -18,7 +18,18 @@ Every account `seed.py` creates starts with the same password,
 exactly this reason. **Production is not ready until every row below reads
 "rotated."**
 
-Two ways to check this without reading the database directly:
+As of this phase, `must_change_password=1` is an enforced gate, not just a
+flag to query: `wt/api.py`'s `needs()` (every capability-gated route)
+refuses with `403 password_change_required` until the account changes its
+own password — only `/auth/login` and `/auth/change_password` stay reachable.
+Landing, POS, KDS, and the console login screen all detect
+`must_change_password: true` in the `/auth/login` response and show a
+"Set a new password" step immediately, before ever entering the app — so
+signing in with `wingstheory` on any of the four real accounts now walks the
+person straight into rotating it; no separate step to remember.
+
+Two ways to check remaining unrotated accounts without reading the database
+directly:
 - `GET /auth/login` response for any account includes `"must_change_password"`.
 - An admin can query directly: `SELECT username, must_change_password FROM app_user;`
 

@@ -42,4 +42,33 @@ export function resetPassword(username) {
   return api.post(`/console/users/${encodeURIComponent(username)}/reset_password`);
 }
 
+/**
+ * Every account and its role — never password fields. Admin-only
+ * (user.manage), same as resetPassword above.
+ */
+export async function listUsers() {
+  const out = await api.get('/console/users');
+  return (out.users || []).map((u) => ({
+    username: u.username,
+    displayName: u.display_name,
+    role: u.role,
+    mustChangePassword: !!u.must_change_password,
+    lockedUntil: u.locked_until || null,
+    isActive: !!u.is_active,
+  }));
+}
+
+/**
+ * Provision a new account (2026-09-11 — there was no way to do this before).
+ * Same one-time-secret contract as resetPassword: the temp password is
+ * returned exactly once, in this response, and never stored or logged
+ * anywhere else.
+ */
+export async function createUser({ username, displayName, role }) {
+  const out = await api.post('/console/users', {
+    username, display_name: displayName, role,
+  });
+  return { username: out.username, role: out.role, temporaryPassword: out.temporary_password };
+}
+
 export { MIN_PASSWORD_LENGTH };

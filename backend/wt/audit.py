@@ -30,6 +30,16 @@ def log(
     new_value=None,
     note: str | None = None,
 ) -> None:
+    # admin_audit_log.user_id is NOT NULL — every row that exists must name a
+    # real actor. A None here means no authenticated caller was involved at
+    # all (reservation.py's mutation functions default user_id=None and are
+    # also called directly by this project's own test suite, bypassing the
+    # API layer's principal() entirely); there is nothing truthful to
+    # attribute, so no row is written rather than crashing the caller's
+    # transaction or inventing a placeholder actor. Every real HTTP request
+    # reaches here with p["sub"], never None.
+    if user_id is None:
+        return
     conn.execute(
         "INSERT INTO admin_audit_log "
         "(entity_type, entity_id, action, field, previous_value, new_value, user_id, note) "

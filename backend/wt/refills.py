@@ -55,10 +55,13 @@ already distinguish them for orders.
 """
 from __future__ import annotations
 
+import json
+import math
+import re
 import sqlite3
 
 from .db import write_tx
-from .errors import InsufficientStockError, InvalidStateError, NotFoundError
+from .errors import InsufficientStockError, InvalidStateError, NotFoundError, ValidationError
 from .reservation import EPS, _ledger, _try_hold, deplete_fefo, restore_fefo
 from .resolver import expand_recipe
 from .unli import get_setting
@@ -72,6 +75,13 @@ DEFAULT_PIECES_PER_HEAD = 3
 # a precision the source data does not support, and the document states the
 # portion directly.
 DEFAULT_SAUCE_G_PER_HEAD = 40.0
+
+# Mirrors api.DEFAULT_TABLE_COUNT — kept as a separate constant rather than
+# imported to avoid a refills<->api circular import; both read the same
+# 'pos_table_count' app_setting, so an admin's configured count is honoured
+# either way and this is only the bootstrap fallback before one is set.
+DEFAULT_TABLE_COUNT = 9
+_TABLE_LABEL_RE = re.compile(r"^Table (\d+)$")
 
 # A round may only be recorded against a live session.
 REFILL_OPEN_STATES = ("pending",)
@@ -254,7 +264,112 @@ def session_detail(conn: sqlite3.Connection, session_pk: int) -> dict:
     data["charges"] = _rows(conn.execute(
         "SELECT * FROM order_charge WHERE order_id=? ORDER BY id", (data["order_id"],)))
     data["accepts_refills"] = data["status"] == "active"
+    data["head_flavors"] = json.loads(data["head_flavors"]) if data["head_flavors"] else []
     return data
+
+
+def set_head_flavors(conn: sqlite3.Connection, session_pk: int, flavors: list[str | None],
+                     user_id: str | None = None) -> dict:
+    """Record which flavour each head at this unlimited table initially
+    chose — repeats allowed (three diners can all pick Buffalo), capped at
+    the session's own head_count, exactly as many "slots" as there are
+    diners to fill.
+
+    `flavors` is positional: index 0 is head 1, index 1 is head 2, and so
+    on, with `None` meaning "not chosen yet." It is stored (and returned)
+    that way rather than as a compacted list of only the chosen names, so
+    that clearing head 2's flavour leaves head 3's exactly where it was —
+    the till renders one fixed row per head, not a list that reflows when
+    one entry in the middle is removed.
+
+    Purely informational: this never touches a refill, a reservation, or the
+    stock ledger. record_refill still sizes every actual served round off
+    the session's head_count alone (see _record_refill_tx's own comment,
+    "a till cannot talk the kitchen into a bigger round") — completely
+    unchanged by this. This exists only so the POS can show and enforce
+    "which flavour is head N having" against the true head count, before or
+    between refill rounds, the way the floor already thinks about the table.
+
+    Replaces the whole list on each call (not append-only) — the cashier
+    correcting "actually head 2 wanted Garlic Parmesan, not Buffalo" is a
+    normal, harmless edit to this informational record, not a financial or
+    inventory event the way a served refill is.
+    """
+    with write_tx(conn):
+        session = conn.execute(
+            "SELECT head_count, status FROM unli_session WHERE id=?", (session_pk,)
+        ).fetchone()
+        if not session:
+            raise NotFoundError(f"unlimited session {session_pk} not found")
+        if session["status"] != "active":
+            raise InvalidStateError(f"this session is {session['status']} — nothing to assign")
+        if len(flavors) > session["head_count"]:
+            raise ValidationError(
+                f"{len(flavors)} head slots exceeds this table's {session['head_count']} head(s)"
+            )
+        chosen = [f for f in flavors if f is not None]
+        if len(chosen) > session["head_count"]:
+            raise ValidationError(
+                f"{len(chosen)} flavour selections exceeds this table's {session['head_count']} head(s)"
+            )
+        valid_names = {f["display_name"] for f in list_flavors(conn, active_only=True)}
+        unknown = [f for f in chosen if f not in valid_names]
+        if unknown:
+            raise ValidationError(f"not a selectable flavour: {', '.join(unknown)}")
+        conn.execute(
+            "UPDATE unli_session SET head_flavors=? WHERE id=?",
+            (json.dumps(flavors) if chosen else None, session_pk),
+        )
+    return session_detail(conn, session_pk)
+
+
+def set_session_table(conn: sqlite3.Connection, session_pk: int, table_label: str,
+                      user_id: str | None = None) -> dict:
+    """Assign the physical table for an already-open unlimited session.
+
+    Deliberately not part of order creation: the cashier rings up the first
+    serve (heads, flavours, payment) before the floor necessarily knows which
+    table it's going to, and the till shouldn't block on that. The table is
+    instead required here, from the refill screen, which is also where every
+    later round is served against it — so 'Table 5' becomes the thing a
+    cashier scans for on the refill list from the very first serve onward.
+
+    Writes customer_order.table_label directly. Safe post-checkout: the
+    immutability trigger from migration 0011 only guards the five money
+    columns (subtotal/service_charge/total/cash_received/change_due) once
+    total is set — table_label was never one of them, the same way
+    status/served_at/voided_at are freely updated after checkout today.
+    """
+    with write_tx(conn):
+        session = conn.execute(
+            "SELECT order_id, status FROM unli_session WHERE id=?", (session_pk,)
+        ).fetchone()
+        if not session:
+            raise NotFoundError(f"unlimited session {session_pk} not found")
+        if session["status"] != "active":
+            raise InvalidStateError(
+                f"this session is {session['status']} — its table cannot be changed")
+        m = _TABLE_LABEL_RE.match(table_label)
+        if not m:
+            raise ValidationError("choose a table from the grid")
+        n = int(m.group(1))
+        table_count = int(get_setting(conn, "pos_table_count", DEFAULT_TABLE_COUNT))
+        if not (1 <= n <= table_count):
+            raise ValidationError(f"choose a table between 1 and {table_count}")
+        clash = conn.execute(
+            """
+            SELECT s.id FROM unli_session s JOIN customer_order o ON o.id = s.order_id
+             WHERE s.status = 'active' AND o.table_label = ? AND s.id != ?
+            """,
+            (table_label, session_pk),
+        ).fetchone()
+        if clash:
+            raise InvalidStateError(f"Table {n} is already in use by another active order")
+        conn.execute(
+            "UPDATE customer_order SET table_label=? WHERE id=?",
+            (table_label, session["order_id"]),
+        )
+    return session_detail(conn, session_pk)
 
 
 def list_sessions(conn: sqlite3.Connection, status: str | None = "active",
@@ -266,7 +381,10 @@ def list_sessions(conn: sqlite3.Connection, status: str | None = "active",
         params.append(status)
     sql += " ORDER BY started_at DESC LIMIT ?"
     params.append(limit)
-    return {"sessions": _rows(conn.execute(sql, params))}
+    sessions = _rows(conn.execute(sql, params))
+    for s in sessions:
+        s["head_flavors"] = json.loads(s["head_flavors"]) if s["head_flavors"] else []
+    return {"sessions": sessions}
 
 
 def set_session_status(conn: sqlite3.Connection, session_pk: int, status: str,
@@ -417,6 +535,25 @@ def _record_refill_tx(
     flavor = _flavor_or_404(conn, flavor_pk)
     heads = session["head_count"]
     pieces = heads * pieces_per_head(conn)
+    # A round is still sized and cooked as ONE flavour for the whole table
+    # (unchanged, immediately below) — but the heads it covers may each have
+    # initially asked for something different (set_head_flavors). That
+    # breakdown was being collected on the till and then never reaching the
+    # kitchen at all: the SELECT FLAVOR grid's last tap decides flavor_id for
+    # the round, so an earlier, different tap for another head was silently
+    # dropped from what the kitchen sees. Snapshotting session["head_flavors"]
+    # into this round's own `note` — an existing, already-displayed column,
+    # not a new one — fixes exactly that, and has to happen here rather than
+    # from the till: set_head_flavors resets to blank right after a round is
+    # served (so the NEXT round starts clean), so by the time that PATCH
+    # fires this round's assignments would already be gone if not captured
+    # at creation time, inside the same transaction, before it.
+    head_flavors = json.loads(session["head_flavors"]) if session["head_flavors"] else []
+    if any(head_flavors):
+        head_note = " · ".join(
+            f"Head {i + 1}: {name}" for i, name in enumerate(head_flavors) if name
+        )
+        note = f"{note} — {head_note}" if note else head_note
     # Sauce is sized per head, not per piece — see DEFAULT_SAUCE_G_PER_HEAD.
     sauce_base = heads * sauce_per_head(conn)
     need = _refill_requirements(conn, flavor, sauce_base)
@@ -761,6 +898,39 @@ def refill_detail(conn: sqlite3.Connection, refill_pk: int) -> dict:
 # ---------------------------------------------------------------------------
 # receipt view — financial record plus its operational history
 # ---------------------------------------------------------------------------
+# Standard Philippine cash denominations a till actually has on hand.
+_PH_CASH_DENOMINATIONS = (20, 50, 100, 200, 500, 1000)
+
+
+def _reconstruct_cash_tender(total: float) -> tuple[float, float]:
+    """A deterministic, realistic cash tender for a historical sale whose
+    actual payment was never recorded in the source workbook (it has no
+    payment-tender field at all — see wt/xlsx_history_import.py).
+
+    Pure function of `total` alone: no randomness, no per-order seed, so the
+    same order produces the exact same figures every time this runs, forever
+    — the requirement is determinism across page loads, and a total is
+    already a stable, immutable number once an order is settled, so nothing
+    else is needed to guarantee that.
+
+    Never persisted: migration 0011's trg_order_financials_immutable already
+    (rightly) refuses to write cash_received/change_due back onto a row
+    whose total is already set, and this does not try to get around that —
+    it exists purely so a historical receipt can show a complete-looking
+    payment section instead of "CASH — / CHANGE —", computed fresh on every
+    read. The smallest standard bill that covers the total, so the
+    reconstructed change is always a normal, unremarkable amount rather than
+    an oddly large one.
+    """
+    if total <= 0:
+        return 0.0, 0.0
+    for note in _PH_CASH_DENOMINATIONS:
+        if note >= total:
+            return float(note), round(note - total, 2)
+    tender = math.ceil(total / 500) * 500
+    return float(tender), round(tender - total, 2)
+
+
 def order_receipt(conn: sqlite3.Connection, order_pk: int) -> dict:
     """Everything a receipt shows: the settled sale exactly as it was paid,
     plus the unlimited session hanging off it if there is one.
@@ -772,8 +942,9 @@ def order_receipt(conn: sqlite3.Connection, order_pk: int) -> dict:
     order = conn.execute(
         """
         SELECT id, order_no, status, table_label, head_count, created_by, created_at,
-               committed_at, served_at, voided_at, void_reason, subtotal, service_charge,
-               total, cash_received, change_due
+               committed_at, served_at, voided_at, void_reason, subtotal,
+               discount_type, discount_amount, service_charge,
+               total, cash_received, change_due, source, source_order_id
           FROM customer_order WHERE id=?
         """, (order_pk,)).fetchone()
     if not order:
@@ -791,6 +962,21 @@ def order_receipt(conn: sqlite3.Connection, order_pk: int) -> dict:
     addon_total = round(sum(ch["amount"] for ch in charges), 2)
     original_total = order["total"]
 
+    # A historical sale genuinely has no recorded cash tender (the source
+    # workbook has no payment field at all) — reconstructed_* are computed
+    # fresh here, kept OUT of the `order` dict (which stays the untouched,
+    # frozen database record — never silently rewritten to imply the source
+    # actually recorded a payment), and flagged so a client can label them
+    # honestly rather than presenting them as a source-recorded fact.
+    payment_reconstructed = (
+        order["source"] == "historical"
+        and order["cash_received"] is None
+        and original_total is not None
+    )
+    reconstructed_cash = reconstructed_change = None
+    if payment_reconstructed:
+        reconstructed_cash, reconstructed_change = _reconstruct_cash_tender(original_total)
+
     session = session_for_order(conn, order_pk)
     return {
         "order": dict(order),
@@ -799,6 +985,9 @@ def order_receipt(conn: sqlite3.Connection, order_pk: int) -> dict:
         "charges": charges,
         "addon_total": addon_total,
         "original_total": original_total,
+        "payment_reconstructed": payment_reconstructed,
+        "reconstructed_cash_received": reconstructed_cash,
+        "reconstructed_change_due": reconstructed_change,
         "current_total": round((original_total or 0) + addon_total, 2)
                          if original_total is not None else None,
     }

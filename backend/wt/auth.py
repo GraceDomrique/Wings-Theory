@@ -49,80 +49,134 @@ MIN_PASSWORD_LENGTH = 10
 MAX_LOGIN_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
 
-ROLES = ("admin", "manager", "cashier", "kitchen")
+ROLES = ("admin", "manager", "cashier", "kitchen", "owner")
 
 # Capability -> roles allowed.
 #
 # 2026-08 RBAC audit finding: 'admin' and 'manager' were IDENTICAL in every
-# capability below except user.manage — the owner's account (seed.py maps
-# username 'owner' to role 'admin') could silently create, void, and edit
-# every operational record a manager could, with no separation of duties.
-# That is a real accountability gap: it means the one person with no
-# on-site supervisor could alter inventory, prices, or sales records and
-# there would be nothing structurally distinguishing that from a manager's
-# routine action.
+# capability below except user.manage. The fix at the time made 'admin'
+# structurally read-only-plus-sign-off, on the theory that the one account
+# with no on-site supervisor should never unilaterally alter operational
+# records. That produced its own problem in practice: the Administrator
+# role is the one meant to hold full system authority (it already owns
+# user.manage, the most sensitive capability there is), while 'manager' —
+# reachable from a shared back-of-house login — was the one actually able
+# to create, edit and delete inventory, recipes and prices.
 #
-# Redesigned around one rule: 'admin' keeps read access to everything (the
-# owner must be able to monitor the restaurant remotely) plus the specific
-# actions that are inherently an OWNER-LEVEL oversight decision rather than
-# a floor operation — user administration, confirming a physical constant
-# is correct (queue.resolve — the owner is often the one who actually
-# negotiated the pack size/cost with the supplier), and approving a
-# reconciliation a manager or kitchen already performed (unli.approve —
-# a second-party sign-off is a control, not a risk). Everything that
-# directly creates or mutates a live operational record on the floor
-# (orders, inventory quantities, recipes/prices, unlimited refills/
-# sessions) now requires the operational role that actually did the work
-# — 'manager' for back-of-house writes, 'cashier'/'kitchen' for their own
-# station — so the owner's account is structurally read-only plus sign-off
-# there, never a route to unilaterally alter or erase what a manager or
-# line worker was accountable for. See TestRBAC in run_tests.py.
+# 2026-09 revision: 'admin' now holds every capability — full view, create,
+# edit and delete access system-wide, consistent with it being the single
+# fully-trusted role. 'manager' is narrowed to read/monitoring capabilities
+# only: dashboards, sales, inventory, recipes, queues, forecasts and
+# anomaly/consumption monitoring. No capability below grants 'manager' the
+# ability to create, edit, delete, or otherwise mutate a record. Where a
+# capability previously covered both a read and a write action for the same
+# resource (viewing pending reconciliations vs. submitting one), it has been
+# split so the read half can stay with 'manager' and the kitchen station
+# that also depends on it, while the write half moves to 'admin' only. See
+# TestRBAC in run_tests.py.
+#
+# 2026-09-11 addition: 'owner' is a genuinely new, separate role (not a
+# relabeling of 'manager' — both exist, independently, going forward). It
+# is read-only across every existing capability below, added only to rows
+# 'manager' already held (order.read, menu.read, inventory.read,
+# recipe.read) — never inventory.write, recipe.write, queue.resolve,
+# unli.approve, user.manage, or permissions.manage. It gets exactly two new
+# capabilities that exist nowhere else in this table, each a net-new
+# workflow designed for it: instruction.create (an owner-to-admin task, see
+# wt/instructions.py) and purchase_order.create (a draft purchase order,
+# see wt/purchasing.py). Nothing here weakens 'admin' or 'manager'.
 CAPABILITIES = {
     "order.create":       ("cashier",),
     # Kitchen can void too, but only ever reaches a 'punched' (not-yet-
     # started) ticket from the KDS UI — releasing a hold with zero ledger
     # impact. Voiding an order already in progress still requires walking
-    # back to the till; that path posts a real compensating wastage entry
-    # and stays a cashier/manager decision — not the owner's account,
-    # which is not present at the till and should not be able to erase or
-    # adjust a sales record it did not create.
-    "order.void":         ("cashier", "manager", "kitchen"),
+    # back to the till; that path posts a real compensating wastage entry,
+    # which is a create/edit/delete-class action reserved for the till
+    # itself, the kitchen's own zero-impact case, or the admin's full
+    # access — never the manager's read-only role.
+    "order.void":         ("cashier", "admin", "kitchen"),
     "order.status":       ("kitchen",),
-    "order.read":         ("cashier", "manager", "admin"),
-    "menu.read":          ("cashier", "kitchen", "manager", "admin"),
-    "inventory.read":     ("manager", "admin"),
-    "inventory.write":    ("manager",),
-    "recipe.read":        ("manager", "admin"),
-    "recipe.write":       ("manager",),
+    "order.read":         ("cashier", "manager", "admin", "owner"),
+    "menu.read":          ("cashier", "kitchen", "manager", "admin", "owner"),
+    "inventory.read":     ("manager", "admin", "owner"),
+    "inventory.write":    ("admin",),
+    "recipe.read":        ("manager", "admin", "owner"),
+    "recipe.write":       ("admin",),
+    # Whether a service charge applies at all, and which of the
+    # Senior/PWD/Staff discount cards a cashier may select — a business
+    # decision, admin-only like every other write capability. Reading the
+    # effective result is menu.read (GET /pos/menu), same as every other
+    # POS-preview figure; this only gates changing it.
+    "pos_config.write":   ("admin",),
     "queue.read":         ("manager", "admin"),
-    "queue.resolve":      ("manager", "admin"),
-    # Narrowly scoped on purpose. Reconciling an unlimited stream is a kitchen
-    # job — the kitchen is the only station that can weigh the tray — but it
-    # is the ONLY inventory-affecting thing the kitchen may do. Granting
-    # inventory.write to make it work would also hand a kitchen tablet stock
-    # receiving, write-offs, physical counts and every ingredient field in the
-    # console, none of which it has any business touching. The owner's
-    # account cannot weigh a tray remotely either, so it is not here.
-    "unli.reconcile":     ("kitchen", "manager"),
+    "queue.resolve":      ("admin",),
+    # Viewing pending/completed reconciliations and the coefficients they
+    # feed — a monitoring capability, so the manager keeps it, alongside the
+    # kitchen station that reads its own pending list from the KDS. Actually
+    # *submitting* a reconciliation is unli.reconcile.write, just below.
+    "unli.reconcile":     ("kitchen", "manager", "admin"),
+    # Recording the measurement is a create action against a real ledger
+    # entry (it posts a stock correction). The kitchen is the only station
+    # that can physically weigh the tray, so it keeps this; the manager,
+    # who cannot, does not.
+    "unli.reconcile.write": ("kitchen", "admin"),
     # Signing off a day that fell outside tolerance, and recalibrating a
-    # coefficient off the validated history, both change what the POS will
-    # deduct tomorrow. That is a management decision — and unlike the write
-    # capabilities above, a second-party sign-off from the owner's account
-    # is a genuine control (the person approving did not also perform the
-    # reconciliation being approved), so admin keeps this one.
-    "unli.approve":       ("manager", "admin"),
-    # Recording a round of unlimited wings. Both stations legitimately do this
-    # — the cashier takes the table's flavour, the kitchen serves it — so both
-    # hold it. It grants nothing beyond refills: the sauce deduction it
-    # triggers is sized by the server from the session's own head count, so
-    # holding this capability is not a way to move arbitrary stock. Still a
-    # floor action the owner's account does not perform remotely.
-    "unli.refill":        ("cashier", "kitchen", "manager"),
-    # Closing or cancelling a table's session. The floor owns this; reopening
-    # a closed one is deliberately separate (unli.approve) so a session cannot
-    # be resurrected by the same accidental tap that ended it.
-    "unli.session":       ("cashier", "kitchen", "manager"),
+    # coefficient off the validated history, both edit records that change
+    # what the POS will deduct tomorrow — admin-only, like every other
+    # write capability.
+    "unli.approve":       ("admin",),
+    # Recording a round of unlimited wings, opening/closing a table's
+    # session. Floor stations create these records as part of taking and
+    # serving an order; the manager's role is monitoring, not floor
+    # execution, so it holds neither. Admin gains both so an administrator
+    # signed into POS/KDS (see ALLOWED_ROLES on those pages) has full,
+    # working access rather than a capability gap.
+    "unli.refill":        ("cashier", "kitchen", "admin"),
+    "unli.session":       ("cashier", "kitchen", "admin"),
     "user.manage":        ("admin",),
+    # Configuring which console PAGES a role can reach at all (distinct from
+    # every capability above, which governs an individual action). See
+    # wt/permissions.py.
+    "permissions.manage": ("admin",),
+
+    # --- 2026-09-11: Owner instructions and purchase orders --------------
+    # Creating an instruction/draft PO, and cancelling one's own while it is
+    # still in its initial state ('open'/'draft') — enforced inside
+    # wt/instructions.py and wt/purchasing.py by checking created_by against
+    # the caller, not by a separate capability per branch (same pattern
+    # order.void already uses). Every other transition — acknowledge, start,
+    # complete, mark ordered, receive, admin-side cancel — is admin-only:
+    # OWNER never gains write access to the operational system itself.
+    "instruction.create":      ("owner",),
+    "instruction.update_status": ("admin",),
+    # Both roles can reach the cancel endpoint; which instruction and from
+    # which status is a finer rule enforced inside wt/instructions.cancel()
+    # (owner: only their own, only from 'open'; admin: from any cancellable
+    # status) — same shape as order.void below, whose capability also lists
+    # every role that can reach the route and leaves the per-branch rule to
+    # the function itself.
+    "instruction.cancel":       ("owner", "admin"),
+    "instruction.read":         ("owner", "admin"),
+    "purchase_order.create":    ("owner",),
+    "purchase_order.manage":    ("admin",),
+    "purchase_order.cancel":    ("owner", "admin"),
+    "purchase_order.read":      ("owner", "admin"),
+
+    # Operational updates (migration 0029): the free-text, bidirectional half
+    # of Owner/Admin communication that instructions' fixed state machine
+    # doesn't cover. Both roles can create and read; who may acknowledge a
+    # given update (only the role that did NOT post it) is a finer rule
+    # enforced inside wt/updates.acknowledge(), same shape as
+    # instruction.cancel above.
+    "update.create":      ("owner", "admin"),
+    "update.read":        ("owner", "admin"),
+    "update.acknowledge": ("owner", "admin"),
+
+    # Saving a "combo idea" (wt/combo_pricing.py) as a draft, and reviewing/
+    # approving that draft — a pricing decision, same owner/admin pairing as
+    # purchase_order.cancel above. Never publishes to the live menu/POS;
+    # see wt/api.py's draft-combo endpoints.
+    "combo.draft":        ("owner", "admin"),
 }
 
 

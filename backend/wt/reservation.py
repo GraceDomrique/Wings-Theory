@@ -48,7 +48,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
-from . import timeutil
+from . import audit, timeutil
 from .db import write_tx
 from .errors import InsufficientStockError, InvalidStateError, NotFoundError
 from .resolver import order_requirements
@@ -460,6 +460,10 @@ def release_order(
             "WHERE id=?",
             (reason, order_pk),
         )
+        audit.log(
+            conn, "order", order["order_no"], "void", user_id,
+            field="status", previous_value=order["status"], new_value="void", note=reason,
+        )
         return {
             "order_id": order_pk,
             "order_no": order["order_no"],
@@ -540,6 +544,11 @@ def void_after_commit(
             "WHERE id=?",
             (wastage_reason, order_pk),
         )
+        audit.log(
+            conn, "order", order["order_no"], "void", user_id,
+            field="status", previous_value=order["status"], new_value="void",
+            note=f"{wastage_reason} (restocked={restock})",
+        )
         return {
             "order_id": order_pk,
             "order_no": order["order_no"],
@@ -558,10 +567,30 @@ def receive_stock(
     user_id: str | None = None,
 ) -> dict:
     """Record a delivery: the only legitimate way on-hand stock increases
-    outside of a void-with-restock. Every other mutation in this module only
-    ever decreases stock or corrects a previous entry — this is the one path
-    that adds real, newly-purchased stock, so it is also the one path that
-    opens a new FEFO batch.
+    outside of a void-with-restock. Public entry point — opens its own
+    transaction and delegates to _receive_stock_locked(). See that function
+    for the actual logic; this wrapper exists only so purchasing.receive_line
+    can run the identical logic inside ITS OWN already-open transaction
+    (write_tx forbids nesting), keeping a PO's received_qty_base/status
+    update and the resulting ledger/FEFO write atomic — see wt/purchasing.py.
+    """
+    with write_tx(conn):
+        return _receive_stock_locked(conn, ingredient_pk, purchase_qty, lot_no, expires_at, user_id)
+
+
+def _receive_stock_locked(
+    conn: sqlite3.Connection,
+    ingredient_pk: int,
+    purchase_qty: float,
+    lot_no: str | None = None,
+    expires_at: str | None = None,
+    user_id: str | None = None,
+) -> dict:
+    """The actual receiving logic — assumes the caller already holds an open
+    write transaction (same contract audit.log() uses). Every other mutation
+    in this module only ever decreases stock or corrects a previous entry —
+    this is the one path that adds real, newly-purchased stock, so it is
+    also the one path that opens a new FEFO batch.
 
     purchase_qty is in the ingredient's own purchase unit (packs, bottles,
     kilos — whatever purchase_unit says); it is converted to base units via
@@ -570,42 +599,49 @@ def receive_stock(
     — the console's Needs Verification queue exists precisely to catch this
     before someone tries to fix it by pushing more real stock through it.
     """
-    with write_tx(conn):
-        row = conn.execute(
-            "SELECT name, pack_size, yield_factor, base_unit FROM ingredient WHERE id=?",
-            (ingredient_pk,),
-        ).fetchone()
-        if not row:
-            raise NotFoundError(f"ingredient {ingredient_pk} not found")
-        if purchase_qty <= 0:
-            raise InvalidStateError("received quantity must be greater than zero")
-        if row["pack_size"] is None:
-            raise InvalidStateError(
-                f"{row['name']} has no pack size set — set it first so a purchase "
-                f"quantity can be converted into base units"
-            )
-
-        base_qty = purchase_to_base(purchase_qty, row["pack_size"], row["yield_factor"])
-
-        conn.execute(
-            "UPDATE ingredient SET on_hand_base = on_hand_base + :qty, "
-            "updated_at = datetime('now') WHERE id = :id",
-            {"qty": base_qty, "id": ingredient_pk},
+    row = conn.execute(
+        "SELECT name, pack_size, yield_factor, base_unit FROM ingredient WHERE id=?",
+        (ingredient_pk,),
+    ).fetchone()
+    if not row:
+        raise NotFoundError(f"ingredient {ingredient_pk} not found")
+    if purchase_qty <= 0:
+        raise InvalidStateError("received quantity must be greater than zero")
+    if row["pack_size"] is None:
+        raise InvalidStateError(
+            f"{row['name']} has no pack size set — set it first so a purchase "
+            f"quantity can be converted into base units"
         )
-        _ledger(conn, ingredient_pk, base_qty, "purchase_receipt", "purchase",
-               lot_no or f"RECV-{ingredient_pk}-{purchase_qty}", user_id, note=lot_no)
-        conn.execute(
-            """
-            INSERT INTO fefo_batch
-              (ingredient_id, lot_no, qty_base, received_at, expires_at, expiry_status, state)
-            VALUES (?,?,?, datetime('now'), ?, ?, 'open')
-            """,
-            (ingredient_pk, lot_no, base_qty, expires_at,
-             "needs_verification" if expires_at else "unset"),
-        )
-        new_on_hand = conn.execute(
-            "SELECT on_hand_base FROM ingredient WHERE id=?", (ingredient_pk,)
-        ).fetchone()["on_hand_base"]
+
+    base_qty = purchase_to_base(purchase_qty, row["pack_size"], row["yield_factor"])
+    previous_on_hand = conn.execute(
+        "SELECT on_hand_base FROM ingredient WHERE id=?", (ingredient_pk,)
+    ).fetchone()["on_hand_base"]
+
+    conn.execute(
+        "UPDATE ingredient SET on_hand_base = on_hand_base + :qty, "
+        "updated_at = datetime('now') WHERE id = :id",
+        {"qty": base_qty, "id": ingredient_pk},
+    )
+    _ledger(conn, ingredient_pk, base_qty, "purchase_receipt", "purchase",
+           lot_no or f"RECV-{ingredient_pk}-{purchase_qty}", user_id, note=lot_no)
+    conn.execute(
+        """
+        INSERT INTO fefo_batch
+          (ingredient_id, lot_no, qty_base, received_at, expires_at, expiry_status, state)
+        VALUES (?,?,?, datetime('now'), ?, ?, 'open')
+        """,
+        (ingredient_pk, lot_no, base_qty, expires_at,
+         "needs_verification" if expires_at else "unset"),
+    )
+    new_on_hand = conn.execute(
+        "SELECT on_hand_base FROM ingredient WHERE id=?", (ingredient_pk,)
+    ).fetchone()["on_hand_base"]
+    audit.log(
+        conn, "ingredient", ingredient_pk, "receive", user_id,
+        field="on_hand_base", previous_value=round(previous_on_hand, 4),
+        new_value=round(new_on_hand, 4), note=lot_no,
+    )
 
     return {
         "ingredient_id": ingredient_pk,
@@ -632,16 +668,39 @@ def record_count(
 
     Always writes a ledger entry, even when the count matches exactly (delta
     0) — a confirmed count is itself worth a record, not just a correction.
+
+    A count states physical reality and is never refused for landing below
+    on_hand alone. But it IS refused when it would land below what is
+    currently reserved for active orders: the schema enforces
+    reserved_base <= on_hand_base as a hard invariant (see
+    migrations/0001_ingredient_master.sql), because every other order path
+    (commit_order, availability checks) relies on a held reservation always
+    being physically fulfillable. A count that would break that is a real
+    operational conflict — stock promised to an order the count did not
+    find — and it must surface as a named shortfall for a person to resolve
+    (release or void the order) rather than either being hidden behind
+    MAX(0, ...) or crashing the request as a raw database error.
     """
     with write_tx(conn):
         row = conn.execute(
-            "SELECT name, base_unit, on_hand_base FROM ingredient WHERE id=?",
+            "SELECT name, base_unit, on_hand_base, reserved_base FROM ingredient WHERE id=?",
             (ingredient_pk,),
         ).fetchone()
         if not row:
             raise NotFoundError(f"ingredient {ingredient_pk} not found")
         if actual_base < 0:
             raise InvalidStateError("a physical count cannot be negative")
+        if actual_base < row["reserved_base"] - EPS:
+            raise InsufficientStockError(
+                f"physical count of {actual_base:g} {row['base_unit']} for {row['name']} is "
+                f"below the {row['reserved_base']:g} {row['base_unit']} already reserved for "
+                f"active orders — release or resolve those orders before applying this count",
+                shortfalls=[{
+                    "ingredient_id": ingredient_pk, "name": row["name"],
+                    "needed_base": row["reserved_base"], "available_base": actual_base,
+                    "base_unit": row["base_unit"],
+                }],
+            )
 
         expected = row["on_hand_base"]
         delta = actual_base - expected
@@ -656,6 +715,11 @@ def record_count(
         _sync_fefo(conn, ingredient_pk, delta)
         _ledger(conn, ingredient_pk, delta, "count_adjustment", "manual_count", None,
                user_id, note=note)
+        audit.log(
+            conn, "ingredient", ingredient_pk, "count", user_id,
+            field="on_hand_base", previous_value=round(expected, 4),
+            new_value=round(actual_base, 4), note=note,
+        )
 
     return {
         "ingredient_id": ingredient_pk,
@@ -687,23 +751,36 @@ def record_wastage(
     Deliberately clamped at zero rather than allowed to go negative: you
     cannot throw away more than you have, and a CHECK-constraint crash here
     would be a worse answer than refusing the input.
+
+    Checked against on_hand MINUS what is already reserved for active
+    orders, not on_hand alone: on_hand=100 with reserved=80 means 20 is
+    actually free to write off, not 100. Letting a correction spend stock a
+    held reservation is already counting on would silently break the
+    invariant commit_order relies on (reserved_base <= on_hand_base) and let
+    an order's kitchen ticket commit against ingredients that no longer
+    physically exist.
     """
     if reason not in ("wastage", "spoilage"):
         raise InvalidStateError("reason must be 'wastage' or 'spoilage'")
 
     with write_tx(conn):
         row = conn.execute(
-            "SELECT name, base_unit, on_hand_base FROM ingredient WHERE id=?",
+            "SELECT name, base_unit, on_hand_base, reserved_base FROM ingredient WHERE id=?",
             (ingredient_pk,),
         ).fetchone()
         if not row:
             raise NotFoundError(f"ingredient {ingredient_pk} not found")
         if qty_base <= 0:
             raise InvalidStateError("the amount wasted must be greater than zero")
-        if qty_base > row["on_hand_base"] + EPS:
+        available = row["on_hand_base"] - row["reserved_base"]
+        if qty_base > available + EPS:
+            reserved_note = (
+                f" ({row['reserved_base']:g} {row['base_unit']} is reserved for active orders)"
+                if row["reserved_base"] > EPS else ""
+            )
             raise InvalidStateError(
                 f"cannot write off {qty_base:g} {row['base_unit']} — only "
-                f"{row['on_hand_base']:g} {row['base_unit']} is on hand"
+                f"{max(available, 0):g} {row['base_unit']} is available{reserved_note}"
             )
 
         conn.execute(
@@ -717,6 +794,11 @@ def record_wastage(
         new_on_hand = conn.execute(
             "SELECT on_hand_base FROM ingredient WHERE id=?", (ingredient_pk,)
         ).fetchone()["on_hand_base"]
+        audit.log(
+            conn, "ingredient", ingredient_pk, reason, user_id,
+            field="on_hand_base", previous_value=round(row["on_hand_base"], 4),
+            new_value=round(new_on_hand, 4), note=note,
+        )
 
     return {
         "ingredient_id": ingredient_pk,
@@ -756,6 +838,251 @@ CONSUMPTION_REASONS = ("sale_commit", "wastage", "spoilage", "operational_use")
 # derived from this dataset.
 VARIANCE_FLAG_RATIO = 0.10
 
+# Minimum independent physical-count dates before a repeated-direction
+# variance is treated as a pattern worth surfacing rather than one unusual
+# count or ordinary counting noise. Three counts landing on the same
+# calendar date are one observation, not three -- see
+# _repeated_variance_signals()'s per-date collapse below.
+MIN_INDEPENDENT_COUNT_DATES = 3
+
+
+def _repeated_variance_signals(conn: sqlite3.Connection, since: str) -> dict[int, dict]:
+    """Per ingredient: has the same DIRECTION of count variance shown up on
+    at least MIN_INDEPENDENT_COUNT_DATES distinct Manila business dates,
+    each individually at or past the existing VARIANCE_FLAG_RATIO (the same
+    10% figure ingredient_reconciliation_report's own per-window aggregate
+    already uses -- reused here, not re-derived)?
+
+    This is deliberately a SEPARATE pass from the aggregate SUM(...) query
+    above: that query collapses every count_adjustment row in the window
+    into one lump total, which is exactly right for "how much variance
+    landed in this window" but cannot answer "did the same thing happen
+    on three separate occasions" -- a single huge one-off count and three
+    small-but-consistent counts can sum to the same total and must not
+    read as the same kind of evidence.
+
+    For any single count_adjustment row, record_count() (this module)
+    posted delta_base = actual_base - expected (the on_hand figure at that
+    exact moment) and _ledger() stamped balance_after_base = actual_base in
+    the same transaction. So, per row, with no new column and no
+    reconstruction of anything not already stored:
+        physical  = balance_after_base
+        expected  = balance_after_base - delta_base
+        variance  = delta_base                    (signed: physical - expected)
+    This is real per-event evidence ("a difference was observed between
+    expected and physical stock at this count"), never "the kitchen used
+    X extra" -- no cause is inferred here, only the fact and its direction.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT l.id, l.ingredient_id, l.delta_base, l.balance_after_base, l.created_at,
+               {timeutil.sql_business_date('l.created_at')} AS count_date
+          FROM stock_ledger l
+         WHERE l.reason = 'count_adjustment' AND l.created_at >= ?
+         ORDER BY l.ingredient_id, l.created_at
+        """,
+        (since,),
+    ).fetchall()
+
+    by_ingredient: dict[int, dict[str, sqlite3.Row]] = {}
+    for r in rows:
+        # Later rows overwrite earlier ones for the same date (ORDER BY
+        # created_at above) -- if an ingredient was counted twice on one
+        # date, the later count is the physical reality that date actually
+        # settled on; the two counts are not two independent observations.
+        by_ingredient.setdefault(r["ingredient_id"], {})[r["count_date"]] = r
+
+    out: dict[int, dict] = {}
+    for ing_id, by_date in by_ingredient.items():
+        observations = []
+        for count_date in sorted(by_date):
+            r = by_date[count_date]
+            physical = r["balance_after_base"]
+            delta = r["delta_base"]
+            expected = physical - delta
+            ratio_signed = (delta / expected) if expected > EPS else None
+            observations.append({
+                "date": count_date,
+                "ledger_id": r["id"],
+                "expected_base": round(expected, 4),
+                "physical_base": round(physical, 4),
+                "variance_base": round(delta, 4),
+                "variance_ratio": round(ratio_signed, 4) if ratio_signed is not None else None,
+            })
+
+        if len(observations) < MIN_INDEPENDENT_COUNT_DATES:
+            continue  # not enough independent evidence yet -- no signal either way
+
+        # Only the most recent MIN_INDEPENDENT_COUNT_DATES independent dates
+        # count as "recent physical checks" -- a pattern from a month ago
+        # that two clean recent counts have since resolved should not keep
+        # showing as an active signal today.
+        recent = observations[-MIN_INDEPENDENT_COUNT_DATES:]
+        qualifying_ratios = [o["variance_ratio"] for o in recent
+                             if o["variance_ratio"] is not None
+                             and abs(o["variance_ratio"]) >= VARIANCE_FLAG_RATIO]
+        directions = {("below" if v < 0 else "above") for v in qualifying_ratios}
+
+        # Active only when EVERY one of the most recent required dates
+        # individually clears the threshold AND they all agree on
+        # direction. One or two qualifying counts out of three is not yet
+        # a pattern; a mix of "below" and "above" is evidence of noise or
+        # measurement error, not a consistent drift -- see spec: no false
+        # signal on mixed directions.
+        active = len(qualifying_ratios) == MIN_INDEPENDENT_COUNT_DATES and len(directions) == 1
+
+        # Signed mean, e.g. -0.18 for "18% consistently short" -- kept
+        # signed (never abs()) so a caller can never accidentally print a
+        # magnitude without knowing which way it points. Only meaningful
+        # when every one of the recent observations had a valid ratio.
+        recent_ratios = [o["variance_ratio"] for o in recent if o["variance_ratio"] is not None]
+        avg_ratio = round(sum(recent_ratios) / len(recent_ratios), 4) if len(recent_ratios) == len(recent) else None
+
+        out[ing_id] = {
+            "active": active,
+            "observation_count": len(recent),
+            "dates": [o["date"] for o in recent],
+            "observations": recent,
+            "direction": (next(iter(directions)) if active else None),
+            "average_variance_ratio": avg_ratio,
+            "threshold_ratio": VARIANCE_FLAG_RATIO,
+            "min_observations": MIN_INDEPENDENT_COUNT_DATES,
+            # The most recent count's ledger row — real, permanent evidence a
+            # variance review (see record_variance_review) can point at.
+            # Exposed here only, never used in the active/direction math above.
+            "evidence_ledger_id": recent[-1]["ledger_id"],
+        }
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Variance review — a human's suspected operational cause for a physical-
+# count discrepancy. Deliberately separate from verification.py's
+# calibration workflow (pack_size/yield_factor/unit_cost/recipe_line.
+# qty_base/unli_coefficient.lambda/fefo_batch.expires_at): those confirm or
+# correct a MODEL INPUT the deduction math reads live; this records a
+# HYPOTHESIS about why a count came out short or long. Recording one never
+# touches on_hand_base, never touches stock_ledger, never edits a recipe or
+# ingredient value, and never backdates a conclusion onto historical
+# variance the system had no evidence for at the time. See migration 0033.
+# ---------------------------------------------------------------------------
+VARIANCE_REASONS = (
+    "waste", "portion_variance", "counting_error",
+    "recipe_yield_issue", "receiving_issue", "other",
+)
+VARIANCE_REASON_LABEL = {
+    "waste":              "Unrecorded waste",
+    "portion_variance":   "Preparation or portion variance",
+    "counting_error":     "Counting error",
+    "recipe_yield_issue": "Recipe or yield issue",
+    "receiving_issue":    "Receiving or stock issue",
+    "other":              "Other",
+}
+
+
+def _variance_review_view(row: sqlite3.Row | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "reason": row["reason"],
+        "reason_label": VARIANCE_REASON_LABEL[row["reason"]],
+        "note": row["note"],
+        "user_id": row["user_id"],
+        "created_at": row["created_at"],
+    }
+
+
+def record_variance_review(
+    conn: sqlite3.Connection,
+    ingredient_pk: int,
+    reason: str,
+    note: str | None = None,
+    user_id: str | None = None,
+    client_request_id: str | None = None,
+) -> dict:
+    """Record a human's suspected cause for this ingredient's physical-count
+    variance. This is an annotation of a signal, not a correction of it:
+    nothing here writes to stock_ledger, ingredient, recipe_line, or any
+    other operational column, and the original count_adjustment row(s) this
+    review responds to are never touched — append-only, exactly like that
+    row itself.
+
+    A review requires real evidence to point at: this ingredient must
+    already have at least one count_adjustment ledger row, i.e. a physical
+    count actually happened. Reviewing an ingredient that has never been
+    counted would have nothing real to annotate.
+
+    Idempotent via client_request_id, same convention as purchase receipts
+    and order creation: a retried submission of the same request replays the
+    original row rather than creating a second one. A genuinely new
+    conclusion (the reviewer changed their mind) is a new call with a new
+    (or no) client_request_id, and appends a new row — the earlier review is
+    never edited or deleted.
+    """
+    if reason not in VARIANCE_REASONS:
+        raise InvalidStateError(f"unknown variance review reason '{reason}'")
+
+    if client_request_id:
+        existing = conn.execute(
+            "SELECT * FROM ingredient_variance_review WHERE client_request_id=?",
+            (client_request_id,),
+        ).fetchone()
+        if existing:
+            return _variance_review_row(existing)
+
+    with write_tx(conn):
+        ing = conn.execute(
+            "SELECT id, name FROM ingredient WHERE id=?", (ingredient_pk,)
+        ).fetchone()
+        if not ing:
+            raise NotFoundError(f"ingredient {ingredient_pk} not found")
+
+        evidence = conn.execute(
+            "SELECT id FROM stock_ledger WHERE ingredient_id=? AND reason='count_adjustment' "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (ingredient_pk,),
+        ).fetchone()
+        if not evidence:
+            raise InvalidStateError(
+                f"{ing['name']} has never had a physical count recorded — "
+                "there is no variance evidence to review yet"
+            )
+
+        cur = conn.execute(
+            "INSERT INTO ingredient_variance_review "
+            "(ingredient_id, evidence_ledger_id, reason, note, user_id, client_request_id) "
+            "VALUES (?,?,?,?,?,?)",
+            (ingredient_pk, evidence["id"], reason, note, user_id, client_request_id),
+        )
+        row = conn.execute(
+            "SELECT * FROM ingredient_variance_review WHERE id=?", (cur.lastrowid,)
+        ).fetchone()
+        return _variance_review_row(row)
+
+
+def _variance_review_row(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "ingredient_id": row["ingredient_id"],
+        "evidence_ledger_id": row["evidence_ledger_id"],
+        "reason": row["reason"],
+        "reason_label": VARIANCE_REASON_LABEL[row["reason"]],
+        "note": row["note"],
+        "user_id": row["user_id"],
+        "created_at": row["created_at"],
+    }
+
+
+def variance_review_history(conn: sqlite3.Connection, ingredient_pk: int) -> list[dict]:
+    """Every review ever recorded for this ingredient, oldest first — the
+    same provenance-trail shape as verification.history_for()."""
+    return [
+        _variance_review_row(r) for r in conn.execute(
+            "SELECT * FROM ingredient_variance_review WHERE ingredient_id=? ORDER BY id",
+            (ingredient_pk,),
+        ).fetchall()
+    ]
+
 
 def ingredient_reconciliation_report(conn: sqlite3.Connection, days: int = 30) -> dict:
     """Expected (recipe/wastage) consumption vs. what physical counts
@@ -782,6 +1109,30 @@ def ingredient_reconciliation_report(conn: sqlite3.Connection, days: int = 30) -
         (since,),
     ).fetchall()
 
+    # Repeated-direction signal, same window, same threshold -- see
+    # _repeated_variance_signals()'s own docstring for why this needs a
+    # separate per-count-date pass rather than reading off the aggregate
+    # SUM(...) above. Advisory only: never changes flagged/variance_ratio/
+    # count_variance_base above, never writes anything, never infers a
+    # cause.
+    signals = _repeated_variance_signals(conn, since)
+
+    # Latest human review per ingredient, read-only — this never changes any
+    # of the figures above and never decides `flagged` on its own behalf; it
+    # only lets the caller show "Reviewed — <reason>" next to a signal that
+    # a human has already looked at. See record_variance_review().
+    latest_reviews: dict[int, sqlite3.Row] = {}
+    for rev in conn.execute(
+        """
+        SELECT v.ingredient_id, v.reason, v.note, v.user_id, v.created_at
+          FROM ingredient_variance_review v
+          JOIN (SELECT ingredient_id, MAX(id) AS max_id
+                  FROM ingredient_variance_review GROUP BY ingredient_id) m
+            ON m.ingredient_id = v.ingredient_id AND m.max_id = v.id
+        """
+    ).fetchall():
+        latest_reviews[rev["ingredient_id"]] = rev
+
     items = []
     for r in rows:
         consumed = round(r["consumed_base"] or 0.0, 4)
@@ -804,6 +1155,8 @@ def ingredient_reconciliation_report(conn: sqlite3.Connection, days: int = 30) -
             "has_count_data": has_count_data,
             "variance_ratio": variance_ratio,
             "flagged": flagged,
+            "repeated_variance_signal": signals.get(r["id"]),
+            "latest_variance_review": _variance_review_view(latest_reviews.get(r["id"])),
         })
 
     items.sort(key=lambda x: (not x["flagged"], -(x["variance_ratio"] or 0)))
@@ -811,6 +1164,7 @@ def ingredient_reconciliation_report(conn: sqlite3.Connection, days: int = 30) -
         "days": days,
         "since": since,
         "flag_ratio": VARIANCE_FLAG_RATIO,
+        "min_independent_count_dates": MIN_INDEPENDENT_COUNT_DATES,
         "items": items,
     }
 
@@ -820,17 +1174,33 @@ def inventory_valuation(conn: sqlite3.Connection) -> dict:
     (unit_cost_status='verified') -- most ingredients still carry an
     unverified estimate (see the owner-verification queue), and folding
     those into the same total as confirmed costs would present a
-    partly-invented number as a real one. priced_items/total_items lets a
-    caller show exactly how much of the catalog this total actually
-    covers, the same "no data is not zero" discipline the console applies
-    everywhere else. Shared by GET /reports/valuation and the Today
-    dashboard's stock-value KPI so both ever compute this one way."""
+    partly-invented number as a real one.
+
+    unit_cost is stored PER PURCHASE UNIT (see the column comment in
+    migrations/0001_ingredient_master.sql), not per base unit, so it must be
+    divided by pack_size * yield_factor before being multiplied against
+    on_hand_base (which is always in base units) -- exactly the conversion
+    resolver.recipe_cost() already applies for menu costing. Multiplying
+    on_hand_base directly by unit_cost skips that conversion and overstates
+    value by a factor of pack_size: e.g. 10,000 g of rice at PHP 1,000/25kg
+    sack is PHP 400 (10,000 * (1000 / 25000)), not PHP 10,000,000. An
+    ingredient priced but missing pack_size cannot be safely converted, so
+    it is excluded from the total rather than valued as if pack_size were 1.
+
+    priced_items/total_items lets a caller show exactly how much of the
+    catalog this total actually covers, the same "no data is not zero"
+    discipline the console applies everywhere else. Shared by
+    GET /reports/valuation and the Today dashboard's stock-value KPI so both
+    ever compute this one way."""
     row = conn.execute(
         """
         SELECT
           COALESCE(SUM(CASE WHEN unit_cost_status='verified'
-                             THEN on_hand_base * unit_cost END), 0) AS total_value,
-          SUM(CASE WHEN unit_cost_status='verified' THEN 1 ELSE 0 END) AS priced_items,
+                              AND pack_size IS NOT NULL AND pack_size > 0
+                             THEN on_hand_base * (unit_cost / (pack_size * yield_factor))
+                             END), 0) AS total_value,
+          SUM(CASE WHEN unit_cost_status='verified'
+                     AND pack_size IS NOT NULL AND pack_size > 0 THEN 1 ELSE 0 END) AS priced_items,
           COUNT(*) AS total_items
           FROM ingredient WHERE is_active=1
         """
@@ -886,6 +1256,11 @@ def record_usage(
         new_on_hand = conn.execute(
             "SELECT on_hand_base FROM ingredient WHERE id=?", (ingredient_pk,)
         ).fetchone()["on_hand_base"]
+        audit.log(
+            conn, "ingredient", ingredient_pk, "operational_use", user_id,
+            field="on_hand_base", previous_value=round(row["on_hand_base"], 4),
+            new_value=round(new_on_hand, 4), note=note,
+        )
 
     return {
         "ingredient_id": ingredient_pk,

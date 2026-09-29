@@ -1,5 +1,5 @@
 import { api } from './client.js';
-import { severityFromRisk, severityFromAnomaly } from '../severity.js';
+import { severityFromDepletionStatus, severityFromAnomaly } from '../severity.js';
 
 /**
  * Forecast & Insights domain — forecasting, replenishment, anomalies,
@@ -7,7 +7,7 @@ import { severityFromRisk, severityFromAnomaly } from '../severity.js';
  *
  * ROUTE MAP:
  *   GET /forecast?menuItemId=   -> GET /console/forecasts/demand?menu_item_pk=
- *   GET /replenishment          -> GET /console/forecasts/depletion
+ *   GET /replenishment          -> GET /console/forecasts/ingredients
  *   GET /anomalies?window=90d   -> GET /console/anomalies?lookback_days=90
  *   GET /reconciliation/:date   -> GET /unli/reconciliation/pending?service_date=
  *                                  + GET /unli/coefficients
@@ -24,11 +24,16 @@ export async function listDemandSummaries() {
   return (out.items || []).map(toForecastSeries);
 }
 
-/** @returns {Promise<import('../types.js').ForecastSeries>} */
-export async function getForecast(menuItemPk, horizonDays = 7) {
-  const out = await api.get('/console/forecasts/demand', {
-    menu_item_pk: menuItemPk, horizon_days: horizonDays,
-  });
+/** @returns {Promise<import('../types.js').ForecastSeries>}
+ * lookbackDays is optional (server default 60, single-item requests are
+ * always widened server-side to at least 90 — see /console/forecasts/demand)
+ * — the caller passes it explicitly to show more than the default window,
+ * up to the server's 365-day ceiling (a full year, since that's as much
+ * real order history as this system tracks in one place). */
+export async function getForecast(menuItemPk, horizonDays = 7, lookbackDays) {
+  const params = { menu_item_pk: menuItemPk, horizon_days: horizonDays };
+  if (lookbackDays) params.lookback_days = lookbackDays;
+  const out = await api.get('/console/forecasts/demand', params);
   return toForecastSeries(out);
 }
 
@@ -57,32 +62,56 @@ function toForecastSeries(r) {
 }
 
 /**
- * Replenishment. `reorderPoint` stays null when the manager has not set one —
- * the backend is explicit that an unset reorder point is never treated as
- * zero, and neither is this. `suggestedReorderPoint` is advice, shown as such.
- * @returns {Promise<{rows:import('../types.js').ReplenishmentRow[], belowReorderPoint:number, configured:number}>}
+ * Replenishment — the actual purchase-recommendation table. Reads
+ * GET /console/forecasts/ingredients, wt/depletion.py's forward chain
+ * (menu demand -> recipe -> projected consumption -> stock trajectory ->
+ * depletion date -> suggested order quantity), NOT
+ * wt/forecasting.ingredient_depletion()'s trailing-ledger-rate runway.
+ *
+ * That backward function used to carry its own independent purchase-quantity
+ * calculation and this adapter read it — a second reorder engine, reachable
+ * from the one screen an owner actually uses to decide what to buy, that
+ * could disagree with wt/depletion.py's (it ignored yield_factor in the pack
+ * conversion and had no seasonality or today's-pace signal). It no longer
+ * computes one; this is the only source of suggestedOrderQty now, which is
+ * also what the Today dashboard's "below reorder point" KPI counts against —
+ * see wt/api.py's dashboard_summary(), which reads this exact function with
+ * the same cache key so the two screens cannot disagree.
+ *
+ * `reorderPoint` stays null when the manager has not set one — the backend
+ * is explicit that an unset reorder point is never treated as zero, and
+ * neither is this. `suggestedReorderPoint` is advice, shown as such.
+ *
+ * `demandModel`/`prophetDrivenIngredients` are passed through from the same
+ * raw response (getIngredientForecast() below reads them too, from the same
+ * endpoint) so a caller — e.g. the manager Forecast Status KPI — can tell
+ * whether the forecast behind this table is Prophet-driven or still
+ * falling back to a trend average, without a second network call.
+ * @returns {Promise<{rows:import('../types.js').ReplenishmentRow[], belowReorderPoint:number, configured:number, demandModel:string, prophetDrivenIngredients:number}>}
  */
-export async function getReplenishment(lookbackDays = 30) {
-  const out = await api.get('/console/forecasts/depletion', { lookback_days: lookbackDays });
+export async function getReplenishment() {
+  const out = await api.get('/console/forecasts/ingredients');
   return {
     rows: (out.ingredients || []).map((d) => ({
-      ingredientId: d.ingredient_id,
+      ingredientId: d.ingredientId,
       name: d.name,
-      onHand: d.available_base ?? null,
-      baseUnit: d.base_unit,
-      usedPerDay: d.avg_daily_consumption > 0 ? d.avg_daily_consumption : null,
-      daysLeft: d.days_remaining ?? null,
-      leadTimeDays: d.lead_time_days ?? null,
-      reorderPoint: d.reorder_point_base ?? null,
-      suggestedReorderPoint: d.suggested_reorder_point_base ?? null,
-      suggestedOrderQty: d.suggested_order_qty ?? null,
-      suggestedOrderUnit: d.suggested_order_unit ?? null,
-      belowReorderPoint: !!d.below_reorder_point,
-      status: severityFromRisk(d.risk),
-      risk: d.risk,
+      onHand: d.available ?? null,
+      baseUnit: d.baseUnit,
+      usedPerDay: d.forecastDailyConsumption > 0 ? d.forecastDailyConsumption : null,
+      daysLeft: d.daysOfSupply ?? null,
+      leadTimeDays: d.leadTimeDays ?? null,
+      reorderPoint: d.reorderPoint ?? null,
+      suggestedReorderPoint: d.suggestedReorderPoint ?? null,
+      suggestedOrderQty: d.suggestedOrderQty ?? null,
+      suggestedOrderUnit: d.suggestedOrderUnit ?? null,
+      belowReorderPoint: !!d.belowReorderPoint,
+      status: severityFromDepletionStatus(d.status),
+      risk: d.status,
     })),
-    belowReorderPoint: out.below_reorder_point || 0,
-    configured: out.reorder_points_configured || 0,
+    belowReorderPoint: out.belowReorderPoint || 0,
+    configured: out.reorderPointsConfigured || 0,
+    demandModel: out.demandModel || null,
+    prophetDrivenIngredients: out.prophetDrivenIngredients || 0,
   };
 }
 
@@ -94,8 +123,17 @@ export async function getReplenishment(lookbackDays = 30) {
  * "N.Nx this ingredient's typical wastage"). It is displayed verbatim and
  * never rewritten into something accusatory — spec section 6 point 5.
  */
-export async function getAnomalies(lookbackDays = 90) {
-  const out = await api.get('/console/anomalies', { lookback_days: lookbackDays });
+export async function getAnomalies(lookbackDays = 90, ingredientPk = null) {
+  // `ingredient_id` narrows the result server-side. It is applied AFTER
+  // detection (see api.py), so the models still score against the whole
+  // pooled population — the `why` sentence is a comparison against every
+  // recent loss, and refitting on one ingredient's handful of rows would
+  // silently change what that sentence means. Without it, the ingredient
+  // drawer downloaded all 183 flags in the system to display the handful
+  // belonging to the ingredient on screen.
+  const out = await api.get('/console/anomalies', {
+    lookback_days: lookbackDays, ingredient_id: ingredientPk,
+  });
   return {
     stockLoss: (out.stock_loss_anomalies || []).map((a) => ({
       id: String(a.ledger_id),
@@ -112,6 +150,10 @@ export async function getAnomalies(lookbackDays = 90) {
       note: a.note || null,
     })),
     consumption: out.consumption_anomalies || [],
+    // The raw lists too: the ingredient drawer leads with the model's own
+    // `why` sentence and needs the untouched rows, not the remapped ones.
+    stock_loss_anomalies: out.stock_loss_anomalies || [],
+    consumption_anomalies: out.consumption_anomalies || [],
   };
 }
 
@@ -143,11 +185,6 @@ export async function getReconciliation(serviceDate) {
       };
     }),
   };
-}
-
-/** Current auto sign-off tolerance (e.g. 0.10 for 10%). */
-export function getTolerance() {
-  return api.get('/unli/tolerance');
 }
 
 /** POST /unli/reconciliation — stage 2+3, posts only the difference to stock. */
@@ -265,6 +302,7 @@ export async function getIngredientVariance(days = 30) {
     days: out.days,
     since: out.since,
     flagRatio: out.flag_ratio,
+    minIndependentCountDates: out.min_independent_count_dates,
     items: (out.items || []).map((i) => ({
       ingredientId: i.ingredient_id,
       name: i.name,
@@ -277,6 +315,90 @@ export async function getIngredientVariance(days = 30) {
       hasCountData: i.has_count_data,
       varianceRatio: i.variance_ratio,
       flagged: i.flagged,
+      // Repeated-direction evidence across independent physical-count
+      // dates (reservation._repeated_variance_signals) — a SEPARATE fact
+      // from the window-aggregate fields above. null when there isn't
+      // enough independent evidence yet (fewer than minIndependentCountDates
+      // distinct count dates in the window) — never fabricated as "no
+      // signal = fine".
+      repeatedVarianceSignal: i.repeated_variance_signal ? {
+        active: !!i.repeated_variance_signal.active,
+        observationCount: i.repeated_variance_signal.observation_count,
+        dates: i.repeated_variance_signal.dates || [],
+        // 'below' | 'above' | null (null when not active — mixed
+        // directions or not enough of the recent dates individually
+        // qualified). Never a cause, only a direction.
+        direction: i.repeated_variance_signal.direction,
+        averageVarianceRatio: i.repeated_variance_signal.average_variance_ratio,
+        thresholdRatio: i.repeated_variance_signal.threshold_ratio,
+        minObservations: i.repeated_variance_signal.min_observations,
+      } : null,
     })),
+  };
+}
+
+/**
+ * GET /console/forecasts/ingredients — the ingredient-level depletion
+ * forecast: menu demand run through recipes into projected daily ingredient
+ * consumption and a day-by-day stock trajectory.
+ *
+ * Deliberately separate from getReplenishment() above, which reads
+ * /console/forecasts/depletion — that endpoint is the BACKWARD runway (a
+ * trailing ledger rate) and this one is the FORWARD projection. They are two
+ * different questions and the console shows both; neither is recomputed here.
+ *
+ * The backend already returns camelCase for this route, so this adapter only
+ * passes it through. Nothing below invents a number: a null depletion date
+ * means the line does not cross zero inside the horizon, and it stays null.
+ */
+export function getIngredientForecast({ horizonDays = 21, lookbackDays = 56 } = {}) {
+  return api.get('/console/forecasts/ingredients', {
+    horizon_days: horizonDays, lookback_days: lookbackDays,
+  });
+}
+
+/** GET /console/forecasts/ingredients/{pk} — trajectory, history, drivers, evidence. */
+export function getIngredientForecastDetail(ingredientPk, { horizonDays = 21, historyDays = 30 } = {}) {
+  return api.get(`/console/forecasts/ingredients/${ingredientPk}`, {
+    horizon_days: horizonDays, history_days: historyDays,
+  });
+}
+
+/**
+ * GET /console/menu/margins — every menu price against its recipe's
+ * estimated ingredient cost, computed server-side (wt/api.py's
+ * menu_margins(), from the same recipe_cost() Recipes.js's own detail view
+ * reads) — one margin calculation, read here, not a second one recomputed
+ * in the frontend from price and cost. `costConfidence` is carried through
+ * untouched: almost every ingredient cost in this database is a benchmark
+ * pending supplier confirmation, and a margin computed from one is an
+ * estimate, not a fact.
+ *
+ * The raw response mixes snake_case (menu_item table columns, spread as-is)
+ * with the camelCase fields the endpoint computes itself (marginPct,
+ * costConfidence, ...) — normalised to one casing here rather than leaking
+ * that inconsistency to callers.
+ */
+export async function getMenuMargins() {
+  const out = await api.get('/console/menu/margins');
+  return {
+    items: (out.items || []).map((r) => ({
+      menuItemId: r.id,
+      recipeId: r.recipe_id,
+      name: r.name,
+      category: r.category,
+      price: r.price,
+      isUnli: !!r.is_unli,
+      cost: r.cost,
+      marginPct: r.marginPct,
+      costConfidence: r.costConfidence,
+      unpricedIngredients: r.unpricedIngredients || [],
+      unverifiedCostLines: r.unverifiedCostLines || 0,
+      flags: r.flags || [],
+    })),
+    negativeMargin: out.negativeMargin || 0,
+    thinMargin: out.thinMargin || 0,
+    confirmedCostItems: out.confirmedCostItems || 0,
+    note: out.note || null,
   };
 }

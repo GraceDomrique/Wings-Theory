@@ -59,6 +59,21 @@ export function getModelDetails() {
 }
 
 /**
+ * Replenishment early-warning backtest (wt/depletion.replenishment_backtest)
+ * and the ML-related data-quality report (wt/data_quality.data_quality_report)
+ * — both already computed by the backend for the technical panel, fetched
+ * here the same way every other model-details call is: nothing recomputed
+ * or relabelled on this side.
+ */
+export function getReplenishmentBacktest() {
+  return api.get('/console/replenishment/backtest');
+}
+
+export function getDataQuality() {
+  return api.get('/console/data-quality');
+}
+
+/**
  * Recent login attempts (login_event, migration 0017) and recent sensitive
  * mutations (admin_audit_log, migration 0016) — both admin-only
  * (user.manage), both append-only on the backend. "Who did what, when" for
@@ -91,36 +106,29 @@ export async function getActionAudit(limit = 50) {
 }
 
 /**
- * Capability matrix. This is a static description of wt/auth.py's CAPABILITIES
- * table, not a live read — there is no endpoint that enumerates the policy,
- * and inventing one client-side would risk showing a permission model that
- * differs from the one actually enforced. It is labelled as a reference in the
- * UI for that reason.
- *
- * TODO(backend): a GET /system/capabilities that dumps auth.CAPABILITIES would
- * let this table be live instead of transcribed.
- *
- * 2026-08 RBAC audit: this table was found stale — it still showed admin as
- * holding every capability manager has, which stopped being true the moment
- * auth.py's CAPABILITIES was redesigned for separation of duties (admin/
- * owner keeps read access, queue.resolve, unli.approve and user.manage;
- * every capability that directly writes a floor/operational record now
- * requires the operational role that actually does the work). A reference
- * table that silently drifts from the policy it describes is worse than no
- * table — re-transcribed below to match auth.py's CAPABILITIES exactly as
- * of that redesign. Update this table if CAPABILITIES changes; there is no
- * endpoint that returns the policy live (see the TODO above).
+ * POS billing configuration — service charge on/off + rate, and which of
+ * the Senior/PWD/Staff discount cards a cashier may select. Admin-only to
+ * write (GET /console/pos-config needs recipe.read, PATCH needs the new
+ * pos_config.write capability — see wt/auth.py). The till itself never
+ * calls this: it reads the effective result off GET /pos/menu instead, so
+ * this screen and the checkout math can never drift apart.
  */
-export const CAPABILITY_REFERENCE = [
-  { capability: 'Create orders (POS)', cashier: true, kitchen: false, manager: false, admin: false },
-  { capability: 'Void an order', cashier: true, kitchen: true, manager: true, admin: false },
-  { capability: 'Take an unlimited refill', cashier: true, kitchen: true, manager: true, admin: false },
-  { capability: 'Weigh in a reconciliation', cashier: false, kitchen: true, manager: true, admin: false },
-  { capability: 'Sign off / reject a reconciliation', cashier: false, kitchen: false, manager: true, admin: true },
-  { capability: 'Set tolerance / recalibrate coefficients', cashier: false, kitchen: false, manager: true, admin: true },
-  { capability: 'Receive, count, waste, use, edit, add ingredients', cashier: false, kitchen: false, manager: true, admin: false },
-  { capability: 'Add or edit recipes, edit menu prices, edit flavors', cashier: false, kitchen: false, manager: true, admin: false },
-  { capability: 'Resolve the Ingredient Queue', cashier: false, kitchen: false, manager: true, admin: true },
-  { capability: 'Confirm / change verification items', cashier: false, kitchen: false, manager: true, admin: true },
-  { capability: 'Reset another user’s password', cashier: false, kitchen: false, manager: false, admin: true },
-];
+export function getPosConfig() {
+  return api.get('/console/pos-config');
+}
+
+export function setPosConfig(body) {
+  return api.patch('/console/pos-config', body);
+}
+
+/**
+ * The capability matrix used to be transcribed here as CAPABILITY_REFERENCE —
+ * a static, hand-maintained copy of wt/auth.py's CAPABILITIES dict, with a
+ * comment on it recording that a previous transcription had already drifted
+ * out of step with the policy it described, and a TODO asking for a live
+ * endpoint.
+ *
+ * That endpoint now exists (GET /console/capabilities), so the transcription
+ * is gone rather than being re-transcribed and left to drift again. See
+ * getCapabilityMatrix() in lib/api/permissions.js.
+ */

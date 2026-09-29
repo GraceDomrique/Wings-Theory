@@ -5,25 +5,24 @@ import { api, ApiError } from './client.js';
  *
  *   "Aggregation endpoint — do NOT have Today independently query 6 other
  *    endpoints and merge client-side. Backend should return one shaped
- *    payload: { kpis, alerts, forecastPreview, expiryPreview, verifyPreview }."
+ *    payload: { kpis, alerts, forecastPreview, useFirst, verifyPreview }."
  *
- * STATUS: `GET /dashboard/summary` DOES NOT EXIST in this backend yet. Nothing
- * under wt/api.py serves it, and there is no near-equivalent that returns the
- * whole shape.
+ * `GET /dashboard/summary` (wt/api.py's dashboard_summary()) composes,
+ * server-side, from the same sources the individual pages use:
+ * v_ingredient_readiness + fefo_batch expiry (kpis.expired / expiringSoon),
+ * wt/depletion.ingredient_forecast() (kpis.needRestock — the forward
+ * depletion engine's own out/critical/at_risk count; NOT the same number as
+ * wt/depletion's own belowReorderPoint field on the Replenishment screen,
+ * which is a literal reorder-point comparison — the two were briefly given
+ * the same key despite meaning different things, which is exactly the
+ * contract bug the 2026-09 rename fixed), v_menu_item_availability
+ * (unsellable), reservation.inventory_valuation() (stockValue, plus how
+ * many items are actually priced), and the verification queue.
  *
- * TODO(backend): implement GET /dashboard/summary returning DashboardSummary
- * below. It should compose, server-side, from the same sources the individual
- * pages use: v_ingredient_readiness + fefo_batch expiry (kpis.expired /
- * expiringSoon), ingredient_depletion() (belowReorderPoint),
- * v_menu_item_availability (unsellable), ingredient.unit_cost * on_hand_base
- * (stockValue, plus how many items are actually priced), and the verification
- * queue.
- *
- * Until it exists this module returns the typed mock below, and Today renders
- * a banner saying so. The mock is NOT quietly presented as real numbers — the
- * failure mode this whole rebuild exists to prevent is exactly "sample data
- * read as real". When the endpoint ships, delete `SAMPLE` and the fallback;
- * the route needs no change.
+ * getSummary() below calls it directly. SAMPLE only remains as the fallback
+ * for a 404 — "this backend build predates the endpoint" — never presented
+ * as real data (isSample stays true), and not the normal path: it should not
+ * fire against this codebase's own backend any more.
  */
 
 /**
@@ -52,9 +51,12 @@ import { api, ApiError } from './client.js';
  * @property {TodayKpi[]} kpis
  * @property {TodayAlert[]} alerts
  * @property {{ insufficientData:boolean, daysOfHistory:number, requiredDays:number,
- *              labels:string[], values:(number|null)[], note:string }} forecastPreview
- * @property {{ name:string, qty:string|null, label:string,
- *              severity:import('../types.js').Severity }[]} expiryPreview
+ *              labels:string[], values:(number|null)[], note:string|null }} forecastPreview
+ * @property {{ ingredientId:number, name:string, qty:{qty:number,unit:string,display:string},
+ *              label:string, daysToExpiry:number, severity:import('../types.js').Severity }[]} useFirst
+ *              renamed from the old expiryPreview — same "oldest batches
+ *              first" list, qty is now the structured {qty,unit,display}
+ *              pair every quantity on this payload uses
  * @property {{ label:string, priority:1|2|3 }[]} verifyPreview
  */
 
@@ -70,7 +72,7 @@ const SAMPLE = {
   kpis: [
     { key: 'expired', value: 8, display: null, label: 'Expired batches', foot: 'discard or credit today', severity: 'crit', icon: '⏱', route: 'expiry' },
     { key: 'expiringSoon', value: 6, display: null, label: 'Expiring ≤7 days', foot: 'use first, FEFO order', severity: 'warn', icon: '◔', route: 'expiry' },
-    { key: 'belowReorderPoint', value: 0, display: null, label: 'Below reorder point', foot: 'every item has a buffer', severity: 'good', icon: '✓', route: 'intel' },
+    { key: 'needRestock', value: 0, display: null, label: 'Need restock', foot: 'every item has a buffer', severity: 'good', icon: '✓', route: 'purchasing' },
     { key: 'unsellable', value: 1, display: null, label: 'Menu item unsellable', foot: 'missing ingredient stock', severity: 'warn', icon: '⨯', route: 'menu' },
     { key: 'stockValue', value: 64510, display: '₱64.5k', label: 'Stock on hand', foot: '94 of 111 items priced', severity: 'info', icon: '₱', route: 'inventory' },
   ],
@@ -79,7 +81,7 @@ const SAMPLE = {
     { severity: 'crit', headline: 'Shredded Cabbage — expired', detail: '3,000 g on hand', route: 'expiry' },
     { severity: 'crit', headline: 'Fresh Garlic Peeled — use today', detail: '950 g · exp 2026-08-20', route: 'expiry' },
     { severity: 'warn', headline: 'White Truffle Pasta unsellable', detail: 'Missing: Cheese Sauce (house)', route: 'menu' },
-    { severity: 'warn', headline: 'Buffalo Hot Sauce waste — review soon', detail: '2.4× this ingredient’s typical wastage', route: 'intel' },
+    { severity: 'warn', headline: 'Buffalo Hot Sauce waste — review soon', detail: '2.4× this ingredient’s typical wastage', route: 'purchasing' },
     { severity: 'flat', headline: '94 ingredients need cost confirmed', detail: 'Affects inventory valuation', route: 'verify' },
     { severity: 'flat', headline: '465 stock-amount values unconfirmed', detail: 'Affects how much stock a sale deducts', route: 'verify' },
   ],
@@ -91,12 +93,12 @@ const SAMPLE = {
     values: [],
     note: 'Prophet needs 7+ days of real sales per menu item. The closest item has 2 days on file.',
   },
-  expiryPreview: [
-    { name: 'Fresh Garlic Peeled', qty: '950 g', label: 'today', severity: 'crit' },
-    { name: 'Shredded Cabbage', qty: '3,000 g', label: 'expired', severity: 'crit' },
-    { name: 'Fresh Milk', qty: '5,000 ml', label: 'expired', severity: 'crit' },
-    { name: 'Plain Yogurt', qty: '3,000 g', label: '4d', severity: 'warn' },
-    { name: 'Lemon', qty: '75 g', label: '11d', severity: 'warn' },
+  useFirst: [
+    { name: 'Fresh Garlic Peeled', qty: { qty: 950, unit: 'g', display: '950 g' }, label: 'today', severity: 'crit' },
+    { name: 'Shredded Cabbage', qty: { qty: 3000, unit: 'g', display: '3000 g' }, label: 'expired', severity: 'crit' },
+    { name: 'Fresh Milk', qty: { qty: 5000, unit: 'ml', display: '5000 ml' }, label: 'expired', severity: 'crit' },
+    { name: 'Plain Yogurt', qty: { qty: 3000, unit: 'g', display: '3000 g' }, label: '4d', severity: 'warn' },
+    { name: 'Lemon', qty: { qty: 75, unit: 'g', display: '75 g' }, label: '11d', severity: 'warn' },
   ],
   verifyPreview: [
     { label: 'Alcohol — pack size', priority: 1 },
@@ -105,6 +107,43 @@ const SAMPLE = {
     { label: 'Banana — expiry date', priority: 3 },
   ],
 };
+
+/**
+ * Inventory valuation — GET /reports/valuation (wt/reservation.
+ * inventory_valuation(), the exact figure the Today dashboard's own
+ * "Stock value" KPI is built from — see getSummary() above). Reports and
+ * Inventory > On Hand both need this number; this is the one
+ * implementation, re-exported from lib/api/reports.js so neither caller's
+ * import line has to change.
+ *
+ * `available: false` covers both "the backend call failed" and (once it
+ * succeeds) "nothing is priced yet" is still `available: true` with
+ * `pricedItems: 0` — a real answer, not a failure — so callers must not
+ * conflate the two.
+ *
+ * @returns {Promise<{available:boolean, totalValue:number|null,
+ *   pricedItems:number|null, totalItems:number|null, reason:string}>}
+ */
+export async function getValuation() {
+  try {
+    const out = await api.get('/reports/valuation');
+    return {
+      available: true,
+      totalValue: out.total_value,
+      pricedItems: out.priced_items,
+      totalItems: out.total_items,
+      reason: '',
+    };
+  } catch (e) {
+    return {
+      available: false,
+      totalValue: null,
+      pricedItems: null,
+      totalItems: null,
+      reason: e instanceof ApiError ? e.message : 'Inventory value is not available right now.',
+    };
+  }
+}
 
 /**
  * @returns {Promise<DashboardSummary>}

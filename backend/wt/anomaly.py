@@ -51,12 +51,37 @@ import numpy as np
 from sklearn.ensemble import IsolationForest
 
 from . import timeutil
+from .db import write_tx
+from .errors import InvalidStateError
+
+REVIEW_STATUSES = ("flagged", "under_review", "confirmed_anomaly", "false_positive", "resolved")
 
 ANOMALY_REASONS = ("wastage", "spoilage", "count_adjustment")
 MIN_POOLED_SAMPLES = 15          # entries needed before IsolationForest is trained at all
 RULE_FRACTION_THRESHOLD = 0.25   # a single entry removing >=25% of prior on-hand stock
 N_ESTIMATORS = 200
 RANDOM_STATE = 42                # deterministic output for the same ledger
+
+# 2026-09 audit: detect_anomalies() trained IsolationForest with
+# contamination="auto" and NO cap, unlike the consumption pass below (see
+# MAX_FLAG_FRACTION's own comment, which explains why an uncapped 'auto'
+# cutoff is unsafe on this kind of pooled, mostly-ordinary data). Against
+# the real production ledger this flagged 496 of 2,534 entries (19.6%) —
+# one in five wastage/spoilage/count-adjustment rows called "unusual" is not
+# a usable signal for anyone; it is the model describing the shape of the
+# whole distribution, not outliers within it. Same fix as the consumption
+# pass: keep only the worst-scoring MAX_STOCK_LOSS_FLAG_FRACTION before the
+# rule-based pass (which needs no cap — it already requires a >=25%-of-
+# on-hand single event, which is rare by construction) adds any more.
+MAX_STOCK_LOSS_FLAG_FRACTION = 0.10
+
+# Ground-truth threshold for detect_anomalies()'s Precision/Recall/F1 — see
+# anomaly_model_details()'s validation block. Chosen the same way
+# MIN_RECONCILED_DAYS/MIN_POOLED_SAMPLES were: small enough to be reachable,
+# large enough that one or two lucky/unlucky reviews cannot swing a reported
+# metric wildly. Never computed below this regardless of how the labels
+# split between confirmed/false-positive.
+MIN_VALIDATED_LABELS = 20
 
 # --- consumption pass (the specified model) --------------------------------
 MIN_RECONCILED_DAYS = 12         # reconciled service-days before the forest is trained
@@ -131,9 +156,16 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 90) -> list[
                                 random_state=RANDOM_STATE)
         preds = model.fit_predict(X)
         scores = model.decision_function(X)   # lower (more negative) = more anomalous
-        for rec, pred, score in zip(records, preds, scores):
-            if pred != -1:
-                continue
+        # Cap to the worst-scoring MAX_STOCK_LOSS_FLAG_FRACTION of the pool —
+        # see that constant's comment for why 'auto' alone over-flags this
+        # data. Sorted first so a cap that bites keeps the genuinely worst
+        # entries, not an arbitrary slice of an over-broad verdict.
+        candidates = sorted(
+            ((rec, score) for rec, pred, score in zip(records, preds, scores) if pred == -1),
+            key=lambda pair: pair[1],
+        )
+        cap = max(1, int(len(records) * MAX_STOCK_LOSS_FLAG_FRACTION)) if candidates else 0
+        for rec, score in candidates[:cap]:
             r = rec["row"]
             flagged_by_id[r["id"]] = {
                 "ledger_id": r["id"], "ingredient_id": r["ingredient_id"],
@@ -384,6 +416,136 @@ def consumption_model_details(conn: sqlite3.Connection, lookback_days: int = 90)
     }
 
 
+def _review_row(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"], "ledger_id": row["ledger_id"], "status": row["status"],
+        "note": row["note"], "user_id": row["user_id"], "created_at": row["created_at"],
+    }
+
+
+def record_anomaly_review(
+    conn: sqlite3.Connection, ledger_id: int, status: str,
+    note: str | None = None, user_id: str | None = None,
+    client_request_id: str | None = None,
+) -> dict:
+    """Record a human reviewer's classification of one flagged (or any other)
+    stock_ledger row -- the ground truth Precision/Recall/F1 below depend on.
+    Append-only, exactly like ingredient_variance_review: a reviewer who
+    changes their mind submits a NEW review rather than editing the old one.
+
+    Reviewing an ingredient's ledger row that was never actually flagged by
+    detect_anomalies() is allowed and meaningful: a reviewer confirming such
+    a row as confirmed_anomaly is a false negative the model missed, which is
+    exactly what makes Recall (as opposed to Precision alone, computable from
+    flagged rows only) measurable at all -- see model_details()'s
+    validation block.
+    """
+    if status not in REVIEW_STATUSES:
+        raise InvalidStateError(f"unknown anomaly review status '{status}'")
+
+    if client_request_id:
+        existing = conn.execute(
+            "SELECT * FROM anomaly_review WHERE client_request_id=?", (client_request_id,),
+        ).fetchone()
+        if existing:
+            return _review_row(existing)
+
+    with write_tx(conn):
+        ledger = conn.execute("SELECT id FROM stock_ledger WHERE id=?", (ledger_id,)).fetchone()
+        if not ledger:
+            raise InvalidStateError(f"stock_ledger row {ledger_id} does not exist")
+        cur = conn.execute(
+            "INSERT INTO anomaly_review (ledger_id, status, note, user_id, client_request_id) "
+            "VALUES (?,?,?,?,?)",
+            (ledger_id, status, note, user_id, client_request_id),
+        )
+        row = conn.execute("SELECT * FROM anomaly_review WHERE id=?", (cur.lastrowid,)).fetchone()
+    return _review_row(row)
+
+
+def anomaly_review_history(conn: sqlite3.Connection, ledger_id: int) -> list[dict]:
+    """Every review ever recorded for this ledger row, oldest first."""
+    return [
+        _review_row(r) for r in conn.execute(
+            "SELECT * FROM anomaly_review WHERE ledger_id=? ORDER BY id", (ledger_id,),
+        ).fetchall()
+    ]
+
+
+def _latest_review_statuses(conn: sqlite3.Connection) -> dict[int, str]:
+    """ledger_id -> most recent review status, across every ledger row that
+    has ever been reviewed at all (not scoped to the current lookback window
+    -- a validated label does not expire just because the underlying ledger
+    row aged out of a 90-day query)."""
+    rows = conn.execute(
+        """
+        SELECT ar.ledger_id, ar.status FROM anomaly_review ar
+         WHERE ar.id = (SELECT MAX(ar2.id) FROM anomaly_review ar2 WHERE ar2.ledger_id = ar.ledger_id)
+        """
+    ).fetchall()
+    return {r["ledger_id"]: r["status"] for r in rows}
+
+
+def validation_metrics(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:
+    """Precision/Recall/F1/confusion matrix for the stock-loss Isolation
+    Forest pass, built ONLY from human-reviewed ledger rows -- never
+    fabricated, never inferred from the model's own scores.
+
+    TP = flagged by the model AND a human confirmed it as an anomaly.
+    FP = flagged by the model AND a human classified it false_positive.
+    FN = NOT flagged AND a human separately confirmed it as an anomaly
+         (a reviewer catching something the model missed).
+    TN = NOT flagged AND a human classified it false_positive (i.e.
+         reviewed and found ordinary).
+
+    Below MIN_VALIDATED_LABELS confirmed_anomaly + false_positive labels,
+    or with zero labels on either side of "flagged by the model", the
+    corresponding metric is reported as unavailable rather than computed
+    from an incomplete confusion matrix cell -- see the returned
+    `available`/`reason` fields, which the API/frontend must show instead of
+    a number.
+    """
+    anomalies = detect_anomalies(conn, lookback_days)
+    flagged_ids = {a["ledger_id"] for a in anomalies}
+    statuses = _latest_review_statuses(conn)
+
+    tp = fp = fn = tn = 0
+    for ledger_id, status in statuses.items():
+        is_flagged = ledger_id in flagged_ids
+        if status == "confirmed_anomaly":
+            tp += is_flagged
+            fn += (not is_flagged)
+        elif status == "false_positive":
+            fp += is_flagged
+            tn += (not is_flagged)
+
+    total_labels = tp + fp + fn + tn
+    if total_labels < MIN_VALIDATED_LABELS:
+        return {
+            "available": False,
+            "reason": ("Validation metrics unavailable — insufficient confirmed labels "
+                      f"({total_labels}/{MIN_VALIDATED_LABELS} required: confirmed_anomaly "
+                      "or false_positive reviews)"),
+            "confirmed_labels": total_labels, "min_required": MIN_VALIDATED_LABELS,
+            "confusion_matrix": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        }
+
+    precision = (tp / (tp + fp)) if (tp + fp) > 0 else None
+    recall = (tp / (tp + fn)) if (tp + fn) > 0 else None
+    f1 = (2 * precision * recall / (precision + recall)) if precision and recall and (precision + recall) > 0 else None
+    return {
+        "available": True,
+        "confirmed_labels": total_labels,
+        "confusion_matrix": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        "precision": round(precision, 3) if precision is not None else None,
+        "recall": round(recall, 3) if recall is not None else None,
+        "f1": round(f1, 3) if f1 is not None else None,
+        "recall_note": (None if fn > 0 or tn > 0 else
+                        "no unflagged ledger row has been independently reviewed yet, so Recall "
+                        "and the FN/TN cells cannot yet reflect anomalies the model missed"),
+    }
+
+
 def model_details(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:
     """Real parameters and current stats for the Isolation Forest pass —
     backs the technical panel under System Check, not the main Anomaly
@@ -403,9 +565,11 @@ def model_details(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:
         "n_estimators": N_ESTIMATORS,
         "min_pooled_samples": MIN_POOLED_SAMPLES,
         "rule_fraction_threshold": RULE_FRACTION_THRESHOLD,
+        "max_flag_fraction": MAX_STOCK_LOSS_FLAG_FRACTION,
         "lookback_days": lookback_days,
         "records_evaluated": total,
         "trained_this_call": total >= MIN_POOLED_SAMPLES,
         "flagged": len(anomalies),
         "flagged_by_method": by_method,
+        "validation": validation_metrics(conn, lookback_days),
     }

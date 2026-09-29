@@ -9,8 +9,12 @@ leak a capability the role does not hold.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
+import subprocess
 import sqlite3
+from datetime import date as _date, timedelta as _timedelta
 from pathlib import Path as _Path
 from typing import Any, Literal
 
@@ -20,21 +24,48 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import audit, auth, db, refills, timeutil, unli, verification
+from . import (
+    audit, auth, db, instructions, permissions, purchasing, refills, timeutil, unli, updates,
+    verification,
+)
 from .cache import TTLCache
 from .anomaly import detect_anomalies, detect_consumption_anomalies
 from .anomaly import consumption_model_details
 from .anomaly import model_details as anomaly_model_details
 from .associations import product_combinations
 from .associations import model_details as association_model_details
-from .errors import AuthenticationError, NotFoundError, ValidationError, WTError
-from .forecasting import (
-    evaluate_demand_model, ingredient_depletion, menu_item_demand, menu_item_demand_prophet,
+from .combo_pricing import (
+    create_draft_combo, estimate_combo_cost, get_combo_pricing_config, list_draft_combos,
+    review_draft_combo, set_combo_pricing_config, suggest_price_range,
 )
+from .errors import (
+    AuthenticationError,
+    NotFoundError,
+    PasswordChangeRequiredError,
+    PermissionError_,
+    ValidationError,
+    WTError,
+)
+from .depletion import (
+    HORIZON_DAYS as DEPLETION_HORIZON_DAYS,
+    LOOKBACK_DAYS as DEPLETION_LOOKBACK_DAYS,
+    ingredient_detail as ingredient_depletion_detail,
+    ingredient_forecast,
+    prophet_refresh_generation,
+    refresh_prophet_baselines,
+    replenishment_backtest,
+)
+from .forecasting import (
+    MIN_DEMAND_SAMPLE_DAYS, STORE_METRICS, evaluate_demand_model, evaluate_store_demand_model,
+    ingredient_depletion, menu_item_demand, menu_item_demand_prophet, store_demand_prophet,
+)
+from .anomaly import anomaly_review_history, record_anomaly_review
+from .data_quality import data_quality_report
 from .reservation import (
     availability_for_menu_item, commit_order, ingredient_reconciliation_report,
-    inventory_valuation, receive_stock, record_count, record_usage, record_wastage,
-    release_order, reserve_order, void_after_commit,
+    inventory_valuation, receive_stock, record_count, record_usage,
+    record_variance_review, record_wastage, release_order, reserve_order,
+    variance_review_history, void_after_commit,
 )
 from .resolver import expand_recipe, recipe_cost, validate_recipe
 from .units import format_base, normalise_label, to_base
@@ -77,6 +108,12 @@ app.add_middleware(
 # reconciliation rows) and unrelated cost profiles.
 _forecast_cache = TTLCache()
 _anomaly_cache = TTLCache()
+# Rolling backtest (evaluate_demand_model) fits Prophet up to
+# ROLLING_MAX_ITEMS x ROLLING_MAX_FOLDS times per call -- far too slow to
+# redo on every technical-panel page load. Longer TTL than the other two
+# since a new order does not change which folds/items get evaluated in any
+# way that matters for a technical-metrics panel refreshed occasionally.
+_model_details_cache = TTLCache(ttl_seconds=1800)
 
 
 @app.on_event("startup")
@@ -117,14 +154,52 @@ def conn():
         c.close()
 
 
+_BACKEND_DIR = _Path(__file__).resolve().parent.parent
+_PROJECT_ROOT = _BACKEND_DIR.parent
+
+
+def _git_commit() -> str | None:
+    """Best-effort, computed once at import time rather than per-request —
+    a checkout with no git history (or git missing) just reports None
+    instead of failing health checks over it."""
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(_PROJECT_ROOT),
+            capture_output=True, text=True, timeout=3,
+        )
+        return out.stdout.strip() if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
+_GIT_COMMIT = _git_commit()
+
+
 @app.get("/health", tags=["ops"], include_in_schema=False)
 def health(c: sqlite3.Connection = Depends(conn)):
     """Unauthenticated on purpose — this is what a launcher script or an
     external monitor checks before assuming the server is actually usable,
     not a console page, so it can't require a login token. Reports nothing
     that isn't already visible to anyone on the LAN who can reach the
-    server at all."""
-    return db.integrity_report(c)
+    server at all.
+
+    The project_root/backend_dir/git_commit/pid fields exist specifically
+    so two checkouts of this project can never be confused for each other
+    again by eye — see the 2026-09 consolidation: a stale second checkout
+    (C:\\Users\\PLPASIG\\wings-theory) was, for a time, indistinguishable
+    from this one except by which port answered first. No secrets here —
+    same threat model as the rest of this endpoint."""
+    report = db.integrity_report(c)
+    report.update({
+        "app": "Wings Theory",
+        "environment": os.environ.get("WT_ENV"),
+        "project_root": str(_PROJECT_ROOT),
+        "backend_dir": str(_BACKEND_DIR),
+        "cwd": os.getcwd(),
+        "git_commit": _GIT_COMMIT,
+        "pid": os.getpid(),
+    })
+    return report
 
 
 def principal(
@@ -143,19 +218,50 @@ def principal(
         raise HTTPException(401, "missing bearer token")
     payload = auth.decode_token(authorization.split(" ", 1)[1])
     row = c.execute(
-        "SELECT password_changed_at, is_active FROM app_user WHERE username=?",
+        "SELECT password_changed_at, is_active, must_change_password FROM app_user WHERE username=?",
         (payload.get("sub"),),
     ).fetchone()
     if not row or not row["is_active"]:
         raise AuthenticationError("account no longer active — please sign in again")
     if payload.get("pwd") != row["password_changed_at"]:
         raise AuthenticationError("session invalidated by a password change — please sign in again")
+    # Stapled onto the decoded payload, not looked up again by needs() below,
+    # so the must_change_password gate costs zero extra queries — this SELECT
+    # already runs on every request.
+    payload["_must_change_password"] = bool(row["must_change_password"])
     return payload
 
 
 def needs(capability: str):
     def _dep(p: dict = Depends(principal)) -> dict:
+        # Gated here, not in principal() itself: principal() also backs
+        # /auth/change_password (bare Depends(principal), never needs()), and
+        # that is the one endpoint a flagged account must still be able to
+        # reach. Every other capability-gated route blocks until the account
+        # sets its own password.
+        if p.get("_must_change_password"):
+            raise PasswordChangeRequiredError(
+                "sign-in still uses a temporary password — set a new password to continue"
+            )
         auth.require(p, capability)
+        return p
+    return _dep
+
+
+def needs_page(page_key: str):
+    """A second, narrower gate meant to sit ALONGSIDE a needs(capability)
+    dependency on the same route, not replace it: the capability governs
+    whether the ACTION is allowed at all (wt/auth.py's CAPABILITIES, code-
+    only, unchanged by this); this governs whether the caller's role
+    currently has admin-granted visibility into this whole PAGE
+    (wt/permissions.py, admin-editable at runtime via /console/admin/
+    permissions). Admin is always granted and never queried."""
+    def _dep(p: dict = Depends(principal), c: sqlite3.Connection = Depends(conn)) -> dict:
+        if not permissions.get_effective_grants(c, p.get("role"))[page_key]:
+            raise PermissionError_(
+                f"role '{p.get('role')}' does not have the '{page_key}' page enabled",
+                page=page_key,
+            )
         return p
     return _dep
 
@@ -305,6 +411,88 @@ def reset_password(
     }
 
 
+@app.get("/console/users", tags=["console"])
+def list_users(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage")),
+):
+    """Every account and its role — never password_hash/password_salt.
+    Admin-only, same capability as every other account-management action."""
+    return {"users": rows(c.execute(
+        "SELECT username, display_name, role, must_change_password, locked_until, is_active "
+        "FROM app_user ORDER BY username"
+    ))}
+
+
+class CreateUserIn(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(min_length=1, max_length=128)
+    role: str
+
+
+@app.post("/console/users", tags=["console"], status_code=201)
+def create_user(
+    body: CreateUserIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("user.manage")),
+):
+    """Provision a new operational staff account: cashier or kitchen (admin
+    may also provision another admin). Mirrors reset_password's exact
+    contract: a random, server-generated temp password, hashed the same way,
+    returned exactly once in this response and never stored or logged
+    anywhere else, with must_change_password=1 so the account holder must set
+    their own password before reaching anything capability-gated.
+
+    role='owner' is refused unconditionally, regardless of whether one
+    already exists — OWNER is the business owner/CEO, not a staff role ADMIN
+    provisions through account management. The only way an OWNER account is
+    created is the deployment-only wt/owner_provisioning.py CLI, run once by
+    whoever controls the deployment; there is deliberately no HTTP path to it
+    at all, so no crafted request against this endpoint can reach it either.
+
+    role='manager' is likewise refused: the current business roles are
+    OWNER/ADMIN/CASHIER/KITCHEN, and ADMIN is now the sole administrative
+    role. A legacy 'manager' account that already exists in the database
+    keeps working (auth.CAPABILITIES and auth.ROLES both still recognize the
+    role — nothing here revokes or converts it) — this endpoint only closes
+    off creating any *new* one."""
+    if body.role == "owner":
+        raise PermissionError_(
+            "OWNER accounts cannot be created through account management — "
+            "OWNER is provisioned once, at deployment, outside this endpoint",
+            capability="user.manage",
+        )
+    if body.role == "manager":
+        raise PermissionError_(
+            "'manager' is a legacy role and can no longer be assigned to a new "
+            "account — create an admin, cashier, or kitchen account instead",
+            capability="user.manage",
+        )
+    if body.role not in auth.ROLES:
+        raise ValidationError(f"unknown role '{body.role}' — expected one of {auth.ROLES}")
+    existing = c.execute(
+        "SELECT 1 FROM app_user WHERE username=?", (body.username,)
+    ).fetchone()
+    if existing:
+        raise HTTPException(409, f"username '{body.username}' is already in use")
+    temp_password = auth.generate_temp_password()
+    h, s = auth.hash_password(temp_password)
+    with db.write_tx(c):
+        c.execute(
+            "INSERT INTO app_user "
+            "(username, display_name, role, password_hash, password_salt, "
+            "password_changed_at, must_change_password) "
+            "VALUES (?,?,?,?,?, datetime('now','subsec'), 1)",
+            (body.username, body.display_name, body.role, h, s),
+        )
+        audit.log(c, "user", body.username, "create", p["sub"], new_value=body.role)
+    return {
+        "ok": True,
+        "username": body.username,
+        "role": body.role,
+        "temporary_password": temp_password,
+        "note": "Shown once. Give this to the user directly — it is not stored or logged anywhere.",
+    }
+
+
 @app.get("/console/audit/logins", tags=["console"])
 def audit_logins(
     limit: int = Query(100, ge=1, le=500),
@@ -340,6 +528,264 @@ def audit_actions(
 
 
 # ===========================================================================
+# owner instructions
+# ===========================================================================
+@app.get("/console/instructions", tags=["console"])
+def list_instructions(
+    status: str | None = Query(default=None),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("instruction.read")),
+):
+    """Owner and admin see the same shared task board."""
+    return instructions.list_for_role(c, status)
+
+
+class InstructionCreateIn(BaseModel):
+    title: str
+    body: str
+    priority: Literal["normal", "important", "urgent"] = "normal"
+    assigned_to: str | None = None
+    due_date: str | None = None
+
+
+@app.post("/console/instructions", tags=["console"], status_code=201)
+def create_instruction(
+    body: InstructionCreateIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("instruction.create")),
+):
+    return instructions.create(
+        c, body.title, body.body, body.priority, body.assigned_to, body.due_date, p["sub"],
+    )
+
+
+@app.post("/console/instructions/{pk}/acknowledge", tags=["console"])
+def acknowledge_instruction(
+    pk: int, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("instruction.update_status")),
+):
+    return instructions.acknowledge(c, pk, p["sub"])
+
+
+@app.post("/console/instructions/{pk}/start", tags=["console"])
+def start_instruction(
+    pk: int, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("instruction.update_status")),
+):
+    return instructions.start(c, pk, p["sub"])
+
+
+class InstructionCompleteIn(BaseModel):
+    completion_note: str
+
+
+@app.post("/console/instructions/{pk}/complete", tags=["console"])
+def complete_instruction(
+    pk: int, body: InstructionCompleteIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("instruction.update_status")),
+):
+    return instructions.complete(c, pk, body.completion_note, p["sub"])
+
+
+class InstructionCancelIn(BaseModel):
+    reason: str | None = None
+
+
+@app.post("/console/instructions/{pk}/cancel", tags=["console"])
+def cancel_instruction(
+    pk: int, body: InstructionCancelIn = Body(default=InstructionCancelIn()),
+    c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("instruction.cancel")),
+):
+    """Reachable by both owner and admin (instruction.cancel lists both) —
+    the finer rule (owner: only their own, only while 'open') is enforced
+    inside instructions.cancel() itself, same shape as order.void."""
+    return instructions.cancel(c, pk, body.reason, p["sub"], p["role"])
+
+
+# ===========================================================================
+# operational updates — the free-text, bidirectional half of Owner/Admin
+# communication instructions' fixed state machine doesn't cover.
+# ===========================================================================
+@app.get("/console/updates", tags=["console"])
+def list_updates(
+    owner_instruction_id: int | None = Query(default=None),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("update.read")),
+):
+    return updates.list_all(c, owner_instruction_id)
+
+
+class UpdateCreateIn(BaseModel):
+    body: str
+    owner_instruction_id: int | None = None
+
+
+@app.post("/console/updates", tags=["console"], status_code=201)
+def create_update(
+    body: UpdateCreateIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("update.create")),
+):
+    return updates.create(c, body.body, body.owner_instruction_id, p["sub"], p["role"])
+
+
+@app.post("/console/updates/{pk}/acknowledge", tags=["console"])
+def acknowledge_update(
+    pk: int, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("update.acknowledge")),
+):
+    """Reachable by both roles — updates.acknowledge() itself refuses when
+    the caller's role matches whoever posted the update, same shape as
+    instruction cancellation above."""
+    return updates.acknowledge(c, pk, p["sub"], p["role"])
+
+
+# ===========================================================================
+# purchase orders
+# ===========================================================================
+@app.get("/console/purchase-orders", tags=["console"])
+def list_purchase_orders(
+    status: str | None = Query(default=None),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("purchase_order.read")),
+):
+    return purchasing.list_all(c, status)
+
+
+@app.get("/console/purchase-orders/{pk}", tags=["console"])
+def get_purchase_order(
+    pk: int, c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("purchase_order.read")),
+):
+    return purchasing.get(c, pk)
+
+
+class PurchaseOrderItemIn(BaseModel):
+    ingredient_id: int
+    quantity: float = Field(gt=0)
+    recommended_qty_base: float | None = None
+    note: str | None = None
+
+
+class PurchaseOrderCreateIn(BaseModel):
+    supplier: str | None = None
+    notes: str | None = None
+    expected_delivery_date: str | None = None
+    items: list[PurchaseOrderItemIn]
+
+
+@app.post("/console/purchase-orders", tags=["console"], status_code=201)
+def create_purchase_order(
+    body: PurchaseOrderCreateIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("purchase_order.create")),
+):
+    return purchasing.create(
+        c, body.supplier, body.notes, body.expected_delivery_date,
+        [item.model_dump() for item in body.items], p["sub"],
+    )
+
+
+@app.post("/console/purchase-orders/{pk}/order", tags=["console"])
+def order_purchase_order(
+    pk: int, c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("purchase_order.manage")),
+):
+    return purchasing.mark_ordered(c, pk, p["sub"])
+
+
+class PurchaseOrderCancelIn(BaseModel):
+    reason: str | None = None
+
+
+@app.post("/console/purchase-orders/{pk}/cancel", tags=["console"])
+def cancel_purchase_order(
+    pk: int, body: PurchaseOrderCancelIn = Body(default=PurchaseOrderCancelIn()),
+    c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("purchase_order.cancel")),
+):
+    """Reachable by both owner and admin — see purchasing.cancel() for the
+    finer per-role rule, same shape as instruction cancellation above."""
+    return purchasing.cancel(c, pk, body.reason, p["sub"], p["role"])
+
+
+class ReceiveLineIn(BaseModel):
+    qty_base: float = Field(gt=0)
+    lot_no: str | None = None
+    expires_at: str | None = None
+    client_request_id: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/console/purchase-orders/items/{item_pk}/receive", tags=["console"])
+def receive_purchase_order_line(
+    item_pk: int, body: ReceiveLineIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("purchase_order.manage")),
+):
+    """The only endpoint in the purchasing module that ever touches
+    inventory — see purchasing.receive_line for the transaction/idempotency
+    design. client_request_id makes a retried submission safe to repeat."""
+    return purchasing.receive_line(
+        c, item_pk, body.qty_base, p["sub"], body.client_request_id,
+        body.lot_no, body.expires_at,
+    )
+
+
+@app.get("/console/capabilities", tags=["console"])
+def capabilities(p: dict = Depends(principal)):
+    """A live read of auth.CAPABILITIES -- the actual policy the needs()
+    gate enforces on every other route -- for System & Settings' "Who can
+    do what" reference table.
+
+    2026-09 contract fix: this table used to be hand-transcribed in the
+    frontend (lib/api/system.js's old CAPABILITY_REFERENCE), with its own
+    comment recording that a PRIOR transcription had already drifted out of
+    step with CAPABILITIES and asking for exactly this endpoint so the
+    table could stop being copied by hand. No signed-in role is excluded --
+    everyone benefits from seeing the real policy, not just admin -- so
+    this only requires a valid session, not a capability of its own.
+
+    Returned keyed by the raw capability string (e.g. "order.create"), not
+    a hand-picked human label -- inventing prose grouping here would be
+    the exact kind of second copy of the policy this endpoint exists to
+    stop maintaining. Presentation is the frontend's job."""
+    return {
+        "roles": list(auth.ROLES),
+        "capabilities": {cap: list(allowed) for cap, allowed in auth.CAPABILITIES.items()},
+    }
+
+
+@app.get("/console/permissions/pages", tags=["console"])
+def my_page_permissions(c: sqlite3.Connection = Depends(conn), p: dict = Depends(principal)):
+    """What the CALLING role can currently see — no capability required
+    beyond being signed in, since every role needs to be able to ask this
+    about itself to build its own sidebar. Distinct from the admin-only
+    endpoints below, which read/write every role's grants."""
+    return {"role": p["role"], "grants": permissions.get_effective_grants(c, p["role"])}
+
+
+@app.get("/console/admin/permissions", tags=["console"])
+def admin_permissions(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("permissions.manage")),
+):
+    """The full editable matrix for the Role & Permissions section of System
+    & Settings — every role wt/permissions.DEFAULT_GRANTS knows how to
+    configure (today, just 'manager')."""
+    return {"pageKeys": list(permissions.PAGE_KEYS), "grants": permissions.get_all_grants(c)}
+
+
+class SetPagePermissionIn(BaseModel):
+    role: str
+    page_key: str
+    allowed: bool
+
+
+@app.put("/console/admin/permissions", tags=["console"])
+def set_page_permission(
+    body: SetPagePermissionIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("permissions.manage")),
+):
+    """Grant or revoke one role's access to one console page. Audited the
+    same way every other admin mutation is (admin_audit_log via audit.log,
+    see wt/permissions.set_grant) — who changed what a role can see, and
+    when, is exactly the kind of record this table already keeps for
+    ingredient edits and password resets."""
+    with db.write_tx(c):
+        grants = permissions.set_grant(c, body.role, body.page_key, body.allowed, p["sub"])
+    return {"role": body.role, "grants": grants}
+
+
+# ===========================================================================
 # POS — menu with the completeness gate applied
 # ===========================================================================
 @app.get("/pos/menu", tags=["pos"])
@@ -370,6 +816,8 @@ def pos_menu(
     ))
     if not include_blocked:
         data = [d for d in data if d["sellable"]]
+    svc_enabled, svc_rate = _effective_service_charge(c)
+    enabled_discounts = _enabled_discount_types(c)
     return {
         "items": data,
         "sellable": sum(1 for d in data if d["sellable"]),
@@ -380,8 +828,22 @@ def pos_menu(
         # could silently drift from what checkout actually charges. Menu
         # load is the one call every POS session makes before any of that
         # math happens, so it rides along here rather than needing its own
-        # endpoint.
-        "service_charge_rate": SERVICE_CHARGE_RATE,
+        # endpoint. The rate is already 0 when service charge is disabled —
+        # the till never needs to know *why*, only what to charge.
+        "service_charge_rate": svc_rate,
+        "service_charge_enabled": svc_enabled,
+        # Same reasoning as service_charge_rate above: the discount buttons on
+        # the till preview an amount before checkout, and that preview has to
+        # use the exact rate checkout will charge, not a second copy that
+        # could drift from DISCOUNT_RATES. Only types an admin has left
+        # enabled are offered — see _enabled_discount_types().
+        "discount_rates": {t: r for t, r in DISCOUNT_RATES.items() if t in enabled_discounts},
+        "discount_labels": {t: l for t, l in DISCOUNT_LABELS.items() if t in enabled_discounts},
+        # The restaurant's configured seating — same reasoning as the two
+        # rates above, read once at menu load rather than a copy the till
+        # could drift from. Defaults to DEFAULT_TABLE_COUNT (9) until an
+        # admin configures it via PATCH /console/pos-config.
+        "table_count": int(unli.get_setting(c, "pos_table_count", DEFAULT_TABLE_COUNT)),
     }
 
 
@@ -428,12 +890,50 @@ class OrderIn(BaseModel):
     # One key per checkout attempt, chosen by the till. Replaying it returns
     # the order already created rather than charging the customer twice.
     client_request_id: str | None = Field(default=None, max_length=64)
+    # The till only ever sends which discount card the customer presented —
+    # never a rate or an amount. The percentage that means is decided here,
+    # server-side, from DISCOUNT_RATES, so a compromised or buggy client
+    # cannot charge a rate it made up.
+    discount_type: Literal["senior", "pwd", "staff"] | None = None
 
 
-# Matches the POS cart's own display formula — the cart has always shown this
-# 10% line, so charging anything else at the till would contradict what the
-# customer was just shown.
+# Fallback rate an admin gets the first time they flip service charge on
+# without also choosing a rate. Wings Theory currently runs with NO service
+# charge at all — see _effective_service_charge() below, which is what
+# create_order and GET /pos/menu actually use. This constant is never
+# applied on its own any more.
 SERVICE_CHARGE_RATE = 0.10
+
+# RA 9994 (senior citizens) and RA 10754 (PWD) both mandate 20% off the sale
+# price before service charge/VAT; staff is a house courtesy discount at half
+# that rate. Applied to the subtotal, then service charge is computed on
+# what's left — a discounted order is never charged service on the amount it
+# didn't actually pay. These are the rates in effect when an admin has not
+# disabled a discount type — see _enabled_discount_types() below.
+DISCOUNT_RATES = {"senior": 0.20, "pwd": 0.20, "staff": 0.10}
+DISCOUNT_LABELS = {"senior": "SC 20%", "pwd": "PWD 20%", "staff": "Staff 10%"}
+
+
+# ---------------------------------------------------------------------------
+# POS billing configuration — service charge on/off + rate, and which
+# discount types a cashier may select. Stored in app_setting (wt/unli.py's
+# get_setting/set_setting, already used for depletion_demand_model and
+# unli_variance_tolerance) rather than a new table. Defaults preserve the
+# actual current business rule: service charge OFF, every discount type
+# enabled at its existing rate — installing this changes nothing until an
+# admin deliberately opts in via PATCH /console/pos-config.
+# ---------------------------------------------------------------------------
+def _effective_service_charge(c: sqlite3.Connection) -> tuple[bool, float]:
+    enabled = unli.get_setting(c, "service_charge_enabled", 0.0) >= 1.0
+    rate = unli.get_setting(c, "service_charge_rate", SERVICE_CHARGE_RATE) if enabled else 0.0
+    return enabled, rate
+
+
+def _enabled_discount_types(c: sqlite3.Connection) -> set[str]:
+    return {
+        t for t in DISCOUNT_RATES
+        if unli.get_setting(c, f"discount_{t}_enabled", 1.0) >= 1.0
+    }
 
 
 class _DuplicateCheckout(Exception):
@@ -445,8 +945,8 @@ def _find_order_by_key(c: sqlite3.Connection, key: str | None):
     if not key:
         return None
     return c.execute(
-        "SELECT id, order_no, subtotal, service_charge, total, cash_received, change_due "
-        "FROM customer_order WHERE client_request_id = ?",
+        "SELECT id, order_no, subtotal, discount_type, discount_amount, service_charge, "
+        "total, cash_received, change_due FROM customer_order WHERE client_request_id = ?",
         (key,),
     ).fetchone()
 
@@ -456,7 +956,9 @@ def _replay_payload(row) -> dict:
     replay so the till can say so instead of implying a second order."""
     return {
         "order_id": row["id"], "order_no": row["order_no"],
-        "subtotal": row["subtotal"], "service_charge": row["service_charge"],
+        "subtotal": row["subtotal"],
+        "discount_type": row["discount_type"], "discount_amount": row["discount_amount"],
+        "service_charge": row["service_charge"],
         "total": row["total"], "cash_received": row["cash_received"],
         "change_due": row["change_due"],
         "state": "reserved", "duplicate": True,
@@ -489,7 +991,7 @@ def create_order(
 
     try:
         with db.write_tx(c):
-            n = c.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+            n = c.execute("SELECT COALESCE(MAX(id), 0) AS n FROM customer_order").fetchone()["n"]
             order_no = f"WT-{n + 1001}"
             try:
                 cur = c.execute(
@@ -525,6 +1027,16 @@ def create_order(
                         f"add it once and set Heads to {ln.qty * max(body.head_count, 1)} "
                         f"if that is the number of covers",
                     )
+                # Unlimited Wings is priced per head (₱399/head, not a flat
+                # ₱399 regardless of how many are eating) — head_count=0 would
+                # silently punch a ₱0 unlimited line and open no session (the
+                # session guard just below only fires when head_count > 0), so
+                # it is refused here rather than producing a free ticket.
+                if item["is_unli"] and body.head_count < 1:
+                    raise HTTPException(
+                        422,
+                        f"'{item['name']}' is priced per head — set Heads to at least 1",
+                    )
                 gate = c.execute(
                     "SELECT sellable, block_reason, name FROM v_menu_item_availability "
                     "WHERE menu_item_pk=?",
@@ -539,10 +1051,24 @@ def create_order(
                     "VALUES (?,?,?,?,?)",
                     (order_pk, ln.menu_item_pk, ln.qty, item["price"], ln.note),
                 )
-                subtotal += item["price"] * ln.qty
+                # An unlimited line's commercial quantity is always 1 (guarded
+                # above) — what it's actually charged for is the number of
+                # diners it covers, so price is per head_count, not per qty.
+                # An ordinary line is charged per its own qty as always.
+                subtotal += item["price"] * (body.head_count if item["is_unli"] else ln.qty)
 
-            service_charge = round(subtotal * SERVICE_CHARGE_RATE, 2)
-            total = round(subtotal + service_charge, 2)
+            if body.discount_type and body.discount_type not in _enabled_discount_types(c):
+                raise HTTPException(
+                    422, f"'{body.discount_type}' discount is not currently enabled"
+                )
+            discount_amount = (
+                round(subtotal * DISCOUNT_RATES[body.discount_type], 2)
+                if body.discount_type else 0.0
+            )
+            discounted_subtotal = round(subtotal - discount_amount, 2)
+            _svc_enabled, svc_rate = _effective_service_charge(c)
+            service_charge = round(discounted_subtotal * svc_rate, 2)
+            total = round(discounted_subtotal + service_charge, 2)
             change_due = None
             if body.cash_received is not None:
                 if body.cash_received < total:
@@ -553,9 +1079,10 @@ def create_order(
                     )
                 change_due = round(body.cash_received - total, 2)
             c.execute(
-                "UPDATE customer_order SET subtotal=?, service_charge=?, total=?, "
-                "cash_received=?, change_due=? WHERE id=?",
-                (round(subtotal, 2), service_charge, total, body.cash_received, change_due, order_pk),
+                "UPDATE customer_order SET subtotal=?, discount_type=?, discount_amount=?, "
+                "service_charge=?, total=?, cash_received=?, change_due=? WHERE id=?",
+                (round(subtotal, 2), body.discount_type, discount_amount,
+                 service_charge, total, body.cash_received, change_due, order_pk),
             )
             # This is the last write this order's money columns will ever
             # accept — migration 0011's trigger refuses every later one. An
@@ -613,7 +1140,9 @@ def create_order(
         raise
     return {
         "order_id": order_pk, "order_no": order_no,
-        "subtotal": round(subtotal, 2), "service_charge": service_charge, "total": total,
+        "subtotal": round(subtotal, 2),
+        "discount_type": body.discount_type, "discount_amount": discount_amount,
+        "service_charge": service_charge, "total": total,
         "cash_received": body.cash_received, "change_due": change_due,
         **result,
     }
@@ -679,9 +1208,13 @@ def void_order(
 ):
     """Routes by order state: before commit releases holds and writes nothing;
     after commit posts a compensating pair."""
-    row = c.execute("SELECT status FROM customer_order WHERE id=?", (order_pk,)).fetchone()
+    row = c.execute("SELECT status, source FROM customer_order WHERE id=?", (order_pk,)).fetchone()
     if not row:
         raise HTTPException(404, "order not found")
+    if row["source"] == "historical":
+        raise HTTPException(
+            409, "a historical sale cannot be voided — it is a read-only record of a completed past sale"
+        )
     if row["status"] == "punched":
         result = release_order(c, order_pk, body.reason, user_id=p["sub"])
     else:
@@ -710,14 +1243,41 @@ def list_orders(
 ):
     """Backs the till's Current Orders (status=open) and Order History
     (status=all) screens. Same table, same rows a receipt was built from at
-    punch time — this is a read of that record, not a second calculation."""
-    sql = "SELECT id, order_no, status, table_label, head_count, created_at, " \
-          "committed_at, served_at, voided_at, subtotal, service_charge, total, " \
-          "cash_received, change_due FROM customer_order o "
+    punch time — this is a read of that record, not a second calculation.
+
+    total stays the frozen, settled figure (migration 0011's
+    trg_order_financials_immutable never lets it move). current_total adds
+    in whatever has posted to order_charge since — served refill add-ons —
+    the same arithmetic v_unli_session_summary and refills.order_receipt()
+    already use for the receipt/"View order" path. Without this, a table
+    that took a ₱50 special-flavor add-on after checkout showed the correct
+    ₱489 on the receipt but a stale ₱439 in this list — the exact
+    History/Current-Orders inconsistency this join closes.
+
+    status="all" (the till's Order History screen) is additionally capped
+    to a rolling last-3-Manila-calendar-months window -- a query-level
+    restriction only, not a data deletion; the full ledger stays in the
+    database and is reachable without this cap from the admin console's
+    own order-history route."""
+    sql = ("SELECT o.id, o.order_no, o.status, o.table_label, o.head_count, o.created_at, "
+           "o.committed_at, o.served_at, o.voided_at, o.subtotal, o.discount_type, "
+           "o.discount_amount, o.service_charge, o.total, "
+           "o.total + COALESCE(ch.addon_total, 0) AS current_total, "
+           "o.cash_received, o.change_due, o.source, o.source_order_id, "
+           "(SELECT GROUP_CONCAT(m.name, ', ') FROM order_line ol "
+           "   JOIN menu_item m ON m.id = ol.menu_item_id WHERE ol.order_id = o.id) AS item_names "
+           "FROM customer_order o "
+           "LEFT JOIN (SELECT order_id, SUM(amount) AS addon_total FROM order_charge "
+           "           GROUP BY order_id) ch ON ch.order_id = o.id ")
+    params: list = []
     if status == "open":
         sql += "WHERE o.status IN ('punched','in_progress','ready') "
+    else:
+        sql += "WHERE o.created_at >= ? "
+        params.append(timeutil.utc_bound_n_manila_months_ago(3))
     sql += "ORDER BY o.created_at DESC LIMIT ?"
-    orders = rows(c.execute(sql, (limit,)))
+    params.append(limit)
+    orders = rows(c.execute(sql, params))
     for o in orders:
         o["line_count"] = c.execute(
             "SELECT COUNT(*) AS n FROM order_line WHERE order_id=?", (o["id"],)
@@ -733,8 +1293,9 @@ def order_detail(
     or checking what's actually in a still-open ticket before voiding it."""
     order = c.execute(
         "SELECT id, order_no, status, table_label, head_count, created_by, created_at, "
-        "committed_at, served_at, voided_at, void_reason, subtotal, service_charge, total, "
-        "cash_received, change_due FROM customer_order WHERE id=?",
+        "committed_at, served_at, voided_at, void_reason, subtotal, discount_type, "
+        "discount_amount, service_charge, total, "
+        "cash_received, change_due, source, source_order_id FROM customer_order WHERE id=?",
         (order_pk,),
     ).fetchone()
     if not order:
@@ -963,6 +1524,43 @@ def waste_ingredient(
     return record_wastage(c, pk, body.qty_base, body.reason, body.note, user_id=p["sub"])
 
 
+class VarianceReviewIn(BaseModel):
+    reason: Literal[
+        "waste", "portion_variance", "counting_error",
+        "recipe_yield_issue", "receiving_issue", "other",
+    ]
+    note: str | None = None
+    client_request_id: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/console/ingredients/{pk}/variance-review", tags=["console"])
+def review_ingredient_variance(
+    pk: int, body: VarianceReviewIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")),
+):
+    """Record a human's suspected cause for a repeated physical-count
+    variance — waste, portion drift, a miscount, a recipe/yield issue, or a
+    receiving problem. This is a REVIEW, not a correction: it never touches
+    on_hand_base, stock_ledger, or any recipe/ingredient value. Pack size,
+    yield factor, and recipe quantity corrections stay on /verify, exactly
+    where they already are — see reservation.record_variance_review."""
+    return record_variance_review(
+        c, pk, body.reason, body.note, user_id=p["sub"],
+        client_request_id=body.client_request_id,
+    )
+
+
+@app.get("/console/ingredients/{pk}/variance-review", tags=["console"])
+def ingredient_variance_review_history(
+    pk: int, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")),
+):
+    """Every review ever recorded for this ingredient, oldest first — the
+    provenance trail behind whatever "Reviewed — ..." line the reconciliation
+    view is currently showing for it."""
+    return {"ingredient_id": pk, "reviews": variance_review_history(c, pk)}
+
+
 class UsageIn(BaseModel):
     qty_base: float = Field(gt=0, description="amount used, in the ingredient's base unit")
     note: str | None = None
@@ -1036,8 +1634,17 @@ def edit_ingredient(
         ).fetchone()
         if not before:
             raise HTTPException(404, "ingredient not found")
+        # Millisecond precision -- see verification.resolve()'s identical
+        # note. This edit (reorder_point_base, lead_time_days, pack_size,
+        # etc.) writes no stock_ledger/customer_order row, so
+        # _depletion_fingerprint() keys on ingredient.updated_at alone to
+        # detect it; datetime('now')'s bare-second resolution can collide
+        # with a same-second commit_order write (which also bumps this
+        # column, at far higher frequency) and leave the forecast cache
+        # stale.
         cur = c.execute(
-            f"UPDATE ingredient SET {set_sql}, updated_at = datetime('now') WHERE id = :id",
+            f"UPDATE ingredient SET {set_sql}, "
+            f"updated_at = strftime('%Y-%m-%d %H:%M:%f','now') WHERE id = :id",
             params,
         )
         if cur.rowcount != 1:
@@ -1248,7 +1855,7 @@ def edit_menu_price(
 @app.get("/console/queues/unmapped", tags=["queues"])
 def queue_unmapped(
     state: str = "open", c: sqlite3.Connection = Depends(conn),
-    _p: dict = Depends(needs("queue.read")),
+    _p: dict = Depends(needs("queue.read")), _pg: dict = Depends(needs_page("verify")),
 ):
     """Recipe lines with no ingredient mapping. Each entry blocks every menu
     item whose recipe contains it."""
@@ -1331,6 +1938,7 @@ def resolve_unmapped(
 @app.get("/console/queues/verification", tags=["queues"])
 def queue_verification(
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("queue.read")),
+    _pg: dict = Depends(needs_page("verify")),
 ):
     """Every physical constant still carrying a seeded placeholder, translated
     into plain operational language and grouped by what breaks if it's
@@ -1342,6 +1950,7 @@ def queue_verification(
 def queue_verification_history(
     field: str, row_id: int,
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("queue.read")),
+    _pg: dict = Depends(needs_page("verify")),
 ):
     """Every decision ever recorded for one field/row: what it was, what it
     became, who decided, and when — the provenance trail."""
@@ -1370,7 +1979,10 @@ def resolve_verification(
 
 
 @app.get("/console/readiness", tags=["console"])
-def readiness(c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read"))):
+def readiness(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+    _pg: dict = Depends(needs_page("system")),
+):
     """One call for the console banner: is this database production-ready?"""
     menu = c.execute(
         "SELECT COUNT(*) AS total, SUM(sellable) AS sellable FROM v_menu_item_availability"
@@ -1417,10 +2029,19 @@ def list_ledger(
         params.append(reason)
     sql += " ORDER BY l.id DESC LIMIT ? OFFSET ?"
     params += [limit, offset]
-    total = c.execute(
-        "SELECT COUNT(*) AS n FROM stock_ledger" + (" WHERE ingredient_id=?" if ingredient_id else ""),
-        [ingredient_id] if ingredient_id else [],
-    ).fetchone()["n"]
+    # Same WHERE conditions as the row query above (minus LIMIT/OFFSET) --
+    # a `reason` filter must narrow the page-count total exactly as it
+    # narrows the rows themselves, or "Page X of Y" undercounts the pages
+    # whenever a reason filter is active.
+    count_sql = "SELECT COUNT(*) AS n FROM stock_ledger WHERE 1=1"
+    count_params: list[Any] = []
+    if ingredient_id:
+        count_sql += " AND ingredient_id = ?"
+        count_params.append(ingredient_id)
+    if reason:
+        count_sql += " AND reason = ?"
+        count_params.append(reason)
+    total = c.execute(count_sql, count_params).fetchone()["n"]
     return {"entries": rows(c.execute(sql, params)), "total": total}
 
 
@@ -1521,50 +2142,123 @@ def ingredient_reconciliation(
 
 @app.get("/console/reports/sales", tags=["console"])
 def sales_summary(
-    days: int = Query(30, description="look-back window"),
+    days: int = Query(30, description="look-back window (ignored when start_date or all_time is given)"),
+    start_date: str | None = Query(default=None, description="Manila business date YYYY-MM-DD, inclusive"),
+    end_date: str | None = Query(
+        default=None, description="Manila business date YYYY-MM-DD, inclusive; defaults to today when start_date is given",
+    ),
+    all_time: bool = Query(default=False, description="every order ever recorded — no lower date bound"),
+    preset: Literal["today", "yesterday", "this_week", "this_month"] | None = Query(
+        default=None, description="A named Manila calendar window — an alternative to start_date/end_date/days "
+        "so a client never has to reimplement 'what day is today in Manila' itself",
+    ),
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
 ):
     """Real numbers only — this reads customer_order/order_line directly, so
     on a system with only a handful of test orders the totals will be small.
     No synthetic history is generated to make the chart look busier.
 
-    days may be negative (a window into the future, matching nothing) — used
-    by tests to get a deterministically-empty result. utc_bound_n_manila_days_ago
-    handles that the same way the old f"-{days} days" SQLite modifier did: a
-    negative or zero `days` pushes the bound into the future, so nothing real
-    can be >= it.
+    Four mutually exclusive ways to pick the window, checked in this order:
+      1. all_time=true            — every order ever recorded, no lower bound.
+      2. start_date (+ end_date)  — an explicit Manila-business-date range,
+         inclusive on both ends. end_date defaults to today when omitted.
+      3. preset                   — a named Manila calendar window:
+         'today'/'yesterday' (a single closed business day, both bounds set —
+         NOT the same as days=1, which is open-ended through the current
+         instant) or 'this_week'/'this_month' (Monday-of-this-Manila-week, or
+         the 1st of this Manila month, through today). Kept server-side
+         (never left to the client to derive from a preset id) so "what day
+         is today in Manila" has exactly the one home timeutil.py's own
+         docstring already claims for every other business-date calculation.
+      4. days (default 30)        — the original trailing-window behaviour,
+         unchanged for every existing caller that only ever passed `days`.
+         May be negative (a window into the future, matching nothing) — used
+         by tests to get a deterministically-empty result.
+    response echoes back the resolved range as `start_date`/`end_date` (or
+    null/null for all_time) so a client can label a preset or custom range
+    without re-deriving the same Manila-calendar arithmetic client-side.
 
-    The bound is computed once in Python (Manila calendar-day aligned) rather
-    than left to SQLite's own `datetime('now', ?)`, and calendar-day grouping
-    below uses the Manila business date, not the UTC one — see wt/timeutil.py.
+    Every bound is computed once in Python (Manila calendar-day aligned)
+    rather than left to SQLite's own `datetime('now', ?)`, and calendar-day
+    grouping below uses the Manila business date, not the UTC one — see
+    wt/timeutil.py.
     """
-    bound = timeutil.utc_bound_n_manila_days_ago(days)
+    upper_bound: str | None = None
+    if all_time:
+        bound = "0001-01-01 00:00:00"
+        window_days_out: int | None = None
+        range_start, range_end = None, timeutil.business_today_iso()
+    elif start_date:
+        try:
+            start_d = _date.fromisoformat(start_date)
+        except ValueError:
+            raise ValidationError("start_date must be an ISO date (YYYY-MM-DD)")
+        if end_date:
+            try:
+                end_d = _date.fromisoformat(end_date)
+            except ValueError:
+                raise ValidationError("end_date must be an ISO date (YYYY-MM-DD)")
+        else:
+            end_d = timeutil.business_today()
+        if end_d < start_d:
+            raise ValidationError("end_date cannot be before start_date")
+        bound = timeutil.utc_bound_for_manila_date(start_d.isoformat())
+        upper_bound = timeutil.utc_bound_for_manila_date((end_d + _timedelta(days=1)).isoformat())
+        window_days_out = (end_d - start_d).days + 1
+        range_start, range_end = start_d.isoformat(), end_d.isoformat()
+    elif preset:
+        today = timeutil.business_today()
+        if preset == "today":
+            start_d = end_d = today
+        elif preset == "yesterday":
+            start_d = end_d = today - _timedelta(days=1)
+        elif preset == "this_week":
+            start_d, end_d = today - _timedelta(days=today.weekday()), today
+        else:  # this_month
+            start_d, end_d = today.replace(day=1), today
+        bound = timeutil.utc_bound_for_manila_date(start_d.isoformat())
+        # today/yesterday are single closed days and need a real upper bound
+        # too (an order from today must not leak into 'yesterday'); the
+        # week/month presets stay open-ended through the current instant,
+        # matching every other "...to date" window in this endpoint.
+        if preset in ("today", "yesterday"):
+            upper_bound = timeutil.utc_bound_for_manila_date((end_d + _timedelta(days=1)).isoformat())
+        window_days_out = (end_d - start_d).days + 1
+        range_start, range_end = start_d.isoformat(), end_d.isoformat()
+    else:
+        bound = timeutil.utc_bound_n_manila_days_ago(days)
+        window_days_out = days
+        range_end = timeutil.business_today_iso()
+        range_start = timeutil.business_date_n_days_ago(days - 1) if days > 0 else None
+
+    upper_clause = " AND o.created_at < :upper" if upper_bound is not None else ""
+    params: dict[str, Any] = {"bound": bound, "upper": upper_bound}
     totals = c.execute(
-        """
+        f"""
         SELECT COUNT(*) AS orders, COALESCE(SUM(o.head_count), 0) AS covers
           FROM customer_order o
-         WHERE o.status != 'void' AND o.created_at >= ?
+         WHERE o.status != 'void' AND o.created_at >= :bound{upper_clause}
         """,
-        (bound,),
+        params,
     ).fetchone()
     revenue = c.execute(
-        """
+        f"""
         SELECT COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE o.status != 'void' AND o.created_at >= ?
+         WHERE o.status != 'void' AND o.created_at >= :bound{upper_clause}
         """,
-        (bound,),
+        params,
     ).fetchone()["revenue"]
     by_item = rows(c.execute(
-        """
+        f"""
         SELECT m.name, SUM(ol.qty) AS qty_sold, SUM(ol.qty * ol.unit_price) AS revenue
           FROM order_line ol
           JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND o.created_at >= ?
+         WHERE o.status != 'void' AND o.created_at >= :bound{upper_clause}
          GROUP BY m.id ORDER BY revenue DESC
         """,
-        (bound,),
+        params,
     ))
     # Revenue per calendar day, oldest first. Purely additive: the console's
     # dashboard charts this instead of deriving it from recent_orders, which
@@ -1577,28 +2271,31 @@ def sales_summary(
                COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue
           FROM customer_order o
           LEFT JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.created_at >= ?
+         WHERE o.status != 'void' AND o.created_at >= :bound{upper_clause}
          GROUP BY {day_bd} ORDER BY day
         """,
-        (bound,),
+        params,
     ))
     # Voided orders stay in this list on purpose (audit visibility — seeing
     # "this one was voided" is useful in a report) but were missing the same
     # date-window filter as everything else above, so this returned the last
     # 50 orders ever, unconditionally, no matter what `days` was asked for.
     recent = rows(c.execute(
-        """
+        f"""
         SELECT o.id, o.order_no, o.status, o.table_label, o.created_at,
                (SELECT COALESCE(SUM(ol2.qty*ol2.unit_price),0) FROM order_line ol2
                  WHERE ol2.order_id=o.id) AS total
           FROM customer_order o
-         WHERE o.created_at >= ?
+         WHERE o.created_at >= :bound{upper_clause}
          ORDER BY o.created_at DESC LIMIT 50
         """,
-        (bound,),
+        params,
     ))
     return {
-        "window_days": days,
+        "window_days": window_days_out,
+        "start_date": range_start,
+        "end_date": range_end,
+        "all_time": all_time,
         "orders": totals["orders"],
         "covers": totals["covers"],
         "revenue": round(revenue, 2),
@@ -1620,21 +2317,96 @@ def reports_valuation(
     return inventory_valuation(c)
 
 
+def _forecast_preview(c: sqlite3.Connection, horizon_days: int = 7, lookback_days: int = 60,
+                       top_n: int = 5) -> dict:
+    """Today's 'Demand Forecast' mini-panel: total forecasted units/day,
+    summed across the shop's top-selling menu items, for the next
+    `horizon_days`. Restored 2026-09 after a dashboard_summary() rewrite
+    dropped this field while Today.js still read it (contract-audit
+    finding) -- reuses menu_item_demand()'s existing cheap trailing-average
+    method unmodified (the same one /console/forecasts/demand's bulk list
+    already runs for every POS-visible item), so this adds no new
+    forecasting logic, just a small, bounded consumer of it."""
+    top_items = rows(c.execute(
+        """
+        SELECT m.id AS id
+          FROM order_line ol
+          JOIN customer_order o ON o.id = ol.order_id
+          JOIN menu_item m ON m.id = ol.menu_item_id
+         WHERE o.status != 'void' AND m.pos_visible = 1
+         GROUP BY m.id
+         ORDER BY SUM(ol.qty) DESC
+         LIMIT ?
+        """,
+        (top_n,),
+    ))
+    if not top_items:
+        return {
+            "insufficientData": True, "daysOfHistory": 0, "requiredDays": MIN_DEMAND_SAMPLE_DAYS,
+            "labels": [], "values": [], "note": "No completed orders yet.",
+        }
+
+    results = [menu_item_demand(c, it["id"], horizon_days, lookback_days) for it in top_items]
+    usable = [r for r in results if not r["insufficient_data"]]
+
+    if not usable:
+        best_days = max((r["active_days"] for r in results), default=0)
+        return {
+            "insufficientData": True, "daysOfHistory": best_days, "requiredDays": MIN_DEMAND_SAMPLE_DAYS,
+            "labels": [], "values": [],
+            "note": f"The closest menu item has {best_days} day(s) on file.",
+        }
+
+    labels = [p["date"] for p in usable[0]["forecast"]]
+    values = [round(sum(r["forecast"][i]["qty"] for r in usable), 2) for i in range(len(labels))]
+    return {
+        "insufficientData": False,
+        "daysOfHistory": max(r["active_days"] for r in usable),
+        "requiredDays": MIN_DEMAND_SAMPLE_DAYS,
+        "labels": labels, "values": values,
+        "note": None,
+    }
+
+
 @app.get("/dashboard/summary", tags=["console"])
 def dashboard_summary(
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
 ):
-    """2026-08 audit: the console's Today page (the first thing anyone sees)
-    was fully built and waiting on this one aggregation endpoint -- until
-    now it rendered a permanent "sample figures, not your real numbers"
-    banner rather than ever showing a fabricated number as real, which is
-    the correct failure mode but not the goal. This composes entirely from
-    functions/queries every other endpoint already uses (ingredient_depletion,
-    _annotate_batch_expiry, v_menu_item_availability, inventory_valuation,
-    verification.list_queue, menu_item_demand_prophet) -- it derives
-    nothing new, only aggregates five already-authoritative sources into
-    the one shaped payload static/assets/console/js/lib/api/dashboard.js
-    documents."""
+    """The Today screen's single aggregation payload.
+
+    Composes entirely from functions/queries every other endpoint already
+    uses (ingredient_forecast, _annotate_batch_expiry, v_menu_item_
+    availability, inventory_valuation, verification.list_queue). It derives
+    no business meaning of its own -- it aggregates already-authoritative
+    sources into the one shaped payload the console's Today route reads.
+
+    2026-09 frontend rebuild. Three things changed here, all additive to the
+    data model and none of them touching an algorithm:
+
+    1. THE 'BELOW REORDER POINT' KPI IS GONE, and is not replaced by a
+       silent equivalent. It read "0 -- every item has a buffer, severity
+       good" against a catalog where reorder_point_base is NULL for 131 of
+       131 ingredients. Nothing was below its reorder point because nothing
+       HAS one; the KPI turned an unconfigured field into a clean bill of
+       health on the first screen anyone sees. The replacement, "Need
+       restock", counts the forward depletion engine's out/critical/at_risk
+       rows -- a real signal that exists today -- and `coverage.
+       reorderPointsConfigured` is reported alongside it so the UI can say
+       out loud which basis it is using and that the other one is unset.
+
+    2. DATA FRESHNESS IS REPORTED. Every demand-derived number here is built
+       from orders that stop at MAX(customer_order.created_at), which on the
+       live database is several days behind the reader's today. The payload
+       now carries that timestamp (plus the ledger's and the last receiving)
+       so a purchasing decision cannot be taken from this screen without the
+       age of its evidence being visible.
+
+    3. QUANTITIES ARE STRUCTURED. Every quantity that used to ship only as a
+       pre-formatted string ("4000 g") now also ships as {qty, unit}. The
+       display string is kept for compatibility, but the console reads the
+       structured pair, so unit presentation is a frontend decision made
+       once rather than a string parsed back apart at each call site.
+    """
     # ---- expiry (same query/annotation expiry_monitor uses) ----
     raw_batches = rows(c.execute(
         """
@@ -1662,9 +2434,25 @@ def dashboard_summary(
         if days < 1: return "today"
         return f"{days}d"
 
-    # ---- below reorder point (same source Replenishment reads) ----
-    depletion = ingredient_depletion(c, 30)
-    below_rop = sum(1 for d in depletion if d["below_reorder_point"])
+    def qty_pair(value, unit) -> dict:
+        """The structured half of point 3 above. `display` stays for any
+        client that still wants a ready-made string; `qty`/`unit` are what
+        the console actually formats from."""
+        return {"qty": value, "unit": unit, "display": f"{value:g} {unit}"}
+
+    # ---- forward depletion engine (same source + cache key Purchasing reads,
+    # so the two screens cannot disagree about which ingredients need buying) --
+    fc_key = _depletion_fingerprint(c) + ("ingredients", DEPLETION_HORIZON_DAYS, DEPLETION_LOOKBACK_DAYS)
+    ing_forecast = _forecast_cache.get_or_compute(
+        fc_key, lambda: ingredient_forecast(c, DEPLETION_HORIZON_DAYS, DEPLETION_LOOKBACK_DAYS,
+                                            demand_model=_demand_model(c))
+    )
+    fc_rows = ing_forecast["ingredients"]
+    buckets = ing_forecast["buckets"]
+    # "Needs restock" = the engine's own urgent tiers. Not a reorder-point
+    # comparison: see point 1 above for why that KPI could not be honest.
+    need_restock = sum(buckets.get(k, 0) for k in ("out", "critical", "at_risk"))
+    running_low = buckets.get("at_risk", 0)
 
     # ---- unsellable menu items (same view /pos/menu reads) ----
     menu_avail = rows(c.execute(
@@ -1675,97 +2463,215 @@ def dashboard_summary(
     # ---- stock value (shared with GET /reports/valuation) ----
     valuation = inventory_valuation(c)
 
-    # ---- verification queue preview (same source the Verification page reads) ----
-    verify_all = verification.list_queue(c)["items"]
+    # ---- verification queue (same source the Data Quality page reads) ----
+    verify_queue = verification.list_queue(c)
+    verify_all = verify_queue["items"]
 
-    # ---- kpis, fixed order: soonest-to-hurt first ----
+    # ---- master-data coverage: what share of the catalog each figure rests on --
+    cov = c.execute(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN reorder_point_base IS NOT NULL THEN 1 ELSE 0 END) AS rop,
+               SUM(CASE WHEN supplier IS NOT NULL AND TRIM(supplier) <> '' THEN 1 ELSE 0 END) AS supplier,
+               SUM(CASE WHEN pack_size IS NULL OR pack_size <= 0 THEN 1 ELSE 0 END) AS no_pack,
+               SUM(CASE WHEN unit_cost IS NULL THEN 1 ELSE 0 END) AS no_cost,
+               COUNT(DISTINCT TRIM(purchase_unit)) AS purchase_unit_spellings
+          FROM ingredient WHERE is_active=1
+        """
+    ).fetchone()
+
+    # ---- freshness: the age of the evidence behind everything above -------
+    latest_order = c.execute(
+        "SELECT MAX(created_at) AS t FROM customer_order WHERE status != 'void'"
+    ).fetchone()["t"]
+    latest_ledger = c.execute("SELECT MAX(created_at) AS t FROM stock_ledger").fetchone()["t"]
+    latest_receipt = c.execute(
+        "SELECT MAX(created_at) AS t FROM stock_ledger WHERE reason='purchase_receipt'"
+    ).fetchone()["t"]
+
+    freshness = {
+        # Demand, and therefore every runway and purchase quantity on this
+        # screen, cannot be more current than this.
+        "latestOrderAt": latest_order,
+        "latestLedgerAt": latest_ledger,
+        "latestReceivingAt": latest_receipt,
+        "businessDate": ing_forecast["businessDate"],
+        "computedAt": ing_forecast["asOf"],
+        "demandLookbackDays": ing_forecast["lookbackDays"],
+        "tradingDaysInWindow": ing_forecast["tradingDaysInWindow"],
+        "demandModel": ing_forecast["demandModel"],
+        "prophetDrivenIngredients": ing_forecast["prophetDrivenIngredients"],
+    }
+
+    coverage = {
+        "ingredientsTotal": cov["total"],
+        "ingredientsForecast": len(fc_rows),
+        "reorderPointsConfigured": ing_forecast["reorderPointsConfigured"],
+        "reorderPointsTotal": cov["total"],
+        "suppliersConfigured": cov["supplier"],
+        "missingPackSize": cov["no_pack"],
+        "missingUnitCost": cov["no_cost"],
+        "purchaseUnitSpellings": cov["purchase_unit_spellings"],
+        "costVerified": valuation["priced_items"],
+        "costEstimated": max(0, cov["total"] - valuation["priced_items"] - cov["no_cost"]),
+        "costUnset": cov["no_cost"],
+        "verificationOpen": verify_queue["count"],
+        "verificationByPriority": verify_queue["by_priority"],
+    }
+
+    # ---- kpis, fixed order: soonest-to-hurt first -------------------------
+    # `basis` is new and is the point of the rewrite: every count says what
+    # it was actually derived from, so a reader can tell a measured signal
+    # from an unconfigured field without leaving the screen.
+    rop_note = (
+        "from the demand forecast — reorder points are not configured"
+        if coverage["reorderPointsConfigured"] == 0 else
+        f"{coverage['reorderPointsConfigured']} of {coverage['reorderPointsTotal']} "
+        "ingredients have a reorder point"
+    )
     kpis = [
-        {"key": "expired", "value": len(expired), "display": None, "label": "Expired batches",
-         "foot": "discard or credit today", "severity": "crit" if expired else "good",
-         "icon": "⏱", "route": "expiry"},
-        {"key": "expiringSoon", "value": len(expiring_soon), "display": None, "label": "Expiring ≤7 days",
-         "foot": "use first, FEFO order", "severity": "warn" if expiring_soon else "good",
-         "icon": "◔", "route": "expiry"},
-        {"key": "belowReorderPoint", "value": below_rop, "display": None, "label": "Below reorder point",
-         "foot": "every item has a buffer" if not below_rop else "restock before the next delivery",
-         "severity": "crit" if below_rop else "good", "icon": "✓" if not below_rop else "⚠",
-         "route": "intel"},
-        {"key": "unsellable", "value": len(unsellable), "display": None, "label": "Menu item unsellable",
-         "foot": "missing ingredient stock" if unsellable else "every item can be sold",
-         "severity": "warn" if unsellable else "good", "icon": "⨯" if unsellable else "✓",
-         "route": "menu"},
+        {"key": "expired", "value": len(expired), "display": None, "label": "Expired",
+         "foot": "discard or credit today" if expired else "nothing has expired",
+         "severity": "crit" if expired else "good", "icon": "⏱", "route": "expiry",
+         "basis": "open FEFO batches past their expiry date"},
+        {"key": "expiringSoon", "value": len(expiring_soon), "display": None,
+         "label": "Expiring soon",
+         "foot": "use first, oldest first" if expiring_soon else "nothing due in the next 7 days",
+         "severity": "warn" if expiring_soon else "good", "icon": "◔", "route": "expiry",
+         "basis": "open batches expiring within 7 days"},
+        {"key": "needRestock", "value": need_restock, "display": None, "label": "Need restock",
+         "foot": rop_note,
+         "severity": "crit" if need_restock else "good",
+         "icon": "⚠" if need_restock else "✓", "route": "purchasing",
+         "basis": "forward demand forecast: projected to run out or fall below "
+                  "safety stock inside the lead time"},
+         # 2026-09 contract fix: this KPI used to be keyed "belowReorderPoint",
+         # which collided in name (though not in meaning) with
+         # wt/depletion.ingredient_forecast()'s own belowReorderPoint field --
+         # that one is a literal count of ingredients under a configured
+         # reorder_point_base; this one counts forward-forecast risk tiers.
+         # Same key, two different numbers was a real contract bug (see
+         # TestReplenishmentEndToEnd), not a naming preference -- renamed
+         # rather than documented around.
+        {"key": "unsellable", "value": len(unsellable), "display": None,
+         "label": "Blocked menu items",
+         "foot": "missing ingredient stock" if unsellable
+                 else f"all {len(menu_avail)} items can be sold",
+         "severity": "crit" if unsellable else "good",
+         "icon": "⨯" if unsellable else "✓", "route": "menu",
+         "basis": "v_menu_item_availability — the same view the POS sells from"},
         {"key": "stockValue", "value": valuation["total_value"],
          "display": f"₱{valuation['total_value']/1000:.1f}k" if valuation["total_value"] >= 1000
                      else f"₱{valuation['total_value']:.0f}",
-         "label": "Stock on hand", "foot": f"{valuation['priced_items']} of {valuation['total_items']} items priced",
-         "severity": "info", "icon": "₱", "route": "inventory"},
+         "label": "Stock value",
+         "foot": f"{valuation['priced_items']} of {valuation['total_items']} items priced",
+         "severity": "info", "icon": "₱", "route": "inventory",
+         "basis": "confirmed unit costs only; estimated costs are excluded from this total"},
     ]
 
-    # ---- action-required alerts, most urgent first, capped ----
-    alerts = []
-    for b in expired[:4]:
-        alerts.append({"severity": "crit", "headline": f"{b['ingredient_name']} — expired {abs(b['days_to_expiry'])}d ago",
-                        "detail": f"{b['qty_base']:g} {b['base_unit']} on hand", "route": "expiry"})
-    for b in [x for x in expiring_soon if x["days_to_expiry"] >= 0][:3]:
-        alerts.append({"severity": expiry_severity(b["days_to_expiry"]),
-                        "headline": f"{b['ingredient_name']} — {expiry_label(b['days_to_expiry'])}",
-                        "detail": f"{b['qty_base']:g} {b['base_unit']} on hand", "route": "expiry"})
-    for m in unsellable[:3]:
-        alerts.append({"severity": "warn", "headline": f"{m['name']} unsellable",
-                        "detail": f"Missing: {m['block_reason']}" if m["block_reason"] else "Missing ingredient stock",
-                        "route": "menu"})
+    # ---- action required, worst first ------------------------------------
+    attention = []
+    for b in expired[:6]:
+        attention.append({
+            "kind": "expired", "severity": "crit",
+            "headline": f"{b['ingredient_name']} — expired {abs(b['days_to_expiry'])} days ago",
+            "detail": "still counted as on hand until it is written off",
+            "qty": qty_pair(b["qty_base"], b["base_unit"]),
+            "ingredientId": b["ingredient_id"], "route": "expiry",
+        })
+    for r in [x for x in fc_rows if x["status"] in ("out", "critical")][:6]:
+        attention.append({
+            "kind": "restock", "severity": "crit",
+            "headline": f"{r['name']} — "
+                        + ("out of stock" if r["status"] == "out"
+                           else "runs out today" if (r["daysOfSupply"] or 0) < 1
+                           else f"about {round(r['daysOfSupply'])} day(s) left"),
+            "detail": f"lead time {r['leadTimeDays']} days"
+                      if r["leadTimeDays"] is not None else "lead time not set",
+            "qty": qty_pair(r["available"], r["baseUnit"]),
+            "ingredientId": r["ingredientId"], "route": "purchasing",
+        })
+    for b in [x for x in expiring_soon if x["days_to_expiry"] >= 0][:4]:
+        attention.append({
+            "kind": "expiring", "severity": expiry_severity(b["days_to_expiry"]),
+            "headline": f"{b['ingredient_name']} — expires "
+                        + ("today" if b["days_to_expiry"] < 1
+                           else f"in {b['days_to_expiry']} days"),
+            "detail": "use before it turns",
+            "qty": qty_pair(b["qty_base"], b["base_unit"]),
+            "ingredientId": b["ingredient_id"], "route": "expiry",
+        })
+    for m in unsellable[:4]:
+        attention.append({
+            "kind": "blocked", "severity": "crit",
+            "headline": f"{m['name']} cannot be sold",
+            "detail": m["block_reason"] or "an ingredient it needs is out of stock",
+            "qty": None, "ingredientId": None, "route": "menu",
+        })
     order = {"crit": 0, "warn": 1, "info": 2, "good": 3, "flat": 4}
-    alerts.sort(key=lambda a: order.get(a["severity"], 5))
-    alerts = alerts[:8]
+    attention.sort(key=lambda a: order.get(a["severity"], 5))
+    attention = attention[:12]
 
-    # ---- forecast preview: the single highest-recent-volume POS-visible item ----
-    top_item = c.execute(
-        """
-        SELECT m.id, m.name, SUM(ol.qty) AS qty_sold
-          FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-          JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND m.pos_visible = 1
-           AND o.created_at >= ?
-         GROUP BY m.id ORDER BY qty_sold DESC LIMIT 1
-        """,
-        (timeutil.utc_bound_n_manila_days_ago(30),),
-    ).fetchone()
-    if top_item is None:
-        forecast_preview = {"insufficientData": True, "daysOfHistory": 0, "requiredDays": 7,
-                             "labels": [], "values": [], "note": "No completed orders yet."}
-    else:
-        max_order = c.execute("SELECT MAX(id) AS m FROM customer_order").fetchone()["m"] or 0
-        key = (str(db.db_path()), top_item["id"], 7, 90, max_order)
-        fc = _forecast_cache.get_or_compute(
-            key, lambda: menu_item_demand_prophet(c, top_item["id"], 7, 90)
-        )
-        if fc.get("insufficient_data"):
-            forecast_preview = {
-                "insufficientData": True, "daysOfHistory": fc.get("active_days", 0),
-                "requiredDays": fc.get("required_days", 7), "labels": [], "values": [],
-                "note": f"Prophet needs {fc.get('required_days', 7)}+ days of real sales per menu item. "
-                        f"The closest item ({top_item['name']}) has {fc.get('active_days', 0)} days on file.",
-            }
-        else:
-            forecast_preview = {
-                "insufficientData": False, "daysOfHistory": None, "requiredDays": 7,
-                "labels": [f["date"] for f in fc["forecast"]],
-                "values": [f["qty"] for f in fc["forecast"]],
-                "note": f"{top_item['name']} — next 7 days",
-            }
+    # ---- buy today: the ingredients with a real restock recommendation ----
+    # suggestedOrderQty is the depletion engine's own figure, in the
+    # ingredient's own purchase unit. Rows without one are omitted rather
+    # than shown with an invented quantity.
+    buy_today = [
+        {
+            "ingredientId": r["ingredientId"], "name": r["name"], "status": r["status"],
+            "available": qty_pair(r["available"], r["baseUnit"]),
+            "daysOfSupply": r["daysOfSupply"],
+            "depletionDate": r["depletionDate"],
+            "leadTimeDays": r["leadTimeDays"],
+            "purchaseUnit": r["purchaseUnit"],
+            "packSize": r["packSize"],
+            "suggestedOrderQty": r["suggestedOrderQty"],
+            "suggestedOrderUnit": r["suggestedOrderUnit"],
+            "expectedBaseQty": (r["suggestedOrderQty"] * r["packSize"])
+                               if (r["suggestedOrderQty"] is not None and r["packSize"]) else None,
+            "baseUnit": r["baseUnit"],
+            "demandSource": r["demandSource"],
+        }
+        for r in fc_rows
+        if r["status"] in ("out", "critical", "at_risk")
+    ]
+
+    # ---- use first: oldest stock, FEFO order ------------------------------
+    use_first = [
+        {"ingredientId": b["ingredient_id"], "name": b["ingredient_name"],
+         "qty": qty_pair(b["qty_base"], b["base_unit"]),
+         "label": expiry_label(b["days_to_expiry"]),
+         "daysToExpiry": b["days_to_expiry"],
+         "tracking": b["tracking"],
+         "severity": expiry_severity(b["days_to_expiry"])}
+        for b in batches[:8]
+    ]
 
     return {
+        "asOf": ing_forecast["asOf"],
+        "businessDate": ing_forecast["businessDate"],
+        "freshness": freshness,
+        "coverage": coverage,
+        "valuation": valuation,
         "kpis": kpis,
-        "alerts": alerts,
-        "forecastPreview": forecast_preview,
-        "expiryPreview": [
-            {"name": b["ingredient_name"], "qty": f"{b['qty_base']:g} {b['base_unit']}",
-             "label": expiry_label(b["days_to_expiry"]), "severity": expiry_severity(b["days_to_expiry"])}
-            for b in batches[:5]
+        "alerts": attention,
+        "forecastPreview": _forecast_preview(c),
+        "buyToday": buy_today,
+        "useFirst": use_first,
+        "buckets": buckets,
+        "runningLow": running_low,
+        "menuItemsTotal": len(menu_avail),
+        "blockedMenuItems": [
+            {"name": m["name"], "reason": m["block_reason"]} for m in unsellable[:10]
         ],
+        # Not-yet-reviewed items lead (stable sort preserves list_queue's own
+        # priority/group/name ordering within each half) -- a value an admin
+        # has already looked at and knowingly kept as an estimate shouldn't
+        # crowd a genuinely untouched one out of this 6-item preview.
         "verifyPreview": [
-            {"label": f"{i['entity_name']} — {i['field_label']}", "priority": i["priority"]}
-            for i in verify_all[:5]
+            {"label": f"{i['entity_name']} — {i['field_label']}", "priority": i["priority"],
+             "entityName": i["entity_name"], "fieldLabel": i["field_label"]}
+            for i in sorted(verify_all, key=lambda i: i["reviewed"])[:6]
         ],
     }
 
@@ -1789,6 +2695,32 @@ def forecast_depletion(
         "below_reorder_point": sum(1 for d in data if d["below_reorder_point"]),
         "reorder_points_configured": sum(1 for d in data if d["reorder_point_base"] is not None),
     }
+
+
+@app.get("/console/data-quality", tags=["console"])
+def data_quality_endpoint(
+    lookback_days: int = Query(90, ge=1, le=365),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs_page("system")),
+):
+    """Machine-readable data-quality report over the real tables the ML
+    layer reads — see wt/data_quality.py. Read-only: every check is a plain
+    SQL query, nothing here alters a row."""
+    return data_quality_report(c, lookback_days)
+
+
+@app.get("/console/replenishment/backtest", tags=["console"])
+def replenishment_backtest_endpoint(
+    lookback_days: int = Query(60, ge=37, le=365),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Historical simulation of the replenishment early-warning signal
+    (ingredient_forecast()'s critical/out status) against what the real
+    ledger shows actually happened afterward — see
+    wt/depletion.replenishment_backtest() for the full methodology and
+    exactly what this does and does not claim to evaluate. Not cached: this
+    is an on-demand technical-panel report, not something read on every
+    dashboard load."""
+    return replenishment_backtest(c, lookback_days)
 
 
 @app.get("/console/forecasts/demand", tags=["console"])
@@ -1821,12 +2753,229 @@ def forecast_demand(
     return {"items": [menu_item_demand(c, i["id"], horizon_days, lookback_days) for i in items]}
 
 
+@app.get("/console/forecasts/store-demand", tags=["console"])
+def forecast_store_demand(
+    metric: str = Query("items", description="orders | items | sales"),
+    horizon_days: int = Query(7, ge=1, le=30),
+    lookback_days: int = Query(90, ge=7, le=365),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Store-wide daily demand (orders taken, items sold, or gross sales)
+    plus a real Prophet forecast — the store-level analogue of
+    /console/forecasts/demand, aggregated across the whole menu instead of
+    one item. See wt/forecasting.store_demand_prophet(). Cached the same way
+    as the per-item fit, and invalidated the same way — MAX(customer_order.id)
+    in the cache key."""
+    if metric not in STORE_METRICS:
+        raise ValidationError(f"metric must be one of {STORE_METRICS}")
+    max_order = c.execute("SELECT MAX(id) AS m FROM customer_order").fetchone()["m"] or 0
+    key = (str(db.db_path()), "store-demand", metric, horizon_days, lookback_days, max_order)
+    return _forecast_cache.get_or_compute(
+        key, lambda: store_demand_prophet(c, metric, horizon_days, lookback_days)
+    )
+
+
+def _demand_model(c: sqlite3.Connection) -> str:
+    """'prophet' or 'ewma' -- which demand model wt/depletion.py's forward
+    chain uses for future-day demand (see build_demand()'s docstring).
+    Backed by the app_setting 'depletion_demand_model' (0=ewma, 1=prophet;
+    app_setting is float-only, see unli.get_setting), defaulting to ewma so
+    installing this code changes nothing until someone deliberately opts in.
+    One setting, one authoritative answer at a time -- never both engines
+    live simultaneously for the same request the way the old
+    forecasting.ingredient_depletion() purchase-quantity duplicate was."""
+    return "prophet" if unli.get_setting(c, "depletion_demand_model", 0.0) >= 1.0 else "ewma"
+
+
+def _depletion_fingerprint(c: sqlite3.Connection) -> tuple:
+    """What the ingredient forecast actually reads, cheaply summarised.
+
+    A new order (demand + today's observation), a new ledger row (stock,
+    receipts, wastage), a recipe edit, or an ingredient-record edit all
+    change the answer, so all four are in the key — the instant any of them
+    lands, the next request recomputes for real rather than serving a number
+    that predates it. The Manila hour is in there too because the intraday
+    nowcast is explicitly a function of how much of today has elapsed; it
+    must not be frozen at whatever hour the first caller happened to ask.
+
+    2026-09 audit finding: ingredient.updated_at was missing from this key.
+    on_hand_base/reserved_base changes are covered indirectly (every path
+    that moves them -- commit, receive, count, wastage -- also writes a
+    stock_ledger row), but PATCH /console/ingredients/{pk} changes
+    reorder_point_base, lead_time_days, pack_size, yield_factor and
+    unit_cost with no ledger/order/recipe_line row at all. An owner
+    resetting an ingredient's reorder point or lead time (both read
+    directly by ingredient_forecast) would silently keep serving the
+    pre-edit forecast/replenishment numbers until some unrelated order or
+    recipe change happened to invalidate the cache for an entirely
+    different reason. Caught by
+    TestReplenishmentEndToEnd.test_served_orders_flow_through_forecast_and_replenishment_to_the_api,
+    which sets a reorder point mid-test and expects the very next request
+    to see it.
+    """
+    return (
+        str(db.db_path()),
+        c.execute("SELECT MAX(id) AS m FROM customer_order").fetchone()["m"] or 0,
+        c.execute("SELECT MAX(id) AS m FROM stock_ledger").fetchone()["m"] or 0,
+        c.execute("SELECT MAX(id) AS m FROM recipe_line").fetchone()["m"] or 0,
+        c.execute("SELECT MAX(updated_at) AS m FROM ingredient").fetchone()["m"] or "",
+        timeutil.to_manila(timeutil.utc_now()).hour,
+        # 2026-09: which demand model is active, and which generation of
+        # Prophet fits is cached -- either changing must invalidate exactly
+        # like any other input this forecast reads, or a demand_model
+        # toggle or a completed refresh could serve pre-change numbers
+        # until an unrelated order happened to invalidate the cache too.
+        _demand_model(c),
+        prophet_refresh_generation(),
+    )
+
+
+@app.get("/console/forecasts/ingredients", tags=["console"])
+def forecast_ingredients(
+    horizon_days: int = Query(DEPLETION_HORIZON_DAYS, ge=3, le=60),
+    lookback_days: int = Query(DEPLETION_LOOKBACK_DAYS, ge=14, le=365),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Ingredient-level depletion forecasting — the whole chain, forward.
+
+    POS order -> ordered menu quantity -> recipe quantities -> ingredient
+    consumption -> current on-hand -> historical demand -> today's observed
+    demand -> future demand -> projected consumption -> projected remaining
+    stock -> projected depletion date -> days of supply -> lead-time warning.
+
+    Distinct from /console/forecasts/depletion, which is the *backward*
+    runway number (trailing ledger rate) that powers the Replenishment
+    table. Both are kept: they answer different questions and neither is a
+    substitute for the other. See wt/depletion.py for the model.
+    """
+    key = _depletion_fingerprint(c) + ("ingredients", horizon_days, lookback_days)
+    return _forecast_cache.get_or_compute(
+        key, lambda: ingredient_forecast(c, horizon_days, lookback_days, demand_model=_demand_model(c))
+    )
+
+
+@app.get("/console/forecasts/ingredients/{ingredient_pk}", tags=["console"])
+def forecast_ingredient_detail(
+    ingredient_pk: int,
+    horizon_days: int = Query(DEPLETION_HORIZON_DAYS, ge=3, le=60),
+    lookback_days: int = Query(DEPLETION_LOOKBACK_DAYS, ge=14, le=365),
+    history_days: int = Query(30, ge=7, le=180),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """One ingredient's full picture: reconstructed stock history, forward
+    trajectory with the demand model's own uncertainty band, the menu items
+    driving consumption (measured, from order_line x v_recipe_leaf), and the
+    specific observations behind the forecast. Every figure traces to a row
+    in this database — nothing here is generated to fill a gap."""
+    key = _depletion_fingerprint(c) + ("detail", ingredient_pk, horizon_days,
+                                       lookback_days, history_days)
+    return _forecast_cache.get_or_compute(
+        key,
+        lambda: ingredient_depletion_detail(c, ingredient_pk, horizon_days,
+                                            lookback_days, history_days,
+                                            demand_model=_demand_model(c)),
+    )
+
+
+@app.post("/console/forecasts/refresh-prophet-baselines", tags=["console"])
+def refresh_prophet_baselines_endpoint(
+    horizon_days: int = Query(DEPLETION_HORIZON_DAYS, ge=3, le=60),
+    lookback_days: int = Query(DEPLETION_LOOKBACK_DAYS, ge=14, le=365),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.write")),
+):
+    """Fit Prophet for every POS-visible menu item and cache the result --
+    the only place ingredient replenishment's Prophet model is ever fit. Not
+    triggered automatically by any request: measured at ~1.8s per item, so a
+    realistic menu is tens of seconds to a couple of minutes, which is fine
+    for an explicit call (an admin action, or a scheduled task hitting this
+    endpoint on a cadence such as nightly) and not fine to block a live page
+    load on. Only takes effect for demand_model='prophet' -- see the
+    'depletion_demand_model' app_setting; with it left at the default
+    ('ewma'), calling this is harmless but has no visible effect. See
+    wt/depletion.refresh_prophet_baselines() for the full reasoning."""
+    return refresh_prophet_baselines(c, horizon_days, lookback_days)
+
+
+@app.get("/console/menu/margins", tags=["console"])
+def menu_margins(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Every menu price against its recipe's estimated ingredient cost.
+
+    ESTIMATED is the operative word and it is reported, not buried: almost no
+    ingredient in this database carries a supplier-confirmed unit cost yet
+    (unit_cost_status / price_status), so a margin here is a margin against a
+    benchmark, and `costConfidence` says so per row. Nothing on this screen
+    changes a price — a negative margin is a flag for a human, and the two
+    plausible causes (a wrong benchmark cost vs. a genuinely underpriced
+    item) are not distinguishable from inside this system.
+    """
+    out = []
+    for m in rows(c.execute(
+        "SELECT id, menu_item_id, name, category, price, recipe_id, is_unli "
+        "FROM menu_item ORDER BY category, name"
+    )):
+        row = {**m, "cost": None, "marginPct": None, "unpricedIngredients": [],
+               "unverifiedCostLines": 0, "costConfidence": "none", "flags": []}
+        if m["price"] is None or m["price"] <= 0:
+            row["flags"].append("price is zero or unset")
+        if m["is_unli"]:
+            # An unlimited cover's consumption is the reconciled lambda vector,
+            # not a recipe — costing it from a recipe it does not have would be
+            # a fabrication. wt/unli.py owns that number.
+            row["costConfidence"] = "not_recipe_costed"
+            out.append(row)
+            continue
+        if m["recipe_id"] is None:
+            row["flags"].append("no recipe linked")
+            out.append(row)
+            continue
+        rc = recipe_cost(c, m["recipe_id"])
+        row["cost"] = rc["total_cost"]
+        row["unpricedIngredients"] = rc["unpriced_ingredients"]
+        unverified = sum(1 for ln in rc["lines"] if not ln["cost_confirmed"])
+        row["unverifiedCostLines"] = unverified
+        row["costConfidence"] = (
+            "incomplete" if rc["unpriced_ingredients"]
+            else "estimated" if unverified else "confirmed"
+        )
+        if m["price"]:
+            row["marginPct"] = round((m["price"] - rc["total_cost"]) / m["price"] * 100, 1)
+            if row["marginPct"] < 0:
+                row["flags"].append("estimated ingredient cost exceeds the menu price")
+            elif row["marginPct"] < 15:
+                row["flags"].append("estimated gross margin under 15%")
+        out.append(row)
+
+    return {
+        "items": out,
+        "negativeMargin": sum(1 for r in out if r["marginPct"] is not None and r["marginPct"] < 0),
+        "thinMargin": sum(1 for r in out
+                          if r["marginPct"] is not None and 0 <= r["marginPct"] < 15),
+        "confirmedCostItems": sum(1 for r in out if r["costConfidence"] == "confirmed"),
+        "note": ("Costs are computed from each recipe's expansion times the ingredient's "
+                 "recorded unit cost. Ingredient costs in this database are benchmarks "
+                 "pending supplier confirmation, so treat every margin below as an "
+                 "estimate — see Needs Verification."),
+    }
+
+
 @app.get("/console/anomalies", tags=["console"])
 def anomalies(
     lookback_days: int = Query(90, ge=1, le=365),
+    ingredient_id: int | None = None,
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
 ):
     """Both anomaly passes, reported separately rather than merged.
+
+    `ingredient_id`, when given, narrows stock_loss_anomalies (and its
+    `anomalies` alias) to one ingredient's own flags -- applied AFTER
+    detection, so the model still scores against the whole pooled
+    population; only the response list is filtered (see lib/api/
+    intelligence.js's getAnomalies(), which documents exactly this and was
+    already sending the param before this route accepted it). consumption_
+    anomalies is keyed by unlimited-item stream, not a raw ingredient, so
+    it is intentionally not narrowed by this parameter.
 
     consumption_anomalies is the specified model: IsolationForest over the
     seven-feature reconciled daily consumption vectors. stock_loss_anomalies
@@ -1853,11 +3002,45 @@ def anomalies(
         (path, "consumption", lookback_days, max_recon),
         lambda: detect_consumption_anomalies(c, lookback_days),
     )
+    if ingredient_id is not None:
+        losses = [a for a in losses if a["ingredient_id"] == ingredient_id]
     return {
         "consumption_anomalies": consumption,
         "stock_loss_anomalies": losses,
         "anomalies": losses,
     }
+
+
+class AnomalyReviewIn(BaseModel):
+    status: Literal["flagged", "under_review", "confirmed_anomaly", "false_positive", "resolved"]
+    note: str | None = None
+    client_request_id: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/console/anomalies/{ledger_id}/review", tags=["console"])
+def review_anomaly(
+    ledger_id: int, body: AnomalyReviewIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")),
+):
+    """Record a human reviewer's classification of one stock-loss anomaly
+    flag (or, to catch a false negative, of a ledger row the model never
+    flagged at all). This is the ground truth wt/anomaly.py's
+    validation_metrics() computes Precision/Recall/F1 from — nothing is
+    ever auto-labeled confirmed_anomaly, and there is no accusation implied
+    by a flag alone. See wt/anomaly.py's record_anomaly_review()."""
+    return record_anomaly_review(
+        c, ledger_id, body.status, body.note, user_id=p["sub"],
+        client_request_id=body.client_request_id,
+    )
+
+
+@app.get("/console/anomalies/{ledger_id}/reviews", tags=["console"])
+def anomaly_review_history_endpoint(
+    ledger_id: int, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")),
+):
+    """Every review ever recorded for this ledger row, oldest first."""
+    return {"ledger_id": ledger_id, "reviews": anomaly_review_history(c, ledger_id)}
 
 
 @app.get("/console/combinations", tags=["console"])
@@ -1870,16 +3053,144 @@ def combinations(
     return product_combinations(c, lookback_days)
 
 
+class ComboPricingPreviewIn(BaseModel):
+    item_a_menu_item_id: int
+    item_b_menu_item_id: int
+    portion_multiplier_a: float = Field(default=1.0, gt=0, le=5)
+    portion_multiplier_b: float = Field(default=1.0, gt=0, le=5)
+
+
+@app.post("/console/combo-pricing/preview", tags=["console"])
+def combo_pricing_preview(
+    body: ComboPricingPreviewIn, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")),
+):
+    """Read-only cost + suggested price range for a potential combo of two
+    menu items — never writes anything. See wt/combo_pricing.py for the
+    ingredient/packaging/labor/overhead breakdown and price-range logic;
+    portion multipliers default to each item's real recipe portion as sold
+    (1.0) and are only ever scaled down on an explicit request, never
+    invented (Part 16)."""
+    cost = estimate_combo_cost(
+        c, body.item_a_menu_item_id, body.item_b_menu_item_id,
+        body.portion_multiplier_a, body.portion_multiplier_b,
+    )
+    price = suggest_price_range(c, cost)
+    return {"cost_estimate": cost, "price_suggestion": price}
+
+
+class ComboPricingConfigIn(BaseModel):
+    target_food_cost_pct: float | None = Field(default=None, ge=1, le=100)
+    labor_method: Literal["fixed_per_serving", "pct_of_ingredient_cost"] | None = None
+    labor_fixed_amount: float | None = Field(default=None, ge=0)
+    labor_pct: float | None = Field(default=None, ge=0, le=100)
+    overhead_pct: float | None = Field(default=None, ge=0, le=100)
+    preferred_min_price: float | None = Field(default=None, ge=0)
+    preferred_max_price: float | None = Field(default=None, ge=0)
+    max_discount_pct: float | None = Field(default=None, ge=0, le=100)
+
+
+@app.get("/console/combo-pricing-config", tags=["console"])
+def combo_pricing_config(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    return get_combo_pricing_config(c)
+
+
+@app.patch("/console/combo-pricing-config", tags=["console"])
+def set_combo_pricing_config_endpoint(
+    body: ComboPricingConfigIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")),
+):
+    """Admin-only, same capability level as pos-config. Every field left
+    out of the request body (Python None on a field that was never sent
+    at all is indistinguishable from an explicit null in a plain dict, so
+    the frontend only ever sends fields the admin actually touched) is left
+    exactly as it was — sending a field explicitly as null clears it back
+    to 'not configured'."""
+    provided = body.model_dump(exclude_unset=True)
+    return set_combo_pricing_config(c, provided, user_id=p["sub"])
+
+
+class DraftComboIn(BaseModel):
+    item_a_menu_item_id: int
+    item_b_menu_item_id: int
+    name: str | None = Field(default=None, max_length=120)
+    portion_multiplier_a: float = Field(default=1.0, gt=0, le=5)
+    portion_multiplier_b: float = Field(default=1.0, gt=0, le=5)
+    chosen_price: float | None = Field(default=None, ge=0)
+    note: str | None = Field(default=None, max_length=2000)
+    pair_stats: dict[str, Any] | None = None
+    client_request_id: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/console/combo-pricing/drafts", tags=["console"])
+def create_draft_combo_endpoint(
+    body: DraftComboIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("combo.draft")),
+):
+    """Saves a combo idea as a draft — never publishes to menu_item/POS
+    (Part 38). Recomputes cost/price server-side; the pricing_snapshot this
+    writes is the audit trail for what was used at the moment of saving
+    (Part 50/51)."""
+    return create_draft_combo(
+        c, body.item_a_menu_item_id, body.item_b_menu_item_id,
+        name=body.name, portion_multiplier_a=body.portion_multiplier_a,
+        portion_multiplier_b=body.portion_multiplier_b, chosen_price=body.chosen_price,
+        note=body.note, pair_stats=body.pair_stats, user_id=p["sub"],
+        client_request_id=body.client_request_id,
+    )
+
+
+@app.get("/console/combo-pricing/drafts", tags=["console"])
+def list_draft_combos_endpoint(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    return {"drafts": list_draft_combos(c)}
+
+
+class DraftComboReviewIn(BaseModel):
+    status: Literal["draft", "approved", "rejected"]
+    note: str | None = Field(default=None, max_length=2000)
+    client_request_id: str | None = Field(default=None, max_length=64)
+
+
+@app.post("/console/combo-pricing/drafts/{draft_id}/review", tags=["console"])
+def review_draft_combo_endpoint(
+    draft_id: int, body: DraftComboReviewIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("combo.draft")),
+):
+    """Records an owner/admin review decision on a saved draft combo.
+    Approving here is a record-keeping decision only — it does NOT create a
+    real menu_item or POS product; publishing a combo to the live menu is a
+    separate action outside this endpoint's scope (Part 62)."""
+    return review_draft_combo(
+        c, draft_id, body.status, note=body.note, user_id=p["sub"],
+        client_request_id=body.client_request_id,
+    )
+
+
 @app.get("/console/model-details", tags=["console"])
 def model_details_endpoint(
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+    _pg: dict = Depends(needs_page("system")),
 ):
     """Real technical stats for the three Phase 3 models — a holdout
     backtest for Prophet, live parameters and current pooled-sample counts
     for IsolationForest and FP-growth. Kept separate from the plain-language
     Forecasts/Anomaly/Reports pages; this is the evidence-of-work view."""
+    max_order = c.execute("SELECT MAX(id) AS m FROM customer_order").fetchone()["m"] or 0
+    demand_forecast = _model_details_cache.get_or_compute(
+        (str(db.db_path()), "demand_forecast", max_order),
+        lambda: evaluate_demand_model(c),
+    )
+    store_demand_forecast = _model_details_cache.get_or_compute(
+        (str(db.db_path()), "store_demand_forecast", max_order),
+        lambda: evaluate_store_demand_model(c),
+    )
     return {
-        "demand_forecast": evaluate_demand_model(c),
+        "demand_forecast": demand_forecast,
+        "store_demand_forecast": store_demand_forecast,
         "anomaly_detection": consumption_model_details(c),
         "stock_loss_detection": anomaly_model_details(c),
         "product_combinations": association_model_details(c),
@@ -1921,7 +3232,7 @@ class ReconcileIn(BaseModel):
 @app.post("/unli/reconciliation", tags=["unli"], status_code=201)
 def unli_reconcile(
     body: ReconcileIn, c: sqlite3.Connection = Depends(conn),
-    p: dict = Depends(needs("unli.reconcile")),
+    p: dict = Depends(needs("unli.reconcile.write")),
 ):
     """Stage 2 + 3 in one transaction: record the measurement, compute actual
     consumption, compare it against the provisional deduction, judge it
@@ -2133,6 +3444,39 @@ def unli_reopen_session(
     return refills.set_session_status(c, pk, "active", body.note, user_id=p["sub"])
 
 
+class HeadFlavorsIn(BaseModel):
+    flavors: list[str | None] = Field(default_factory=list, max_length=50)
+
+
+@app.patch("/unli/sessions/{pk}/head-flavors", tags=["unli"])
+def unli_set_head_flavors(
+    pk: int, body: HeadFlavorsIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("unli.refill")),
+):
+    """Which flavour each head at this table initially chose — repeats
+    allowed, capped server-side at the session's own head_count (see
+    refills.set_head_flavors). Purely informational: never touches a
+    refill, a reservation, or the stock ledger — record_refill still sizes
+    every actual served round off head_count alone, completely unchanged."""
+    return refills.set_head_flavors(c, pk, body.flavors, user_id=p["sub"])
+
+
+class SessionTableIn(BaseModel):
+    table_label: str = Field(min_length=1, max_length=40)
+
+
+@app.patch("/unli/sessions/{pk}/table", tags=["unli"])
+def unli_set_session_table(
+    pk: int, body: SessionTableIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("unli.refill")),
+):
+    """Assign (or change) the physical table for an already-open unlimited
+    session — the table is picked from the refill workflow, not at order
+    creation, so a busy cashier can ring up the first serve before the floor
+    even knows which table it's going to. See refills.set_session_table."""
+    return refills.set_session_table(c, pk, body.table_label, user_id=p["sub"])
+
+
 class RefillIn(BaseModel):
     flavor_id: int
     note: str | None = None
@@ -2241,6 +3585,72 @@ def unli_set_tolerance(
     return {"tolerance_ratio": body.tolerance_ratio}
 
 
+# The restaurant's actual seating: how many numbered tables the POS offers
+# a cashier when taking a Dine In order. 9 until an admin says otherwise —
+# installing this changes nothing about an existing deployment.
+DEFAULT_TABLE_COUNT = 9
+
+
+class PosConfigIn(BaseModel):
+    service_charge_enabled: bool | None = None
+    service_charge_rate: float | None = Field(default=None, ge=0, le=1)
+    # Only present for a discount type the admin wants to flip; omitted
+    # types are left exactly as they were. Wings Theory's default (nothing
+    # ever sent here) is every type enabled at its existing statutory/house
+    # rate — this never invents a new rate, only whether the till may offer
+    # a type at all.
+    discount_enabled: dict[Literal["senior", "pwd", "staff"], bool] | None = None
+    table_count: int | None = Field(default=None, ge=1, le=200)
+
+
+@app.get("/console/pos-config", tags=["console"])
+def get_pos_config(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("recipe.read")),
+):
+    """The admin-configurable half of order pricing that isn't a per-item
+    price or a per-flavour add-on: whether a service charge applies at all,
+    and which of the Senior/PWD/Staff discount cards a cashier may select.
+    Both default to "current business rule, unchanged" — service charge
+    off, every discount type enabled — until an admin explicitly touches
+    this. See _effective_service_charge()/_enabled_discount_types(), the
+    same functions create_order() and GET /pos/menu actually use, so this
+    screen can never drift from what checkout charges."""
+    enabled, rate = _effective_service_charge(c)
+    enabled_discounts = _enabled_discount_types(c)
+    return {
+        "service_charge_enabled": enabled,
+        "service_charge_rate": rate if enabled else unli.get_setting(
+            c, "service_charge_rate", SERVICE_CHARGE_RATE),
+        "discounts": {
+            t: {"enabled": t in enabled_discounts, "rate": DISCOUNT_RATES[t],
+                "label": DISCOUNT_LABELS[t]}
+            for t in DISCOUNT_RATES
+        },
+        "table_count": int(unli.get_setting(c, "pos_table_count", DEFAULT_TABLE_COUNT)),
+    }
+
+
+@app.patch("/console/pos-config", tags=["console"])
+def set_pos_config(
+    body: PosConfigIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("pos_config.write")),
+):
+    """Admin-only. Cashiers read the effective result through GET /pos/menu
+    (service_charge_enabled/service_charge_rate/discount_rates) but cannot
+    reach this endpoint — see auth.CAPABILITIES' pos_config.write."""
+    if body.service_charge_enabled is not None:
+        unli.set_setting(c, "service_charge_enabled",
+                          1.0 if body.service_charge_enabled else 0.0, user_id=p["sub"])
+    if body.service_charge_rate is not None:
+        unli.set_setting(c, "service_charge_rate", body.service_charge_rate, user_id=p["sub"])
+    if body.discount_enabled:
+        for t, on in body.discount_enabled.items():
+            unli.set_setting(c, f"discount_{t}_enabled", 1.0 if on else 0.0, user_id=p["sub"])
+    if body.table_count is not None:
+        unli.set_setting(c, "pos_table_count", float(body.table_count), user_id=p["sub"])
+    return get_pos_config(c, p)
+
+
 # ===========================================================================
 # Static clients — kiosk pages for the POS and kitchen tablets. Served
 # same-origin so a tablet on the shop LAN needs only the server's address:
@@ -2259,25 +3669,57 @@ _STATIC_DIR = _Path(__file__).resolve().parent.parent / "static"
 app.mount("/img", StaticFiles(directory=_STATIC_DIR / "img"), name="brand-img")
 
 # Shared brand layer (intro animation CSS/JS) used by all four pages, so it
-# lives in one file instead of being duplicated into each HTML client.
+# lives in one file instead of being duplicated into each HTML client. This
+# is also where the entire console SPA's JS tree lives (assets/console/js).
+#
+# 2026-09 fix: StaticFiles emits ETag/Last-Modified but no Cache-Control, so
+# a browser is free to serve a console module byte-for-byte from disk cache
+# on a later visit without ever asking the server whether it changed --
+# discovered when a console bugfix kept failing to show up in an already-
+# cached browser tab even after a full page reload. Exactly the same failure
+# mode /pos's own "no-store" comment above already describes for pos.html,
+# just one layer down (the JS the HTML shell imports, not the shell itself).
+# no-cache (not no-store) still lets the browser keep a local copy and
+# revalidate it with a conditional GET against the ETag StaticFiles already
+# sends -- a 304 on every unchanged asset, a real fetch only when something
+# actually changed -- rather than re-downloading every asset on every load.
+@app.middleware("http")
+async def _no_cache_console_assets(request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/assets/"):
+        response.headers["Cache-Control"] = "no-cache"
+    return response
+
+
 app.mount("/assets", StaticFiles(directory=_STATIC_DIR / "assets"), name="assets")
 
 
 @app.get("/pos", include_in_schema=False)
 def pos_client():
-    return FileResponse(_STATIC_DIR / "pos.html")
+    # no-store: this file gets patched frequently mid-shift, and a stale
+    # cached copy silently running last week's JS in an already-open tab is
+    # a much worse failure mode than one extra fetch on every reload.
+    return FileResponse(_STATIC_DIR / "pos.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/kds", include_in_schema=False)
 def kds_client():
-    return FileResponse(_STATIC_DIR / "kds.html")
+    # no-store, same reasoning as /pos above — this shell was missing the
+    # same protection despite being exactly as susceptible: found 2026-09
+    # when a console.html fix (below) kept silently not showing up in an
+    # already-open tab, for this same reason.
+    return FileResponse(_STATIC_DIR / "kds.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/console", include_in_schema=False)
 def console_client():
-    return FileResponse(_STATIC_DIR / "console.html")
+    # no-store — same reasoning as /pos/ /kds above. Console changes land
+    # less often mid-shift than POS/KDS, but an owner reopening an
+    # already-open console tab expecting a just-shipped fix and silently
+    # getting yesterday's page is the same failure, not a smaller one.
+    return FileResponse(_STATIC_DIR / "console.html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/", include_in_schema=False)
 def landing():
-    return FileResponse(_STATIC_DIR / "landing.html")
+    return FileResponse(_STATIC_DIR / "landing.html", headers={"Cache-Control": "no-store"})

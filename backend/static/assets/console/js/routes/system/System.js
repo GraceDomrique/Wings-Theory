@@ -7,8 +7,9 @@ import { toast } from '../../components/ui/Feedback.js';
 import { stamp } from '../../lib/format.js';
 import { session } from '../../lib/api/client.js';
 import {
-  getChecks, getModelDetails, getLoginAudit, getActionAudit, CAPABILITY_REFERENCE,
+  getChecks, getModelDetails, getLoginAudit, getActionAudit,
 } from '../../lib/api/system.js';
+import { getCapabilityMatrix } from '../../lib/api/permissions.js';
 import { changePassword, resetPassword, MIN_PASSWORD_LENGTH } from '../../lib/api/account.js';
 
 /**
@@ -21,11 +22,12 @@ import { changePassword, resetPassword, MIN_PASSWORD_LENGTH } from '../../lib/ap
  */
 export async function render(ctx) {
   const isAdmin = (session.user || {}).role === 'admin';
-  const [state, models, logins, actions] = await Promise.all([
+  const [state, models, logins, actions, capabilities] = await Promise.all([
     getChecks(),
     getModelDetails().catch(() => null),
     isAdmin ? getLoginAudit(50).catch(() => null) : Promise.resolve(null),
     isAdmin ? getActionAudit(50).catch(() => null) : Promise.resolve(null),
+    getCapabilityMatrix().catch(() => []),
   ]);
 
   return h('div', {},
@@ -64,7 +66,7 @@ export async function render(ctx) {
           { key: 'manager', label: 'Manager', render: (r) => tick(r.manager) },
           { key: 'admin', label: 'Admin', render: (r) => tick(r.admin) },
         ],
-        rows: CAPABILITY_REFERENCE,
+        rows: capabilities,
       }),
       h('div', { class: 't-xs t-faint', style: { marginTop: '10px' } },
         `Signed in as ${(session.user || {}).displayName || 'unknown'} · role: ${(session.user || {}).role || 'unknown'}`)),
@@ -225,6 +227,23 @@ function modelCard(eyebrow, name, detail, fallbackNote) {
       if (detail.transactions_evaluated != null) bits.push(`${detail.transactions_evaluated} transactions analysed`);
       if (detail.min_pooled_samples != null) bits.push(`needs ${detail.min_pooled_samples} pooled samples`);
       if (detail.mae != null) bits.push(`MAE ${detail.mae}`);
+      // Rolling-backtest shape (demand_forecast / store_demand_forecast —
+      // see evaluate_demand_model() / evaluate_store_demand_model() in
+      // wt/forecasting.py): no top-level mae/n_estimators, so without this
+      // branch `bits` stays empty and the card silently falls back to
+      // fallbackNote's "not available" text even though the model is live.
+      if (detail.items_evaluated != null) {
+        bits.push(`${detail.items_evaluated} of ${detail.items_considered} items backtested`);
+        const prophetWape = (detail.fleet_summary || {}).prophet
+          ? detail.fleet_summary.prophet.mean_wape : null;
+        if (prophetWape != null) bits.push(`Prophet mean WAPE ${prophetWape}%`);
+        const pvb = detail.prophet_vs_baseline;
+        if (pvb && pvb.prophet_actually_better != null) {
+          bits.push(pvb.prophet_actually_better
+            ? `beats best baseline by ${pvb.absolute_improvement_wape_pts} pts`
+            : 'not measurably better than best baseline');
+        }
+      }
       if (bits.length) note = bits.join(' · ');
     }
   }

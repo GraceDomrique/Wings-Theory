@@ -24,7 +24,6 @@
  * @property {number} pk                  the integer primary key the API takes
  * @property {string} name
  * @property {'Wet food'|'Dry food'|'Consumable'|'Operational supply'|string} category
- * @property {number|null} onHandQty      in purchase units, if convertible
  * @property {string} onHandUnit          "packs", "bottles", "g"
  * @property {number|null} onHandBaseQty  normalized (grams / ml)
  * @property {string} baseUnit
@@ -198,7 +197,7 @@
  * @property {Object} kpis
  * @property {Object[]} alerts
  * @property {Object} forecastPreview
- * @property {Object[]} expiryPreview
+ * @property {Object[]} useFirst        renamed from expiryPreview, 2026-09
  * @property {Object[]} verifyPreview
  */
 

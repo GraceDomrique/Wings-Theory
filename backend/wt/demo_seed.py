@@ -158,7 +158,13 @@ def _pick_lines(rng: random.Random, items: list[dict], by_name: dict[str, dict])
 
 
 def _new_order(conn: sqlite3.Connection, table_label: str, head_count: int) -> tuple[int, str]:
-    n = conn.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+    # MAX(id), not COUNT(*): customer_order.id is AUTOINCREMENT (SQLite never
+    # reuses it), so this stays gap-safe if any row has ever been deleted --
+    # COUNT(*) would eventually regenerate an order_no that an earlier,
+    # still-surviving row already holds once enough new rows fill the gap.
+    # Identical to the COUNT(*) result whenever the table has never had a
+    # row removed (id and row count march together from an empty table).
+    n = conn.execute("SELECT COALESCE(MAX(id), 0) AS n FROM customer_order").fetchone()["n"]
     order_no = f"WT-{n + 1001}"
     cur = conn.execute(
         "INSERT INTO customer_order (order_no, table_label, head_count) VALUES (?,?,?)",
@@ -233,8 +239,22 @@ def _restock_shortfalls(conn: sqlite3.Connection, shortfalls: list[dict], ts: st
                         day: _dt.date, rng: random.Random) -> int:
     """Reactive restocking — exactly what a real shop does when something
     runs low mid-service: sized generously (25x the immediate need) so the
-    same ingredient isn't triggering a restock every other order."""
+    same ingredient isn't triggering a restock every other order.
+
+    InsufficientStockError carries two different shortfall shapes (see
+    errors.py): a quantity shortage (`needed`/`available`, from reserve_order
+    or _refill_requirements running short on hand) — receiving more stock
+    fixes exactly this — versus a structural block (`reason`, e.g. "pack
+    size not set", from an ingredient reservation/refills.py refuses to
+    touch at all). Receiving more of an ingredient that cannot be deducted
+    changes nothing; retrying afterward would just raise the identical
+    error again. Those are skipped here rather than crashing on a missing
+    `needed` key, and are reported back so the caller knows this ingredient
+    needs a data fix, not another delivery."""
+    restocked = 0
     for s in shortfalls:
+        if "needed" not in s:
+            continue
         row = conn.execute("SELECT pack_size, category, expiry_mode FROM ingredient WHERE id=?",
                            (s["ingredient_id"],)).fetchone()
         pack_size = row["pack_size"] or 1.0
@@ -243,7 +263,8 @@ def _restock_shortfalls(conn: sqlite3.Connection, shortfalls: list[dict], ts: st
         purchase_qty = max(1.0, top_up_base / pack_size)
         _receive_realistic(conn, s["ingredient_id"], row["category"], row["expiry_mode"],
                            purchase_qty, ts, day, rng, lot_prefix="DEMO")
-    return len(shortfalls)
+        restocked += 1
+    return restocked
 
 
 def _seed_periodic_receiving(conn: sqlite3.Connection, start: _dt.date, end: _dt.date,
@@ -414,22 +435,54 @@ def _seed_wastage_history(conn: sqlite3.Connection, start: _dt.date, end: _dt.da
 # ---------------------------------------------------------------------------
 def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rng: random.Random,
                           flavors_included: list[dict], flavors_premium: list[dict],
-                          unli_menu_id: int, price: float) -> dict | None:
+                          unli_menu_id: int, price: float, *,
+                          head_count: int | None = None,
+                          walkout_rate: float = 0.03,
+                          random_table_label: bool = True,
+                          extra_lines: dict[int, int] | None = None,
+                          extra_prices: dict[int, float] | None = None) -> dict | None:
     """One unlimited table, start to close: order -> session -> 1-5 refill
     rounds, each individually held-then-served through the real two-phase
     refill path -> occasionally a round voided or corrected along the way.
     Returns None for a table that voided before the kitchen ever started
     (no ledger impact, matching release_order's own contract) or stats
-    otherwise."""
+    otherwise.
+
+    head_count and walkout_rate default to this function's original
+    self-contained synthetic model (a random 1-6 head draw, 3% pre-kitchen
+    walkout) so demo_seed.py's own CLI and scripts/generate_demo_history.py
+    -- callers with no real head-count or cancellation data of their own --
+    are unaffected. wt/xlsx_history_import.py passes both explicitly: a
+    source-derived head_count (the sum of the unli flavor-pick line
+    quantities the workbook recorded for that Order ID) and walkout_rate=0.0,
+    since the source records no cancellation concept at all and introducing
+    one here would misrepresent completed historical sales as walkouts.
+
+    random_table_label=False (also xlsx_history_import.py only) skips the
+    T-01..T-14 random draw and leaves table_label NULL instead -- the
+    workbook has no table/seating field at all, and a randomly generated one
+    is not a fact about that historical sale.
+
+    extra_lines/extra_prices (same shape as _add_lines' own two arguments)
+    let a caller attach ordinary a-la-carte order_line rows to this SAME
+    order -- reserved, committed and receipted as one order, one ticket. This
+    exists for xlsx_history_import.py's mixed workbook orders (one source
+    Order ID listing both unlimited-wings and a-la-carte lines): the two are
+    no longer replayed as two separate customer_order rows just because this
+    function only used to know how to create the unlimited half."""
     minute = rng.randint(0, 59)
     ts = f"{day.isoformat()} {hour:02d}:{minute:02d}:00"
-    head_count = rng.choices([1, 2, 3, 4, 5, 6], weights=[10, 30, 25, 18, 10, 7])[0]
+    if head_count is None:
+        head_count = rng.choices([1, 2, 3, 4, 5, 6], weights=[10, 30, 25, 18, 10, 7])[0]
 
-    order_pk, order_no = _new_order(conn, f"T-{rng.randint(1, 14):02d}", head_count)
+    table_label = f"T-{rng.randint(1, 14):02d}" if random_table_label else None
+    order_pk, order_no = _new_order(conn, table_label, head_count)
     conn.execute(
         "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,?,?)",
         (order_pk, unli_menu_id, 1, price),
     )
+    if extra_lines:
+        _add_lines(conn, order_pk, extra_lines, extra_prices or {})
 
     try:
         reserve_order(conn, order_pk, user_id=USER_ID)
@@ -437,7 +490,7 @@ def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rn
         _restock_shortfalls(conn, e.shortfalls, ts, day, rng)
         reserve_order(conn, order_pk, user_id=USER_ID)
 
-    if rng.random() < 0.03:
+    if rng.random() < walkout_rate:
         release_order(conn, order_pk, "demo: table left before kitchen started", user_id=USER_ID)
         conn.execute("UPDATE customer_order SET created_at=?, voided_at=? WHERE id=?", (ts, ts, order_pk))
         return None

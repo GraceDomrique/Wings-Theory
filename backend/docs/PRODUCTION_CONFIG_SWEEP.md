@@ -74,12 +74,19 @@ place that should name it.
 
 ## Other findings, not on the named list
 
-- **`backend/static/console.html.bak`** — a stray, tracked, superseded copy
-  of `console.html` (confirmed by diff: an older CSS token layout). Not
-  served by any route, contains no secrets. SAFE, but housekeeping: worth
-  deleting in a future cleanup pass now that git history makes a `.bak`
-  copy unnecessary. Left in place this phase rather than deleted
-  unilaterally.
+- **`backend/static/console.html.bak`** — removed. It was a stray, tracked,
+  superseded copy of `console.html` (an older CSS token layout), not served
+  by any route and containing no secrets; deleted once git history made the
+  `.bak` copy unnecessary.
+- **`backend/scripts/generate_demo_history.py`** — removed (production
+  cleanup pass, 2026-09). It only ever wrote to `backend/dev/wings_theory_
+  dev.db` and refused to touch production, so its removal has no effect on
+  the deployed app. `wt/demo_seed.py` stays: `wt/xlsx_history_import.py`
+  (the real order-history import used against production) imports its
+  `_new_order`/`_seed_unlimited_order` helpers, so it is a load-bearing
+  dependency, not a standalone demo entrypoint. Its own `__main__` guard
+  (`db.require_destructive_confirmation()` + `db.reset()`'s production
+  refusal) is unchanged.
 - No `.env`, `.secret`, or `*.db` file is tracked in git (`git ls-files`
   checked directly) — the `.gitignore` rules from the original baseline
   commit, extended this phase to also cover `backend/dev/.secret`, are

@@ -30,3 +30,7 @@ prophet>=1.1,<2
 scikit-learn>=1.4,<2
 mlxtend>=0.23,<1
 pandas>=2.0,<3
+
+# wt/xlsx_history_import.py reads the owner's .xlsx workbooks directly
+# (pandas alone needs an engine for .xlsx; this is that engine).
+openpyxl>=3.1,<4

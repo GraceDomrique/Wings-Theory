@@ -70,29 +70,59 @@ export function count(v, missing = 'unknown') {
   return has(v) ? text(new Intl.NumberFormat('en-PH').format(Math.round(v))) : nodata(missing);
 }
 
-/** Quantity plus its base unit: "1,021.5 g". */
-export function qty(v, unit, missing = 'not counted') {
-  if (!has(v)) return nodata(missing);
-  const n = new Intl.NumberFormat('en-PH', { maximumFractionDigits: 2 }).format(v);
-  return text(unit ? `${n} ${unit}` : n);
+/**
+ * Scale a base-unit quantity to a human-readable unit — mirrors
+ * wt/units.py:format_base()'s g->kg / ml->L rollup (>=1000 in the base
+ * unit) so the same "9,042.12 g -> 9.04 kg" rule holds on both sides. Any
+ * other unit (pc, an already-rolled-up kg/L, etc.) passes through unscaled.
+ */
+function scaleUnit(v, unit) {
+  if (unit === 'g' && Math.abs(v) >= 1000) return { value: v / 1000, unit: 'kg' };
+  if (unit === 'ml' && Math.abs(v) >= 1000) return { value: v / 1000, unit: 'L' };
+  return { value: v, unit };
 }
 
-/** Signed stock movement: "+0.70 g" / "-24.5 g". */
+/** Quantity plus its unit, scaled to kg/L above 1000 g/ml: "9.04 kg". */
+export function qty(v, unit, missing = 'not counted') {
+  if (!has(v)) return nodata(missing);
+  const s = scaleUnit(v, unit);
+  const n = new Intl.NumberFormat('en-PH', { maximumFractionDigits: 2 }).format(s.value);
+  return text(s.unit ? `${n} ${s.unit}` : n);
+}
+
+/** Signed stock movement, scaled to kg/L above 1000 g/ml: "+0.70 g" / "-24.50 kg". */
 export function delta(v, unit, missing = 'unrecorded') {
   if (!has(v)) return nodata(missing);
-  const n = new Intl.NumberFormat('en-PH', { maximumFractionDigits: 3 }).format(Math.abs(v));
+  const s = scaleUnit(v, unit);
+  const n = new Intl.NumberFormat('en-PH', { maximumFractionDigits: 3 }).format(Math.abs(s.value));
   const sign = v > 0 ? '+' : v < 0 ? '−' : '';
-  return text(`${sign}${n}${unit ? ' ' + unit : ''}`);
+  return text(`${sign}${n}${s.unit ? ' ' + s.unit : ''}`);
 }
 
 /**
- * Days of runway or days to expiry. Absent means the backend could not
- * compute a rate — "needs 7+ days" of history, not "0 days left".
+ * Days of runway or days to expiry, EXACT decimal — for admin/technical
+ * tables that want precision (spec section 51/56 explicitly allows it
+ * there). Absent means the backend could not compute a rate — "needs 7+
+ * days" of history, not "0 days left". Primary/manager-facing screens
+ * should use stockCover() below instead, never this.
  */
 export function days(v, missing = 'no usage rate yet') {
   if (!has(v)) return nodata(missing);
   if (v < 0) return text(`${Math.abs(Math.round(v))}d ago`);
   return text(`${Number(v.toFixed(1)).toLocaleString('en-PH')}d`);
+}
+
+/**
+ * Days of runway as a plain sentence, not a decimal — spec's "no 0.4d in
+ * primary operator UI" rule. Under a day reads as "Runs out today";
+ * otherwise rounds to the nearest whole day. The exact figure stays
+ * available via days() for the technical tables that want it.
+ */
+export function stockCover(v, missing = 'no usage rate yet') {
+  if (!has(v)) return nodata(missing);
+  if (v < 1) return text('Runs out today');
+  const n = Math.round(v);
+  return text(`~${n} day${n === 1 ? '' : 's'} left`);
 }
 
 /** Short days label for the tight runway column: "110d", "expired". */
@@ -111,6 +141,25 @@ export function pct(v, missing = 'not measured', decimals = 1) {
 export function date(iso, missing = 'no expiry date') {
   if (!has(iso) || iso === '') return nodata(missing);
   return text(String(iso).slice(0, 10));
+}
+
+/**
+ * How long ago an ISO timestamp was, in words: "3m ago", "6h ago", "2d ago".
+ * Pairs with stamp() for the freshness lines decision-critical screens must
+ * show (spec section 49) — the exact clock time plus how stale it is, both
+ * computed from the same backend-supplied timestamp, never hardcoded.
+ */
+export function ageFromNow(iso, missing = 'unknown') {
+  if (!has(iso) || iso === '') return nodata(missing);
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return nodata(missing);
+  const ms = Date.now() - d.getTime();
+  if (ms < 60000) return text('just now');
+  const mins = Math.floor(ms / 60000);
+  if (mins < 60) return text(`${mins}m ago`);
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return text(`${hrs}h ago`);
+  return text(`${Math.floor(hrs / 24)}d ago`);
 }
 
 /** ISO timestamp -> "08-16 03:42" (the ledger's compact form). */
@@ -141,6 +190,29 @@ export const asText = {
     (has(v) ? new Intl.NumberFormat('en-PH', { maximumFractionDigits: decimals }).format(v) : missing),
   days: (v, missing = 'no usage rate yet') => (has(v) ? `${v}d` : missing),
   date: (iso, missing = 'no date') => (has(iso) && iso !== '' ? String(iso).slice(0, 10) : missing),
+  /** Same rollup as qty() above, for the few places a Node won't fit (a
+   * sentence built with a template string). */
+  qty: (v, unit, missing = 'not counted') => {
+    if (!has(v)) return missing;
+    const s = scaleUnit(v, unit);
+    const n = new Intl.NumberFormat('en-PH', { maximumFractionDigits: 2 }).format(s.value);
+    return s.unit ? `${n} ${s.unit}` : n;
+  },
+  /** Same rollup + sign convention as delta() above, string form. */
+  delta: (v, unit, missing = 'unrecorded') => {
+    if (!has(v)) return missing;
+    const s = scaleUnit(v, unit);
+    const n = new Intl.NumberFormat('en-PH', { maximumFractionDigits: 3 }).format(Math.abs(s.value));
+    const sign = v > 0 ? '+' : v < 0 ? '−' : '';
+    return `${sign}${n}${s.unit ? ' ' + s.unit : ''}`;
+  },
+  /** Same rule as stockCover() above, lower-cased for mid-sentence use. */
+  stockCover: (v, missing = 'no usage rate yet') => {
+    if (!has(v)) return missing;
+    if (v < 1) return 'runs out today';
+    const n = Math.round(v);
+    return `~${n} day${n === 1 ? '' : 's'} left`;
+  },
 };
 
 /** Title-cases a backend enum for display: sale_deduction -> Sale deduction. */

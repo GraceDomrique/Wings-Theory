@@ -1,380 +1,1313 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Wings Theory — Kitchen</title>
-<link rel="stylesheet" href="/assets/design-system.css">
-<link rel="stylesheet" href="/assets/brand.css">
-<style>
-/* KDS-specific layout only — every color/type/spacing token, and every
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+    />
+    <title>Wings Theory — Kitchen</title>
+    <!-- Self-hosted webfonts. These pages referenced var(--font-sans)/
+         --font-display but never actually loaded a font file, so POS, KDS and the
+         landing page silently rendered in whatever the device had while the
+         console (which did load them, from Google) rendered in Inter/Fraunces —
+         three surfaces of one product, three typefaces. Now all four load the
+         same local files, and none of them reach the internet. -->
+    <link rel="stylesheet" href="/assets/fonts/fonts.css">
+    <link rel="stylesheet" href="/assets/design-system.css" />
+    <link rel="stylesheet" href="/assets/brand.css" />
+    <style>
+      /* KDS-specific layout only — every color/type/spacing token, and every
    reusable primitive (.card/.btn/.chip/.field/.modal/.toast/etc.), lives
    in /assets/design-system.css, shared with console.html and pos.html.
    A wall-mounted kitchen board wants the same working-ink palette at
    higher contrast and larger type, not a separate light theme. */
-*{box-sizing:border-box}
-body{margin:0;font-family:var(--font-sans);-webkit-tap-highlight-color:transparent;
-  overscroll-behavior:none;-webkit-font-smoothing:antialiased}
-.hide{display:none!important}
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        font-family: var(--font-sans);
+        -webkit-tap-highlight-color: transparent;
+        overscroll-behavior: none;
+        -webkit-font-smoothing: antialiased;
+      }
+      .hide {
+        display: none !important;
+      }
 
-/* ---------- login ---------- */
-#login{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
-  padding:20px;background:var(--ink-0);z-index:90}
-.login-box{background:var(--ink-1);border:1px solid var(--line);border-radius:16px;
-  padding:32px 28px;width:100%;max-width:360px;box-shadow:var(--sh-3)}
-.login-mark{height:44px;display:inline-flex;align-items:center;margin-bottom:14px}
-.login-mark img{height:100%;width:auto;display:block}
-.login-box h1{font-family:var(--font-display);font-size:20px;font-weight:600;margin:0 0 4px;color:var(--text-0)}
-.login-box p{color:var(--text-2);font-size:13px;margin:0 0 22px}
-.login-box .field{height:48px;font-size:17px;margin-bottom:12px}
-.pass-wrap{position:relative;margin-bottom:12px}
-.pass-wrap .field{margin-bottom:0;padding-right:42px}
-.pass-toggle{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:none;
-  padding:8px;border-radius:8px;display:flex;color:var(--text-3);cursor:pointer}
-.pass-toggle:hover{color:var(--text-0)}
-.pass-toggle svg{width:17px;height:17px;display:block}
-#loginErr{color:var(--bad-text);font-size:13px;margin-top:10px;min-height:16px}
+      /* ---------- login: see brand.css .wt-rl-* (shared with POS/Console) ---------- */
 
-/* ---------- board shell ---------- */
-#app{display:none;height:100vh;flex-direction:column;padding:14px;background:var(--ink-0)}
-header{display:flex;align-items:center;gap:14px;padding-bottom:12px;flex-shrink:0}
-header h1{font-family:var(--font-display);font-size:20px;font-weight:600;margin:0;color:var(--text-0)}
-.brand-mark{height:30px;display:inline-flex;align-items:center;flex-shrink:0}
-.brand-mark img{height:100%;width:auto;display:block}
-.stat{font-size:13px;color:var(--text-2)}
-.stat b{font-family:var(--font-mono);color:var(--text-0);font-weight:600;font-variant-numeric:tabular-nums}
-header .r{margin-left:auto;display:flex;align-items:center;gap:12px}
-#connDot{width:9px;height:9px;border-radius:99px;background:var(--ok);flex-shrink:0}
-#connDot.off{background:var(--bad)}
+      /* ---------- board shell ---------- */
+      #app {
+        display: none;
+        height: 100vh;
+        flex-direction: column;
+        padding: 16px 18px;
+        background: var(--ink-0);
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 16px;
+        padding-bottom: 16px;
+        margin-bottom: 2px;
+        border-bottom: 1px solid var(--line-soft);
+        flex-shrink: 0;
+      }
+      header h1 {
+        font-family: var(--font-display);
+        font-size: 20px;
+        font-weight: 600;
+        margin: 0;
+        color: var(--text-0);
+        letter-spacing: -0.01em;
+      }
+      .brand-mark {
+        height: 28px;
+        display: inline-flex;
+        align-items: center;
+        flex-shrink: 0;
+      }
+      .brand-mark img {
+        height: 100%;
+        width: auto;
+        display: block;
+      }
+      .stat {
+        font-size: 12.5px;
+        color: var(--text-2);
+        display: flex;
+        align-items: baseline;
+        gap: 5px;
+      }
+      .stat b {
+        font-family: var(--font-mono);
+        color: var(--text-0);
+        font-weight: 600;
+        font-size: 14px;
+        font-variant-numeric: tabular-nums;
+      }
+      header .r {
+        margin-left: auto;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
 
-#errBanner{background:var(--bad-wash);color:var(--bad-text);padding:9px 14px;font-size:13px;border-radius:9px;
-  margin-bottom:12px;display:flex;align-items:center;gap:10px}
-#errBanner button{border:1px solid var(--bad-text);border-radius:7px;padding:4px 10px;
-  font-size:12px;color:var(--bad-text);margin-left:auto}
-.cols{flex:1;display:grid;grid-template-columns:repeat(4,1fr);gap:12px;min-height:0}
-.station{font-size:11px;font-weight:600;letter-spacing:.04em;color:var(--text-2);
-  background:var(--ink-1);border:1px solid var(--line);border-radius:99px;padding:4px 12px}
-.col{display:flex;flex-direction:column;min-height:0;gap:10px}
-.col-h{display:flex;align-items:center;gap:8px;padding:0 2px}
-.col-h b{font-size:13px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}
-.col-h .n{margin-left:auto;font-family:var(--font-mono);font-size:12px;color:var(--text-2);background:var(--ink-1);
-  padding:2px 9px;border-radius:99px;font-variant-numeric:tabular-nums}
-.col-l{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding-bottom:8px}
-.empty-col{border:1.5px dashed var(--line);border-radius:12px;padding:28px 14px;text-align:center;
-  color:var(--text-3);font-size:13px}
+      #logoutBtn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        padding: 6px 12px;
+        transition:
+          background-color 0.2s ease,
+          color 0.2s ease;
+      }
 
-/* ---------- loading skeleton ----------
+      #logoutBtn:hover {
+        background-color: #e0a80d;
+        color: #080808;
+        border-color: #756507;
+        cursor: pointer;
+      }
+
+      #connDot {
+        width: 8px;
+        height: 8px;
+        border-radius: 99px;
+        background: var(--ok);
+        box-shadow: 0 0 0 3px var(--ok-wash);
+        flex-shrink: 0;
+      }
+      #connDot.off {
+        background: var(--bad);
+        box-shadow: 0 0 0 3px var(--bad-wash);
+      }
+
+      #errBanner {
+        background: var(--bad-wash);
+        color: var(--bad-text);
+        padding: 9px 14px;
+        font-size: 13px;
+        border-radius: 9px;
+        margin-bottom: 12px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      #errBanner button {
+        border: 1px solid var(--bad-text);
+        border-radius: 7px;
+        padding: 4px 10px;
+        font-size: 12px;
+        color: var(--bad-text);
+        margin-left: auto;
+      }
+      .cols {
+        flex: 1;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 18px;
+        min-height: 0;
+      }
+      .station {
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        color: var(--text-2);
+        background: var(--ink-1);
+        border: 1px solid var(--line);
+        border-radius: 99px;
+        padding: 5px 13px;
+        line-height: 1;
+      }
+      .col {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        gap: 12px;
+      }
+      .col-h {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 1px;
+      }
+      .col-h b {
+        font-size: 12.5px;
+        font-weight: 800;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+      .col-h .n {
+        margin-left: auto;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        font-weight: 600;
+        color: var(--text-1);
+        background: var(--ink-1);
+        border: 1px solid var(--line);
+        min-width: 24px;
+        text-align: center;
+        padding: 2px 8px;
+        border-radius: 99px;
+        font-variant-numeric: tabular-nums;
+      }
+      .col-l {
+        flex: 1;
+        overflow-y: auto;
+        overflow-x: hidden;
+        display: flex;
+        flex-direction: column;
+        gap: 11px;
+        padding: 2px 2px 8px;
+      }
+      .empty-col {
+        border: 1.5px dashed var(--line);
+        border-radius: 12px;
+        background: var(--ink-1);
+        padding: 32px 14px;
+        text-align: center;
+        color: var(--text-3);
+        font-size: 13px;
+        letter-spacing: 0.01em;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex: 1;
+      }
+
+      /* ---------- loading skeleton ----------
    Shown only until the first queue fetch resolves — after that a slow poll
    never blanks the board, it just keeps the last good state on screen with
    the connection dot as the only signal something's stale. */
-.col-l.loading{gap:10px}
-.ko-skel{height:96px;border-radius:12px}
+      .col-l.loading {
+        gap: 10px;
+      }
+      .ko-skel {
+        height: 96px;
+        border-radius: 12px;
+      }
 
-/* ---------- ticket cards ---------- */
-.ko{background:var(--ink-1);border:1px solid var(--line);border-radius:12px;padding:14px;
-  border-left-width:4px;display:flex;flex-direction:column;gap:10px;box-shadow:var(--sh-1)}
-.ko.pri-hi{border-left-color:var(--bad)} .ko.pri-md{border-left-color:var(--warn)} .ko.pri-lo{border-left-color:var(--ok)}
-.ko.pri-done{border-left-color:var(--line);opacity:.6}
-.ko-h{display:flex;align-items:baseline;gap:9px}
-.ko-h .no{font-family:var(--font-mono);font-size:20px;font-weight:600;letter-spacing:-.02em;color:var(--text-0)}
-.ko-h .tbl{font-size:12.5px;color:var(--text-2)}
-.ko-h .tm{margin-left:auto;font-family:var(--font-mono);font-size:15px;font-weight:600;color:var(--text-1);
-  font-variant-numeric:tabular-nums}
-.ko-h .tm.late{color:var(--bad-text)}
-.ko-l{display:flex;flex-direction:column;gap:6px}
-.ko-i{font-size:15px;line-height:1.35;display:flex;gap:8px;color:var(--text-0)}
-.ko-i .q{font-weight:800;color:var(--amber-text);min-width:22px}
-.ko-i .nt{font-size:12px;color:var(--text-2);display:block}
-/* A refill is a real unit of preparation — a named flavour and a piece count
+      /* ---------- ticket cards ---------- */
+      .ko {
+        background: var(--ink-1);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px 15px;
+        border-left-width: 4px;
+        display: flex;
+        flex-direction: column;
+        gap: 11px;
+        box-shadow: var(--sh-1);
+        transition:
+          border-color 120ms ease,
+          box-shadow 120ms ease;
+      }
+      .ko:hover {
+        border-color: var(--text-3);
+        box-shadow: var(--sh-2);
+      }
+      .ko.pri-hi {
+        border-left-color: var(--bad);
+      }
+      .ko.pri-md {
+        border-left-color: var(--warn);
+      }
+      .ko.pri-lo {
+        border-left-color: var(--ok);
+      }
+      .ko.pri-done {
+        border-left-color: var(--line);
+        opacity: 0.65;
+      }
+      .ko-h {
+        display: flex;
+        align-items: baseline;
+        gap: 9px;
+        padding-bottom: 9px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+      .ko-h .no {
+        font-family: var(--font-mono);
+        font-size: 19px;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+        color: var(--text-0);
+      }
+      .ko-h .tbl {
+        font-size: 12.5px;
+        color: var(--text-2);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .ko-h .tm {
+        margin-left: auto;
+        flex-shrink: 0;
+        font-family: var(--font-mono);
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--text-1);
+        font-variant-numeric: tabular-nums;
+      }
+      .ko-h .tm.late {
+        color: var(--bad-text);
+      }
+      .ko-l {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+      .ko-i {
+        font-size: 14.5px;
+        line-height: 1.4;
+        display: flex;
+        gap: 8px;
+        color: var(--text-0);
+      }
+      .ko-i .q {
+        font-weight: 800;
+        color: var(--amber-text);
+        min-width: 22px;
+        flex-shrink: 0;
+      }
+      .ko-i .nt {
+        font-size: 12px;
+        color: var(--text-2);
+        display: block;
+        margin-top: 1px;
+      }
+      /* A refill is a real unit of preparation — a named flavour and a piece count
    — so it gets its own card on the board rather than being something the
    kitchen has to infer from an order note. Tinted and badged so it reads as a
    different kind of ticket at a glance across the pass. */
-.ko.refill{border-left-color:var(--amber);background:var(--amber-wash)}
-.ko-badge{display:inline-block;font-size:10.5px;font-weight:800;letter-spacing:.07em;
-  background:var(--amber);color:var(--amber-ink);border-radius:99px;padding:2px 9px}
-.ko-flav{font-family:var(--font-display);font-size:19px;font-weight:600;letter-spacing:-.01em;line-height:1.2;color:var(--text-0)}
-.ko-pcs{font-size:14px;font-weight:700;color:var(--text-2)}
-.ko-pcs b{font-family:var(--font-mono);color:var(--text-0);font-size:17px}
-.ko-add{font-size:11.5px;font-weight:800;color:var(--bad-text);letter-spacing:.03em}
-.ko-b{display:flex;gap:8px;margin-top:2px}
-.kbtn{flex:1;height:44px;border-radius:10px;font-size:14px;font-weight:700}
-.kbtn.p{background:var(--amber);color:var(--amber-ink);border:0}
-.kbtn.p:active{filter:brightness(1.08)}
-.kbtn.s{background:transparent;border:1px solid var(--line);color:var(--text-2)}
-.kbtn.s:active{color:var(--text-0);border-color:var(--text-3)}
+      .ko.refill {
+        border-left-color: var(--amber);
+        background: var(--amber-wash);
+      }
+      .ko-badge {
+        display: inline-block;
+        font-size: 10.5px;
+        font-weight: 800;
+        letter-spacing: 0.07em;
+        background: var(--amber);
+        color: var(--amber-ink);
+        border-radius: 99px;
+        padding: 3px 10px;
+        line-height: 1.3;
+      }
+      .ko-flav {
+        font-family: var(--font-display);
+        font-size: 19px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        line-height: 1.25;
+        color: var(--text-0);
+      }
+      .ko-pcs {
+        font-size: 13.5px;
+        font-weight: 600;
+        color: var(--text-2);
+      }
+      .ko-pcs b {
+        font-family: var(--font-mono);
+        color: var(--text-0);
+        font-weight: 700;
+        font-size: 16px;
+      }
+      .ko-add {
+        font-size: 11.5px;
+        font-weight: 800;
+        color: var(--bad-text);
+        letter-spacing: 0.03em;
+      }
+      /* Which head gets which flavour, at a glance — a numbered chip per
+   flavour with its heads listed underneath, instead of a sentence the
+   kitchen has to read word-by-word mid-rush. Heads sharing a flavour are
+   grouped into one chip (see groupHeadFlavors). */
+      .ko-heads {
+        padding: 9px 10px 8px;
+        border: 1px solid var(--line);
+        border-radius: 9px;
+        background: var(--ink-2);
+      }
+      .ko-heads-lbl {
+        font-size: 9.5px;
+        font-weight: 800;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--text-3);
+        margin-bottom: 7px;
+      }
+      .ko-heads-grid {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px 18px;
+      }
+      .ko-heads-cell {
+        flex: 1 1 auto;
+        min-width: 92px;
+      }
+      .ko-heads-top {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+      .ko-heads-num {
+        display: inline-flex;
+        flex-shrink: 0;
+        align-items: center;
+        justify-content: center;
+        width: 15px;
+        height: 15px;
+        border-radius: 50%;
+        background: var(--amber);
+        color: var(--amber-ink);
+        font-size: 9.5px;
+        font-weight: 800;
+        line-height: 1;
+      }
+      .ko-heads-name {
+        font-family: var(--font-display);
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: -0.005em;
+        color: var(--text-0);
+        line-height: 1.2;
+      }
+      .ko-heads-of {
+        margin-top: 3px;
+        margin-left: 21px;
+        font-size: 10.5px;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        color: var(--text-2);
+      }
+      .ko-b {
+        display: flex;
+        gap: 8px;
+        margin-top: 3px;
+      }
+      .kbtn {
+        flex: 1;
+        height: 42px;
+        border-radius: 9px;
+        font-size: 13.5px;
+        font-weight: 700;
+        letter-spacing: 0.01em;
+        cursor: pointer;
+        transition:
+          filter 120ms ease,
+          background 120ms ease,
+          border-color 120ms ease,
+          color 120ms ease,
+          opacity 120ms ease;
+      }
+      .kbtn.p {
+        background: var(--amber);
+        color: var(--amber-ink);
+        border: 0;
+        box-shadow: var(--sh-1);
+      }
+      .kbtn.p:hover {
+        background: var(--amber-press);
+      }
+      .kbtn.p:active {
+        filter: brightness(0.96);
+      }
+      .kbtn.s {
+        background: var(--ink-2);
+        border: 1px solid var(--line);
+        color: var(--text-2);
+      }
+      .kbtn.s:hover {
+        color: var(--text-0);
+        border-color: var(--text-3);
+        background: var(--ink-3);
+      }
+      .kbtn.s:active {
+        color: var(--text-0);
+        border-color: var(--text-3);
+      }
+      .kbtn:disabled {
+        opacity: 0.55;
+        cursor: default;
+      }
 
-/* --- End-of-service reconciliation sheet -------------------------------
+      /* --- End-of-service reconciliation sheet -------------------------------
    A full-screen overlay rather than a fifth column: it is not a live board,
    it is a task the kitchen does once at close, and it needs room for the
    numbers and their arithmetic to be legible on a wall-mounted tablet. */
-#recScrim{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:40}
-#recSheet{position:fixed;inset:auto 0 0 0;max-height:92vh;overflow-y:auto;z-index:41;
-  background:var(--ink-1);border-radius:16px 16px 0 0;padding:20px;box-shadow:var(--sh-3)}
-@media (min-width:760px){ #recSheet{inset:5vh 50% auto auto;transform:translateX(50%);
-  width:min(720px,94vw);border-radius:16px;max-height:90vh} }
-#recSheet h2{font-family:var(--font-display);margin:0 0 4px;font-size:19px;font-weight:600;color:var(--text-0)}
-#recSheet .sub{color:var(--text-2);font-size:13px;margin:0 0 16px;line-height:1.5}
-.rec-row{border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
-.rec-row .rh{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;margin-bottom:10px}
-.rec-row .rh b{font-size:16px;color:var(--text-0)}
-.rec-row .rh .m{color:var(--text-2);font-size:13px}
-.rec-in{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
-.rec-in label{display:block;font-size:11.5px;color:var(--text-2);margin-bottom:3px;font-weight:600}
-.rec-in .field{height:44px;font-size:16px;margin-bottom:0;text-align:right;font-family:var(--font-mono)}
-.rec-calc{margin-top:10px;font-size:13.5px;line-height:1.5;background:var(--ink-2);
-  border-radius:9px;padding:10px 12px;color:var(--text-2)}
-.rec-calc b{color:var(--text-0)}
-.rec-calc.warn{background:var(--warn-wash);color:var(--warn-text)} .rec-calc.warn b{color:var(--warn-text)}
-.rec-calc.ok{background:var(--ok-wash);color:var(--ok-text)} .rec-calc.ok b{color:var(--ok-text)}
-.rec-calc.bad{background:var(--bad-wash);color:var(--bad-text)} .rec-calc.bad b{color:var(--bad-text)}
-.rec-done{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:13.5px}
-.rec-done span{color:var(--text-2)} .rec-done b{font-family:var(--font-mono);color:var(--text-0)}
-.rec-f{display:flex;gap:10px;margin-top:6px}
-.rec-f .btn{flex:1}
-#recErr{color:var(--bad-text);font-size:13px;min-height:16px;margin-top:8px}
+      #recScrim {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.6);
+        z-index: 40;
+      }
+      #recSheet {
+        position: fixed;
+        inset: auto 0 0 0;
+        max-height: 92vh;
+        overflow-y: auto;
+        z-index: 41;
+        background: var(--ink-1);
+        border-radius: 16px 16px 0 0;
+        padding: 20px;
+        box-shadow: var(--sh-3);
+      }
+      @media (min-width: 760px) {
+        #recSheet {
+          inset: 5vh 50% auto auto;
+          transform: translateX(50%);
+          width: min(720px, 94vw);
+          border-radius: 16px;
+          max-height: 90vh;
+        }
+      }
+      #recSheet h2 {
+        font-family: var(--font-display);
+        margin: 0 0 4px;
+        font-size: 19px;
+        font-weight: 600;
+        color: var(--text-0);
+      }
+      #recSheet .sub {
+        color: var(--text-2);
+        font-size: 13px;
+        margin: 0 0 16px;
+        line-height: 1.5;
+      }
+      .rec-row {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 14px;
+        margin-bottom: 12px;
+      }
+      .rec-row .rh {
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+        flex-wrap: wrap;
+        margin-bottom: 10px;
+      }
+      .rec-row .rh b {
+        font-size: 16px;
+        color: var(--text-0);
+      }
+      .rec-row .rh .m {
+        color: var(--text-2);
+        font-size: 13px;
+      }
+      .rec-in {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+      }
+      .rec-in label {
+        display: block;
+        font-size: 11.5px;
+        color: var(--text-2);
+        margin-bottom: 3px;
+        font-weight: 600;
+      }
+      .rec-in .field {
+        height: 44px;
+        font-size: 16px;
+        margin-bottom: 0;
+        text-align: right;
+        font-family: var(--font-mono);
+      }
+      .rec-calc {
+        margin-top: 10px;
+        font-size: 13.5px;
+        line-height: 1.5;
+        background: var(--ink-2);
+        border-radius: 9px;
+        padding: 10px 12px;
+        color: var(--text-2);
+      }
+      .rec-calc b {
+        color: var(--text-0);
+      }
+      .rec-calc.warn {
+        background: var(--warn-wash);
+        color: var(--warn-text);
+      }
+      .rec-calc.warn b {
+        color: var(--warn-text);
+      }
+      .rec-calc.ok {
+        background: var(--ok-wash);
+        color: var(--ok-text);
+      }
+      .rec-calc.ok b {
+        color: var(--ok-text);
+      }
+      .rec-calc.bad {
+        background: var(--bad-wash);
+        color: var(--bad-text);
+      }
+      .rec-calc.bad b {
+        color: var(--bad-text);
+      }
+      .rec-done {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 14px;
+        font-size: 13.5px;
+      }
+      .rec-done span {
+        color: var(--text-2);
+      }
+      .rec-done b {
+        font-family: var(--font-mono);
+        color: var(--text-0);
+      }
+      .rec-f {
+        display: flex;
+        gap: 10px;
+        margin-top: 6px;
+      }
+      .rec-f .btn {
+        flex: 1;
+      }
+      #recErr {
+        color: var(--bad-text);
+        font-size: 13px;
+        min-height: 16px;
+        margin-top: 8px;
+      }
 
-@media (max-width:820px){ .cols{grid-template-columns:1fr;overflow-y:auto} .col{min-height:200px} }
-@media (max-width:480px){
-  header{flex-wrap:wrap;row-gap:8px}
-  header h1{font-size:17px}
-  header .r{margin-left:0;width:100%;justify-content:space-between}
-}
-</style>
-</head>
-<body>
+      /* --- Void confirmation popup ---------------------------------------------
+   Replaces the browser's native confirm() for voiding an order or refill —
+   same yes/no decision, but styled to match the board and colored the way an
+   irreversible/reversible action pair should read at a glance: red for the
+   destructive action, green for backing out. */
+      .cf-scrim {
+        position: fixed;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.62);
+        z-index: 95;
+      }
+      .cf-box {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        z-index: 96;
+        width: min(380px, 92vw);
+        background: var(--ink-1);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 22px;
+        box-shadow: var(--sh-3);
+        animation: cfIn 160ms ease both;
+      }
+      @keyframes cfIn {
+        from {
+          opacity: 0;
+          transform: translate(-50%, -50%) scale(0.96);
+        }
+        to {
+          opacity: 1;
+          transform: translate(-50%, -50%) scale(1);
+        }
+      }
+      .cf-box .cf-title {
+        font-family: var(--font-display);
+        font-size: 17px;
+        font-weight: 600;
+        color: var(--text-0);
+        margin: 0 0 8px;
+      }
+      .cf-box .cf-msg {
+        font-size: 13.5px;
+        line-height: 1.55;
+        color: var(--text-2);
+        margin: 0;
+      }
+      .cf-actions {
+        display: flex;
+        gap: 10px;
+        margin-top: 20px;
+      }
+      .cf-btn {
+        flex: 1;
+        height: 44px;
+        border-radius: 10px;
+        font-size: 14px;
+        font-weight: 700;
+        border: 0;
+        cursor: pointer;
+        transition:
+          filter 120ms ease,
+          background 120ms ease;
+      }
+      .cf-btn.cf-no {
+        background: var(--ok);
+        color: #0d1f12;
+      }
+      .cf-btn.cf-no:hover {
+        filter: brightness(1.08);
+      }
+      .cf-btn.cf-yes {
+        background: var(--bad);
+        color: #2c0a05;
+      }
+      .cf-btn.cf-yes:hover {
+        filter: brightness(1.08);
+      }
 
-<div id="login">
-  <div class="login-box">
-    <div class="login-mark"><img src="/img/logo.png" alt="Wings Theory"></div>
-    <h1>Wings Theory</h1>
-    <p>Kitchen display sign in</p>
-    <input class="field" id="luser" placeholder="Username" autocomplete="username">
-    <div class="pass-wrap">
-      <input class="field" id="lpass" type="password" placeholder="Password" autocomplete="current-password">
-      <button type="button" class="pass-toggle" id="passToggle" aria-label="Show password" aria-pressed="false"></button>
+      @media (max-width: 820px) {
+        .cols {
+          grid-template-columns: 1fr;
+          overflow-y: auto;
+        }
+        .col {
+          min-height: 200px;
+        }
+        /* header .r (connection dot, queue/cooking counts, reconciliation button,
+     name, sign out) doesn't shrink or wrap on its own -- confirmed live via
+     screenshot at 768px and 600px, both overflowing the viewport by exactly
+     the sign-out button's width, pushing it a few px past the edge. The
+     phone-only wrap below used to start at 480px, leaving this whole
+     tablet-portrait/mid range unhandled -- the classic break-between-
+     breakpoints gap. */
+        header {
+          flex-wrap: wrap;
+          row-gap: 8px;
+        }
+        header h1 {
+          font-size: 18px;
+        }
+        header .r {
+          margin-left: 0;
+          width: 100%;
+          justify-content: space-between;
+        }
+      }
+      @media (max-width: 480px) {
+        header h1 {
+          font-size: 17px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="login" class="wt-rl">
+      <div class="wt-rl-bg"></div>
+      <div class="wt-rl-grain"></div>
+      <div class="wt-rl-card">
+        <h1>Kitchen Staff Access</h1>
+        <p class="wt-rl-desc">Sign in to access the Kitchen Display.</p>
+        <div class="wt-rl-field">
+          <label for="luser">Username</label>
+          <input
+            id="luser"
+            placeholder="Enter username"
+            autocomplete="username"
+          />
+        </div>
+        <div class="wt-rl-field">
+          <label for="lpass">Password</label>
+          <div class="wt-rl-input-wrap">
+            <input
+              id="lpass"
+              type="password"
+              placeholder="Enter password"
+              autocomplete="current-password"
+            />
+            <button
+              type="button"
+              class="wt-rl-pass-toggle"
+              id="passToggle"
+              aria-label="Show password"
+              aria-pressed="false"
+            ></button>
+          </div>
+        </div>
+        <button class="wt-rl-btn" id="loginBtn">Enter System &rarr;</button>
+        <div class="wt-rl-err" id="loginErr"></div>
+      </div>
+      <div class="wt-rl-card" id="pwChangeBox" style="display: none">
+        <div class="wt-rl-eyebrow">Kitchen Staff Access</div>
+        <h1>Set a new password</h1>
+        <p class="wt-rl-desc">
+          This account still uses a temporary password. Choose your own before
+          continuing.
+        </p>
+        <div class="wt-rl-field">
+          <label for="pwNew">New password</label>
+          <input
+            id="pwNew"
+            type="password"
+            placeholder="New password"
+            autocomplete="new-password"
+          />
+        </div>
+        <div class="wt-rl-field">
+          <label for="pwConfirm">Confirm new password</label>
+          <input
+            id="pwConfirm"
+            type="password"
+            placeholder="Confirm new password"
+            autocomplete="new-password"
+          />
+        </div>
+        <button class="wt-rl-btn" id="pwChangeBtn">
+          Set password &amp; continue
+        </button>
+        <div class="wt-rl-err" id="pwChangeErr"></div>
+      </div>
     </div>
-    <button class="btn btn-p btn-lg" id="loginBtn">Sign in</button>
-    <div id="loginErr"></div>
-  </div>
-</div>
 
-<div id="app">
-  <header>
-    <span id="connDot"></span>
-    <div class="brand-mark"><img src="/img/logo.png" alt="Wings Theory"></div>
-    <h1>Kitchen Display</h1>
-    <span class="station">Station 1</span>
-    <div class="stat">Queue <b id="nQueue">0</b></div>
-    <div class="stat">Cooking <b id="nCook">0</b></div>
-    <div class="r"><button class="btn btn-s btn-sm" id="recBtn">End-of-service reconciliation</button>
-      <span class="stat" id="whoName"></span><button class="btn btn-s btn-sm" id="logoutBtn">Sign out</button></div>
-  </header>
-  <div id="errBanner" class="hide"></div>
-  <div class="cols">
-    <div class="col"><div class="col-h"><b style="color:var(--warn-text)">Queued</b><span class="n" id="cQ">0</span></div>
-      <div class="col-l" id="colQueued"><div class="ko-skel skel"></div><div class="ko-skel skel"></div></div></div>
-    <div class="col"><div class="col-h"><b style="color:var(--amber-text)">Cooking</b><span class="n" id="cC">0</span></div>
-      <div class="col-l" id="colCooking"><div class="ko-skel skel"></div></div></div>
-    <div class="col"><div class="col-h"><b style="color:var(--ok-text)">Ready</b><span class="n" id="cR">0</span></div>
-      <div class="col-l" id="colReady"><div class="ko-skel skel"></div></div></div>
-    <div class="col"><div class="col-h"><b style="color:var(--text-2)">Served</b><span class="n" id="cS">0</span></div>
-      <div class="col-l" id="colServed"><div class="ko-skel skel"></div></div></div>
-  </div>
-</div>
+    <div id="app">
+      <header>
+        <span id="connDot"></span>
+        <div class="brand-mark">
+          <img src="/img/logo.png" alt="Wings Theory" />
+        </div>
+        <h1>Kitchen Display</h1>
+        <span class="station">Station 1</span>
+        <div class="stat">Queue <b id="nQueue">0</b></div>
+        <div class="stat">Cooking <b id="nCook">0</b></div>
+        <div class="r">
+          <button class="btn btn-s btn-sm" id="recBtn">
+            End-of-service reconciliation
+          </button>
+          <span class="stat" id="whoName"></span
+          ><button class="btn btn-s btn-sm" id="logoutBtn">Sign out</button>
+        </div>
+      </header>
+      <div id="errBanner" class="hide"></div>
+      <div class="cols">
+        <div class="col">
+          <div class="col-h">
+            <b style="color: var(--warn-text)">Queued</b
+            ><span class="n" id="cQ">0</span>
+          </div>
+          <div class="col-l" id="colQueued">
+            <div class="ko-skel skel"></div>
+            <div class="ko-skel skel"></div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="col-h">
+            <b style="color: var(--amber-text)">Cooking</b
+            ><span class="n" id="cC">0</span>
+          </div>
+          <div class="col-l" id="colCooking">
+            <div class="ko-skel skel"></div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="col-h">
+            <b style="color: var(--ok-text)">Ready</b
+            ><span class="n" id="cR">0</span>
+          </div>
+          <div class="col-l" id="colReady">
+            <div class="ko-skel skel"></div>
+          </div>
+        </div>
+        <div class="col">
+          <div class="col-h">
+            <b style="color: var(--text-2)">Served</b
+            ><span class="n" id="cS">0</span>
+          </div>
+          <div class="col-l" id="colServed">
+            <div class="ko-skel skel"></div>
+          </div>
+        </div>
+      </div>
+    </div>
 
-<script src="/assets/brand.js"></script>
-<script>
-const API = location.origin;
-// Namespaced per app — see pos.html for why: /pos, /kds and /console used to
-// share one localStorage session, so opening one after another silently
-// carried over a role with no permission for the new page, and the page
-// just sat blank with an already-faded toast as the only clue.
-const NS = 'wt_kds_';
-const ALLOWED_ROLES = ['kitchen', 'admin'];
-let TOKEN = localStorage.getItem(NS + 'token');
-let ROLE = localStorage.getItem(NS + 'role');
-let NAME = localStorage.getItem(NS + 'name');
-let ORDERS = [];
-let REFILLS = [];
-let POLL = null;
+    <script src="/assets/brand.js"></script>
+    <script>
+      const API = location.origin;
+      // Namespaced per app — see pos.html for why: /pos, /kds and /console used to
+      // share one localStorage session, so opening one after another silently
+      // carried over a role with no permission for the new page, and the page
+      // just sat blank with an already-faded toast as the only clue.
+      const NS = "wt_kds_";
+      const ALLOWED_ROLES = ["kitchen", "admin"];
+      let TOKEN = localStorage.getItem(NS + "token");
+      let ROLE = localStorage.getItem(NS + "role");
+      let NAME = localStorage.getItem(NS + "name");
+      let ORDERS = [];
+      let REFILLS = [];
+      let POLL = null;
 
-const $ = s => document.querySelector(s);
+      const $ = (s) => document.querySelector(s);
 
-/* Two error shapes come from this backend:
+      /* Void confirmation popup — a styled yes/no in place of the browser's
+   native confirm(), so the destructive choice (red) and backing out
+   (green) are visually distinct instead of two identical gray buttons. */
+      function askConfirm(message, opts = {}) {
+        const title = opts.title || "Confirm void";
+        const yesLabel = opts.yesLabel || "Yes, void it";
+        const noLabel = opts.noLabel || "No, keep it";
+        return new Promise((resolve) => {
+          const scrim = document.createElement("div");
+          scrim.className = "cf-scrim";
+          const box = document.createElement("div");
+          box.className = "cf-box";
+          box.setAttribute("role", "dialog");
+          box.setAttribute("aria-modal", "true");
+          box.setAttribute("aria-labelledby", "cf-title-active");
+          box.innerHTML = `
+        <h3 class="cf-title" id="cf-title-active">${title}</h3>
+        <p class="cf-msg">${message}</p>
+        <div class="cf-actions">
+          <button type="button" class="cf-btn cf-no">${noLabel}</button>
+          <button type="button" class="cf-btn cf-yes">${yesLabel}</button>
+        </div>`;
+          document.body.appendChild(scrim);
+          document.body.appendChild(box);
+
+          function done(v) {
+            document.removeEventListener("keydown", onKey);
+            scrim.remove();
+            box.remove();
+            resolve(v);
+          }
+          function onKey(e) {
+            if (e.key === "Escape") done(false);
+            if (e.key === "Enter") done(true);
+          }
+
+          scrim.addEventListener("click", () => done(false));
+          box
+            .querySelector(".cf-no")
+            .addEventListener("click", () => done(false));
+          box
+            .querySelector(".cf-yes")
+            .addEventListener("click", () => done(true));
+          document.addEventListener("keydown", onKey);
+          box.querySelector(".cf-no").focus();
+        });
+      }
+
+      /* Two error shapes come from this backend:
      FastAPI HTTPException -> { detail: "a string" }
      domain WTError        -> { code, message: "a string", detail: {...} }
    `body.detail || body.message` was wrong: a WTError with no extra context
    carries `detail: {}`, an EMPTY OBJECT, which is truthy in JavaScript — so
    it won every time and the cashier saw "[object Object]" instead of the
    real reason (e.g. "not enough stock"). Prefer the human message. */
-function apiErrorMessage(body, status) {
-  if (body) {
-    if (typeof body.message === 'string' && body.message) return body.message;
-    if (typeof body.detail === 'string' && body.detail) return body.detail;
-  }
-  if (status === 401) return 'Session expired — please sign in again.';
-  if (status === 403) return 'Your account does not have permission for this.';
-  return 'HTTP ' + status;
-}
+      function apiErrorMessage(body, status) {
+        if (body) {
+          if (typeof body.message === "string" && body.message)
+            return body.message;
+          if (typeof body.detail === "string" && body.detail)
+            return body.detail;
+        }
+        if (status === 401) return "Session expired — please sign in again.";
+        if (status === 403)
+          return "Your account does not have permission for this.";
+        return "HTTP " + status;
+      }
 
+      async function api(path, opts = {}) {
+        const r = await fetch(API + path, {
+          ...opts,
+          headers: {
+            "Content-Type": "application/json",
+            ...(TOKEN ? { Authorization: "Bearer " + TOKEN } : {}),
+            ...(opts.headers || {}),
+          },
+        });
+        if (r.status === 401) {
+          doLogout();
+          throw new Error("session expired");
+        }
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(apiErrorMessage(body, r.status));
+        return body;
+      }
 
-async function api(path, opts = {}) {
-  const r = await fetch(API + path, {
-    ...opts,
-    headers: { 'Content-Type': 'application/json', ...(TOKEN ? { Authorization: 'Bearer ' + TOKEN } : {}), ...(opts.headers || {}) },
-  });
-  if (r.status === 401) { doLogout(); throw new Error('session expired'); }
-  const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(apiErrorMessage(body, r.status));
-  return body;
-}
+      function showApp() {
+        $("#login").style.display = "none";
+        $("#app").style.display = "flex";
+        $("#whoName").textContent = `${NAME} · ${ROLE}`;
+        refresh();
+        POLL = setInterval(refresh, 5000);
+      }
+      function doLogout() {
+        if (POLL) clearInterval(POLL);
+        localStorage.removeItem(NS + "token");
+        localStorage.removeItem(NS + "role");
+        localStorage.removeItem(NS + "name");
+        location.reload();
+      }
+      $("#logoutBtn").onclick = doLogout;
+      let PENDING_CURRENT_PW = null;
+      // Admins can sign in here directly too (ALLOWED_ROLES above), so the
+      // boot screen's role tag reflects who actually authenticated, not just
+      // this page's usual audience.
+      function bootLabels(role) {
+        return {
+          roleLabel: role === "admin" ? "Administrator" : "Kitchen Staff",
+          destLabel: "Kitchen Display",
+        };
+      }
+      function finishLogin(token, role, name) {
+        TOKEN = token;
+        ROLE = role;
+        NAME = name;
+        localStorage.setItem(NS + "token", TOKEN);
+        localStorage.setItem(NS + "role", ROLE);
+        localStorage.setItem(NS + "name", NAME);
+        PENDING_CURRENT_PW = null;
+        if (window.WingsIntro && window.WingsIntro.boot) {
+          WingsIntro.boot(bootLabels(ROLE)).then(showApp);
+        } else {
+          showApp();
+        }
+      }
+      $("#loginBtn").onclick = async () => {
+        const u = $("#luser").value.trim(),
+          p = $("#lpass").value;
+        $("#loginErr").textContent = "";
+        $("#loginBtn").disabled = true;
+        try {
+          const r = await fetch(API + "/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ username: u, password: p }),
+          });
+          const body = await r.json();
+          if (!r.ok)
+            throw new Error(
+              apiErrorMessage(body, r.status) || "invalid credentials",
+            );
+          if (!ALLOWED_ROLES.includes(body.role))
+            throw new Error(
+              `'${body.role}' accounts cannot use the kitchen display`,
+            );
+          if (body.must_change_password) {
+            PENDING_CURRENT_PW = p;
+            TOKEN = body.token;
+            ROLE = body.role;
+            NAME = body.display_name;
+            $("#login .wt-rl-card").style.display = "none";
+            $("#pwChangeBox").style.display = "";
+            $("#pwNew").focus();
+            return;
+          }
+          finishLogin(body.token, body.role, body.display_name);
+        } catch (e) {
+          $("#loginErr").textContent =
+            e.message || "Could not reach the server";
+        } finally {
+          $("#loginBtn").disabled = false;
+        }
+      };
+      $("#lpass").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") $("#loginBtn").click();
+      });
 
-function showApp() {
-  $('#login').style.display = 'none';
-  $('#app').style.display = 'flex';
-  $('#whoName').textContent = `${NAME} · ${ROLE}`;
-  refresh();
-  POLL = setInterval(refresh, 5000);
-}
-function doLogout() {
-  if (POLL) clearInterval(POLL);
-  localStorage.removeItem(NS + 'token'); localStorage.removeItem(NS + 'role'); localStorage.removeItem(NS + 'name');
-  location.reload();
-}
-$('#logoutBtn').onclick = doLogout;
-$('#loginBtn').onclick = async () => {
-  const u = $('#luser').value.trim(), p = $('#lpass').value;
-  $('#loginErr').textContent = ''; $('#loginBtn').disabled = true;
-  try {
-    const r = await fetch(API + '/auth/login', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: u, password: p }),
-    });
-    const body = await r.json();
-    if (!r.ok) throw new Error(apiErrorMessage(body, r.status) || 'invalid credentials');
-    if (!ALLOWED_ROLES.includes(body.role))
-      throw new Error(`'${body.role}' accounts cannot use the kitchen display`);
-    TOKEN = body.token; ROLE = body.role; NAME = body.display_name;
-    localStorage.setItem(NS + 'token', TOKEN); localStorage.setItem(NS + 'role', ROLE); localStorage.setItem(NS + 'name', NAME);
-    showApp();
-  } catch (e) {
-    $('#loginErr').textContent = e.message || 'Could not reach the server';
-  } finally { $('#loginBtn').disabled = false; }
-};
-$('#lpass').addEventListener('keydown', e => { if (e.key === 'Enter') $('#loginBtn').click(); });
+      $("#pwChangeBtn").onclick = async () => {
+        const n = $("#pwNew").value,
+          c = $("#pwConfirm").value;
+        $("#pwChangeErr").textContent = "";
+        $("#pwChangeBtn").disabled = true;
+        try {
+          const r = await fetch(API + "/auth/change_password", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: "Bearer " + TOKEN,
+            },
+            body: JSON.stringify({
+              current_password: PENDING_CURRENT_PW,
+              new_password: n,
+              confirm_new_password: c,
+            }),
+          });
+          const body = await r.json();
+          if (!r.ok)
+            throw new Error(
+              apiErrorMessage(body, r.status) || "could not set password",
+            );
+          finishLogin(body.token, ROLE, NAME);
+          $("#pwChangeBox").style.display = "none";
+          $("#login .wt-rl-card").style.display = "";
+          $("#pwNew").value = "";
+          $("#pwConfirm").value = "";
+        } catch (e) {
+          $("#pwChangeErr").textContent =
+            e.message || "Could not reach the server";
+        } finally {
+          $("#pwChangeBtn").disabled = false;
+        }
+      };
+      $("#pwConfirm").addEventListener("keydown", (e) => {
+        if (e.key === "Enter") $("#pwChangeBtn").click();
+      });
 
-const EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
-const EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a13.16 13.16 0 0 1-1.67 2.68M6.61 6.61A13.5 13.5 0 0 0 1 11s4 7 11 7a9.26 9.26 0 0 0 4.39-1.02M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>';
-$('#passToggle').innerHTML = EYE;
-$('#passToggle').addEventListener('click', () => {
-  const showing = $('#lpass').type === 'text';
-  $('#lpass').type = showing ? 'password' : 'text';
-  $('#passToggle').innerHTML = showing ? EYE : EYE_OFF;
-  $('#passToggle').setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
-  $('#passToggle').setAttribute('aria-pressed', showing ? 'false' : 'true');
-});
+      const EYE =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7Z"/><circle cx="12" cy="12" r="3"/></svg>';
+      const EYE_OFF =
+        '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 7 11 7a13.16 13.16 0 0 1-1.67 2.68M6.61 6.61A13.5 13.5 0 0 0 1 11s4 7 11 7a9.26 9.26 0 0 0 4.39-1.02M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="M1 1l22 22"/></svg>';
+      $("#passToggle").innerHTML = EYE;
+      $("#passToggle").addEventListener("click", () => {
+        const showing = $("#lpass").type === "text";
+        $("#lpass").type = showing ? "password" : "text";
+        $("#passToggle").innerHTML = showing ? EYE : EYE_OFF;
+        $("#passToggle").setAttribute(
+          "aria-label",
+          showing ? "Show password" : "Hide password",
+        );
+        $("#passToggle").setAttribute(
+          "aria-pressed",
+          showing ? "false" : "true",
+        );
+      });
 
-function mins(iso) {
-  const m = (Date.now() - new Date(iso + 'Z')) / 60000;
-  const mm = Math.max(0, Math.floor(m)), ss = Math.max(0, Math.floor((m % 1) * 60));
-  return { text: `${String(mm).padStart(2, '0')}:${String(ss).padStart(2, '0')}`, val: m };
-}
+      function mins(iso) {
+        const m = (Date.now() - new Date(iso + "Z")) / 60000;
+        const mm = Math.max(0, Math.floor(m)),
+          ss = Math.max(0, Math.floor((m % 1) * 60));
+        return {
+          text: `${String(mm).padStart(2, "0")}:${String(ss).padStart(2, "0")}`,
+          val: m,
+        };
+      }
 
-async function refresh() {
-  try {
-    const d = await api('/kds/queue');
-    ORDERS = d.orders;
-    REFILLS = d.refills || [];
-    $('#connDot').classList.remove('off');
-    $('#errBanner').classList.add('hide');
-    paint();
-  } catch (e) {
-    $('#connDot').classList.add('off');
-    $('#errBanner').innerHTML = `<span>Could not reach the server: ${e.message}</span>
+      async function refresh() {
+        try {
+          const d = await api("/kds/queue");
+          ORDERS = d.orders;
+          REFILLS = d.refills || [];
+          $("#connDot").classList.remove("off");
+          $("#errBanner").classList.add("hide");
+          paint();
+        } catch (e) {
+          $("#connDot").classList.add("off");
+          $("#errBanner").innerHTML =
+            `<span>Could not reach the server: ${e.message}</span>
       <button onclick="refresh()">Retry now</button>`;
-    $('#errBanner').classList.remove('hide');
-  }
-}
+          $("#errBanner").classList.remove("hide");
+        }
+      }
 
-function orderCard(o) {
-  const t = mins(o.created_at);
-  const pri = o.status === 'served' ? 'pri-done' : t.val > 15 ? 'pri-hi' : t.val > 8 ? 'pri-md' : 'pri-lo';
-  const nextAction = o.status === 'punched'
-    ? { label: 'Start cooking', path: 'start' }
-    : o.status === 'in_progress'
-    ? { label: 'Mark ready', path: 'ready' }
-    : o.status === 'ready'
-    ? { label: 'Mark served', path: 'served' }
-    : null;
-  // Voiding a queued (not-yet-started) ticket has zero inventory impact —
-  // the hold is simply released. Once cooking has started, voiding books a
-  // real compensating wastage entry and is a till-side decision, so the
-  // button only appears here for 'punched' orders.
-  const canVoid = o.status === 'punched';
-  return `<div class="ko ${pri}">
-    <div class="ko-h"><span class="no">#${o.order_no.replace('WT-', '')}</span>
-      <span class="tbl">${o.table_label || 'Walk-in'}${o.head_count ? ` · ${o.head_count} pax` : ''}</span>
-      <span class="tm ${t.val > 15 && o.status !== 'served' ? 'late' : ''}">${t.text}</span></div>
-    <div class="ko-l">${o.lines.map(l => `<div class="ko-i"><span class="q">${l.qty}×</span>
-      <span>${l.name}${l.note ? `<span class="nt">${l.note}</span>` : ''}</span></div>`).join('')}</div>
-    ${nextAction ? `<div class="ko-b">
+      function orderCard(o) {
+        const t = mins(o.created_at);
+        const pri =
+          o.status === "served"
+            ? "pri-done"
+            : t.val > 15
+              ? "pri-hi"
+              : t.val > 8
+                ? "pri-md"
+                : "pri-lo";
+        const nextAction =
+          o.status === "punched"
+            ? { label: "Start cooking", path: "start" }
+            : o.status === "in_progress"
+              ? { label: "Mark ready", path: "ready" }
+              : o.status === "ready"
+                ? { label: "Mark served", path: "served" }
+                : null;
+        // Voiding a queued (not-yet-started) ticket has zero inventory impact —
+        // the hold is simply released. Once cooking has started, voiding books a
+        // real compensating wastage entry and is a till-side decision, so the
+        // button only appears here for 'punched' orders.
+        const canVoid = o.status === "punched";
+        return `<div class="ko ${pri}">
+    <div class="ko-h"><span class="no">#${o.order_no.replace("WT-", "")}</span>
+      <span class="tbl">${o.table_label || "Walk-in"}${o.head_count ? ` · ${o.head_count} pax` : ""}</span>
+      <span class="tm ${t.val > 15 && o.status !== "served" ? "late" : ""}">${t.text}</span></div>
+    <div class="ko-l">${o.lines
+      .map(
+        (l) => `<div class="ko-i"><span class="q">${l.qty}×</span>
+      <span>${l.name}${l.note ? `<span class="nt">${l.note}</span>` : ""}</span></div>`,
+      )
+      .join("")}</div>
+    ${
+      nextAction
+        ? `<div class="ko-b">
       <button class="kbtn p" data-adv="${o.id}:${nextAction.path}">${nextAction.label}</button>
-      ${canVoid ? `<button class="kbtn s" data-void="${o.id}">Void</button>` : ''}
-    </div>` : ''}
+      ${canVoid ? `<button class="kbtn s" data-void="${o.id}">Void</button>` : ""}
+    </div>`
+        : ""
+    }
   </div>`;
-}
+      }
 
-/* A refill ticket. States the flavour and the piece count outright — the
+      /* The per-head flavour breakdown already reaches this client as plain
+   text on the refill's note — refills.py stamps "Head 1: X · Head 2: Y"
+   onto it at creation time (see set_head_flavors upstream). This just turns
+   that sentence back into head→flavour columns instead of asking kitchen
+   staff to read it word-by-word mid-rush, grouping heads that share a
+   flavour so repeats don't take extra space. No data changes: same string,
+   parsed and laid out instead of printed verbatim. */
+      function parseHeadFlavors(note) {
+        if (!note) return null;
+        const m = note.match(/(?:^|\s—\s)((?:Head \d+: [^·]+(?:\s·\s)?)+)$/);
+        if (!m) return null;
+        const heads = [];
+        for (const part of m[1].split(" · ")) {
+          const hm = part.trim().match(/^Head (\d+): (.+)$/);
+          if (hm) heads.push({ head: Number(hm[1]), flavor: hm[2].trim() });
+        }
+        if (!heads.length) return null;
+        const extra = note
+          .slice(0, note.length - m[1].length)
+          .replace(/\s—\s$/, "")
+          .trim();
+        return { heads, extra: extra || null };
+      }
+
+      function groupHeadFlavors(heads) {
+        const order = [];
+        const byFlavor = new Map();
+        for (const { head, flavor } of heads) {
+          if (!byFlavor.has(flavor)) {
+            byFlavor.set(flavor, []);
+            order.push(flavor);
+          }
+          byFlavor.get(flavor).push(head);
+        }
+        return order.map((flavor) => ({ flavor, heads: byFlavor.get(flavor) }));
+      }
+
+      function headFlavorsHtml(note) {
+        const parsed = parseHeadFlavors(note);
+        if (!parsed) return null;
+        const groups = groupHeadFlavors(parsed.heads);
+        const grid = groups
+          .map(
+            (g, i) => `<div class="ko-heads-cell">
+          <div class="ko-heads-top"><span class="ko-heads-num">${i + 1}</span><span class="ko-heads-name">${esc2(g.flavor.toUpperCase())}${g.heads.length > 1 ? ` ×${g.heads.length}` : ""}</span></div>
+          <div class="ko-heads-of">${g.heads.map((h) => `HEAD ${h}`).join(" · ")}</div>
+        </div>`,
+          )
+          .join("");
+        const extraHtml = parsed.extra
+          ? `<div class="ko-i"><span class="nt">${esc2(parsed.extra)}</span></div>`
+          : "";
+        return `<div class="ko-heads">
+      <div class="ko-heads-lbl">Flavors</div>
+      <div class="ko-heads-grid">${grid}</div>
+    </div>${extraHtml}`;
+      }
+
+      /* A refill ticket. States the flavour and the piece count outright — the
    kitchen should never have to open an order or read a note to find out what
    to cook. */
-function refillCard(r) {
-  const t = mins(r.created_at);
-  const done = r.status === 'served';
-  const pri = done ? 'pri-done' : t.val > 10 ? 'pri-hi' : t.val > 5 ? 'pri-md' : 'pri-lo';
-  return `<div class="ko refill ${pri}">
-    <div class="ko-h"><span class="no">#${r.order_no.replace('WT-', '')}</span>
+      function refillCard(r) {
+        const t = mins(r.created_at);
+        const done = r.status === "served";
+        const pri = done
+          ? "pri-done"
+          : t.val > 10
+            ? "pri-hi"
+            : t.val > 5
+              ? "pri-md"
+              : "pri-lo";
+        return `<div class="ko refill ${pri}">
+    <div class="ko-h"><span class="no">#${r.order_no.replace("WT-", "")}</span>
       <span class="ko-badge">UNLIMITED · REFILL #${r.refill_no}</span>
-      <span class="tm ${t.val > 10 && !done ? 'late' : ''}">${t.text}</span></div>
+      <span class="tm ${t.val > 10 && !done ? "late" : ""}">${t.text}</span></div>
     <div class="ko-l">
       <div class="ko-flav">${r.flavor_name.toUpperCase()}</div>
-      <div class="ko-pcs"><b>${r.pieces}</b> pcs · ${r.head_count} head${r.head_count === 1 ? '' : 's'}
-        · ${r.table_label || 'Walk-in'}</div>
-      ${r.flavor_type === 'special'
-        ? `<div class="ko-add">SPECIAL FLAVOR · +₱${Number(r.addon_amount).toFixed(2)}</div>` : ''}
-      ${r.note ? `<div class="ko-i"><span class="nt">${r.note}</span></div>` : ''}
+      <div class="ko-pcs"><b>${r.pieces}</b> pcs · ${r.head_count} head${r.head_count === 1 ? "" : "s"}
+        · ${r.table_label || "Walk-in"}</div>
+      ${
+        r.flavor_type === "special"
+          ? `<div class="ko-add">SPECIAL FLAVOR · +₱${Number(r.addon_amount).toFixed(2)}</div>`
+          : ""
+      }
+      ${headFlavorsHtml(r.note) || (r.note ? `<div class="ko-i"><span class="nt">${r.note}</span></div>` : "")}
     </div>
-    ${!done ? `<div class="ko-b">
+    ${
+      !done
+        ? `<div class="ko-b">
       <button class="kbtn p" data-serve-refill="${r.id}">Refill served</button>
       <button class="kbtn s" data-void-refill="${r.id}">Void</button>
-    </div>` : ''}
+    </div>`
+        : ""
+    }
   </div>`;
-}
+      }
 
-function paint() {
-  const q = ORDERS.filter(o => o.status === 'punched');
-  const c = ORDERS.filter(o => o.status === 'in_progress');
-  const r = ORDERS.filter(o => o.status === 'ready');
-  const s = ORDERS.filter(o => o.status === 'served');
-  // A pending refill is work waiting to be cooked, so it belongs in Cooking
-  // alongside the orders already started; a served one joins the Served
-  // column for the same 30-minute "did I already do that?" window.
-  const rfPending = REFILLS.filter(x => x.status === 'pending');
-  const rfServed = REFILLS.filter(x => x.status === 'served');
+      function paint() {
+        const q = ORDERS.filter((o) => o.status === "punched");
+        const c = ORDERS.filter((o) => o.status === "in_progress");
+        const r = ORDERS.filter((o) => o.status === "ready");
+        const s = ORDERS.filter((o) => o.status === "served");
+        // A pending refill is work waiting to be cooked, so it belongs in Cooking
+        // alongside the orders already started; a served one joins the Served
+        // column for the same 30-minute "did I already do that?" window.
+        const rfPending = REFILLS.filter((x) => x.status === "pending");
+        const rfServed = REFILLS.filter((x) => x.status === "served");
 
-  $('#nQueue').textContent = q.length; $('#nCook').textContent = c.length + rfPending.length;
-  $('#cQ').textContent = q.length; $('#cC').textContent = c.length + rfPending.length;
-  $('#cR').textContent = r.length; $('#cS').textContent = s.length + rfServed.length;
-  $('#colQueued').innerHTML = q.length ? q.map(orderCard).join('') : '<div class="empty-col">No orders waiting</div>';
-  $('#colCooking').innerHTML = (rfPending.length || c.length)
-    ? rfPending.map(refillCard).join('') + c.map(orderCard).join('')
-    : '<div class="empty-col">Nothing on the pass</div>';
-  $('#colReady').innerHTML = r.length ? r.map(orderCard).join('') : '<div class="empty-col">Nothing plated</div>';
-  $('#colServed').innerHTML = (s.length || rfServed.length)
-    ? rfServed.map(refillCard).join('') + s.map(orderCard).join('')
-    : '<div class="empty-col">Nothing served yet</div>';
-}
+        $("#nQueue").textContent = q.length;
+        $("#nCook").textContent = c.length + rfPending.length;
+        $("#cQ").textContent = q.length;
+        $("#cC").textContent = c.length + rfPending.length;
+        $("#cR").textContent = r.length;
+        $("#cS").textContent = s.length + rfServed.length;
+        $("#colQueued").innerHTML = q.length
+          ? q.map(orderCard).join("")
+          : '<div class="empty-col">No orders waiting</div>';
+        $("#colCooking").innerHTML =
+          rfPending.length || c.length
+            ? rfPending.map(refillCard).join("") + c.map(orderCard).join("")
+            : '<div class="empty-col">Nothing on the pass</div>';
+        $("#colReady").innerHTML = r.length
+          ? r.map(orderCard).join("")
+          : '<div class="empty-col">Nothing plated</div>';
+        $("#colServed").innerHTML =
+          s.length || rfServed.length
+            ? rfServed.map(refillCard).join("") + s.map(orderCard).join("")
+            : '<div class="empty-col">Nothing served yet</div>';
+      }
 
-/* ===================== END-OF-SERVICE RECONCILIATION =====================
+      /* ===================== END-OF-SERVICE RECONCILIATION =====================
    The kitchen is the only station that can weigh the tray, so this is where
    the measurement is taken. It is deliberately the ONLY inventory-affecting
    thing this client can do: the endpoints behind it are gated on
@@ -384,65 +1317,99 @@ function paint() {
    Everything shown is either read back from the server or arithmetic the
    operator can check by eye against the scale. The recorded numbers are the
    ones the server returns from the submission, never these. */
-const esc2 = s => String(s == null ? '' : s).replace(/[&<>"']/g,
-  m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
-const n0 = v => (Math.round(Number(v) || 0)).toLocaleString('en-PH');
-const n1 = v => (Number(v) || 0).toLocaleString('en-PH', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+      const esc2 = (s) =>
+        String(s == null ? "" : s).replace(
+          /[&<>"']/g,
+          (m) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[m],
+        );
+      const n0 = (v) => Math.round(Number(v) || 0).toLocaleString("en-PH");
+      const n1 = (v) =>
+        (Number(v) || 0).toLocaleString("en-PH", {
+          minimumFractionDigits: 1,
+          maximumFractionDigits: 1,
+        });
 
-let REC = null;
+      let REC = null;
 
-function closeRec() {
-  const s = document.getElementById('recScrim'); if (s) s.remove();
-  const b = document.getElementById('recSheet'); if (b) b.remove();
-  REC = null;
-}
+      function closeRec() {
+        const s = document.getElementById("recScrim");
+        if (s) s.remove();
+        const b = document.getElementById("recSheet");
+        if (b) b.remove();
+        REC = null;
+      }
 
-async function openRec(dateStr) {
-  const date = dateStr || new Date().toISOString().slice(0, 10);
-  let data;
-  try { data = await api('/unli/reconciliation/pending?service_date=' + date); }
-  catch (e) { alert(e.message); return; }
-  REC = { date, data };
-  closeRec();
-  const scrim = document.createElement('div'); scrim.id = 'recScrim';
-  scrim.addEventListener('click', closeRec);
-  document.body.appendChild(scrim);
-  const sheet = document.createElement('div'); sheet.id = 'recSheet';
-  document.body.appendChild(sheet);
-  paintRec();
-}
+      async function openRec(dateStr) {
+        const date = dateStr || new Date().toISOString().slice(0, 10);
+        let data;
+        try {
+          data = await api("/unli/reconciliation/pending?service_date=" + date);
+        } catch (e) {
+          alert(e.message);
+          return;
+        }
+        REC = { date, data };
+        closeRec();
+        const scrim = document.createElement("div");
+        scrim.id = "recScrim";
+        scrim.addEventListener("click", closeRec);
+        document.body.appendChild(scrim);
+        const sheet = document.createElement("div");
+        sheet.id = "recSheet";
+        document.body.appendChild(sheet);
+        paintRec();
+      }
 
-function paintRec() {
-  const { date, data } = REC;
-  const tolPct = (data.tolerance_ratio * 100).toFixed(0);
-  const active = data.streams.filter(s => s.heads > 0 || s.reconciled);
+      function paintRec() {
+        const { date, data } = REC;
+        const tolPct = (data.tolerance_ratio * 100).toFixed(0);
+        const active = data.streams.filter((s) => s.heads > 0 || s.reconciled);
 
-  const body = active.length ? active.map(s => {
-    if (s.reconciled) {
-      const r = s.reconciled;
-      const chip = r.status === 'within_tolerance' ? 'ok'
-        : r.status === 'over_tolerance' ? 'bad' : 'warn';
-      const label = r.status === 'within_tolerance' ? 'Within tolerance'
-        : r.status === 'over_tolerance' ? 'More than expected' : 'Less than expected';
-      return `<div class="rec-row">
+        const body = active.length
+          ? active
+              .map((s) => {
+                if (s.reconciled) {
+                  const r = s.reconciled;
+                  const chip =
+                    r.status === "within_tolerance"
+                      ? "ok"
+                      : r.status === "over_tolerance"
+                        ? "bad"
+                        : "warn";
+                  const label =
+                    r.status === "within_tolerance"
+                      ? "Within tolerance"
+                      : r.status === "over_tolerance"
+                        ? "More than expected"
+                        : "Less than expected";
+                  return `<div class="rec-row">
         <div class="rh"><b>${esc2(s.label)}</b>
           <span class="chip ${chip}">${label}</span>
-          <span class="chip ${r.validation_state === 'validated' ? 'ok' : 'mute'}">
-            ${r.validation_state === 'validated' ? 'Signed off' : 'Waiting for the manager'}</span></div>
+          <span class="chip ${r.validation_state === "validated" ? "ok" : "mute"}">
+            ${r.validation_state === "validated" ? "Signed off" : "Waiting for the manager"}</span></div>
         <div class="rec-done">
           <span>Covers <b>${s.heads}</b></span>
           <span>Expected <b>${n0(s.theoretical_base)} ${esc2(s.base_unit)}</b></span>
           <span>Measured <b>${n0(r.actual_base)} ${esc2(s.base_unit)}</b></span>
-          <span>Variance <b>${r.variance_base > 0 ? '+' : ''}${n0(r.variance_base)} ${esc2(s.base_unit)}
-            (${r.variance_ratio != null ? (r.variance_ratio > 0 ? '+' : '') + n1(r.variance_ratio * 100) + '%' : '—'})</b></span>
-          <span>Stock ${Math.abs(r.correction_base) > 0.001
-            ? `<b>${r.correction_base > 0 ? 'credited ' : 'reduced by '}${n0(Math.abs(r.correction_base))} ${esc2(s.base_unit)}</b>`
-            : '<b>unchanged — the estimate was right</b>'}</span>
+          <span>Variance <b>${r.variance_base > 0 ? "+" : ""}${n0(r.variance_base)} ${esc2(s.base_unit)}
+            (${r.variance_ratio != null ? (r.variance_ratio > 0 ? "+" : "") + n1(r.variance_ratio * 100) + "%" : "—"})</b></span>
+          <span>Stock ${
+            Math.abs(r.correction_base) > 0.001
+              ? `<b>${r.correction_base > 0 ? "credited " : "reduced by "}${n0(Math.abs(r.correction_base))} ${esc2(s.base_unit)}</b>`
+              : "<b>unchanged — the estimate was right</b>"
+          }</span>
         </div></div>`;
-    }
-    return `<div class="rec-row" data-stream="${esc2(s.item_key)}">
+                }
+                return `<div class="rec-row" data-stream="${esc2(s.item_key)}">
       <div class="rh"><b>${esc2(s.label)}</b>
-        <span class="m">${s.heads} cover${s.heads === 1 ? '' : 's'} ·
+        <span class="m">${s.heads} cover${s.heads === 1 ? "" : "s"} ·
           ${esc2(s.ingredient_name)} ·
           already deducted <b>${n0(s.theoretical_base)} ${esc2(s.base_unit)}</b>
           at ${n1(s.lambda_used)} ${esc2(s.base_unit)} a head</span></div>
@@ -458,10 +1425,12 @@ function paintRec() {
         what was actually eaten.</div>
       <div class="rec-f"><button class="btn btn-p" data-submit="${esc2(s.item_key)}" disabled>Submit ${esc2(s.label)}</button></div>
     </div>`;
-  }).join('') : `<div class="rec-row"><div class="rec-calc">No unlimited covers were served on
+              })
+              .join("")
+          : `<div class="rec-row"><div class="rec-calc">No unlimited covers were served on
       ${esc2(date)}, so there is nothing to reconcile. Pick another date.</div></div>`;
 
-  document.getElementById('recSheet').innerHTML = `
+        document.getElementById("recSheet").innerHTML = `
     <h2>End-of-service reconciliation</h2>
     <p class="sub">The till deducted an estimate when each unlimited order was punched.
       Weigh what actually went out and what came back, and only the difference is corrected.
@@ -475,128 +1444,179 @@ function paintRec() {
     <div id="recErr"></div>
     <div class="rec-f"><button class="btn btn-s" id="recClose">Close</button></div>`;
 
-  document.getElementById('recClose').onclick = closeRec;
-  document.getElementById('recLoad').onclick = () => openRec(document.getElementById('recDate').value);
-  document.querySelectorAll('#recSheet [data-stream]').forEach(wireRecRow);
-}
+        document.getElementById("recClose").onclick = closeRec;
+        document.getElementById("recLoad").onclick = () =>
+          openRec(document.getElementById("recDate").value);
+        document
+          .querySelectorAll("#recSheet [data-stream]")
+          .forEach(wireRecRow);
+      }
 
-function wireRecRow(row) {
-  const key = row.dataset.stream;
-  const s = REC.data.streams.find(x => x.item_key === key);
-  const get = f => parseFloat(row.querySelector(`[data-f="${f}"]`).value);
-  const calc = row.querySelector('[data-calc]');
-  const btn = row.querySelector('[data-submit]');
-  const tolPct = (REC.data.tolerance_ratio * 100).toFixed(0);
+      function wireRecRow(row) {
+        const key = row.dataset.stream;
+        const s = REC.data.streams.find((x) => x.item_key === key);
+        const get = (f) =>
+          parseFloat(row.querySelector(`[data-f="${f}"]`).value);
+        const calc = row.querySelector("[data-calc]");
+        const btn = row.querySelector("[data-submit]");
+        const tolPct = (REC.data.tolerance_ratio * 100).toFixed(0);
 
-  function update() {
-    const o = get('open'), a = get('add') || 0, c = get('close');
-    if (isNaN(o) || isNaN(c)) {
-      btn.disabled = true; calc.className = 'rec-calc';
-      calc.textContent = 'Enter what went out and what came back — the difference is what was actually eaten.';
-      return;
-    }
-    if (c > o + a) {
-      btn.disabled = true; calc.className = 'rec-calc bad';
-      calc.textContent = 'The leftover is more than what went out. Check both readings.';
-      return;
-    }
-    const actual = o + a - c;
-    const variance = actual - s.theoretical_base;
-    const ratio = s.theoretical_base > 0 ? variance / s.theoretical_base : 0;
-    const within = Math.abs(ratio) <= REC.data.tolerance_ratio;
-    btn.disabled = false;
-    calc.className = 'rec-calc ' + (within ? 'ok' : 'warn');
-    calc.innerHTML = `Actually used <b>${n0(actual)} ${esc2(s.base_unit)}</b>
-      — that is <b>${n1(actual / s.heads)} ${esc2(s.base_unit)} a head</b> across ${s.heads} cover${s.heads === 1 ? '' : 's'}.<br>
+        function update() {
+          const o = get("open"),
+            a = get("add") || 0,
+            c = get("close");
+          if (isNaN(o) || isNaN(c)) {
+            btn.disabled = true;
+            calc.className = "rec-calc";
+            calc.textContent =
+              "Enter what went out and what came back — the difference is what was actually eaten.";
+            return;
+          }
+          if (c > o + a) {
+            btn.disabled = true;
+            calc.className = "rec-calc bad";
+            calc.textContent =
+              "The leftover is more than what went out. Check both readings.";
+            return;
+          }
+          const actual = o + a - c;
+          const variance = actual - s.theoretical_base;
+          const ratio =
+            s.theoretical_base > 0 ? variance / s.theoretical_base : 0;
+          const within = Math.abs(ratio) <= REC.data.tolerance_ratio;
+          btn.disabled = false;
+          calc.className = "rec-calc " + (within ? "ok" : "warn");
+          calc.innerHTML = `Actually used <b>${n0(actual)} ${esc2(s.base_unit)}</b>
+      — that is <b>${n1(actual / s.heads)} ${esc2(s.base_unit)} a head</b> across ${s.heads} cover${s.heads === 1 ? "" : "s"}.<br>
       Expected ${n0(s.theoretical_base)} ${esc2(s.base_unit)}, so the variance is
-      <b>${variance > 0 ? '+' : ''}${n0(variance)} ${esc2(s.base_unit)}
-      (${ratio > 0 ? '+' : ''}${n1(ratio * 100)}%)</b> —
-      ${within ? `inside the ${tolPct}% tolerance, so this signs off on its own.`
-               : `outside the ${tolPct}% tolerance, so the manager will be asked to confirm it.`}<br>
-      Stock will be ${Math.abs(variance) < 0.5 ? '<b>left as it is</b>'
-        : variance > 0 ? `<b>reduced by a further ${n0(Math.abs(variance))} ${esc2(s.base_unit)}</b>`
-                       : `<b>credited back ${n0(Math.abs(variance))} ${esc2(s.base_unit)}</b>`}.`;
-  }
+      <b>${variance > 0 ? "+" : ""}${n0(variance)} ${esc2(s.base_unit)}
+      (${ratio > 0 ? "+" : ""}${n1(ratio * 100)}%)</b> —
+      ${
+        within
+          ? `inside the ${tolPct}% tolerance, so this signs off on its own.`
+          : `outside the ${tolPct}% tolerance, so the manager will be asked to confirm it.`
+      }<br>
+      Stock will be ${
+        Math.abs(variance) < 0.5
+          ? "<b>left as it is</b>"
+          : variance > 0
+            ? `<b>reduced by a further ${n0(Math.abs(variance))} ${esc2(s.base_unit)}</b>`
+            : `<b>credited back ${n0(Math.abs(variance))} ${esc2(s.base_unit)}</b>`
+      }.`;
+        }
 
-  row.querySelectorAll('input[data-f]').forEach(i => i.addEventListener('input', update));
+        row
+          .querySelectorAll("input[data-f]")
+          .forEach((i) => i.addEventListener("input", update));
 
-  btn.onclick = async () => {
-    btn.disabled = true;
-    document.getElementById('recErr').textContent = '';
-    try {
-      const r = await api('/unli/reconciliation', {
-        method: 'POST',
-        body: JSON.stringify({
-          service_date: REC.date, item_key: key,
-          opening_base: get('open'), added_base: get('add') || 0, closing_base: get('close'),
-        }),
+        btn.onclick = async () => {
+          btn.disabled = true;
+          document.getElementById("recErr").textContent = "";
+          try {
+            const r = await api("/unli/reconciliation", {
+              method: "POST",
+              body: JSON.stringify({
+                service_date: REC.date,
+                item_key: key,
+                opening_base: get("open"),
+                added_base: get("add") || 0,
+                closing_base: get("close"),
+              }),
+            });
+            // Reload rather than patch the row in place: the server's figures are
+            // the record, and re-reading them is how this screen proves it.
+            await openRec(REC.date);
+            const banner = document.getElementById("recErr");
+            if (banner)
+              banner.textContent = r.inventory_corrected
+                ? `${r.label} reconciled. Stock ${r.correction_base < 0 ? "reduced by" : "credited"} ${Math.abs(r.correction_base).toFixed(0)} ${r.base_unit}.`
+                : `${r.label} reconciled. The estimate matched — no correction needed.`;
+            if (banner) banner.style.color = "var(--ok)";
+          } catch (e) {
+            document.getElementById("recErr").textContent = e.message;
+            document.getElementById("recErr").style.color = "#D92D20";
+            btn.disabled = false;
+          }
+        };
+        update();
+      }
+
+      document.getElementById("recBtn").onclick = () => openRec();
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && REC) closeRec();
       });
-      // Reload rather than patch the row in place: the server's figures are
-      // the record, and re-reading them is how this screen proves it.
-      await openRec(REC.date);
-      const banner = document.getElementById('recErr');
-      if (banner) banner.textContent = r.inventory_corrected
-        ? `${r.label} reconciled. Stock ${r.correction_base < 0 ? 'reduced by' : 'credited'} ${Math.abs(r.correction_base).toFixed(0)} ${r.base_unit}.`
-        : `${r.label} reconciled. The estimate matched — no correction needed.`;
-      if (banner) banner.style.color = 'var(--ok)';
-    } catch (e) {
-      document.getElementById('recErr').textContent = e.message;
-      document.getElementById('recErr').style.color = '#D92D20';
-      btn.disabled = false;
-    }
-  };
-  update();
-}
 
-document.getElementById('recBtn').onclick = () => openRec();
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && REC) closeRec(); });
-
-document.addEventListener('click', async e => {
-  const b = e.target.closest('[data-adv]');
-  if (b) {
-    const [id, path] = b.dataset.adv.split(':');
-    b.disabled = true;
-    try { await api(`/kds/orders/${id}/${path}`, { method: 'POST' }); await refresh(); }
-    catch (err) { alert(err.message); b.disabled = false; }
-    return;
-  }
-  const sr = e.target.closest('[data-serve-refill]');
-  if (sr) {
-    sr.disabled = true;
-    try { await api(`/unli/refills/${sr.dataset.serveRefill}/serve`, { method: 'POST' }); await refresh(); }
-    catch (err) { alert(err.message); sr.disabled = false; }
-    return;
-  }
-  const vr = e.target.closest('[data-void-refill]');
-  if (vr) {
-    if (!confirm('Void this refill? If it has already been made, the sauce is written off as wastage and any special-flavor charge is reversed.')) return;
-    vr.disabled = true;
-    try {
-      await api(`/unli/refills/${vr.dataset.voidRefill}/void`, {
-        method: 'POST', body: JSON.stringify({ reason: 'voided from kitchen display' }),
+      document.addEventListener("click", async (e) => {
+        const b = e.target.closest("[data-adv]");
+        if (b) {
+          const [id, path] = b.dataset.adv.split(":");
+          b.disabled = true;
+          try {
+            await api(`/kds/orders/${id}/${path}`, { method: "POST" });
+            await refresh();
+          } catch (err) {
+            alert(err.message);
+            b.disabled = false;
+          }
+          return;
+        }
+        const sr = e.target.closest("[data-serve-refill]");
+        if (sr) {
+          sr.disabled = true;
+          try {
+            await api(`/unli/refills/${sr.dataset.serveRefill}/serve`, {
+              method: "POST",
+            });
+            await refresh();
+          } catch (err) {
+            alert(err.message);
+            sr.disabled = false;
+          }
+          return;
+        }
+        const vr = e.target.closest("[data-void-refill]");
+        if (vr) {
+          const ok = await askConfirm(
+            "Void this refill? If it has already been made, the sauce is written off as wastage and any special-flavor charge is reversed.",
+            { title: "Void this refill?" },
+          );
+          if (!ok) return;
+          vr.disabled = true;
+          try {
+            await api(`/unli/refills/${vr.dataset.voidRefill}/void`, {
+              method: "POST",
+              body: JSON.stringify({ reason: "voided from kitchen display" }),
+            });
+            await refresh();
+          } catch (err) {
+            alert(err.message);
+            vr.disabled = false;
+          }
+          return;
+        }
+        const v = e.target.closest("[data-void]");
+        if (v) {
+          const ok = await askConfirm(
+            "Void this order? The customer will need to re-order if this was a mistake.",
+            { title: "Void this order?" },
+          );
+          if (!ok) return;
+          v.disabled = true;
+          try {
+            await api(`/pos/orders/${v.dataset.void}/void`, {
+              method: "POST",
+              body: JSON.stringify({ reason: "voided from kitchen display" }),
+            });
+            await refresh();
+          } catch (err) {
+            alert(err.message);
+            v.disabled = false;
+          }
+        }
       });
-      await refresh();
-    } catch (err) { alert(err.message); vr.disabled = false; }
-    return;
-  }
-  const v = e.target.closest('[data-void]');
-  if (v) {
-    if (!confirm('Void this order? The customer will need to re-order if this was a mistake.')) return;
-    v.disabled = true;
-    try {
-      await api(`/pos/orders/${v.dataset.void}/void`, {
-        method: 'POST', body: JSON.stringify({ reason: 'voided from kitchen display' }),
-      });
-      await refresh();
-    } catch (err) { alert(err.message); v.disabled = false; }
-  }
-});
 
-if (TOKEN && ROLE && NAME && ALLOWED_ROLES.includes(ROLE)) showApp();
-else if (TOKEN) doLogout();
-// Arriving from the landing page's unified sign-in already ran the brand
-// intro once there; only a cold direct visit to /kds plays it here too.
-else if (new URLSearchParams(location.search).get('intro') !== 'done') WingsIntro.play();
-</script>
-</body>
+      if (TOKEN && ROLE && NAME && ALLOWED_ROLES.includes(ROLE)) showApp();
+      else if (TOKEN) doLogout();
+    </script>
+  </body>
 </html>

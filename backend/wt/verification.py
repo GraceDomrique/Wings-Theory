@@ -192,15 +192,35 @@ def _sub_recipe_ids(conn: sqlite3.Connection) -> set[int]:
 def list_queue(conn: sqlite3.Connection) -> dict:
     """Every field in v_needs_verification, translated and prioritized. Still
     real rows from the real view -- this only adds copy and grouping on top,
-    it does not filter or reinterpret what needs_verification means."""
+    it does not filter or reinterpret what needs_verification means.
+
+    `reviewed` (added alongside the REVIEWED_ESTIMATE distinction): true iff
+    this exact (field, row_id) has a 'kept_estimate' verification_event on
+    record. No schema change and no new status column -- a row can only
+    still be sitting in v_needs_verification (i.e. present in `raw` at all)
+    AND have a kept_estimate event if nothing has confirmed or changed it
+    since, because 'confirm'/'change' are exactly the two actions that flip
+    the underlying *_status column away from 'needs_verification' and
+    therefore remove the row from this view entirely (see resolve() below).
+    So the mere existence of a kept_estimate event for a row still present
+    here is sufficient evidence it was reviewed and not since re-estimated
+    -- no extra "most recent event" logic required.
+    """
     raw = [dict(r) for r in conn.execute(
         "SELECT * FROM v_needs_verification ORDER BY field, entity_name"
     )]
     sub_recipe_ids = _sub_recipe_ids(conn)
     today = timeutil.business_today_iso()
+    reviewed_keys = {
+        (r["field"], r["row_id"])
+        for r in conn.execute(
+            "SELECT DISTINCT field, row_id FROM verification_event WHERE action='kept_estimate'"
+        )
+    }
 
     items = []
     for r in raw:
+        r["reviewed"] = (r["field"], r["row_id"]) in reviewed_keys
         field = r["field"]
         copy = FIELD_COPY[field]
         group = GROUP_LABEL.get(field)
@@ -240,10 +260,26 @@ def list_queue(conn: sqlite3.Connection) -> dict:
     items.sort(key=lambda i: (i["priority"], i["group_label"], i["entity_name"]))
     by_priority: dict[int, int] = {}
     by_field: dict[str, int] = {}
+    reviewed_count = 0
     for i in items:
         by_priority[i["priority"]] = by_priority.get(i["priority"], 0) + 1
         by_field[i["field"]] = by_field.get(i["field"], 0) + 1
-    return {"items": items, "count": len(items), "by_priority": by_priority, "by_field": by_field}
+        if i["reviewed"]:
+            reviewed_count += 1
+    # needs_decision excludes rows an admin has already looked at and
+    # explicitly chosen to leave as an estimate -- the badge/count is meant
+    # to represent unresolved work, not the size of the whole estimate
+    # inventory. `count` is kept as the full total (used nowhere as the
+    # primary badge number any more, but preserved for anything that still
+    # wants "how many rows exist in this view at all").
+    return {
+        "items": items,
+        "count": len(items),
+        "needs_decision": len(items) - reviewed_count,
+        "reviewed_estimates": reviewed_count,
+        "by_priority": by_priority,
+        "by_field": by_field,
+    }
 
 
 def history_for(conn: sqlite3.Connection, field: str, row_id: int) -> list[dict]:
@@ -318,9 +354,19 @@ def resolve(
                 _log(conn, field, row_id, ing["name"], "kept_estimate", current, None, note, user_id)
                 return {"field": field, "row_id": row_id, "action": action, "value": current}
             value = current if action == "confirm" else validated_value
+            # Millisecond precision, not datetime('now')'s bare second: this
+            # is the only write to lead_time_days/reorder_point_base/
+            # pack_size/yield_factor/unit_cost with no corresponding
+            # stock_ledger/customer_order row for api.py's
+            # _depletion_fingerprint() to key on instead. A plain-second
+            # timestamp landing in the same second as any nearby
+            # commit_order (which also bumps ingredient.updated_at, at high
+            # frequency during service) would produce an identical
+            # MAX(updated_at) and the forecast/replenishment cache would
+            # keep serving the pre-verification numbers.
             conn.execute(
                 f"UPDATE ingredient SET {col}=?, {col}_status='verified', "
-                f"updated_at=datetime('now') WHERE id=?",
+                f"updated_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?",
                 (value, row_id),
             )
             if col in ("pack_size", "yield_factor"):
@@ -394,6 +440,18 @@ def resolve(
             if not coeff:
                 raise NotFoundError(f"coefficient {row_id} not found")
             current = coeff["lambda_value"]
+            # Belt-and-suspenders against migrations/0020's view fix: even if
+            # a baseline-role row ever reached this function some other way
+            # (a future code path, direct API misuse), it must not be
+            # possible to "change" the frozen anomaly-detection reference
+            # through what looks like routine verification triage.
+            # keep_estimate/confirm below don't touch lambda_value at all, so
+            # only "change" needs the guard.
+            if coeff["role"] == "baseline" and action == "change":
+                raise InvalidStateError(
+                    f"'{coeff['label']}' baseline coefficient is a frozen reference and cannot "
+                    "be changed through verification — it is not a pending estimate"
+                )
             if action == "keep_estimate":
                 _log(conn, field, row_id, coeff["label"], "kept_estimate", current, None, note, user_id)
                 return {"field": field, "row_id": row_id, "action": action, "value": current}
