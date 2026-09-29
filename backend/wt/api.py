@@ -1340,7 +1340,7 @@ def kds_queue(c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("o
     for o in orders:
         o["lines"] = rows(c.execute(
             """
-            SELECT ol.qty, ol.note, m.name, m.is_unli
+            SELECT ol.qty, ol.note, m.name, m.is_unli, m.category
               FROM order_line ol JOIN menu_item m ON m.id = ol.menu_item_id
              WHERE ol.order_id = ?
              ORDER BY ol.id

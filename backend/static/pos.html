@@ -1942,10 +1942,15 @@
         border-radius: 9px;
         color: var(--text-1);
       }
-      .rf-r .head-note {
+      .rf-r .head-line {
         flex-basis: 100%;
+        padding-left: 10px;
         font-size: 11.5px;
         color: var(--text-2);
+      }
+      .rf-r .head-line b {
+        color: var(--text-0);
+        font-weight: 800;
       }
       .rf-r .n {
         font-weight: 800;
@@ -2033,10 +2038,18 @@
         opacity: 0.55;
         text-decoration: line-through;
       }
-      .rc-rf .head-note {
-        opacity: 0.7;
+      .rc-rf .head-line {
+        opacity: 0.75;
         font-size: 9.5px;
-        margin: 1px 0 4px 2px;
+        padding-left: 10px;
+        margin: 1px 0;
+      }
+      .rc-rf .head-line:last-of-type {
+        margin-bottom: 4px;
+      }
+      .rc-rf .head-line b {
+        opacity: 1;
+        font-weight: 800;
       }
 
       /* ---------- payment ----------
@@ -2390,7 +2403,6 @@
         text-align: center;
         border: 1.5px solid #1a1713;
         border-radius: 8px;
-        background: #f7f0dd;
       }
       .rc-grand .lbl {
         font-size: 10px;
@@ -3566,6 +3578,16 @@
           )
           .join("");
       }
+      // A trailing "(6 Flavors)" parenthetical could break across the two
+      // words inside it — "...36 pcs (6" / "Flavors)" — since normal word
+      // wrap treats "(6" and "Flavors)" as two separate words. Wrapping the
+      // parenthetical in its own nowrap span forces it to move to the next
+      // line as one unit instead, without changing the name text itself.
+      function menuNameHtml(name) {
+        const m = name.match(/^(.*?)\s+(\([^()]*\))$/);
+        if (!m) return name;
+        return `${m[1]} <span style="white-space:nowrap">${m[2]}</span>`;
+      }
       function paintGrid() {
         const list = MENU.filter((m) => CAT === "All" || m.category === CAT);
         $("#grid").innerHTML = list.length
@@ -3582,7 +3604,7 @@
         ${m.flavor_slots ? `<span class="flav">${m.flavor_slots > 1 ? m.flavor_slots + " flavors" : "pick flavor"}</span>` : ""}
       </div>
       <div class="body">
-        <div class="nm">${m.name}</div>
+        <div class="nm">${menuNameHtml(m.name)}</div>
         ${
           m.sellable
             ? `<div class="row"><span class="price">₱${m.price}</span></div>`
@@ -4549,14 +4571,20 @@
           ? prev
               .map((r) => {
                 const dead = r.status === "voided" || r.status === "cancelled";
+                const headLines = r.note ? r.note.split(" · ") : [];
                 return `<div class="rf-r ${dead ? "gone" : ""}">
       <span class="n">#${r.refill_no}</span>
-      <span class="f">${r.flavor_name} — ${r.pieces} pcs</span>
-      ${r.flavor_type === "special" && !dead ? `<span class="a">+${peso(r.addon_amount)}</span>` : ""}
+      <span class="f">${headLines.length ? r.pieces + " pcs" : r.flavor_name + " — " + r.pieces + " pcs"}</span>
+      ${!headLines.length && r.flavor_type === "special" && !dead ? `<span class="a">+${peso(r.addon_amount)}</span>` : ""}
       ${r.status === "pending" ? `<span class="chip warn">with kitchen</span>` : ""}
       ${dead ? `<span class="chip mute">${r.status}</span>` : ""}
       ${!dead && live ? `<button data-void-refill="${r.id}">Void</button>` : ""}
-      ${r.note ? `<span class="head-note">${r.note}</span>` : ""}
+      ${headLines
+        .map((line) => {
+          const billed = !dead && r.flavor_type === "special" && line.endsWith(r.flavor_name);
+          return `<span class="head-line">${line}${billed ? ` <b>+${peso(r.addon_amount)}</b>` : ""}</span>`;
+        })
+        .join("")}
     </div>`;
               })
               .join("")
@@ -4871,18 +4899,38 @@
         }
         const s = rec.session;
         const live = s.refills.filter((r) => r.status === "served");
+        // A round's own billed flavor used to repeat in the header AND in
+        // the per-head note below it — "SNOW CHEESE ... SPECIAL FLAVOR +₱30"
+        // up top, then "Head 2: Snow Cheese" again underneath — and the
+        // +₱30 read as if it applied to the whole round rather than
+        // specifically Head 2's pick. Now the header only ever states the
+        // round number and piece count; when a per-head breakdown exists,
+        // each head prints on its own line, and the addon price attaches
+        // directly to whichever head's line actually carries the premium
+        // flavor. Falls back to the old single-line "· FLAVOR ... INCLUDED"
+        // shape when there's no per-head breakdown to expand (head_flavors
+        // was never set for that round).
         const rows = s.refills
           .map((r) => {
             const dead = r.status === "voided" || r.status === "cancelled";
+            const headLines = r.note ? r.note.split(" · ") : [];
             const tag = dead
               ? r.status.toUpperCase()
-              : r.flavor_type === "special"
-                ? "SPECIAL FLAVOR +" + peso(r.addon_amount)
-                : "INCLUDED";
+              : headLines.length
+                ? ""
+                : r.flavor_type === "special"
+                  ? "SPECIAL FLAVOR +" + peso(r.addon_amount)
+                  : "INCLUDED";
+            const headRows = headLines
+              .map((line) => {
+                const billed = !dead && r.flavor_type === "special" && line.endsWith(r.flavor_name);
+                return `<div class="head-line">${line}${billed ? ` <b>+${peso(r.addon_amount)}</b>` : ""}</div>`;
+              })
+              .join("");
             return `<div class="r ${dead ? "v" : ""}">
-      <span>REFILL #${r.refill_no} · ${r.pieces} PCS · ${r.flavor_name.toUpperCase()}</span>
+      <span>REFILL #${r.refill_no} · ${r.pieces} PCS${headLines.length ? "" : " · " + r.flavor_name.toUpperCase()}</span>
       <span>${tag}</span></div>
-      ${r.note ? `<div class="head-note">${r.note}</div>` : ""}`;
+      ${headRows}`;
           })
           .join("");
         // The boxed "TOTAL AMOUNT DUE" (below) only ever appears once the
