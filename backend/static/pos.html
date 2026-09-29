@@ -297,13 +297,13 @@
         overflow-y: auto;
         padding: 2px 18px 24px;
         display: grid;
-        /* 2026-09: fixed 2-across, not auto-fill — was 4 when cards were
-        square tiles; the image-on-left layout needs roughly double the
-        width per card to read as a card and not a squeezed strip. Steps
-        down to 1 below 860px (see that breakpoint), same reasoning as
-        before, just fewer columns to start from. */
-        grid-template-columns: repeat(2, 1fr);
-        gap: 15px;
+        /* 2026-09-29: fixed 3-across (was 2) — the menu was reading as an
+        oversized wall of cards at 2-up on a normal POS screen. .mcard/.tile
+        were shrunk to match (see those rules) so a narrower card still
+        reads cleanly. Steps down to 2 at 1200px and 1 at 860px (see those
+        breakpoints) rather than jumping straight to 1. */
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
         align-content: start;
         /* max-content, not the implicit `auto`: once #grid became a real scroll
         region with a definite height (see .stage > div above), Chromium sized the
@@ -417,33 +417,17 @@
       .refill-scroll::-webkit-scrollbar-thumb:hover {
         background: var(--amber);
       }
-      /* .receipt-scroll: same "invisible until hovered" behaviour, but in
-      the receipt's own light, muted-gray palette (#8a8178, already used for
-      its sub-text) instead of the dark theme's tokens — a dark thumb reads
-      fine on white, an amber one would clash with the receipt's
-      deliberately plain, paper-like look. */
+      /* .receipt-scroll: fully hidden, not just thin — a cashier terminal
+      is mostly touch-driven, where "invisible until hover" never actually
+      hides on a device with no real hover state, so the scrollbar sat there
+      permanently. Scrolling itself (wheel/trackpad/touch/keyboard) is
+      untouched; only the visible track/thumb are removed. */
       .receipt-scroll {
-        scrollbar-width: thin;
-        scrollbar-color: transparent transparent;
-      }
-      .receipt-scroll:hover {
-        scrollbar-color: #c9c2b8 transparent;
+        scrollbar-width: none;
       }
       .receipt-scroll::-webkit-scrollbar {
-        width: 6px;
-      }
-      .receipt-scroll::-webkit-scrollbar-track {
-        background: transparent;
-      }
-      .receipt-scroll::-webkit-scrollbar-thumb {
-        background: transparent;
-        border-radius: 99px;
-      }
-      .receipt-scroll:hover::-webkit-scrollbar-thumb {
-        background: #c9c2b8;
-      }
-      .receipt-scroll::-webkit-scrollbar-thumb:hover {
-        background: #8a8178;
+        width: 0;
+        height: 0;
       }
       .mcard {
         /* 2026-09: image-on-left layout (was image-top/details-below) — a
@@ -453,14 +437,14 @@
         paintGrid()) rather than one flat neutral line — falls back to the
         old neutral if a category somehow has none. */
         border: 2px solid var(--card-accent, var(--line));
-        border-radius: 18px;
+        border-radius: 16px;
         background: var(--ink-1);
         overflow: hidden;
         text-align: left;
         box-shadow: var(--sh-1);
         display: flex;
         flex-direction: row;
-        height: 136px;
+        height: 128px;
         transition: transform 0.1s ease;
       }
       /* The whole card is the "add to order" control (see #grid's click
@@ -485,14 +469,20 @@
         opacity: 0.55;
       }
       .tile {
-        /* Fixed width, full card height (was a 4:3 block sitting on top).
-        The two corners facing the text panel get a large radius so the
-        photo's inner edge is one continuous curve rather than a hard
-        vertical line — the two outer corners stay square, clipped instead
-        by .mcard's own 18px radius since the tile sits flush against it. */
-        width: 132px;
+        /* Half the card, not a fixed px width — a fixed width left a big
+        flat "empty" panel on wider cards (1-2 column layouts) since the
+        fade was doing all its work inside a small, unchanging strip. At
+        half-width the fade (below) has room to actually read as a
+        transition rather than a thin edge effect, on any card size. Capped
+        so it doesn't grow unreasonably large on a very wide single-column
+        card. Rounded only on the two outer (left) corners, matching
+        .mcard's own radius, since it sits flush against the card edge
+        there — the inner edge facing the text panel is square, because the
+        ::after fade is what carries the eye from photo into card. */
+        width: 50%;
+        max-width: 220px;
         height: 100%;
-        border-radius: 0 68px 68px 0;
+        border-radius: 16px 0 0 16px;
         display: flex;
         align-items: center;
         justify-content: center;
@@ -506,37 +496,71 @@
         object-fit: cover;
         object-position: center;
       }
+      /* The photo fades into the card's own dark surface toward the text
+      panel — same idea as a top-to-bottom photo fade on a vertical menu
+      card, rotated to this card's left-to-right, image-then-text layout,
+      and in the shop's own near-black/amber palette rather than a cream
+      one. Sits above the <img> (plain flow) and below .flav (explicit
+      z-index) so the "2 flavors" badge stays fully legible. */
+      .tile::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        z-index: 1;
+        background: linear-gradient(
+          to right,
+          transparent 45%,
+          rgba(15, 13, 11, 0.55) 72%,
+          var(--ink-1) 96%
+        );
+        pointer-events: none;
+      }
       .tile b {
         font-family: var(--font-display);
-        font-size: 33px;
+        font-size: 26px;
         font-weight: 600;
         color: rgba(255, 255, 255, 0.92);
         letter-spacing: -0.01em;
       }
       .tile .flav {
         position: absolute;
-        top: 9px;
-        right: 9px;
+        z-index: 2;
+        top: 7px;
+        /* Left, not right — the right edge is where the fade is strongest
+        now, so the badge stays over the clear part of the photo. */
+        left: 7px;
         background: rgba(0, 0, 0, 0.32);
         color: #fff;
-        font-size: 11px;
+        font-size: 9.5px;
         font-weight: 700;
-        padding: 3px 8px;
+        padding: 2px 6px;
         border-radius: 99px;
         letter-spacing: 0.03em;
       }
       .mcard .body {
-        padding: 12px 16px;
+        padding: 9px 12px;
         display: flex;
         flex-direction: column;
-        gap: 6px;
+        /* Centered, not top-anchored: the name+price block reads as one
+        compact unit in the middle of the card rather than the name sitting
+        at the top and the price pinned to the bottom edge (that was
+        `.row{margin-top:auto}` below, now removed) with a dead gap between
+        them. */
+        justify-content: center;
+        gap: 4px;
         flex: 1;
         min-width: 0;
       }
       .mcard .nm {
-        font-size: 15.5px;
-        font-weight: 600;
-        line-height: 1.28;
+        /* The same display serif every card-h/sec-t heading in the app
+        already uses, not the plain UI sans — reads as a menu, not a form
+        field, while staying short/blocky enough at 2 lines + this weight to
+        scan in one glance rather than needing to be read word by word. */
+        font-family: var(--font-display);
+        font-size: 17px;
+        font-weight: 700;
+        letter-spacing: -0.01em;
+        line-height: 1.2;
         color: var(--text-0);
         /* Clamp to 2 lines instead of the old fixed min-height — the card's
         height is fixed now (the row layout needs it for the curve), so a
@@ -550,20 +574,20 @@
       .mcard .row {
         display: flex;
         align-items: center;
+        justify-content: flex-end;
         gap: 8px;
-        margin-top: auto;
       }
       .mcard .price {
         font-family: var(--font-mono);
-        font-size: 18.5px;
-        font-weight: 600;
+        font-size: 19px;
+        font-weight: 700;
         color: var(--text-0);
         font-variant-numeric: tabular-nums;
       }
       .mcard .why {
         font-size: 12.5px;
         color: var(--bad-text);
-        line-height: 1.3;
+        line-height: 1.25;
         display: -webkit-box;
         -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;
@@ -592,39 +616,26 @@
       .list-topbar button {
         margin-left: auto;
       }
-      /* Compact search + date-range filter bar above the order list — only
-      one filter chip is ever visually "selected", neutral dark surfaces
-      with a thin border, amber reserved for the selected state's accent
-      rather than a filled pill. */
+      /* One toolbar row — a segmented date-range control (the shared
+      .tabs/.tab primitive, same component console.html's own filter bars
+      use) on the left, the search field on the right. Replaces the earlier
+      two stacked rows of ad-hoc chip buttons, which read as a loose pile of
+      controls rather than one coherent bar. Wraps to two rows only once the
+      panel is too narrow for both at once. */
       .orders-filters {
         display: flex;
-        flex-direction: column;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
         gap: 10px;
-        padding: 0 18px 12px;
+        padding: 0 18px 14px;
         flex-shrink: 0;
+      }
+      .orders-filters .search-w {
+        width: 260px;
       }
       .orders-search {
         width: 100%;
-        max-width: 320px;
-      }
-      .chip-filters {
-        display: flex;
-        gap: 6px;
-        flex-wrap: wrap;
-      }
-      .chip-filters button {
-        padding: 7px 13px;
-        border-radius: 8px;
-        border: 1px solid var(--line);
-        background: var(--ink-2);
-        font-size: 12px;
-        font-weight: 700;
-        color: var(--text-2);
-      }
-      .chip-filters button.on {
-        background: var(--amber-wash);
-        border-color: var(--amber);
-        color: var(--amber-text);
       }
       #ordersList {
         flex: 1;
@@ -1298,6 +1309,20 @@
       menu keeps the entire remaining screen either way. Touch targets stay at
       44px+ and no font drops below 12px — shrinking text to fit is not a
       responsive strategy. */
+      @media (max-width: 1200px) {
+        #grid {
+          grid-template-columns: repeat(2, 1fr);
+        }
+      }
+      /* A real tablet (iPad portrait etc. is ~768px) was falling into the
+      same "1 column" bucket as a phone below, at a width that clearly still
+      fits 2 — cards ended up stretched full-width with a small photo and a
+      lot of dead space next to the text. Phones only past this point. */
+      @media (max-width: 600px) {
+        #grid {
+          grid-template-columns: 1fr;
+        }
+      }
       @media (max-width: 860px) {
         .shell {
           grid-template-columns: 1fr;
@@ -1327,9 +1352,6 @@
         .stage {
           height: auto;
           min-height: 0;
-        }
-        #grid {
-          grid-template-columns: 1fr;
         }
         /* Room for the collapsed sheet so the last row of menu cards stays tappable. */
         #grid,
@@ -1691,6 +1713,24 @@
       .refill-actions .btn-p {
         flex: 2;
       }
+      /* Three buttons in one row, two of them equal-flex despite very
+      unequal label lengths ("Close" vs "End Unli Order"), overflowed and
+      overlapped the Serve button on a phone-width screen — nowrap text
+      doesn't shrink, so the flex box did instead. Below 520px the primary
+      action (Serve) gets its own full-width row on top; Close/End Unli
+      Order split the row underneath, each with room for their own text. */
+      @media (max-width: 520px) {
+        .refill-actions {
+          flex-wrap: wrap;
+        }
+        .refill-actions .btn-p {
+          flex: 1 1 100%;
+          order: -1;
+        }
+        .refill-actions .btn-s {
+          flex: 1 1 calc(50% - 5px);
+        }
+      }
       .rf-head {
         display: flex;
         align-items: flex-start;
@@ -1893,6 +1933,7 @@
       }
       .rf-r {
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
         gap: 10px;
         font-size: 13.5px;
@@ -1900,6 +1941,11 @@
         border: 1px solid var(--line);
         border-radius: 9px;
         color: var(--text-1);
+      }
+      .rf-r .head-note {
+        flex-basis: 100%;
+        font-size: 11.5px;
+        color: var(--text-2);
       }
       .rf-r .n {
         font-weight: 800;
@@ -1943,6 +1989,11 @@
         padding: 3px 0;
         color: var(--text-1);
       }
+      .rf-tot .row.pending {
+        color: var(--warn-text);
+        font-size: 12.5px;
+        font-style: italic;
+      }
       .rf-tot .row.grand {
         font-weight: 800;
         font-size: 15px;
@@ -1981,6 +2032,11 @@
       .rc-rf .v {
         opacity: 0.55;
         text-decoration: line-through;
+      }
+      .rc-rf .head-note {
+        opacity: 0.7;
+        font-size: 9.5px;
+        margin: 1px 0 4px 2px;
       }
 
       /* ---------- payment ----------
@@ -2317,6 +2373,43 @@
         margin: 6px 0 2px;
         letter-spacing: 0.05em;
       }
+      /* The one number a customer should walk away certain of, once the
+      table's unlimited order is actually finished — boxed so it can't be
+      mistaken for one more line in the totals list above it (that section
+      is what was paid at checkout; refills billed after that point are
+      what this box adds in). Only rendered once the session has ended —
+      see renderReceiptRefills — never while more refills could still come
+      in, since a boxed "final" number would be a lie while the order is
+      still open. Same ink/border tones as the rest of the receipt (#1a1713
+      text, the .rc-note amber family for the border) rather than the
+      till's own dark-mode palette — this is the printed page, always
+      light, regardless of theme. */
+      .rc-grand {
+        margin: 10px 0 2px;
+        padding: 10px 12px;
+        text-align: center;
+        border: 1.5px solid #1a1713;
+        border-radius: 8px;
+        background: #f7f0dd;
+      }
+      .rc-grand .lbl {
+        font-size: 10px;
+        font-weight: 800;
+        letter-spacing: 0.05em;
+        color: #1a1713;
+      }
+      .rc-grand .amt {
+        font-size: 22px;
+        font-weight: 800;
+        color: #1a1713;
+        font-variant-numeric: tabular-nums;
+        margin-top: 2px;
+      }
+      .rc-grand .sub {
+        font-size: 9px;
+        color: #8a8178;
+        margin-top: 2px;
+      }
       .receipt-actions {
         display: flex;
         gap: 10px;
@@ -2514,13 +2607,10 @@
               title="Unlimited refills"
               aria-label="Unlimited refills"
             >
-              <!-- 2026-09: was a generic "two glasses" outline icon from the
-              same stock set as every other nav icon — read as a bar tab, not
-              a sauce refill, and was the specific one flagged as "too AI
-              made". Replaced with a literal sauce bottle (Tabler Icons,
-              MIT-licensed, github.com/tabler/tabler-icons — free for
-              commercial use, no attribution required), which is what this
-              screen is actually tracking. -->
+              <!-- 2026-09-29: was a sauce-bottle icon; replaced with a
+              serving-cloche/dome silhouette (dome + tray) per the owner's
+              own reference icon, closer to how the floor actually thinks
+              about "a refill round going out to a table" than a bottle. -->
               <svg
                 viewBox="0 0 24 24"
                 fill="none"
@@ -2529,13 +2619,10 @@
                 stroke-linecap="round"
                 stroke-linejoin="round"
               >
-                <path d="M10 5h4v-2a1 1 0 0 0 -1 -1h-2a1 1 0 0 0 -1 1v2" />
-                <path
-                  d="M14 3.5c0 1.626 .507 3.212 1.45 4.537l.05 .07a8.093 8.093 0 0 1 1.5 4.694v6.199a2 2 0 0 1 -2 2h-6a2 2 0 0 1 -2 -2v-6.2c0 -1.682 .524 -3.322 1.5 -4.693l.05 -.07a7.823 7.823 0 0 0 1.45 -4.537"
-                />
-                <path
-                  d="M7 14.803a2.4 2.4 0 0 0 1 -.803a2.4 2.4 0 0 1 2 -1a2.4 2.4 0 0 1 2 1a2.4 2.4 0 0 0 2 1a2.4 2.4 0 0 0 2 -1a2.4 2.4 0 0 1 1 -.805"
-                />
+                <path d="M12 3v2" />
+                <path d="M4 16a8 8 0 0 1 16 0" />
+                <path d="M3 16h18" />
+                <path d="M4 19h16" />
               </svg>
               <span>Refills</span>
               <span class="tab-badge hide" id="refillsBadge">0</span>
@@ -2607,20 +2694,26 @@
               <button id="ordersRefresh">Refresh</button>
             </div>
             <div id="ordersFilters" class="orders-filters hide">
-              <input
-                id="ordersSearch"
-                class="field-sm orders-search"
-                type="text"
-                placeholder="Search order, item, or table..."
-                autocomplete="off"
-              />
-              <div class="chip-filters" id="dateFilters">
-                <button class="on" data-range="all">All</button>
-                <button data-range="today">Today</button>
-                <button data-range="yesterday">Yesterday</button>
-                <button data-range="week">This Week</button>
-                <button data-range="lastweek">Last Week</button>
-                <button data-range="month">This Month</button>
+              <div class="tabs" id="dateFilters">
+                <button class="tab on" data-range="all">All</button>
+                <button class="tab" data-range="today">Today</button>
+                <button class="tab" data-range="yesterday">Yesterday</button>
+                <button class="tab" data-range="week">This Week</button>
+                <button class="tab" data-range="lastweek">Last Week</button>
+                <button class="tab" data-range="month">This Month</button>
+              </div>
+              <div class="search search-w">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="M21 21l-4.3-4.3" />
+                </svg>
+                <input
+                  id="ordersSearch"
+                  class="field-sm orders-search"
+                  type="text"
+                  placeholder="Search order, item, or table..."
+                  autocomplete="off"
+                />
               </div>
             </div>
             <div id="ordersList"></div>
@@ -2838,7 +2931,7 @@
         </div>
         <div class="refill-actions">
           <button class="btn btn-s" id="rfClose">Close</button>
-          <button class="btn btn-s" id="rfEnd">End session</button>
+          <button class="btn btn-s" id="rfEnd">End Unli Order</button>
           <button class="btn btn-p" id="rfServe" disabled>Serve refill</button>
         </div>
       </div>
@@ -2870,7 +2963,7 @@
             <div><span>DATE</span><span id="rcDate"></span></div>
             <div><span>TIME</span><span id="rcTime"></span></div>
             <div><span>CASHIER</span><span id="rcCashier"></span></div>
-            <div><span>TYPE</span><span id="rcType"></span></div>
+            <div><span>TABLE</span><span id="rcType"></span></div>
             <div id="rcSourceRow" class="hide"><span>SOURCE</span><span id="rcSourceId"></span></div>
           </div>
           <div class="rc-rule"></div>
@@ -2890,8 +2983,8 @@
             <div class="row">
               <span>SERVICE CHARGE</span><span id="rcSvc"></span>
             </div>
-            <div class="row grand">
-              <span>TOTAL</span><span id="rcTotal"></span>
+            <div class="row grand" id="rcTotalRow">
+              <span id="rcTotalLabel">TOTAL</span><span id="rcTotal"></span>
             </div>
             <div class="row"><span>CASH</span><span id="rcCash"></span></div>
             <div class="row">
@@ -4463,15 +4556,27 @@
       ${r.status === "pending" ? `<span class="chip warn">with kitchen</span>` : ""}
       ${dead ? `<span class="chip mute">${r.status}</span>` : ""}
       ${!dead && live ? `<button data-void-refill="${r.id}">Void</button>` : ""}
+      ${r.note ? `<span class="head-note">${r.note}</span>` : ""}
     </div>`;
               })
               .join("")
           : "";
 
         const addons = s.addon_total || 0;
+        // A special-flavor add-on is only actually charged once the round is
+        // served (see refills.serve_refill — "the point at which the food
+        // genuinely went to the table"), so picking a premium flavor here
+        // never moves "Special-flavor add-ons" itself. That silently looked
+        // like the pick wasn't registering, so this line previews what THIS
+        // round alone will add if served, without pretending it's billed yet.
+        const pendingFlavor = RF_FLAVORS.find((f) => f.id === RF.selected);
+        const pending = pendingFlavor && pendingFlavor.flavor_type === "special"
+          ? pendingFlavor.addon_price
+          : 0;
         $("#rfTotals").innerHTML = `
     <div class="row"><span>Original order total</span><span>${peso(s.order_total || 0)}</span></div>
     <div class="row"><span>Special-flavor add-ons</span><span>${peso(addons)}</span></div>
+    ${pending ? `<div class="row pending"><span>This round (pending, once served)</span><span>+${peso(pending)}</span></div>` : ""}
     <div class="row grand"><span>Current total</span><span>${peso(s.current_total || s.order_total || 0)}</span></div>`;
 
         $("#rfErr").textContent = "";
@@ -4565,17 +4670,40 @@
         }
       };
 
-      async function _updateHeadFlavors(flavors) {
-        try {
-          RF.session = await api(`/unli/sessions/${RF.session.session_id}/head-flavors`, {
-            method: "PATCH",
-            body: JSON.stringify({ flavors }),
+      // Two head-flavour taps in quick succession used to both read the same
+      // stale RF.session.head_flavors before either PATCH resolved, so both
+      // computed the same "next open slot" and raced to write it — whichever
+      // response landed last silently discarded the other tap's flavour.
+      // Fixed two ways together: (1) the local array is updated and repainted
+      // synchronously, before the network call, so the very next tap already
+      // sees this slot filled; (2) the actual PATCHes are chained through
+      // _headFlavorQueue rather than fired in parallel, so a later tap's
+      // request is never even built until the earlier one has finished, and
+      // their responses can never apply out of order.
+      let _headFlavorQueue = Promise.resolve();
+      function _updateHeadFlavors(flavors) {
+        const sessionId = RF.session.session_id;
+        RF.session = { ...RF.session, head_flavors: flavors };
+        paintRefillPanel();
+        _headFlavorQueue = _headFlavorQueue
+          .catch(() => {}) // one failed link must not jam every update after it
+          .then(() =>
+            api(`/unli/sessions/${sessionId}/head-flavors`, {
+              method: "PATCH",
+              body: JSON.stringify({ flavors }),
+            }),
+          )
+          .then((updated) => {
+            if (RF.session.session_id === sessionId) {
+              RF.session = updated;
+              paintRefillPanel();
+            }
+            loadRefillSessions(); // keeps the table card's "x/y flavors" progress in sync
+          })
+          .catch((e) => {
+            $("#rfHeadMsg").textContent = e.message;
           });
-          paintRefillPanel();
-          loadRefillSessions(); // keeps the table card's "x/y flavors" progress in sync
-        } catch (e) {
-          $("#rfHeadMsg").textContent = e.message;
-        }
+        return _headFlavorQueue;
       }
       // Clearing head N's slot sets index N to null in place — it never
       // splices/shifts the array, so every other head's flavour stays put.
@@ -4590,22 +4718,39 @@
       // Single input, two effects: picks the flavour for THIS refill round
       // (RF.selected — repaints instantly, unchanged from before) and, if a
       // head slot is still open, also assigns it to the next unassigned
-      // head (a fire-and-forget PATCH; head_flavors is purely informational
-      // and never gates or resizes the round itself). Once every head has
-      // a flavour, further taps still pick the round's flavour as normal —
-      // this grid keeps serving every future round — they just stop
-      // growing the head list, with a toast explaining why.
+      // head (head_flavors is purely informational and never gates or
+      // resizes the round itself). Once every head has a flavour, further
+      // taps still pick the round's flavour as normal — this grid keeps
+      // serving every future round — they just stop growing the head list,
+      // with a toast explaining why. Retapping the flavour that's already
+      // this round's pick deselects it instead — the same correction the ×
+      // on a head row does, reachable without leaving the flavour grid for a
+      // customer who just changed their mind.
       $("#rfFlavors").onclick = (e) => {
         const b = e.target.closest("[data-flavor]");
         if (!b || b.disabled) return;
-        RF.selected = parseInt(b.dataset.flavor, 10);
+        const flavorId = parseInt(b.dataset.flavor, 10);
+        const flavorName = b.dataset.flavorName;
+        if (RF.selected === flavorId) {
+          RF.selected = null;
+          const current = [...(RF.session.head_flavors || [])];
+          const lastIdx = current.lastIndexOf(flavorName);
+          if (lastIdx !== -1) {
+            current[lastIdx] = null;
+            _updateHeadFlavors(current);
+          } else {
+            paintRefillPanel();
+          }
+          return;
+        }
+        RF.selected = flavorId;
         paintRefillPanel();
         const headCount = RF.session.head_count;
         const current = [...(RF.session.head_flavors || [])];
         while (current.length < headCount) current.push(null);
         const openSlot = current.findIndex((n) => !n);
         if (openSlot !== -1) {
-          current[openSlot] = b.dataset.flavorName;
+          current[openSlot] = flavorName;
           _updateHeadFlavors(current);
         } else {
           toast(`All ${headCount} head${headCount === 1 ? "" : "s"} already ${headCount === 1 ? "has" : "have"} a flavor.`);
@@ -4684,9 +4829,9 @@
       $("#rfEnd").onclick = async () => {
         if (!RF) return;
         const ok = await showConfirm({
-          title: "End unlimited session?",
+          title: "End this Unli Order?",
           body: "No further refills can be served unless a manager reopens it.",
-          confirmLabel: "End session",
+          confirmLabel: "End Unli Order",
         });
         if (!ok) return;
         try {
@@ -4736,9 +4881,27 @@
                 : "INCLUDED";
             return `<div class="r ${dead ? "v" : ""}">
       <span>REFILL #${r.refill_no} · ${r.pieces} PCS · ${r.flavor_name.toUpperCase()}</span>
-      <span>${tag}</span></div>`;
+      <span>${tag}</span></div>
+      ${r.note ? `<div class="head-note">${r.note}</div>` : ""}`;
           })
           .join("");
+        // The boxed "TOTAL AMOUNT DUE" (below) only ever appears once the
+        // table's unlimited order has actually ended — a customer reading a
+        // bold, boxed "final" number while the kitchen could still send out
+        // another round would be shown something that isn't true yet. While
+        // still active, the same figure prints as a plain, unboxed line so
+        // it reads as "so far", not "done".
+        const ended = s.status === "completed";
+        // Exactly one number on the whole receipt is allowed to look like
+        // "the total" once the order has ended — the boxed one below. That
+        // means NOT also printing "Paid at checkout ₱798" as its own line
+        // right next to it: two bold-looking peso figures stacked back to
+        // back reads as two totals to reconcile, even with different
+        // labels. The checkout amount is folded into the box's own one-line
+        // subtitle instead, and the mid-receipt PAID AT CHECKOUT row above
+        // (see showReceipt) drops its own bold styling for the same reason
+        // — only while still active does the running math stay broken out
+        // line by line, because there's no box yet to consolidate it into.
         box.innerHTML = `
     <div class="h">REFILL HISTORY</div>
     ${rows}
@@ -4746,11 +4909,19 @@
     <div class="r"><span>TOTAL PIECES SERVED</span><span>${s.pieces_served}</span></div>
     ${
       rec.addon_total
-        ? `
+        ? ended
+          ? `
       <div class="rc-rule" style="margin:6px 0"></div>
-      <div class="r"><span>ORIGINAL ORDER TOTAL</span><span>${peso(rec.original_total)}</span></div>
-      <div class="r"><span>ADDITIONAL ADD-ONS</span><span>${peso(rec.addon_total)}</span></div>
-      <div class="r" style="font-weight:800"><span>CURRENT TOTAL</span><span>${peso(rec.current_total)}</span></div>`
+      <div class="rc-grand">
+        <div class="lbl">TOTAL AMOUNT DUE</div>
+        <div class="amt">${peso(rec.current_total)}</div>
+        <div class="sub">${peso(rec.original_total)} at checkout + ${peso(rec.addon_total)} refills</div>
+      </div>`
+          : `
+      <div class="rc-rule" style="margin:6px 0"></div>
+      <div class="r"><span>Paid at checkout</span><span>${peso(rec.original_total)}</span></div>
+      <div class="r"><span>Refill add-ons</span><span>${peso(rec.addon_total)}</span></div>
+      <div class="r"><span>Running total so far</span><span>${peso(rec.current_total)}</span></div>`
         : ""
     }
     <div class="rc-rule" style="margin:6px 0"></div>`;
@@ -4791,13 +4962,41 @@
             // side: wt/api.py's create_order) — shown here as price x heads
             // so the receipt's own line item doesn't read as "1 x ₱399"
             // while the total below it reflects the real head-based charge.
-            const qtyLabel = i.unli ? `${i.heads} heads` : i.qty;
+            // "4x" reads the same way an à la carte "2x" qty does — the
+            // "— 14 Flavors" suffix on the menu item's own name is dropped
+            // here (receipt-display only, never touches menu_item.name)
+            // because the actual flavors served now print as their own
+            // lines below, making the suffix redundant.
+            const displayName = i.unli
+              ? i.name.replace(/\s*[—-]\s*14 Flavors\s*$/i, "")
+              : i.name;
+            const qtyLabel = `${i.unli ? i.heads : i.qty}x`;
             const amount = i.unli ? i.price * i.heads : i.price * i.qty;
+            // The first round (refill #1) is what this Unlimited Wings line
+            // actually got served — shown here so the item line answers
+            // "which flavor(s)", not just price. A round is still billed as
+            // ONE flavor (firstRound.flavor_name/addon_amount); if more than
+            // one head asked for something different that round, the note
+            // captured at serve time (_record_refill_tx) lists them all.
+            const firstRound = i.unli && rec && rec.session && rec.session.refills
+              ? rec.session.refills.find(
+                  (r) => r.refill_no === 1 && r.status !== "voided" && r.status !== "cancelled",
+                )
+              : null;
+            const flavorLines = [];
+            if (firstRound) {
+              flavorLines.push(
+                firstRound.flavor_type === "special"
+                  ? `${firstRound.flavor_name} +${peso(firstRound.addon_amount)}`
+                  : firstRound.flavor_name,
+              );
+              if (firstRound.note) flavorLines.push(firstRound.note);
+            }
             return `
     <div class="rc-item">
-      <span>${i.name}</span><span class="c">${qtyLabel}</span>
+      <span>${displayName}</span><span class="c">${qtyLabel}</span>
       <span class="r">${amount.toLocaleString("en-PH", { minimumFractionDigits: 2 })}</span>
-      ${i.unli ? `<span class="rc-note">₱${i.price.toLocaleString()} / person</span>` : ""}
+      ${flavorLines.map((f) => `<span class="rc-note">${f}</span>`).join("")}
       ${i.note ? `<span class="rc-note">${i.note}</span>` : ""}
     </div>
   `;
@@ -4822,6 +5021,17 @@
           order.service_charge ? peso(order.service_charge) : "—";
         $("#rcTotal").textContent =
           order.total != null ? peso(order.total) : "—";
+        // Once the order's unlimited session has ended with priced add-ons,
+        // a boxed "TOTAL AMOUNT DUE" appears further down (renderReceiptRefills)
+        // and that box is the only figure meant to read as "the total" —
+        // relabeled AND demoted off the bold/grand styling here, or a
+        // customer sees two bold peso amounts and has to work out which one
+        // is real. Still bold/plain "TOTAL" whenever there's nothing below
+        // it to compete with (no session, or no priced add-ons yet).
+        const hasFinalGrandTotal =
+          rec && rec.session && rec.session.status === "completed" && rec.addon_total > 0;
+        $("#rcTotalLabel").textContent = hasFinalGrandTotal ? "PAID AT CHECKOUT" : "TOTAL";
+        $("#rcTotalRow").classList.toggle("grand", !hasFinalGrandTotal);
         // A historical sale's payment method/amount was never in the source
         // data at all — the workbook has no tender field. Rather than a
         // receipt that visibly looks incomplete ("CASH — / CHANGE —"), the

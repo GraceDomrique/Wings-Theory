@@ -991,8 +991,16 @@ def create_order(
 
     try:
         with db.write_tx(c):
-            n = c.execute("SELECT COALESCE(MAX(id), 0) AS n FROM customer_order").fetchone()["n"]
-            order_no = f"WT-{n + 1001}"
+            prefix = f"WTRORD-{_date.today().year}"
+            # MAX over the existing numeric suffix, not COUNT(*): gap-safe the
+            # same way the old WT-<n> scheme was (see demo_seed._new_order),
+            # and immune to any row from an earlier year still being present.
+            n = c.execute(
+                "SELECT COALESCE(MAX(CAST(SUBSTR(order_no, LENGTH(?) + 1) AS INTEGER)), 0) AS n "
+                "FROM customer_order WHERE order_no LIKE ?",
+                (prefix, prefix + "%"),
+            ).fetchone()["n"]
+            order_no = f"{prefix}{n + 1:06d}"
             try:
                 cur = c.execute(
                     "INSERT INTO customer_order (order_no, table_label, head_count, created_by, "
