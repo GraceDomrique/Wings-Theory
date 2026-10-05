@@ -18,7 +18,8 @@ button{font-family:inherit; cursor:pointer;}
 ::-webkit-scrollbar-track{background:transparent;}
 
 /* ============ SHELL ============ */
-.shell{display:grid; grid-template-columns:236px 1fr; height:100vh; overflow:hidden;}
+.shell{display:grid; grid-template-columns:236px 1fr; height:100vh; overflow:hidden; transition:grid-template-columns .15s ease;}
+body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
 
 /* ---- Sidebar ---- */
 .sidebar{
@@ -33,8 +34,8 @@ button{font-family:inherit; cursor:pointer;}
 .brand-text .t1{font-family:var(--font-display); font-weight:700; font-size:15.5px; letter-spacing:.2px; color:#fff;}
 .brand-text .t2{font-size:10px; letter-spacing:1.4px; text-transform:uppercase; color:#9C9385; margin-top:1px;}
 
-.nav-group{margin-bottom:4px;}
-.nav-label{font-size:10px; letter-spacing:1.3px; text-transform:uppercase; color:#8B8172; padding:14px 10px 6px;}
+.nav-tree{display:flex; flex-direction:column;}
+.nav-group{margin-bottom:2px;}
 .nav-item{
   display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:8px; color:#D8D1C2;
   font-size:13px; font-weight:500; cursor:pointer; margin-bottom:2px; border:none; background:transparent; width:100%; text-align:left;
@@ -46,6 +47,23 @@ button{font-family:inherit; cursor:pointer;}
 .nav-badge{margin-left:auto; background:var(--crit); color:#fff; font-size:10px; font-weight:700; padding:1px 6px; border-radius:20px;}
 .nav-item.active .nav-badge{background:#221805; color:var(--amber-tint);}
 
+/* Accordion group — a parent that expands/collapses and never mounts a
+   page of its own; only its children (indented .nav-item buttons below it)
+   are real routes. */
+.nav-group-toggle{
+  display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:8px; color:#D8D1C2;
+  font-size:12.5px; font-weight:600; letter-spacing:.2px; cursor:pointer; border:none; background:transparent;
+  width:100%; text-align:left;
+}
+.nav-group-toggle svg{width:16px; height:16px; flex-shrink:0; opacity:.85;}
+.nav-group-toggle:hover{background:rgba(255,255,255,0.06); color:#fff;}
+.nav-group-label{flex:1;}
+.nav-group-chevron{display:flex; flex-shrink:0; transition:transform .15s ease; opacity:.7;}
+.nav-group-chevron svg{width:14px; height:14px;}
+.nav-group-chevron.open{transform:rotate(90deg);}
+.nav-group-body{padding-left:14px; border-left:1px solid rgba(255,255,255,0.08); margin:2px 0 6px 20px;}
+.nav-group-body .nav-item{font-size:12.5px; padding:7px 10px;}
+
 .sidebar-foot{margin-top:auto; padding:10px; border-top:1px solid rgba(255,255,255,0.08); display:flex; align-items:center; gap:9px;}
 .avatar{width:30px; height:30px; border-radius:50%; background:var(--amber-tint); color:var(--amber-deep); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:12px; flex-shrink:0;}
 .sidebar-foot .name{font-size:12.5px; font-weight:600; color:#fff;}
@@ -53,12 +71,40 @@ button{font-family:inherit; cursor:pointer;}
 .sidebar-foot .signout{margin-left:auto; background:transparent; border:none; color:#9C9385; font-size:10.5px; padding:4px; border-radius:6px;}
 .sidebar-foot .signout:hover{color:#fff;}
 
+/* Collapsible rail (2026-10). .nav-item-label wraps every piece of text
+   next to an icon so the collapsed state can hide labels without hiding
+   the icon/badge siblings next to them. Width itself lives on .shell
+   above, not here -- .sidebar has no fixed width of its own. */
+.nav-collapse-toggle{
+  display:flex; align-items:center; gap:10px; padding:9px 10px; margin-top:4px; border-radius:8px; color:#9C9385;
+  font-size:11.5px; font-weight:600; cursor:pointer; border:none; background:transparent; width:100%; text-align:left;
+}
+.nav-collapse-toggle:hover{background:rgba(255,255,255,0.06); color:#fff;}
+.nav-collapse-chevron{display:flex; flex-shrink:0; transition:transform .15s ease; opacity:.8;}
+.nav-collapse-chevron svg{width:14px; height:14px;}
+.nav-collapse-chevron.open{transform:rotate(180deg);}
+
+body.nav-collapsed .brand-text,
+body.nav-collapsed .nav-item-label,
+body.nav-collapsed .nav-group-label,
+body.nav-collapsed .nav-group-chevron,
+body.nav-collapsed .nav-badge,
+body.nav-collapsed .sidebar-foot .signout{display:none;}
+body.nav-collapsed .nav-item,
+body.nav-collapsed .nav-item-top,
+body.nav-collapsed .nav-group-toggle,
+body.nav-collapsed .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
+body.nav-collapsed .nav-group-body{display:none !important;}
+body.nav-collapsed .sidebar-foot{justify-content:center;}
+body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:0;}
+
 /* ---- Main ---- */
 .main{display:flex; flex-direction:column; min-width:0; height:100vh; overflow:hidden;}
 .topbar{
   display:flex; align-items:center; justify-content:space-between; gap:16px;
   padding:14px 26px; border-bottom:1px solid var(--line); background:var(--surface); flex-shrink:0;
 }
+.breadcrumb{font-size:11px; font-weight:600; letter-spacing:.3px; text-transform:uppercase; color:var(--ink-faint); margin-bottom:2px;}
 .topbar h1{font-family:var(--font-display); font-size:21px; font-weight:600; margin:0;}
 .topbar .sub{font-size:12px; color:var(--ink-soft); margin-top:1px;}
 .topbar-right{display:flex; align-items:center; gap:10px;}
@@ -179,19 +225,28 @@ td.num{text-align:right;}
    how-it-works). Severity-tinted, same four colors, no fifth. */
 .callout{border-radius:var(--radius); border:1px solid var(--line); padding:12px 16px; font-size:12.5px; margin-bottom:14px;}
 .callout p{margin:0;}
-.callout-warn{background:var(--amber-tint); border-color:#EAD3A0; color:var(--amber-deep);}
+.callout-warn{background:var(--amber-tint); border-color:#F0A855; color:var(--amber-deep);}
 .callout-info{background:var(--info-tint); border-color:#C9DBEB; color:var(--info);}
 .callout-crit{background:var(--crit-tint); border-color:#EFC9C2; color:var(--crit);}
 
 /* Field — real inputs styled as the prototype's field boxes. */
 .field{display:block; font-size:11.5px; font-weight:600; color:var(--ink-soft);}
-.field > input, .field > select{
-  width:100%; margin-top:5px; border-radius:7px; border:1px solid var(--line); background:var(--surface);
+.field > input, .field > select, .field > textarea{
+  display:block; width:100%; margin-top:5px; border-radius:7px; border:1px solid var(--line); background:var(--surface);
   color:var(--ink); padding:7px 11px; font-size:12px; font-family:inherit; font-weight:500; outline:none;
 }
-.field > input:focus, .field > select:focus{border-color:var(--amber);}
-.field > input::placeholder{color:var(--ink-faint); font-weight:400;}
+.field > input:focus, .field > select:focus, .field > textarea:focus{border-color:var(--amber);}
+.field > input::placeholder, .field > textarea::placeholder{color:var(--ink-faint); font-weight:400;}
 .field .hint{font-weight:400; color:var(--ink-faint); font-size:10.5px; margin-top:4px;}
+/* A textarea used standalone, outside a .field label (e.g. a reply box next
+   to its own Post button rather than under a caption) -- same box as
+   .field > textarea, just not scoped to that ancestor. */
+.textarea-plain{
+  border-radius:7px; border:1px solid var(--line); background:var(--surface);
+  color:var(--ink); padding:7px 11px; font-size:12px; font-family:inherit; font-weight:500; outline:none;
+}
+.textarea-plain:focus{border-color:var(--amber);}
+.textarea-plain::placeholder{color:var(--ink-faint); font-weight:400;}
 
 /* Loading + error states. A skeleton is not a zero — it says "not known yet". */
 .skeleton{background:linear-gradient(90deg,var(--line-soft),var(--surface-sunk),var(--line-soft));
@@ -217,10 +272,10 @@ td.num{text-align:right;}
 .g-kpis{grid-column:1/4; display:grid; grid-template-columns:repeat(5,1fr); gap:12px;}
 .g-alerts{grid-column:1/2; grid-row:2/4; display:flex; flex-direction:column; min-height:0;}
 .g-alerts .scrollpane{flex:1;}
-.g-forecast{grid-column:2/4; grid-row:2/3; min-height:0;}
+.g-messages{grid-column:2/4; grid-row:2/3; display:flex; flex-direction:column; min-height:0;}
 .g-expiry{grid-column:2/3; grid-row:3/4; display:flex; flex-direction:column; min-height:0;}
 .g-verify{grid-column:3/4; grid-row:3/4; display:flex; flex-direction:column; min-height:0;}
-.g-expiry .scrollpane, .g-verify .scrollpane{flex:1;}
+.g-messages .scrollpane, .g-expiry .scrollpane, .g-verify .scrollpane{flex:1;}
 
 .kpi-card{display:flex; flex-direction:column; justify-content:space-between; padding:13px 15px; gap:8px;}
 .kpi-card .top{display:flex; justify-content:space-between; align-items:flex-start; gap:8px;}
@@ -266,7 +321,7 @@ canvas{max-width:100%;}
   .today-grid{grid-template-columns:1fr 1fr; grid-template-rows:auto auto auto auto; height:auto;}
   .g-kpis{grid-column:1/3;}
   .g-alerts{grid-column:1/3; grid-row:auto;}
-  .g-forecast{grid-column:1/3; grid-row:auto;}
+  .g-messages{grid-column:1/3; grid-row:auto;}
   .g-expiry{grid-column:1/2; grid-row:auto;}
   .g-verify{grid-column:2/3; grid-row:auto;}
 }

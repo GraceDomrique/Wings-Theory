@@ -1,6 +1,18 @@
-/* Design tokens — spec §1. Copied verbatim from design/wings-theory-console.html.
-   Nothing outside this file may define a color, font or radius. If a value is
-   needed that isn't here, it doesn't exist in the design system. */
+/* Design tokens — spec §1. Nothing outside this file may define a color,
+   font or radius. If a value is needed that isn't here, it doesn't exist
+   in the design system.
+
+   2026-09-30: accent repainted to the "Autumn Blaze"/"Blackened Orange"
+   palette ACE picked (owner/admin console redesign) -- --bg and --surface
+   stay the same warm cream/white base ("white/cream is the base" was
+   explicit); only the amber, warn and crit tokens below changed.
+   --good/--info keep their existing hues on purpose: they are the ONLY
+   two colors in this system that are not
+   some shade of orange/red/yellow, so "healthy" (good, green) and
+   "excess/informational" (info, blue) stay visually distinct from
+   "buy soon" (warn) and "critical/urgent" (crit) at a glance rather than
+   collapsing into one warm blur. POS/KDS are untouched: they load
+   design-system.css, a completely separate token set/file, not this one.*/
 :root{
   --bg:#F7F5F0;
   --surface:#FFFFFF;
@@ -10,17 +22,31 @@
   --ink:#1F1C17;
   --ink-soft:#6E6656;
   --ink-faint:#A39A87;
-  --amber:#C6791E;
-  --amber-deep:#9C5814;
-  --amber-tint:#FBEBD3;
+  --amber:#FF6F20;
+  --amber-deep:#B34700;
+  --amber-tint:#FFCC80;
   --good:#3E7A55;
   --good-tint:#E4F1E7;
-  --warn:#B4791B;
-  --warn-tint:#FBEED8;
-  --crit:#B23E30;
-  --crit-tint:#FBE6E2;
+  /* --warn is read as TEXT color on --warn-tint (.pill-warn, its dot via
+     currentColor) -- FF9800 itself reads at only ~1.8:1 there, so it's
+     darkened the same way --amber-deep/--crit already are, not softened
+     to a different family. Still orange, just a "blackened" shade of the
+     FF9800 the palette named -- ~9:1 against --warn-tint. */
+  --warn:#A65C00;
+  --warn-tint:#FFE7C2;
+  --crit:#D32F2F;
+  --crit-tint:#FBE0DE;
   --info:#3D6A96;
   --info-tint:#E5EEF6;
+  /* 2026-10: cocoa/brown family, added for Messages (a conversation surface,
+     deliberately NOT orange-accented like the rest of the console so a
+     reply doesn't read as an alert) -- same warm-cream family as --bg, just
+     a browner hue instead of amber. */
+  --cocoa:#6F4E2F;
+  --cocoa-deep:#3E2A18;
+  --cocoa-tint:#E7DCC5;
+  --cocoa-bg:#F6EFE4;
+  --cocoa-faint:#A3886A;
   --radius:10px;
   --radius-sm:6px;
   --shadow:0 1px 2px rgba(31,28,23,0.04), 0 1px 10px rgba(31,28,23,0.03);

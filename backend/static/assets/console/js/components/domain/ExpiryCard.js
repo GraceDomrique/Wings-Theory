@@ -1,6 +1,7 @@
 import { h } from '../../lib/dom.js';
 import { Pill } from '../ui/Pill.js';
 import { Meter } from '../ui/Meter.js';
+import { Button } from '../ui/Button.js';
 import { qty } from '../../lib/format.js';
 
 /**
@@ -11,9 +12,16 @@ import { qty } from '../../lib/format.js';
  * labelled as an estimate — treating it as a printed date would turn a
  * reasonable guess about lettuce into an instruction to throw food away.
  *
- * @param {{batch:any, horizonDays?:number}} opts
+ * Expired stock is never auto-discarded — the date means "do not use", not
+ * "staff already threw this out at midnight". `onDiscard`, when supplied
+ * (only by Expiry.js's Expired column), opens the ingredient's Wastage pane
+ * pre-filled with this batch's own quantity and reason='spoilage', so
+ * recording the disposal is one click instead of re-finding the ingredient
+ * and re-typing a number this card already shows.
+ *
+ * @param {{batch:any, horizonDays?:number, onDiscard?:Function}} opts
  */
-export function ExpiryCard({ batch, horizonDays = 90 }) {
+export function ExpiryCard({ batch, horizonDays = 90, onDiscard }) {
   const d = batch.daysToExpiry;
   const label = d === null ? 'no date'
     : d < 0 ? `${Math.abs(d)}d ago`
@@ -37,5 +45,7 @@ export function ExpiryCard({ batch, horizonDays = 90 }) {
           max: horizonDays,
           severity: batch.severity,
         }))),
-    Pill(batch.severity, label));
+    h('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px', alignItems: 'flex-end' } },
+      Pill(batch.severity, label),
+      onDiscard ? Button({ variant: 'ghost', size: 'sm', onClick: onDiscard }, 'Discard') : null));
 }

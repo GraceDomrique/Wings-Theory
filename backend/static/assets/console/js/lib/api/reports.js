@@ -126,7 +126,7 @@ export async function getOrderReceipt(orderId) {
  * before mining; `dataQualityNote`, when present, explains the gap in plain
  * language (see wt/associations.py's module docstring for the full story).
  */
-export async function getCombinations(lookbackDays = 90) {
+export async function getCombinations(lookbackDays = 365) {
   const out = await api.get('/console/combinations', { lookback_days: lookbackDays });
   return {
     insufficientData: !!out.insufficient_data,

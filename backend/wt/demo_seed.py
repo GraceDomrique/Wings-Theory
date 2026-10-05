@@ -195,7 +195,7 @@ def _backdate_ledger_range(conn: sqlite3.Connection, lo_id: int, hi_id: int, ts:
 # receiving, with realistic expiry
 # ---------------------------------------------------------------------------
 def _pick_expires_at(rng: random.Random, category: str, expiry_mode: str,
-                     received_date: _dt.date) -> str | None:
+                     received_date: _dt.date, guarantee_fresh: bool = False) -> str | None:
     """A believable expiry date for one receiving event — mixed healthy/
     approaching/at-risk so the resulting batches read like a real shop's
     stock, not a uniform wall of one color. None for anything not on a real
@@ -204,12 +204,22 @@ def _pick_expires_at(rng: random.Random, category: str, expiry_mode: str,
     itself, and supplying a date here would just be a second, competing
     number nobody asked for; 'none'-mode ingredients have nothing to invent
     a date for at all.
+
+    guarantee_fresh (_restock_shortfalls only): skips the small roll that
+    would otherwise land this batch already-expired or expiring within
+    days. A reactive top-up exists for exactly one reason — to make a
+    shortfall usable right now — so a result that can come back unusable
+    on arrival would defeat its own purpose; the "a few batches are already
+    near-death" realism is a property of the general stocked-shelf picture
+    _seed_periodic_receiving builds, not of this one delivery.
     """
     if expiry_mode != "fixed_date":
         return None
     healthy_lo, healthy_hi, near_lo, near_hi = SHELF_LIFE_WINDOWS.get(category, (90, 200, 14, 30))
     roll = rng.random()
-    if roll < 0.75:
+    if guarantee_fresh:
+        days_out = rng.randint(healthy_lo, healthy_hi)
+    elif roll < 0.75:
         days_out = rng.randint(healthy_lo, healthy_hi)
     elif roll < 0.93:
         days_out = rng.randint(near_lo, near_hi)
@@ -220,8 +230,9 @@ def _pick_expires_at(rng: random.Random, category: str, expiry_mode: str,
 
 def _receive_realistic(conn: sqlite3.Connection, ingredient_id: int, category: str,
                        expiry_mode: str, purchase_qty: float, ts: str, day: _dt.date,
-                       rng: random.Random, lot_prefix: str = "DEMO") -> dict:
-    expires_at = _pick_expires_at(rng, category, expiry_mode, day)
+                       rng: random.Random, lot_prefix: str = "DEMO",
+                       guarantee_fresh: bool = False) -> dict:
+    expires_at = _pick_expires_at(rng, category, expiry_mode, day, guarantee_fresh=guarantee_fresh)
     before = _last_ledger_id(conn)
     result = receive_stock(conn, ingredient_id, purchase_qty, lot_no=f"{lot_prefix}-{day.isoformat()}",
                            expires_at=expires_at, user_id=USER_ID)
@@ -262,7 +273,7 @@ def _restock_shortfalls(conn: sqlite3.Connection, shortfalls: list[dict], ts: st
         top_up_base = shortfall_base + s["needed"] * 25
         purchase_qty = max(1.0, top_up_base / pack_size)
         _receive_realistic(conn, s["ingredient_id"], row["category"], row["expiry_mode"],
-                           purchase_qty, ts, day, rng, lot_prefix="DEMO")
+                           purchase_qty, ts, day, rng, lot_prefix="DEMO", guarantee_fresh=True)
         restocked += 1
     return restocked
 
@@ -440,7 +451,8 @@ def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rn
                           walkout_rate: float = 0.03,
                           random_table_label: bool = True,
                           extra_lines: dict[int, int] | None = None,
-                          extra_prices: dict[int, float] | None = None) -> dict | None:
+                          extra_prices: dict[int, float] | None = None,
+                          restock_reference_date: _dt.date | None = None) -> dict | None:
     """One unlimited table, start to close: order -> session -> 1-5 refill
     rounds, each individually held-then-served through the real two-phase
     refill path -> occasionally a round voided or corrected along the way.
@@ -469,7 +481,24 @@ def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rn
     exists for xlsx_history_import.py's mixed workbook orders (one source
     Order ID listing both unlimited-wings and a-la-carte lines): the two are
     no longer replayed as two separate customer_order rows just because this
-    function only used to know how to create the unlimited half."""
+    function only used to know how to create the unlimited half.
+
+    restock_reference_date (xlsx_history_import.py only): the date a
+    reactive mid-replay restock's shelf life is measured from, independent
+    of `day` (the historical sale being replayed). Replaying a sale from
+    long ago can still run an ingredient's FABRICATED current on-hand level
+    short and need a reactive top-up (see _restock_shortfalls) -- but that
+    top-up is a bookkeeping fiction invented purely to let the historical
+    SALE go through, never a real delivery that happened back on `day`. A
+    perishable category's shelf life (SHELF_LIFE_WINDOWS -- as little as 10
+    days for wet_food) measured from a `day` that can be 600+ days in the
+    past would make the fictional batch already expired the instant it is
+    created, permanently and for no operational reason, under the exact
+    expired-stock-is-unusable rule this system otherwise correctly relies
+    on (migrations/0040, reservation._try_hold). Left None (every existing
+    caller -- demo_seed.py's own bulk generator always calls with a recent
+    `day`, where this distinction cannot arise), behavior is unchanged:
+    the restock is measured from `day` exactly as before."""
     minute = rng.randint(0, 59)
     ts = f"{day.isoformat()} {hour:02d}:{minute:02d}:00"
     if head_count is None:
@@ -487,7 +516,7 @@ def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rn
     try:
         reserve_order(conn, order_pk, user_id=USER_ID)
     except InsufficientStockError as e:
-        _restock_shortfalls(conn, e.shortfalls, ts, day, rng)
+        _restock_shortfalls(conn, e.shortfalls, ts, restock_reference_date or day, rng)
         reserve_order(conn, order_pk, user_id=USER_ID)
 
     if rng.random() < walkout_rate:
@@ -524,7 +553,7 @@ def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rn
         try:
             refill = record_refill(conn, session_pk, flavor["id"], user_id=USER_ID)
         except InsufficientStockError as e:
-            _restock_shortfalls(conn, e.shortfalls, round_ts, day, rng)
+            _restock_shortfalls(conn, e.shortfalls, round_ts, restock_reference_date or day, rng)
             refill = record_refill(conn, session_pk, flavor["id"], user_id=USER_ID)
         refill_pk = refill["id"]
         conn.execute("UPDATE unli_refill SET created_at=? WHERE id=?", (round_ts, refill_pk))

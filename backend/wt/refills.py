@@ -62,7 +62,7 @@ import sqlite3
 
 from .db import write_tx
 from .errors import InsufficientStockError, InvalidStateError, NotFoundError, ValidationError
-from .reservation import EPS, _ledger, _try_hold, deplete_fefo, restore_fefo
+from .reservation import EPS, _EXPIRED_BATCH, _ledger, _try_hold, deplete_fefo, restore_fefo
 from .resolver import expand_recipe
 from .unli import get_setting
 
@@ -599,13 +599,23 @@ def _record_refill_tx(
                 (refill_pk, ingredient_id, qty),
             )
         else:
+            # available mirrors exactly what _try_hold's own guard just tested
+            # against -- see reservation.reserve_order's identical shortfall
+            # query for why plain on_hand-reserved understates this whenever
+            # expired stock is inflating on_hand_base.
             row = conn.execute(
-                "SELECT name, base_unit, on_hand_base, reserved_base FROM ingredient WHERE id=?",
+                f"""
+                SELECT name, base_unit, on_hand_base, reserved_base,
+                       (SELECT COALESCE(SUM(qty_base), 0) FROM fefo_batch
+                         WHERE ingredient_id = ingredient.id AND state = 'open'
+                           AND ({_EXPIRED_BATCH})) AS expired_base
+                  FROM ingredient WHERE id=?
+                """,
                 (ingredient_id,)).fetchone()
             shortfalls.append({
                 "ingredient_id": ingredient_id, "name": row["name"],
                 "needed": round(qty, 3),
-                "available": round(row["on_hand_base"] - row["reserved_base"], 3),
+                "available": round(row["on_hand_base"] - row["reserved_base"] - row["expired_base"], 3),
                 "unit": row["base_unit"],
             })
     if shortfalls:

@@ -52,6 +52,8 @@ import { api, ApiError } from './client.js';
  * @property {TodayAlert[]} alerts
  * @property {{ insufficientData:boolean, daysOfHistory:number, requiredDays:number,
  *              labels:string[], values:(number|null)[], note:string|null }} forecastPreview
+ * @property {{ openInstructions:number, items:{id:number,title:string,status:string,priority:string}[],
+ *              unacknowledgedForCaller:number }} messagesPreview
  * @property {{ ingredientId:number, name:string, qty:{qty:number,unit:string,display:string},
  *              label:string, daysToExpiry:number, severity:import('../types.js').Severity }[]} useFirst
  *              renamed from the old expiryPreview — same "oldest batches
@@ -92,6 +94,11 @@ const SAMPLE = {
     labels: [],
     values: [],
     note: 'Prophet needs 7+ days of real sales per menu item. The closest item has 2 days on file.',
+  },
+  messagesPreview: {
+    openInstructions: 1,
+    items: [{ id: 1, title: 'Verify Chicken Wings count before ordering', status: 'open', priority: 'normal' }],
+    unacknowledgedForCaller: 0,
   },
   useFirst: [
     { name: 'Fresh Garlic Peeled', qty: { qty: 950, unit: 'g', display: '950 g' }, label: 'today', severity: 'crit' },
@@ -158,4 +165,62 @@ export async function getSummary() {
     if (e instanceof ApiError && e.status === 404) return SAMPLE;
     throw e;
   }
+}
+
+/**
+ * Owner Overview "business companion" — GET /console/dashboard/business-
+ * overview (wt/business_overview.py). A second, independent read over the
+ * same order tables getSummary() already reads, never a duplicate
+ * calculation of anything in DashboardSummary above — see that module's own
+ * docstring for exactly what each block is computed against.
+ *
+ * `dataStaleHours` is the gap between "now" and the most recent real order
+ * — the frontend must check it before presenting `today`/`thisWeek`/
+ * `thisMonth` as a real performance read: a large gap means those blocks
+ * are comparing a trading day against a day nothing was entered on, not
+ * reporting an actual decline.
+ */
+function totalsBlock(t) {
+  return { revenue: t.revenue, orders: t.orders, covers: t.covers, avgOrder: t.avg_order };
+}
+
+function periodBlock(raw) {
+  if (!raw) return null;
+  return {
+    label: raw.label,
+    current: totalsBlock(raw.current),
+    prior: totalsBlock(raw.prior),
+    deltas: {
+      revenuePct: raw.deltas.revenue_pct,
+      ordersPct: raw.deltas.orders_pct,
+      avgOrderPct: raw.deltas.avg_order_pct,
+      coversPct: raw.deltas.covers_pct,
+    },
+  };
+}
+
+export async function getBusinessOverview() {
+  const raw = await api.get('/console/dashboard/business-overview');
+  return {
+    asOf: raw.as_of,
+    latestOrderAt: raw.latest_order_at,
+    dataStaleHours: raw.data_stale_hours,
+    today: periodBlock(raw.today),
+    thisWeek: periodBlock(raw.this_week),
+    thisMonth: periodBlock(raw.this_month),
+    trend: {
+      weeks: (raw.trend.weeks || []).map((w) => ({ weekStart: w.week_start, revenue: w.revenue })),
+      averageRevenue: raw.trend.average_revenue,
+      belowAverageStreak: raw.trend.below_average_streak,
+    },
+    outlook: raw.outlook.available
+      ? {
+        available: true,
+        horizonDays: raw.outlook.horizon_days,
+        forecastTotal: raw.outlook.forecast_total,
+        trailingAvgTotal: raw.outlook.trailing_avg_total,
+        deltaPct: raw.outlook.delta_pct,
+      }
+      : { available: false, reason: raw.outlook.reason },
+  };
 }

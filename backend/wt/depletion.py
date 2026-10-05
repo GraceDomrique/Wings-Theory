@@ -123,7 +123,7 @@ import statistics
 import threading
 import time
 
-from . import forecasting, timeutil
+from . import forecasting, reservation, timeutil
 
 # --- demand model constants -------------------------------------------------
 LOOKBACK_DAYS = 56          # ~8 weeks: enough weekday repeats, recent enough to be this menu
@@ -164,6 +164,23 @@ _prophet_lock = threading.Lock()
 _prophet_generation = 0  # bumped on every refresh; api.py folds this into its cache fingerprint
                           # so a refresh takes effect on the very next request, not the next
                           # unrelated order/edit that happens to invalidate it otherwise.
+
+# --- optional per-series HYBRID baseline (2026-09, production-integration
+# pass) -- Level 2, live -------------------------------------------------
+# Mirrors _prophet_store exactly (same key shape, same lock, same TTL) but
+# holds whichever method forecasting._backtest_series()'s Level-2 selection
+# actually validated as best for that item (naive / trailing-average /
+# day-of-week / Prophet-with-its-own-selected-growth), not always Prophet.
+# Kept as a SEPARATE store from _prophet_store rather than repurposing it,
+# so demand_model='prophet' (today's existing, tested behavior: always
+# Prophet when a fresh fit exists) is completely unaffected -- 'hybrid' is
+# an additive new value, not a redefinition of an existing one. See
+# refresh_prophet_baselines() for how this is populated and build_demand()
+# for how demand_model='hybrid' consumes it.
+_hybrid_store: dict[tuple, tuple[float, dict | None]] = {}
+# Reuses _prophet_lock/_prophet_generation below for both stores -- a single
+# refresh call updates both together, so one lock/one generation counter is
+# simpler and correct (no risk of the two stores' generations drifting).
 
 
 def prophet_refresh_generation() -> int:
@@ -214,30 +231,48 @@ STATUS_ORDER = {
 # ===========================================================================
 # Shared data pulls
 # ===========================================================================
-def _trading_days(conn: sqlite3.Connection, lookback_days: int) -> list[str]:
+def _trading_days(conn: sqlite3.Connection, lookback_days: int,
+                  now: _dt.datetime | None = None) -> list[str]:
     """Manila calendar days inside the window on which the shop actually took
     an order. Excludes days with no `customer_order` row at all -- see the
     module docstring: that is a closed/no-data day, not a zero-sales day, and
-    averaging over it silently understates every rate downstream."""
+    averaging over it silently understates every rate downstream.
+
+    2026-10 leakage fix: `now` now bounds BOTH ends of the window (was
+    lower-bound only, and the lower bound itself was never threaded through
+    at all) -- see build_demand()'s own 2026-10 note for the full audit.
+    now=None (every caller before replenishment_backtest() started passing
+    a historical one) is unchanged: reads up to the live wall clock, same
+    as always."""
     bd = timeutil.sql_business_date("created_at")
+    upper = " AND created_at < ?" if now is not None else ""
+    params = [timeutil.utc_bound_n_manila_days_ago(lookback_days, now)]
+    if now is not None:
+        params.append(timeutil.utc_upper_bound_sql(now))
     rows = conn.execute(
         f"SELECT DISTINCT {bd} AS d FROM customer_order "
-        f"WHERE status != 'void' AND created_at >= ? ORDER BY d",
-        (timeutil.utc_bound_n_manila_days_ago(lookback_days),),
+        f"WHERE status != 'void' AND created_at >= ?{upper} ORDER BY d",
+        params,
     ).fetchall()
     return [r["d"] for r in rows]
 
 
-def _item_daily_qty(conn: sqlite3.Connection, lookback_days: int) -> dict[int, dict[str, float]]:
+def _item_daily_qty(conn: sqlite3.Connection, lookback_days: int,
+                    now: _dt.datetime | None = None) -> dict[int, dict[str, float]]:
+    """2026-10 leakage fix: see _trading_days()'s identical note."""
     bd = timeutil.sql_business_date("o.created_at")
+    upper = " AND o.created_at < ?" if now is not None else ""
+    params = [timeutil.utc_bound_n_manila_days_ago(lookback_days, now)]
+    if now is not None:
+        params.append(timeutil.utc_upper_bound_sql(now))
     rows = conn.execute(
         f"""
         SELECT ol.menu_item_id AS pk, {bd} AS d, SUM(ol.qty) AS qty
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE o.status != 'void' AND o.created_at >= ?
+         WHERE o.status != 'void' AND o.created_at >= ?{upper}
          GROUP BY pk, d
         """,
-        (timeutil.utc_bound_n_manila_days_ago(lookback_days),),
+        params,
     ).fetchall()
     out: dict[int, dict[str, float]] = {}
     for r in rows:
@@ -245,40 +280,57 @@ def _item_daily_qty(conn: sqlite3.Connection, lookback_days: int) -> dict[int, d
     return out
 
 
-def _heads_daily(conn: sqlite3.Connection, lookback_days: int) -> dict[str, float]:
+def _heads_daily(conn: sqlite3.Connection, lookback_days: int,
+                 now: _dt.datetime | None = None) -> dict[str, float]:
     """Covers per day on unlimited tickets. Unlimited consumption is sized by
     heads x lambda, never by line quantity (see resolver.order_requirements),
-    so heads -- not menu units -- is the series that drives those streams."""
+    so heads -- not menu units -- is the series that drives those streams.
+
+    2026-10 leakage fix: see _trading_days()'s identical note -- this was
+    the single biggest contributor to the replenishment-backtest leakage,
+    since every unli-stream ingredient's (and the new unli-refill demand
+    component's) projection scales off this series."""
     bd = timeutil.sql_business_date("o.created_at")
+    upper = " AND o.created_at < ?" if now is not None else ""
+    params = [timeutil.utc_bound_n_manila_days_ago(lookback_days, now)]
+    if now is not None:
+        params.append(timeutil.utc_upper_bound_sql(now))
     rows = conn.execute(
         f"""
         SELECT {bd} AS d, SUM(o.head_count * ol.qty) AS heads
           FROM customer_order o
           JOIN order_line ol ON ol.order_id = o.id
           JOIN menu_item  m  ON m.id = ol.menu_item_id
-         WHERE m.is_unli = 1 AND o.status != 'void' AND o.created_at >= ?
+         WHERE m.is_unli = 1 AND o.status != 'void' AND o.created_at >= ?{upper}
          GROUP BY d
         """,
-        (timeutil.utc_bound_n_manila_days_ago(lookback_days),),
+        params,
     ).fetchall()
     return {r["d"]: float(r["heads"] or 0) for r in rows}
 
 
-def _intraday_share(conn: sqlite3.Connection, lookback_days: int) -> list[float]:
+def _intraday_share(conn: sqlite3.Connection, lookback_days: int,
+                    now: _dt.datetime | None = None) -> list[float]:
     """share[h] = fraction of a normal day's units sold at or before Manila
     hour h, pooled across every item (one item alone is too sparse to profile
     an hour with). This is what makes "40 units by 7pm" comparable to a whole
-    day's baseline."""
+    day's baseline.
+
+    2026-10 leakage fix: see _trading_days()'s identical note."""
     shift = f"+{timeutil.MANILA_UTC_OFFSET_HOURS} hours"
+    upper = " AND o.created_at < ?" if now is not None else ""
+    params = [timeutil.utc_bound_n_manila_days_ago(lookback_days, now)]
+    if now is not None:
+        params.append(timeutil.utc_upper_bound_sql(now))
     rows = conn.execute(
         f"""
         SELECT CAST(strftime('%H', o.created_at, '{shift}') AS INTEGER) AS hr,
                SUM(ol.qty) AS qty
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE o.status != 'void' AND o.created_at >= ?
+         WHERE o.status != 'void' AND o.created_at >= ?{upper}
          GROUP BY hr
         """,
-        (timeutil.utc_bound_n_manila_days_ago(lookback_days),),
+        params,
     ).fetchall()
     by_hour = [0.0] * 24
     for r in rows:
@@ -473,6 +525,17 @@ class DemandSeries:
 # ===========================================================================
 # Prophet-driven baseline for future days (opt in, explicitly refreshed)
 # ===========================================================================
+# Independent of `lookback_days` above (which sizes the actual fit's own
+# training window, unchanged since before adaptive growth existed): Level-1
+# growth selection (forecasting.select_prophet_growth()) wants as much real
+# history as exists to find enough tuning folds -- at this function's own
+# horizon_days=HORIZON_DAYS=21, even 2 folds needs 21+2*21=63 real days,
+# already past LOOKBACK_DAYS=56. A second, longer _daily_series() query
+# (still <30ms per the module's own measurements) is the simplest fix that
+# does not touch the existing fit's window or any test asserting it.
+GROWTH_SELECTION_LOOKBACK_DAYS = 365
+
+
 def refresh_prophet_baselines(conn: sqlite3.Connection, horizon_days: int = HORIZON_DAYS,
                               lookback_days: int = LOOKBACK_DAYS) -> dict:
     """Fit Prophet for every POS-visible menu item and cache the result for
@@ -496,31 +559,164 @@ def refresh_prophet_baselines(conn: sqlite3.Connection, horizon_days: int = HORI
     started selling" -- both fall back to the EWMA baseline for that one
     item either way, but the counts below make the difference visible to
     whoever is watching this run.
+
+    2026-09 adaptive-growth pass: before fitting, each item now runs a
+    Level-1 growth selection (forecasting.select_prophet_growth()) over its
+    own history, picking whichever of growth='flat'/'linear' scored lower
+    tuning WAPE on that item specifically -- see forecasting.py's own
+    "Level 1" section for why a single global default stopped being
+    accurate for this restaurant's highest-volume series. No leakage risk
+    here: unlike evaluate_demand_model()'s reporting backtest, there is no
+    held-out period to protect, because the fit this selection feeds
+    targets genuinely future days no fold, anywhere, has ever seen. The
+    selection is cached two places: alongside the fit itself in
+    _prophet_store (same TTL/generation invalidation already governing that
+    cache, read by build_demand()) AND in forecasting's shared
+    _growth_selection_store (via cache_growth_selection()), which is what
+    menu_item_demand_prophet() (the single-item detail page) now reads too
+    -- closing the inconsistency where that page kept using the old global
+    PROPHET_DEFAULT_GROWTH while replenishment had already gone adaptive.
+
+    2026-09 (second pass): also runs the identical Level-1 selection for the
+    3 store-wide metrics (orders/items/sales) and caches those the same way,
+    for store_demand_prophet() to read -- that path fits inline per request
+    (it is not part of the per-item _prophet_store/build_demand machinery)
+    but needed the same growth consistency fix.
     """
+    # 2026-09 second adaptive-growth pass: anchor to the dead-tail-aware
+    # "now" (see forecasting.effective_now()'s own section) instead of the
+    # live wall clock, which currently sits a few days past a real
+    # data-collection gap in this deployment's order history. Computed once
+    # per refresh call and reused for every item/metric below, so a single
+    # DB round-trip covers the whole run.
+    anchor = forecasting.effective_now(conn)
     items = conn.execute("SELECT id, name FROM menu_item WHERE pos_visible = 1").fetchall()
     scope = _prophet_scope_key(conn)
     fitted = insufficient = failed = 0
+    growth_flat = growth_linear = growth_fallback = 0
+    hybrid_unavailable = 0
+    hybrid_method_counts: dict[str, int] = {}
     for it in items:
-        rows, series = forecasting._daily_series(conn, it["id"], lookback_days)
+        rows, series = forecasting._daily_series(conn, it["id"], lookback_days, now=anchor)
         key = (scope, it["id"], lookback_days, horizon_days)
         if len(rows) < forecasting.MIN_DEMAND_SAMPLE_DAYS:
             result = None
             insufficient += 1
+            hybrid_unavailable += 1
+            with _prophet_lock:
+                _hybrid_store[key] = (time.monotonic(), None)
         else:
-            result = forecasting.fit_prophet(series, rows, horizon_days)
+            growth_rows, growth_series = forecasting._daily_series(
+                conn, it["id"], GROWTH_SELECTION_LOOKBACK_DAYS, now=anchor)
+            selection = forecasting.select_prophet_growth(
+                growth_rows, growth_series, horizon=horizon_days)
+            series_key = f"menu_item:{it['id']}"
+            cached_selection = {
+                **selection,
+                "series_key": series_key,
+                "selection_date": timeutil.business_today().isoformat(),
+                "training_cutoff": selection["tuning_end_date"],
+                "flat_validation_wape": selection["mean_wape"].get("flat"),
+                "linear_validation_wape": selection["mean_wape"].get("linear"),
+            }
+            forecasting.cache_growth_selection(conn, series_key, cached_selection)
+            if selection["is_fallback"]:
+                growth_fallback += 1
+            elif selection["selected_growth"] == "linear":
+                growth_linear += 1
+            else:
+                growth_flat += 1
+
+            result = forecasting.fit_prophet(series, rows, horizon_days,
+                                             growth=selection["selected_growth"])
             if result is None:
                 failed += 1
             else:
                 fitted += 1
+                result = {**result, "growth_used": selection["selected_growth"],
+                         "growth_selection": cached_selection}
+
+            # --- Level 2, live: validate naive/trailing-avg/day-of-week/
+            # Prophet on the SAME growth_series/growth_rows the growth
+            # selection above just used (reusing selection["selected_growth"]
+            # rather than re-deriving it -- _backtest_series's own
+            # prophet_growth override exists exactly for this), then apply
+            # whichever wins to the full series for a real live forecast.
+            # This is what demand_model='hybrid' reads; demand_model=
+            # 'prophet' above is completely unaffected (separate cache).
+            backtest = forecasting._backtest_series(
+                growth_rows, growth_series, horizon_days,
+                forecasting.ROLLING_MIN_TRAIN_DAYS, forecasting.ROLLING_MAX_FOLDS,
+                prophet_growth=selection["selected_growth"],
+            )
+            if backtest is None:
+                hybrid_result = None
+                hybrid_unavailable += 1
+            else:
+                method = backtest["selected_method"]
+                hybrid_forecast = forecasting.forecast_with_method(
+                    growth_series, growth_rows, horizon_days, method,
+                    growth=selection["selected_growth"],
+                )
+                if hybrid_forecast is None:
+                    hybrid_result = None
+                    hybrid_unavailable += 1
+                else:
+                    hybrid_result = {
+                        "forecast": hybrid_forecast,
+                        "method_used": method,
+                        "growth_used": selection["selected_growth"] if method == "prophet" else None,
+                        "method_selection": {
+                            "series_key": series_key,
+                            "selected_method": method,
+                            "selection_reason": backtest["selection_reason"],
+                            "methods": backtest["methods"],
+                            "selection_date": timeutil.business_today().isoformat(),
+                        },
+                    }
+                    hybrid_method_counts[method] = hybrid_method_counts.get(method, 0) + 1
+            with _prophet_lock:
+                _hybrid_store[key] = (time.monotonic(), hybrid_result)
         with _prophet_lock:
             _prophet_store[key] = (time.monotonic(), result)
     global _prophet_generation
     with _prophet_lock:
         _prophet_generation += 1
+
+    store_growth_flat = store_growth_linear = store_growth_fallback = 0
+    for metric in forecasting.STORE_METRICS:
+        growth_rows, growth_series = forecasting._store_daily_series(
+            conn, GROWTH_SELECTION_LOOKBACK_DAYS, now=anchor)[metric]
+        selection = forecasting.select_prophet_growth(
+            growth_rows, growth_series, horizon=horizon_days)
+        series_key = f"store:{metric}"
+        cached_selection = {
+            **selection,
+            "series_key": series_key,
+            "selection_date": timeutil.business_today().isoformat(),
+            "training_cutoff": selection["tuning_end_date"],
+            "flat_validation_wape": selection["mean_wape"].get("flat"),
+            "linear_validation_wape": selection["mean_wape"].get("linear"),
+        }
+        forecasting.cache_growth_selection(conn, series_key, cached_selection)
+        if selection["is_fallback"]:
+            store_growth_fallback += 1
+        elif selection["selected_growth"] == "linear":
+            store_growth_linear += 1
+        else:
+            store_growth_flat += 1
+
     return {
         "itemsConsidered": len(items), "fitted": fitted,
         "insufficientData": insufficient, "fitFailed": failed,
         "horizonDays": horizon_days, "lookbackDays": lookback_days,
+        "growthFlat": growth_flat, "growthLinear": growth_linear,
+        "growthFallback": growth_fallback,
+        "storeGrowthFlat": store_growth_flat, "storeGrowthLinear": store_growth_linear,
+        "storeGrowthFallback": store_growth_fallback,
+        "effectiveNow": timeutil.business_today(anchor).isoformat(),
+        "hybridMethodCounts": hybrid_method_counts,
+        "hybridUnavailable": hybrid_unavailable,
     }
 
 
@@ -549,6 +745,24 @@ def _prophet_daily_for_item(conn: sqlite3.Connection, item_pk: int,
     return result
 
 
+def _hybrid_daily_for_item(conn: sqlite3.Connection, item_pk: int,
+                           lookback_days: int, horizon_days: int) -> dict | None:
+    """Whatever refresh_prophet_baselines() last cached for this item's
+    Level-2 selected method, or None on the identical three conditions
+    _prophet_daily_for_item() documents (never refreshed / stale / too
+    little history) -- same cache contract, same fallback-to-EWMA meaning
+    for the caller, just reading _hybrid_store instead of _prophet_store."""
+    key = (_prophet_scope_key(conn), item_pk, lookback_days, horizon_days)
+    with _prophet_lock:
+        hit = _hybrid_store.get(key)
+    if hit is None:
+        return None
+    computed_at, result = hit
+    if time.monotonic() - computed_at > PROPHET_STALE_AFTER_SECONDS:
+        return None
+    return result
+
+
 def build_demand(conn: sqlite3.Connection, lookback_days: int = LOOKBACK_DAYS,
                  horizon_days: int = HORIZON_DAYS, now: _dt.datetime | None = None,
                  demand_model: str = "ewma") -> dict:
@@ -569,15 +783,39 @@ def build_demand(conn: sqlite3.Connection, lookback_days: int = LOOKBACK_DAYS,
     demand_source note. The unlimited head-count series is also always EWMA:
     Prophet is scoped to menu-item sales, which is what it was actually fit
     on; head counts are a different signal this pass does not extend to.
+
+    demand_model='hybrid' (2026-09, production-integration pass): the same
+    future-day substitution as 'prophet', but each item uses whichever
+    method forecasting._backtest_series()'s Level-2 selection actually
+    validated as most accurate for THAT item (naive / trailing-average /
+    day-of-week / Prophet-with-its-own-selected-growth) -- see
+    _hybrid_daily_for_item() and refresh_prophet_baselines(). This is the
+    strategy evaluate_demand_model() reports 55.69% fleet-mean WAPE for;
+    'prophet' alone is not the same thing (it forces Prophet on every item
+    with a fresh fit, which evaluate_demand_model() measures at 57.81% --
+    worse, because Prophet is not the best method for every series). Same
+    per-item fallback-to-EWMA on a cache miss/stale entry/insufficient
+    history as 'prophet'; never re-tunes or re-backtests inline.
     """
     today = timeutil.business_today(now)
-    manila_hour = timeutil.to_manila(now or timeutil.utc_now()).hour
-    share = _intraday_share(conn, lookback_days)
-    share_by_now = _clamp(share[manila_hour], 0.0, 1.0)
+    now_manila = timeutil.to_manila(now or timeutil.utc_now())
+    manila_hour = now_manila.hour
+    share = _intraday_share(conn, lookback_days, now)
+    # 2026-10 fix: share[h] is cumulative through the END of hour h, but only
+    # part of the current hour has elapsed. Reading share[manila_hour] whole
+    # counted sales that cannot have happened yet as "expected by now", which
+    # understated pace (and, through it, today's remainder and the momentum
+    # carried into every future day) -- by ~23% at 20:00 Manila on the real
+    # profile, where hour 20 alone holds ~20% of a day's units. Interpolate
+    # linearly inside the hour instead, between the previous hour's cumulative
+    # share and this one's.
+    hour_start = share[manila_hour - 1] if manila_hour > 0 else 0.0
+    elapsed = (now_manila.minute * 60 + now_manila.second) / 3600.0
+    share_by_now = _clamp(hour_start + elapsed * (share[manila_hour] - hour_start), 0.0, 1.0)
 
-    trading = set(_trading_days(conn, lookback_days))
-    per_item = _item_daily_qty(conn, lookback_days)
-    heads = _heads_daily(conn, lookback_days)
+    trading = set(_trading_days(conn, lookback_days, now))
+    per_item = _item_daily_qty(conn, lookback_days, now)
+    heads = _heads_daily(conn, lookback_days, now)
 
     items = conn.execute(
         "SELECT id, name, category, recipe_id, is_unli, price FROM menu_item WHERE pos_visible = 1"
@@ -589,17 +827,24 @@ def build_demand(conn: sqlite3.Connection, lookback_days: int = LOOKBACK_DAYS,
         day_map = per_item.get(it["id"], {})
         points = [(_dt.date.fromisoformat(d), day_map.get(d, 0.0)) for d in sorted(trading)]
         s = DemandSeries(it["id"], it["name"], points, today, share_by_now, horizon_days)
-        if demand_model == "prophet":
-            pf = _prophet_daily_for_item(conn, it["id"], lookback_days, horizon_days)
+        if demand_model in ("prophet", "hybrid"):
+            pf = (_prophet_daily_for_item(conn, it["id"], lookback_days, horizon_days)
+                 if demand_model == "prophet" else
+                 _hybrid_daily_for_item(conn, it["id"], lookback_days, horizon_days))
             if pf is not None:
                 for k in range(1, horizon_days + 1):
                     day = pf["forecast"][k - 1]
                     s.daily[k] = max(0.0, day["qty"] * s.momentum)
                     # (high-low)/2 under an 80%-interval normal approximation
-                    # (z=1.2816 each side) -- Prophet's own uncertainty,
-                    # reused rather than re-estimated from EWMA residuals.
+                    # (z=1.2816 each side) -- Prophet's own uncertainty where
+                    # the selected method IS Prophet; a baseline method's
+                    # forecast has low=high=qty (a point forecast, no native
+                    # interval -- see forecasting.forecast_with_method()),
+                    # which correctly collapses this to sigma=0 rather than
+                    # fabricating an uncertainty band a simple average never
+                    # produced.
                     s.sigma_daily[k] = max(0.0, day["high"] - day["low"]) / (2 * 1.2816)
-                s.demand_source = "prophet"
+                s.demand_source = "prophet" if demand_model == "prophet" else pf.get("method_used", "prophet")
         series[it["id"]] = s
         meta[it["id"]] = it
 
@@ -656,16 +901,25 @@ def _stock_history(conn: sqlite3.Connection, ingredient_id: int, on_hand: float,
 # Ingredient projection
 # ===========================================================================
 def _ingredient_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    # available_base excludes whatever sits in an already-expired open batch
+    # (migrations/0040_expired_stock_usability.sql's v_ingredient_expired_stock)
+    # — the same usable-stock definition the POS availability view and the
+    # reservation guard use (see reservation._try_hold). Without this, a
+    # purchase recommendation could read a healthy days-of-supply off stock
+    # that can no longer legally be sold, understating how soon a reorder is
+    # actually needed.
     return conn.execute(
         """
         SELECT i.id, i.ingredient_id, i.name, i.category, i.base_unit, i.purchase_unit,
                i.pack_size, i.yield_factor, i.lead_time_days, i.reorder_point_base,
                i.inventory_type, i.on_hand_base, i.reserved_base,
-               (i.on_hand_base - i.reserved_base) AS available_base,
+               (i.on_hand_base - i.reserved_base - COALESCE(x.expired_base, 0)) AS available_base,
+               COALESCE(x.expired_base, 0) AS expired_base,
                i.unit_cost, i.unit_cost_status, i.pack_size_status,
                r.is_deductable
           FROM ingredient i
           JOIN v_ingredient_readiness r ON r.id = i.id
+          LEFT JOIN v_ingredient_expired_stock x ON x.ingredient_id = i.id
          WHERE i.is_active = 1 AND r.is_deductable = 1
            AND NOT (i.kind = 'sub_recipe' AND i.sub_recipe_mode = 'exploded')
         """
@@ -683,6 +937,76 @@ def _operational_rate(conn: sqlite3.Connection, lookback_days: int) -> dict[int,
         (timeutil.utc_bound_n_manila_days_ago(lookback_days),),
     ).fetchall()
     return {r["ingredient_id"]: max(0.0, float(r["used"] or 0)) / lookback_days for r in rows}
+
+
+def _refill_lambda(conn: sqlite3.Connection, lookback_days: int,
+                   now: _dt.datetime | None = None) -> dict[int, float]:
+    """2026-10 fix (the remaining partial-demand-coverage audit): real
+    per-head consumption rate for every ingredient ever deducted as an
+    unlimited-wings REFILL flavour sauce (unli_refill_line, state=
+    'committed' -- see wt/refills.py's own module docstring: "every
+    unlimited round served... took sauce out of the walk-in that the
+    inventory never knew about"). Reconstructed entirely from real
+    operational records, never fabricated or blended with a flat ledger
+    average:
+
+        refill_lambda[ingredient] = SUM(real committed refill_line.qty_base)
+                                   / SUM(real heads on unli orders)
+
+    over the SAME bounded [now-lookback_days, now) window `heads` itself
+    uses elsewhere in this module -- the identical "per real head, over a
+    real window" quantity _unli_streams()'s registered lambda_value already
+    represents for wings/rice/fries/drinks, just derived from refill-line
+    records instead of a stored coefficient (no unli_item registration
+    exists per flavour, so there is nothing to look up). Validated directly
+    against real data before being wired in: for Honey and Garlic (Minced),
+    refill_lambda * real average daily heads landed within 0.2-2.3% of the
+    independently-measured real trailing ledger rate for those exact
+    ingredients -- the gap this fixes was a genuinely missing, genuinely
+    reconstructible demand component, not noise.
+
+    Applied in ingredient_forecast() as an ADDITIVE term alongside recipe
+    and base-stream demand (never a replacement, never a blend with a flat
+    average) -- an ingredient that already has some real recipe-based
+    demand (e.g. Honey also appears in an a-la-carte recipe) keeps that
+    term fully intact and gains this one on top, so
+    total = recipe/menu demand + unli-refill demand + (base-stream demand,
+    where applicable) stays a legible sum of named, real sources, never an
+    opaque override.
+
+    now=None (every caller except replenishment_backtest()) reads up to the
+    live wall clock, same as every other demand source in this module."""
+    lower = timeutil.utc_bound_n_manila_days_ago(lookback_days, now)
+    heads_upper_clause = " AND o.created_at < ?" if now is not None else ""
+    refill_upper_clause = " AND l.created_at < ?" if now is not None else ""
+    upper_params = (timeutil.utc_upper_bound_sql(now),) if now is not None else ()
+
+    heads_row = conn.execute(
+        f"""
+        SELECT SUM(o.head_count * ol.qty) AS h
+          FROM customer_order o
+          JOIN order_line ol ON ol.order_id = o.id
+          JOIN menu_item m ON m.id = ol.menu_item_id
+         WHERE m.is_unli = 1 AND o.status != 'void' AND o.created_at >= ?
+         {heads_upper_clause}
+        """,
+        (lower, *upper_params),
+    ).fetchone()
+    heads = float(heads_row["h"] or 0.0)
+    if heads <= 0:
+        return {}
+
+    rows = conn.execute(
+        f"""
+        SELECT l.ingredient_id AS ing_id, SUM(l.qty_base) AS q
+          FROM unli_refill_line l
+         WHERE l.state = 'committed' AND l.created_at >= ?
+         {refill_upper_clause}
+         GROUP BY l.ingredient_id
+        """,
+        (lower, *upper_params),
+    ).fetchall()
+    return {r["ing_id"]: (r["q"] or 0.0) / heads for r in rows if (r["q"] or 0.0) > 0}
 
 
 def _cross_zero(trajectory: list[float], start: float) -> float | None:
@@ -721,7 +1045,8 @@ def _interp_at(trajectory: list[float], start: float, day: float) -> float:
 def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DAYS,
                         lookback_days: int = LOOKBACK_DAYS,
                         now: _dt.datetime | None = None,
-                        demand_model: str = "ewma") -> dict:
+                        demand_model: str = "ewma",
+                        historical_available: dict[int, float] | None = None) -> dict:
     """The whole chain, for every deductable ingredient.
 
     Returns one row per ingredient carrying: current stock, projected daily
@@ -733,6 +1058,38 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
     'depletion_demand_model' app_setting (api.py) rather than hardcoding
     this, so a deployment can switch between the EWMA and Prophet-driven
     baselines by changing one setting rather than a code deploy.
+
+    historical_available: 2026-10 fix for replenishment_backtest() --
+    {ingredient_id: on-hand AS OF `now`}, reconstructed by the caller (see
+    _balances_at_cutoff(), the same backward-ledger-walk technique already
+    used elsewhere in this module) and substituted in place of
+    `available_base`'s live, CURRENT value for that ingredient.
+
+    Every other caller leaves this None and gets the unchanged, correct-for-
+    live-use behavior (available_base, read from the live ingredient row).
+    This matters ONLY when `now` is itself in the past: _ingredient_rows()
+    reads ingredient.on_hand_base/reserved_base directly, which are always
+    today's real values -- there is no historical variant of those columns.
+    Confirmed directly: calling this function with `now` set to 10, 30, and
+    50 days ago for the same ingredient returned the IDENTICAL `available`
+    and `onHand` every time, because nothing was reconstructing them to
+    that date. A real backtest (replenishment_backtest()) anchors its
+    demand curve correctly to `now` via build_demand(), but was then
+    starting that correctly-historical demand curve from TODAY's stock
+    level -- silently grading "if today's shelf had looked like this nine
+    weeks ago" rather than how the shelf actually looked nine weeks ago.
+    This parameter lets the demand curve and the starting stock level agree
+    on which date they are both describing.
+
+    Scope, stated plainly: this reconstructs on-hand only. It does not
+    attempt to reconstruct a historical reserved_base (reservations are
+    transient live state with no ledger trail once the order they held
+    stock for is long since committed or released, and are realistically
+    ~0 by the time an evaluation point is days or weeks old) or a
+    historical expired-batch exclusion (fefo_batch.qty_base is itself a
+    live, current-state column with no per-batch history of what it held
+    on an earlier date -- there is no reliable source to reconstruct that
+    from). Both are real, disclosed simplifications, not hidden ones.
     """
     demand = build_demand(conn, lookback_days, horizon_days, now, demand_model)
     today: _dt.date = demand["today"]
@@ -749,7 +1106,7 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
     # forecasting.ingredient_depletion() already scans every deductable
     # ingredient in one pass.
     trailing_rate = {r["ingredient_id"]: r["avg_daily_consumption"]
-                     for r in forecasting.ingredient_depletion(conn, lookback_days=lookback_days)}
+                     for r in forecasting.ingredient_depletion(conn, lookback_days=lookback_days, now=now)}
 
     n = horizon_days + 1        # index 0 = rest of today, then horizon_days full days
 
@@ -793,8 +1150,52 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
             row[k] += heads.daily[k] * lam
             vrow[k] += (heads.sigma_daily[k] * lam) ** 2
 
+    # 2026-10 fix (see _refill_lambda()'s own docstring): a real, named,
+    # ADDITIVE demand component for ingredients deducted as unli-refill
+    # flavour sauces -- added on top of whatever recipe/stream demand an
+    # ingredient already has, never replacing it. refill_daily_base[ing_id]
+    # (k=1, i.e. tomorrow's full day) is kept so the response can show this
+    # component's own size rather than only the combined total.
+    refill_lambda = _refill_lambda(conn, lookback_days, now)
+    refill_daily_base: dict[int, float] = {}
+    for ing_id, lam in refill_lambda.items():
+        if ing_id not in known:
+            continue
+        row, vrow = consumption[ing_id], variance[ing_id]
+        for k in range(n):
+            row[k] += heads.daily[k] * lam
+            vrow[k] += (heads.sigma_daily[k] * lam) ** 2
+        refill_daily_base[ing_id] = heads.daily[1] * lam
+
     for ing_id, rate in op_rate.items():
         if ing_id in known and not any(consumption[ing_id]):
+            consumption[ing_id] = [rate * (1.0 - demand["share_by_now"])] + [rate] * horizon_days
+
+    # 2026-10 fix: an ingredient can have real, measurable consumption in
+    # the ledger that neither of the two structural sources above ever
+    # sees -- confirmed directly against this restaurant's real data for
+    # per-flavor unlimited-wings refill sauces (e.g. Corn Syrup, Garlic):
+    # their consumption posts as genuine sale_commit rows (unli refills),
+    # so _operational_rate() above correctly skips them (they are not
+    # reason='operational_use'), but they are also not tied to any
+    # POS-visible menu item's recipe (leaves, above) or any of the 4
+    # registered unli_item streams (streams, above) -- a specific flavor's
+    # sauce usage is neither. The result, before this fix: consumption stays
+    # all-zero, the ingredient is classified "idle" (steady<=0), and it can
+    # genuinely run out with zero warning (confirmed: Corn Syrup did,
+    # twice, in the real replenishment backtest). trailing_rate (computed
+    # above from forecasting.ingredient_depletion(), which reads
+    # reason='sale_commit' for any non-operational-supply ingredient
+    # regardless of which menu item or refill caused it) already measures
+    # this correctly -- it was only ever used as a sanity-check comparison
+    # before. Used here as a last-resort fallback, and ONLY when the
+    # structural sources found literally nothing: an ingredient with any
+    # real recipe/stream-driven signal keeps that signal unchanged.
+    for ing_id in known:
+        if any(consumption[ing_id]):
+            continue
+        rate = trailing_rate.get(ing_id) or 0.0
+        if rate > 0:
             consumption[ing_id] = [rate * (1.0 - demand["share_by_now"])] + [rate] * horizon_days
 
     # --- trajectory + status --------------------------------------------------
@@ -802,6 +1203,8 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
     for ing in ingredients:
         ing_id = ing["id"]
         available = float(ing["available_base"] or 0.0)
+        if historical_available is not None and ing_id in historical_available:
+            available = historical_available[ing_id]
         cons = consumption[ing_id]
         sig = [math.sqrt(v) for v in variance[ing_id]]
 
@@ -904,6 +1307,13 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
             "available": round(available, 3),
             "restOfTodayConsumption": round(cons[0], 3),
             "forecastDailyConsumption": round(steady, 4),
+            # The unli-refill component's own share of forecastDailyConsumption
+            # above (already included in it, not on top of it) -- see
+            # _refill_lambda()'s docstring. None for an ingredient with no
+            # real refill-line history at all, as opposed to 0.0 for one
+            # that has some but none projected for tomorrow specifically.
+            "refillSauceDailyConsumption": (
+                round(refill_daily_base[ing_id], 4) if ing_id in refill_daily_base else None),
             "trailingLedgerDailyRate": round(trailing, 4) if trailing > 0 else None,
             "forecastDeviationRatio": round(deviation_ratio, 2) if deviation_ratio is not None else None,
             "forecastDeviationFlag": forecast_deviation_flag,
@@ -1049,7 +1459,7 @@ def ingredient_detail(conn: sqlite3.Connection, ingredient_id: int,
     # times reports a 93% collapse in demand that never happened -- it reports
     # a gap in the data. Both counts are surfaced so the reader can see which
     # of the two they are looking at.
-    trading = set(_trading_days(conn, lookback_days))
+    trading = set(_trading_days(conn, lookback_days, now))
     today_d = _dt.date.fromisoformat(full["businessDate"])
     week_days = sum(1 for i in range(7)
                     if (today_d - _dt.timedelta(days=i)).isoformat() in trading)
@@ -1170,6 +1580,14 @@ def ingredient_detail(conn: sqlite3.Connection, ingredient_id: int,
 BACKTEST_CHECK_DAYS_AHEAD = 7
 BACKTEST_STEP_DAYS = 10
 BACKTEST_MIN_LOOKBACK_DAYS = 30
+# A check window only tests a stockout warning if the shop was actually
+# trading during it. If fewer than this share of a normal week's orders were
+# recorded inside the window, no stock outcome could have been driven by
+# demand, so the point is reported as "unobservable" instead of being graded.
+# Not tuned: on the real history every observable point sits near 1.0 and the
+# one data-gap window (no orders recorded for six days) sits at ~0.02.
+BACKTEST_MIN_WINDOW_COVERAGE = 0.25
+BACKTEST_COVERAGE_BASELINE_DAYS = 56
 
 
 def _balances_at_cutoff(conn: sqlite3.Connection, cutoff_iso: str) -> dict[int, float]:
@@ -1186,6 +1604,63 @@ def _balances_at_cutoff(conn: sqlite3.Connection, cutoff_iso: str) -> dict[int, 
         "WHERE created_at >= ? GROUP BY ingredient_id", (cutoff_iso,),
     ).fetchall()}
     return {iid: current[iid] - after.get(iid, 0.0) for iid in current}
+
+
+def _received_within_window(conn: sqlite3.Connection, start_iso: str, end_iso: str) -> set[int]:
+    """ingredient_ids that had at least one real purchase_receipt ledger row
+    land in [start_iso, end_iso) -- used by replenishment_backtest() to tell
+    apart two different things the raw confusion matrix's 'false_alarm'
+    bucket otherwise conflates: a flag that fired on an ingredient that was
+    never really going to run out, vs. a flag that correctly caught a real
+    shortage and a delivery (the same lead-time window the flag itself is
+    keyed to) arrived in time to prevent it. The backtest's own docstring
+    already discloses that it reads real purchasing as given rather than
+    simulating a response to its own suggestion -- this makes that
+    confound visible in the numbers instead of leaving it implicit."""
+    rows = conn.execute(
+        "SELECT DISTINCT ingredient_id FROM stock_ledger "
+        "WHERE reason = 'purchase_receipt' AND created_at >= ? AND created_at < ?",
+        (start_iso, end_iso),
+    ).fetchall()
+    return {r["ingredient_id"] for r in rows}
+
+
+def _orders_between(conn: sqlite3.Connection, start_iso: str, end_iso: str) -> int:
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM customer_order WHERE status != 'void' "
+        "AND created_at >= ? AND created_at < ?", (start_iso, end_iso)).fetchone()[0])
+
+
+def _min_balances_in_window(conn: sqlite3.Connection, start_iso: str, end_iso: str,
+                            start_balance: dict[int, float]) -> dict[int, float]:
+    """ingredient_id -> the lowest running ledger balance reached anywhere in
+    [start_iso, end_iso), walking the real stock_ledger rows in order from
+    `start_balance`. replenishment_backtest()'s docstring has always defined
+    a stockout as stock hitting zero *within* the check window, but its
+    primary label only looks at the balance at the window's END -- a stock
+    that ran out on day 3 and was restocked on day 5 reads as 'never hit
+    zero'. This is the within-window version of the same question."""
+    low = dict(start_balance)
+    run = dict(start_balance)
+    for r in conn.execute(
+        "SELECT ingredient_id, delta_base FROM stock_ledger "
+        "WHERE created_at >= ? AND created_at < ? ORDER BY created_at, id",
+        (start_iso, end_iso),
+    ):
+        i = r["ingredient_id"]
+        run[i] = run.get(i, 0.0) + float(r["delta_base"] or 0.0)
+        if run[i] < low.get(i, 0.0):
+            low[i] = run[i]
+    return low
+
+
+def _confusion_metrics(c: dict) -> dict:
+    tp, fp, fn = c["caught"], c["false_alarm"], c["missed"]
+    p = tp / (tp + fp) if (tp + fp) else None
+    r = tp / (tp + fn) if (tp + fn) else None
+    f1 = (2 * p * r / (p + r)) if p is not None and r is not None and (p + r) > 0 else None
+    rnd = lambda v: round(v, 4) if v is not None else None
+    return {"confusion": dict(c), "precision": rnd(p), "recall": rnd(r), "f1": rnd(f1)}
 
 
 def replenishment_backtest(conn: sqlite3.Connection, lookback_days: int = 60,
@@ -1226,19 +1701,62 @@ def replenishment_backtest(conn: sqlite3.Connection, lookback_days: int = 60,
         return {"available": False, "reason": "lookback_days too small for even one evaluation point"}
 
     counts = {"caught": 0, "false_alarm": 0, "missed": 0, "quiet": 0}
+    # Split of false_alarm only -- see _received_within_window()'s docstring.
+    # false_alarm already includes both; this does not change `counts` or
+    # the existing precision/recall/f1 fields below, it adds a second,
+    # narrower precision alongside them.
+    false_alarm_split = {"resolved_by_restock": 0, "genuine": 0}
     excess_days_of_supply: list[float] = []
     points = []
+    # Supplementary views, all computed from the same forecasts and the same
+    # real ledger; none of them replaces `counts` above.
+    #   observable       : `counts` restricted to points whose check window
+    #                      actually had trading (BACKTEST_MIN_WINDOW_COVERAGE)
+    #   within_window    : stockout label = balance <= 0 ANYWHERE in the
+    #                      window, not only at its end
+    #   any_warning      : positive = critical/out/at_risk, same end-of-window label
+    observable_counts = {"caught": 0, "false_alarm": 0, "missed": 0, "quiet": 0}
+    observable_split = {"resolved_by_restock": 0, "genuine": 0}
+    within_counts = {"caught": 0, "false_alarm": 0, "missed": 0, "quiet": 0}
+    any_warning_counts = {"caught": 0, "false_alarm": 0, "missed": 0, "quiet": 0}
+    unobservable_points: list[dict] = []
+    missed_cases: list[dict] = []
+    genuine_false_alarm_cases: list[dict] = []
     for days_ago in eval_offsets:
         eval_date = today - _dt.timedelta(days=days_ago)
         eval_manila = _dt.datetime.combine(eval_date, _dt.time(20, 0), tzinfo=timeutil.MANILA_TZ)
         eval_utc = eval_manila.astimezone(_dt.timezone.utc)
+        eval_start_iso = timeutil.utc_now_sql(eval_utc)
         check_cutoff_iso = timeutil.utc_now_sql(
             eval_utc + _dt.timedelta(days=BACKTEST_CHECK_DAYS_AHEAD))
 
+        # 2026-10 fix: the forecast's starting stock level must be
+        # reconstructed AS OF eval_utc, not read live -- see
+        # ingredient_forecast()'s historical_available docstring for why
+        # this was silently wrong before (every eval point was starting
+        # from TODAY's on-hand regardless of how far in the past eval_utc
+        # was).
+        historical_on_hand = _balances_at_cutoff(conn, eval_start_iso)
         forecast = ingredient_forecast(conn, horizon_days=BACKTEST_CHECK_DAYS_AHEAD,
-                                       now=eval_utc, demand_model=demand_model)
+                                       now=eval_utc, demand_model=demand_model,
+                                       historical_available=historical_on_hand)
         balances_then = {r["ingredientId"]: r["available"] for r in forecast["ingredients"]}
         balances_after = _balances_at_cutoff(conn, check_cutoff_iso)
+        restocked = _received_within_window(conn, eval_start_iso, check_cutoff_iso)
+        lowest_in_window = _min_balances_in_window(
+            conn, eval_start_iso, check_cutoff_iso, historical_on_hand)
+        window_orders = _orders_between(conn, eval_start_iso, check_cutoff_iso)
+        baseline_orders = _orders_between(
+            conn, timeutil.utc_now_sql(eval_utc - _dt.timedelta(days=BACKTEST_COVERAGE_BASELINE_DAYS)),
+            eval_start_iso)
+        expected_window_orders = baseline_orders * BACKTEST_CHECK_DAYS_AHEAD / BACKTEST_COVERAGE_BASELINE_DAYS
+        coverage = (window_orders / expected_window_orders) if expected_window_orders > 0 else None
+        observable = coverage is None or coverage >= BACKTEST_MIN_WINDOW_COVERAGE
+        if not observable:
+            unobservable_points.append({
+                "evaluationDate": eval_date.isoformat(), "ordersInCheckWindow": window_orders,
+                "expectedOrdersInCheckWindow": round(expected_window_orders, 1),
+                "coverage": round(coverage, 4)})
 
         point_counts = {"caught": 0, "false_alarm": 0, "missed": 0, "quiet": 0}
         for r in forecast["ingredients"]:
@@ -1249,18 +1767,51 @@ def replenishment_backtest(conn: sqlite3.Connection, lookback_days: int = 60,
                 key = "caught"
             elif flagged and not actual_stockout:
                 key = "false_alarm"
+                false_alarm_split["resolved_by_restock" if ing_id in restocked else "genuine"] += 1
             elif not flagged and actual_stockout:
                 key = "missed"
             else:
                 key = "quiet"
             counts[key] += 1
             point_counts[key] += 1
+            if observable:
+                observable_counts[key] += 1
+                if key == "false_alarm":
+                    observable_split["resolved_by_restock" if ing_id in restocked else "genuine"] += 1
+            # within-window label (see _min_balances_in_window)
+            hit_zero = lowest_in_window.get(ing_id, balances_then[ing_id]) <= 0
+            within_counts["caught" if flagged and hit_zero else "false_alarm" if flagged
+                          else "missed" if hit_zero else "quiet"] += 1
+            warned = r["status"] in ("critical", "out", "at_risk")
+            any_warning_counts["caught" if warned and actual_stockout else "false_alarm" if warned
+                               else "missed" if actual_stockout else "quiet"] += 1
+            if key == "missed":
+                dep = r["daysOfSupply"]
+                missed_cases.append({
+                    "evaluationDate": eval_date.isoformat(), "ingredient": r["name"],
+                    "status": r["status"], "availableAtEval": r["available"],
+                    "forecastDailyConsumption": r["forecastDailyConsumption"],
+                    "projectedDepletionDays": dep, "leadTimeDays": r["leadTimeDays"],
+                    # The cause is read off the forecast itself, not guessed:
+                    "cause": ("predicted_inside_window_but_after_lead_time"
+                              if dep is not None and dep <= BACKTEST_CHECK_DAYS_AHEAD
+                              else "demand_exceeded_forecast")})
+            elif key == "false_alarm" and ing_id not in restocked:
+                genuine_false_alarm_cases.append({
+                    "evaluationDate": eval_date.isoformat(), "ingredient": r["name"],
+                    "status": r["status"], "availableAtEval": r["available"],
+                    "forecastDailyConsumption": r["forecastDailyConsumption"],
+                    "projectedDepletionDays": r["daysOfSupply"],
+                    "windowObservable": observable})
             if r["status"] in ("healthy", "excess") and r["forecastDailyConsumption"] > 0:
                 excess_days_of_supply.append(balances_then[ing_id] / r["forecastDailyConsumption"])
 
         points.append({"evaluationDate": eval_date.isoformat(), "checkedThrough":
                        (eval_date + _dt.timedelta(days=BACKTEST_CHECK_DAYS_AHEAD)).isoformat(),
-                       "ingredientsEvaluated": len(forecast["ingredients"]), **point_counts})
+                       "ingredientsEvaluated": len(forecast["ingredients"]),
+                       "ordersInCheckWindow": window_orders,
+                       "windowCoverage": round(coverage, 4) if coverage is not None else None,
+                       "windowObservable": observable, **point_counts})
 
     total = sum(counts.values())
     stockout_events = counts["caught"] + counts["missed"]
@@ -1269,6 +1820,19 @@ def replenishment_backtest(conn: sqlite3.Connection, lookback_days: int = 60,
                 if (counts["caught"] + counts["false_alarm"]) > 0 else None)
     recall = (counts["caught"] / (counts["caught"] + counts["missed"])
              if (counts["caught"] + counts["missed"]) > 0 else None)
+    # Adjusted precision: excludes false_alarm_split.resolved_by_restock from
+    # the denominator -- those are flags where a real purchase_receipt
+    # landed for that exact ingredient inside the check window, i.e. the
+    # early warning may well have driven (or coincided usefully with) the
+    # restock that prevented the stockout, not a wrong call. recall is
+    # unaffected (it is defined only over caught/missed, neither of which
+    # this split touches).
+    genuine_false_alarms = false_alarm_split["genuine"]
+    adjusted_precision = (counts["caught"] / (counts["caught"] + genuine_false_alarms)
+                          if (counts["caught"] + genuine_false_alarms) > 0 else None)
+    adjusted_f1 = (2 * adjusted_precision * recall / (adjusted_precision + recall)
+                  if adjusted_precision is not None and recall is not None
+                  and (adjusted_precision + recall) > 0 else None)
     f1 = (2 * precision * recall / (precision + recall)
           if precision is not None and recall is not None and (precision + recall) > 0 else None)
 
@@ -1308,13 +1872,282 @@ def replenishment_backtest(conn: sqlite3.Connection, lookback_days: int = 60,
         "check_days_ahead": BACKTEST_CHECK_DAYS_AHEAD,
         "total_ingredient_evaluations": total,
         "confusion": counts,
+        "false_alarm_breakdown": {
+            **false_alarm_split,
+            "note": ("'resolved_by_restock': a real purchase_receipt ledger row landed for "
+                     "that exact ingredient within the check window -- the flag's own "
+                     "lead-time logic is what that window is keyed to, so this is at least "
+                     "as consistent with the warning having been acted on as with it being "
+                     "wrong. 'genuine': no such receiving event occurred, yet the ingredient "
+                     "never actually hit zero -- the model overestimated risk with no "
+                     "restocking to explain why."),
+        },
+        "observable_windows": {
+            **_confusion_metrics(observable_counts),
+            "false_alarm_breakdown": observable_split,
+            "precision_adjusted": (
+                round(observable_counts["caught"] / (observable_counts["caught"] + observable_split["genuine"]), 4)
+                if (observable_counts["caught"] + observable_split["genuine"]) > 0 else None),
+            "excluded_points": unobservable_points,
+            "note": (f"Same as `confusion`, but skips evaluation points whose 7-day check window "
+                     f"recorded under {BACKTEST_MIN_WINDOW_COVERAGE:.0%} of a normal week's orders "
+                     "(a data-collection gap or closure). With no trading, no stock outcome can "
+                     "have been driven by demand, so a flag there is neither confirmed nor refuted. "
+                     "`confusion` above still includes them."),
+        },
+        "within_window_label": {
+            **_confusion_metrics(within_counts),
+            "note": ("Stockout = balance <= 0 at any point inside the check window (what the "
+                     "docstring has always claimed), instead of only at its end. Same flags, "
+                     "same forecasts."),
+        },
+        "any_warning": {
+            **_confusion_metrics(any_warning_counts),
+            "note": ("Positive = critical, out OR at_risk, against the same end-of-window label. "
+                     "at_risk means 'depletes after the lead time but within lead + review cycle' "
+                     "-- ordering today still prevents it, so it is not part of the primary flag."),
+        },
+        "missed_stockouts": missed_cases,
+        "genuine_false_alarms": genuine_false_alarm_cases,
         "service_level": round(service_level, 4) if service_level is not None else None,
         "critical_flag_precision": round(precision, 4) if precision is not None else None,
         "critical_flag_recall": round(recall, 4) if recall is not None else None,
         "critical_flag_f1": round(f1, 4) if f1 is not None else None,
+        "critical_flag_precision_adjusted": round(adjusted_precision, 4) if adjusted_precision is not None else None,
+        "critical_flag_f1_adjusted": round(adjusted_f1, 4) if adjusted_f1 is not None else None,
+        "adjusted_precision_note": ("Excludes false_alarm_breakdown.resolved_by_restock from the "
+                                    "false-alarm count -- see that field's note. critical_flag_precision "
+                                    "above is kept unchanged alongside this for comparison."),
         "avg_days_of_supply_when_healthy_or_excess": (
             round(sum(excess_days_of_supply) / len(excess_days_of_supply), 2)
             if excess_days_of_supply else None),
         "days_of_supply_distribution_when_healthy_or_excess": dos_distribution,
         "points": points,
+    }
+
+
+# ===========================================================================
+# Batch expiry annotation
+# ===========================================================================
+def annotate_batch_expiry(b: dict) -> dict | None:
+    """Turn a batch's raw expiry_mode/expires_at/received_at into a usable
+    date. Moved here from wt/api.py (2026-10 audit) so count_today() below
+    and api.py's /console/expiry and ingredient detail all read the exact
+    same calculation — there was exactly one place this happened before, and
+    there still is, just relocated next to the other expiry-aware stock
+    arithmetic (see v_ingredient_expired_stock in
+    migrations/0040_expired_stock_usability.sql, which this function's
+    `expired`/`days_to_expiry < 0` rule matches).
+
+    Pops shelf_life_days/expiry_mode off `b` — they're inputs to this
+    calculation, not part of what either caller wants back. Mutates and
+    returns `b` with tracking/days_to_expiry/expired/storage_status added, or
+    returns None when this batch has no computable expiry at all (not on a
+    shelf-life estimate, and either missing or an unparseable expires_at) —
+    the caller decides what that means for it: expiry_monitor drops it (it
+    isn't an expiry signal to monitor), the drawer keeps it (it's still real
+    stock the owner should see, just with nothing to say about when it
+    turns).
+    """
+    shelf_life_days = b.pop("shelf_life_days")
+    mode = b.pop("expiry_mode")
+    if mode == "shelf_life_estimate":
+        try:
+            # The Manila business date the batch was received on, not the
+            # UTC calendar date its timestamp happens to fall on -- a batch
+            # received at, say, UTC 20:00 (Manila 04:00 the next day) is
+            # "received today" to whoever signed for it.
+            received = _dt.date.fromisoformat(timeutil.business_date_of(b["received_at"]))
+        except (ValueError, TypeError):
+            return None
+        exp = received + _dt.timedelta(days=shelf_life_days or 0)
+        b["expires_at"] = exp.isoformat()
+        b["tracking"] = "estimated_shelf_life"
+    else:
+        try:
+            exp = _dt.date.fromisoformat(b["expires_at"])
+        except (ValueError, TypeError):
+            return None
+        b["tracking"] = "exact_date"
+    days = (exp - timeutil.business_today()).days
+    b["days_to_expiry"] = days
+    b["expired"] = days < 0
+    b["storage_status"] = "Expired" if days < 0 else "Use Soon" if days <= 2 else "Normal"
+    return b
+
+
+# ===========================================================================
+# Count Today — a deterministic, explainable physical-count shortlist
+# ===========================================================================
+# Named thresholds, not a learned score. Each one is a plain business rule a
+# manager could restate without this code; the UI shows exactly which ones
+# fired (count_today()'s `reasons`), never a numeric score (see Change 4
+# spec: "do not expose a meaningless numeric risk score").
+#
+# Stockout-risk statuses come straight from ingredient_forecast()'s own
+# `status` field (out/critical/at_risk/idle/healthy/excess) -- not
+# re-derived here, so Count Today can never disagree with what Replenishment
+# itself is already showing for the same ingredient.
+COUNT_TODAY_URGENT_STATUSES = ("out", "critical")   # may not last to the next delivery
+COUNT_TODAY_WATCH_STATUSES = ("at_risk",)           # a softer version of the same risk
+# Matches annotate_batch_expiry's own "Use Soon" <= 2 days / "Expired" < 0.
+COUNT_TODAY_EXPIRY_URGENT_DAYS = 2
+COUNT_TODAY_EXPIRY_WATCH_DAYS = 5
+# "Hasn't been physically checked in about two weeks" -- long enough that
+# recipe-deduction drift (portioning, scooping, small unlogged losses) has
+# had time to accumulate on an ingredient already showing some other risk.
+# Staleness alone never promotes an otherwise-healthy ingredient onto the
+# list (see count_today()) -- it only adds to the explanation for one that
+# is already there, per the spec's "avoid alert overload".
+COUNT_TODAY_STALE_COUNT_DAYS = 14
+
+
+def _nearest_expiry_by_ingredient(conn: sqlite3.Connection) -> dict[int, dict]:
+    """Per ingredient: the single open batch with the soonest expiry signal
+    (smallest days_to_expiry, already-expired batches included and sorting
+    first). Same source query expiry_monitor uses in api.py, just grouped
+    down to one row per ingredient instead of listed per batch."""
+    rows = conn.execute(
+        """
+        SELECT b.qty_base, b.received_at, b.expires_at,
+               i.id AS ingredient_id, i.expiry_mode, i.shelf_life_days
+          FROM fefo_batch b JOIN ingredient i ON i.id = b.ingredient_id
+         WHERE b.state = 'open' AND b.qty_base > 0
+           AND (b.expires_at IS NOT NULL OR i.expiry_mode = 'shelf_life_estimate')
+        """
+    ).fetchall()
+    nearest: dict[int, dict] = {}
+    for r in rows:
+        annotated = annotate_batch_expiry(dict(r))
+        if annotated is None:
+            continue
+        current = nearest.get(r["ingredient_id"])
+        if current is None or annotated["days_to_expiry"] < current["days_to_expiry"]:
+            nearest[r["ingredient_id"]] = annotated
+    return nearest
+
+
+def count_today(conn: sqlite3.Connection, now: _dt.datetime | None = None) -> dict:
+    """A manageable, explainable shortlist of which ingredients are worth a
+    physical count right now — not all 131. Built entirely from numbers the
+    rest of the system already computes (ingredient_forecast's status/days
+    of supply, reservation's repeated-variance signal, the expiry monitor's
+    nearest-batch calculation, and the ledger's own count history); this
+    function only combines them against the named thresholds above and
+    writes nothing.
+
+    Two tiers:
+      needsChecking — at least one urgent condition fired (likely to run out
+        before the next delivery, a confirmed repeated variance pattern, or
+        stock already expired/expiring within COUNT_TODAY_EXPIRY_URGENT_DAYS).
+      worthChecking — only a softer condition fired (at_risk status, or
+        expiring within the wider watch window) -- worth a look, not urgent.
+
+    An ingredient that triggers neither tier is left off entirely; "count
+    every ingredient" remains available separately (the existing full
+    ingredient list / bulk-count screen), unaffected by this function.
+    """
+    forecast = ingredient_forecast(conn, now=now)
+    status_by_id = {r["ingredientId"]: r for r in forecast["ingredients"]}
+
+    reconciliation = reservation.ingredient_reconciliation_report(conn, days=30)
+    signal_by_id = {
+        item["ingredient_id"]: item["repeated_variance_signal"]
+        for item in reconciliation["items"]
+        if item.get("repeated_variance_signal")
+    }
+
+    last_counted = reservation.last_count_dates(conn)
+    nearest_expiry = _nearest_expiry_by_ingredient(conn)
+    today = timeutil.business_today(now)
+
+    needs: list[dict] = []
+    worth: list[dict] = []
+
+    for ing_id, row in status_by_id.items():
+        reasons: list[str] = []
+        urgent = False
+
+        if row["status"] in COUNT_TODAY_URGENT_STATUSES:
+            urgent = True
+            if row["daysOfSupply"] is not None:
+                reasons.append(
+                    f"May run out before the next delivery arrives — about "
+                    f"{row['daysOfSupply']:g} day(s) of stock left against a "
+                    f"{row['leadTimeDays']} day lead time."
+                )
+            else:
+                reasons.append("Already out of usable stock.")
+        elif row["status"] in COUNT_TODAY_WATCH_STATUSES:
+            reasons.append("Running lower than usual — worth confirming before it becomes urgent.")
+
+        signal = signal_by_id.get(ing_id)
+        if signal and signal.get("active"):
+            urgent = True
+            direction = "short" if signal.get("direction") == "below" else "over"
+            reasons.append(
+                f"The last {signal['observation_count']} physical counts were consistently "
+                f"{direction} of what the system expected — a repeated difference, not a one-off."
+            )
+
+        expiry = nearest_expiry.get(ing_id)
+        if expiry is not None:
+            if expiry["days_to_expiry"] <= COUNT_TODAY_EXPIRY_URGENT_DAYS:
+                urgent = True
+                reasons.append(
+                    "Already expired and may still be counted as stock."
+                    if expiry["expired"] else
+                    "Some stock is expiring within a couple of days — may reduce what's usable."
+                )
+            elif expiry["days_to_expiry"] <= COUNT_TODAY_EXPIRY_WATCH_DAYS:
+                reasons.append("Some stock is expiring soon.")
+
+        if not reasons:
+            continue
+
+        last_at = last_counted.get(ing_id)
+        stale_days = None
+        if last_at:
+            try:
+                last_date = _dt.date.fromisoformat(timeutil.business_date_of(last_at))
+                stale_days = (today - last_date).days
+            except (ValueError, TypeError):
+                stale_days = None
+        if stale_days is None or stale_days >= COUNT_TODAY_STALE_COUNT_DAYS:
+            reasons.append(
+                "Hasn't been physically checked in over two weeks." if last_at is not None
+                else "Has never been physically counted."
+            )
+
+        entry = {
+            "ingredientId": ing_id,
+            "ingredientCode": row["ingredientCode"],
+            "name": row["name"],
+            "baseUnit": row["baseUnit"],
+            "expectedBase": row["onHand"],
+            "status": row["status"],
+            "daysOfSupply": row["daysOfSupply"],
+            "leadTimeDays": row["leadTimeDays"],
+            "lastCountedAt": last_at,
+            "staleDays": stale_days,
+            "reasons": reasons,
+        }
+        (needs if urgent else worth).append(entry)
+
+    needs.sort(key=lambda r: (r["daysOfSupply"] if r["daysOfSupply"] is not None else -1))
+    worth.sort(key=lambda r: (r["daysOfSupply"] if r["daysOfSupply"] is not None else 1e9))
+
+    return {
+        "asOf": timeutil.utc_now().isoformat(timespec="seconds"),
+        "businessDate": today.isoformat(),
+        "totalIngredients": len(status_by_id),
+        "needsChecking": needs,
+        "worthChecking": worth,
+        "thresholds": {
+            "urgentStatuses": list(COUNT_TODAY_URGENT_STATUSES),
+            "watchStatuses": list(COUNT_TODAY_WATCH_STATUSES),
+            "expiryUrgentDays": COUNT_TODAY_EXPIRY_URGENT_DAYS,
+            "expiryWatchDays": COUNT_TODAY_EXPIRY_WATCH_DAYS,
+            "staleCountDays": COUNT_TODAY_STALE_COUNT_DAYS,
+        },
     }

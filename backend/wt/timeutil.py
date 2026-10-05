@@ -118,6 +118,26 @@ def utc_now_sql(now: _dt.datetime | None = None) -> str:
     return (now or utc_now()).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def utc_upper_bound_sql(now: _dt.datetime | None = None) -> str:
+    """utc_now_sql() for use as an EXCLUSIVE upper bound (`created_at < ?`) on
+    a column stamped at whole-second resolution.
+
+    utc_now_sql() floors to the second, so a live instant like 18:57:23.488
+    becomes '18:57:23' and `created_at < '18:57:23'` silently drops every row
+    stamped during that same wall-clock second -- including one written a few
+    milliseconds earlier, which is exactly "already happened" as far as the
+    caller is concerned. Rounding a sub-second instant UP to the next whole
+    second keeps the bound exclusive of anything genuinely at or after `now`
+    (such a row's stamp is at least the next second) while no longer losing
+    the second `now` is in. An instant already on a whole second -- every
+    historical anchor a backtest supplies (e.g. 20:00:00) -- is returned
+    unchanged, so historical-leakage guarantees are exactly as before."""
+    instant = now or utc_now()
+    if instant.microsecond:
+        instant = instant.replace(microsecond=0) + _dt.timedelta(seconds=1)
+    return instant.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def utc_sql_after_minutes(n: int, now: _dt.datetime | None = None) -> str:
     """utc_now_sql(), n minutes in the future -- for stamping a column
     meant to be compared against utc_now_sql() later (a lockout expiry)."""

@@ -25,8 +25,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import (
-    audit, auth, db, instructions, permissions, purchasing, refills, timeutil, unli, updates,
-    verification,
+    audit, auth, business_overview as business_overview_mod, db, instructions, permissions,
+    purchasing, refills, timeutil, unli, updates, verification,
 )
 from .cache import TTLCache
 from .anomaly import detect_anomalies, detect_consumption_anomalies
@@ -49,6 +49,8 @@ from .errors import (
 from .depletion import (
     HORIZON_DAYS as DEPLETION_HORIZON_DAYS,
     LOOKBACK_DAYS as DEPLETION_LOOKBACK_DAYS,
+    annotate_batch_expiry as _annotate_batch_expiry,
+    count_today as _count_today,
     ingredient_detail as ingredient_depletion_detail,
     ingredient_forecast,
     prophet_refresh_generation,
@@ -59,7 +61,14 @@ from .forecasting import (
     MIN_DEMAND_SAMPLE_DAYS, STORE_METRICS, evaluate_demand_model, evaluate_store_demand_model,
     ingredient_depletion, menu_item_demand, menu_item_demand_prophet, store_demand_prophet,
 )
-from .anomaly import anomaly_review_history, record_anomaly_review
+from .anomaly import anomaly_review_history, record_anomaly_review, latest_review_statuses
+from .anomaly import (
+    sample_for_review, submit_validation_label, validation_queue, scientific_validation_metrics,
+)
+from .anomaly import (
+    sample_consumption_for_review, submit_consumption_validation_label,
+    consumption_validation_queue, scientific_consumption_validation_metrics,
+)
 from .data_quality import data_quality_report
 from .reservation import (
     availability_for_menu_item, commit_order, ingredient_reconciliation_report,
@@ -248,6 +257,31 @@ def needs(capability: str):
     return _dep
 
 
+def needs_any(*capabilities: str):
+    """Like needs(), but passes if the caller's role holds ANY one of several
+    capabilities — for a route two differently-scoped roles both need to
+    reach for different reasons. Introduced for the Correct Stock / Count
+    Today endpoints: an 'inventory.read' role (manager, admin, owner) and a
+    role with ONLY the narrower 'inventory.correct_stock' (kitchen) must both
+    be able to view them, but neither existing capability's role list alone
+    covers both. Every single-capability route keeps using needs() —
+    this is additive, not a replacement."""
+    def _dep(p: dict = Depends(principal)) -> dict:
+        if p.get("_must_change_password"):
+            raise PasswordChangeRequiredError(
+                "sign-in still uses a temporary password — set a new password to continue"
+            )
+        role = p.get("role")
+        allowed_any = any(role in (auth.CAPABILITIES.get(cap) or ()) for cap in capabilities)
+        if not allowed_any:
+            raise PermissionError_(
+                f"role '{role}' cannot {' or '.join(capabilities)}",
+                capability=capabilities[0],
+            )
+        return p
+    return _dep
+
+
 def needs_page(page_key: str):
     """A second, narrower gate meant to sit ALONGSIDE a needs(capability)
     dependency on the same route, not replace it: the capability governs
@@ -399,7 +433,8 @@ def reset_password(
     with db.write_tx(c):
         c.execute(
             "UPDATE app_user SET password_hash=?, password_salt=?, "
-            "password_changed_at=datetime('now','subsec'), must_change_password=1 WHERE id=?",
+            "password_changed_at=datetime('now','subsec'), must_change_password=1, "
+            "failed_login_count=0, locked_until=NULL WHERE id=?",
             (h, s, row["id"]),
         )
         audit.log(c, "user", username, "password_reset", p["sub"])
@@ -416,10 +451,19 @@ def list_users(
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage")),
 ):
     """Every account and its role — never password_hash/password_salt.
-    Admin-only, same capability as every other account-management action."""
+    Admin-only, same capability as every other account-management action.
+
+    last_login_at: most recent SUCCESSFUL sign-in from login_event, null for
+    an account that has never signed in. A read, not a second record of
+    truth — login_event is already written by the login path for the audit
+    trail; this just surfaces it where an admin is actually looking at the
+    account list instead of making them cross-reference Audit Trail."""
     return {"users": rows(c.execute(
-        "SELECT username, display_name, role, must_change_password, locked_until, is_active "
-        "FROM app_user ORDER BY username"
+        "SELECT u.username, u.display_name, u.role, u.must_change_password, "
+        "u.locked_until, u.is_active, "
+        "(SELECT MAX(created_at) FROM login_event le "
+        "  WHERE le.username = u.username AND le.success = 1) AS last_login_at "
+        "FROM app_user u ORDER BY u.username"
     ))}
 
 
@@ -1246,7 +1290,10 @@ def void_order(
 @app.get("/pos/orders", tags=["pos"])
 def list_orders(
     status: Literal["open", "all"] = "open",
-    limit: int = 100,
+    limit: int = Query(100, ge=1, le=5000),
+    start_date: str | None = Query(default=None, description="Manila business date YYYY-MM-DD, inclusive — overrides the default 3-month window"),
+    end_date: str | None = Query(default=None, description="Manila business date YYYY-MM-DD, inclusive; defaults to today when start_date is given"),
+    all_time: bool = Query(default=False, description="every order ever recorded — no lower date bound"),
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("order.read")),
 ):
     """Backs the till's Current Orders (status=open) and Order History
@@ -1262,11 +1309,13 @@ def list_orders(
     ₱489 on the receipt but a stale ₱439 in this list — the exact
     History/Current-Orders inconsistency this join closes.
 
-    status="all" (the till's Order History screen) is additionally capped
-    to a rolling last-3-Manila-calendar-months window -- a query-level
-    restriction only, not a data deletion; the full ledger stays in the
-    database and is reachable without this cap from the admin console's
-    own order-history route."""
+    status="all" defaults to a rolling last-3-Manila-calendar-months window
+    (right for the till's own Order History screen, which has no use for
+    anything older) -- a query-level restriction only, not a data deletion.
+    The console's order-history page is read-heavy BI, not a till screen, so
+    it passes start_date/end_date or all_time=true to see the full ledger;
+    plain status=all with none of those keeps the till's original 3-month
+    default so that caller's behavior is unchanged."""
     sql = ("SELECT o.id, o.order_no, o.status, o.table_label, o.head_count, o.created_at, "
            "o.committed_at, o.served_at, o.voided_at, o.subtotal, o.discount_type, "
            "o.discount_amount, o.service_charge, o.total, "
@@ -1280,6 +1329,16 @@ def list_orders(
     params: list = []
     if status == "open":
         sql += "WHERE o.status IN ('punched','in_progress','ready') "
+    elif all_time:
+        sql += "WHERE 1=1 "
+    elif start_date:
+        sql += "WHERE o.created_at >= ? "
+        params.append(timeutil.utc_bound_for_manila_date(start_date))
+        if end_date:
+            sql += "AND o.created_at < ? "
+            params.append(timeutil.utc_bound_for_manila_date(
+                (_date.fromisoformat(end_date) + _timedelta(days=1)).isoformat()
+            ))
     else:
         sql += "WHERE o.created_at >= ? "
         params.append(timeutil.utc_bound_n_manila_months_ago(3))
@@ -1290,7 +1349,11 @@ def list_orders(
         o["line_count"] = c.execute(
             "SELECT COUNT(*) AS n FROM order_line WHERE order_id=?", (o["id"],)
         ).fetchone()["n"]
-    return {"orders": orders}
+    total_count = c.execute(
+        "SELECT COUNT(*) AS n FROM customer_order o WHERE "
+        + ("o.status IN ('punched','in_progress','ready')" if status == "open" else "1=1")
+    ).fetchone()["n"]
+    return {"orders": orders, "total_count": total_count}
 
 
 @app.get("/pos/orders/{order_pk}", tags=["pos"])
@@ -1397,10 +1460,22 @@ def list_ingredients(
     q: str = "", only_blocked: bool = False, limit: int = 200,
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
 ):
+    # expired_base/usable_base (2026-10 audit): on_hand_base is total PHYSICAL
+    # stock, including whatever sits in an already-expired open batch (see
+    # migrations/0040_expired_stock_usability.sql). available_base already
+    # excludes it (matches the POS availability view and the reservation
+    # guard); usable_base is the same figure before subtracting what is
+    # actively held for other orders, for a console reader asking "how much
+    # of what's on the shelf can I actually sell or count as good stock"
+    # rather than "how much is free to reserve right now".
     sql = """
         SELECT i.*, r.is_deductable, r.block_reason, r.unverified_count,
-               (i.on_hand_base - i.reserved_base) AS available_base
-          FROM ingredient i JOIN v_ingredient_readiness r ON r.id = i.id
+               COALESCE(x.expired_base, 0) AS expired_base,
+               (i.on_hand_base - COALESCE(x.expired_base, 0)) AS usable_base,
+               (i.on_hand_base - i.reserved_base - COALESCE(x.expired_base, 0)) AS available_base
+          FROM ingredient i
+          JOIN v_ingredient_readiness r ON r.id = i.id
+          LEFT JOIN v_ingredient_expired_stock x ON x.ingredient_id = i.id
          WHERE i.is_active = 1 AND i.name LIKE ?
     """
     params: list[Any] = [f"%{q}%"]
@@ -1413,6 +1488,58 @@ def list_ingredients(
         d["on_hand_display"] = format_base(d["on_hand_base"], d["base_unit"], d["pack_size"],
                                            d["purchase_unit"], d["yield_factor"])
     return {"ingredients": data, "count": len(data)}
+
+
+@app.get("/console/ingredients/quick", tags=["console"])
+def quick_lookup_ingredients(
+    q: str = "", limit: int = 20, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs_any("inventory.read", "inventory.correct_stock")),
+):
+    """A minimal ingredient search for the Correct Stock fast-entry flow —
+    name, current expected quantity, and the same physical/usable/expired
+    split list_ingredients exposes, nothing else (no cost, supplier, pack
+    size, recipe usage). Reachable by 'inventory.correct_stock' alone
+    (kitchen) specifically so a role that can submit a count is never forced
+    through 'inventory.read' (which would also hand it cost/supplier data it
+    has no business reading) just to find the ingredient to correct."""
+    rows_ = c.execute(
+        """
+        SELECT i.id, i.name, i.base_unit, i.on_hand_base, i.reserved_base,
+               COALESCE(x.expired_base, 0) AS expired_base
+          FROM ingredient i
+          LEFT JOIN v_ingredient_expired_stock x ON x.ingredient_id = i.id
+         WHERE i.is_active = 1 AND i.name LIKE ?
+         ORDER BY i.name LIMIT ?
+        """,
+        (f"%{q}%", limit),
+    ).fetchall()
+    out = []
+    for r in rows_:
+        usable = r["on_hand_base"] - r["expired_base"]
+        available = usable - r["reserved_base"]
+        out.append({
+            "ingredientId": r["id"],
+            "name": r["name"],
+            "baseUnit": r["base_unit"],
+            "expectedBase": round(r["on_hand_base"], 4),
+            "reservedBase": round(r["reserved_base"], 4),
+            "expiredBase": round(r["expired_base"], 4),
+            "usableBase": round(usable, 4),
+            "availableBase": round(available, 4),
+        })
+    return {"ingredients": out, "count": len(out)}
+
+
+@app.get("/console/count-today", tags=["console"])
+def count_today_endpoint(
+    c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs_any("inventory.read", "inventory.correct_stock")),
+):
+    """A prioritized physical-count shortlist — see depletion.count_today()
+    for the full rule set. Reachable by the same two capabilities as the
+    quick-lookup endpoint above, for the same reason: kitchen needs to see
+    what it is being asked to check without being handed full inventory.read."""
+    return _count_today(c)
 
 
 @app.post("/console/ingredients", tags=["console"], status_code=201)
@@ -1469,24 +1596,41 @@ def receive_ingredient(
 class CountIn(BaseModel):
     actual_base: float = Field(ge=0, description="physically counted quantity, in the ingredient's base unit")
     note: str | None = None
+    client_request_id: str | None = Field(
+        default=None, max_length=64,
+        description="idempotency key — a retried submission of the same request replays the original result",
+    )
+    # Which workflow this count came through — see reservation.COUNT_SOURCES.
+    # Defaults to the ingredient drawer's manual Count tab, unchanged from
+    # before this field existed, so an older client omitting it behaves
+    # exactly as it always did.
+    source: Literal["manual_count", "correct_stock", "count_today", "bulk_count"] = "manual_count"
 
 
 @app.post("/console/ingredients/{pk}/count", tags=["console"])
 def count_ingredient(
     pk: int, body: CountIn, c: sqlite3.Connection = Depends(conn),
-    p: dict = Depends(needs("inventory.write")),
+    p: dict = Depends(needs_any("inventory.write", "inventory.correct_stock")),
 ):
     """Reconcile a physical stock count against what the system expects is on
     hand — the recipe-based deduction system assumes every gram used was
     accounted for by a sale; this is how a real count surfaces the gap
     (spillage, an over-generous scoop, anything unlogged) instead of it
-    silently accumulating. See reservation.record_count."""
-    return record_count(c, pk, body.actual_base, body.note, user_id=p["sub"])
+    silently accumulating. See reservation.record_count.
+
+    Gated on EITHER full inventory.write (admin) OR the narrow
+    inventory.correct_stock capability (kitchen, admin) — see auth.py's
+    CAPABILITIES comment for why this one endpoint (and bulk-count below)
+    is deliberately reachable by a role that cannot receive, waste, edit,
+    or do anything else to this ingredient."""
+    return record_count(c, pk, body.actual_base, body.note, user_id=p["sub"],
+                        client_request_id=body.client_request_id, source=body.source)
 
 
 class BulkCountItem(BaseModel):
     ingredient_pk: int
     actual_base: float = Field(ge=0)
+    client_request_id: str | None = Field(default=None, max_length=64)
 
 
 class BulkCountIn(BaseModel):
@@ -1497,19 +1641,24 @@ class BulkCountIn(BaseModel):
 @app.post("/console/ingredients/bulk-count", tags=["console"])
 def bulk_count(
     body: BulkCountIn, c: sqlite3.Connection = Depends(conn),
-    p: dict = Depends(needs("inventory.write")),
+    p: dict = Depends(needs_any("inventory.write", "inventory.correct_stock")),
 ):
     """A full physical stock take in one submission, instead of one ingredient
     at a time — each line still goes through record_count individually (its
     own real ledger entry, its own real variance), so a bulk update carries
     exactly the same audit trail as doing it one by one, just faster to enter.
-    One bad line does not abort the rest; it is reported back instead."""
+    One bad line does not abort the rest; it is reported back instead.
+
+    source='bulk_count' on every line — this endpoint IS the bulk-take
+    workflow, so there is nothing for a caller to choose here."""
     if not body.items:
         raise HTTPException(422, "no items provided")
     results, errors = [], []
     for item in body.items:
         try:
-            results.append(record_count(c, item.ingredient_pk, item.actual_base, body.note, user_id=p["sub"]))
+            results.append(record_count(c, item.ingredient_pk, item.actual_base, body.note,
+                                        user_id=p["sub"], client_request_id=item.client_request_id,
+                                        source="bulk_count"))
         except WTError as e:
             errors.append({"ingredient_pk": item.ingredient_pk, "error": e.message})
     return {"updated": len(results), "failed": len(errors), "results": results, "errors": errors}
@@ -1519,6 +1668,9 @@ class WasteIn(BaseModel):
     qty_base: float = Field(gt=0, description="amount thrown away, in the ingredient's base unit")
     reason: Literal["wastage", "spoilage"] = "wastage"
     note: str | None = None
+    # See reservation.WASTAGE_SOURCES. Defaults to the ordinary Wastage pane;
+    # 'expired_disposal' is set only by Expiry's "Discard" action.
+    source: Literal["manual_writeoff", "expired_disposal"] = "manual_writeoff"
 
 
 @app.post("/console/ingredients/{pk}/waste", tags=["console"])
@@ -1529,7 +1681,8 @@ def waste_ingredient(
     """Write stock off as thrown away or spoiled. Closes a real gap: before
     this, a dropped tray had no way into the system except a physical count
     that absorbed it with no stated cause. See reservation.record_wastage."""
-    return record_wastage(c, pk, body.qty_base, body.reason, body.note, user_id=p["sub"])
+    return record_wastage(c, pk, body.qty_base, body.reason, body.note, user_id=p["sub"],
+                          source=body.source)
 
 
 class VarianceReviewIn(BaseModel):
@@ -1675,8 +1828,12 @@ def ingredient_detail(
     row = c.execute(
         """
         SELECT i.*, r.is_deductable, r.block_reason, r.unverified_count,
-               (i.on_hand_base - i.reserved_base) AS available_base
-          FROM ingredient i JOIN v_ingredient_readiness r ON r.id = i.id
+               COALESCE(x.expired_base, 0) AS expired_base,
+               (i.on_hand_base - COALESCE(x.expired_base, 0)) AS usable_base,
+               (i.on_hand_base - i.reserved_base - COALESCE(x.expired_base, 0)) AS available_base
+          FROM ingredient i
+          JOIN v_ingredient_readiness r ON r.id = i.id
+          LEFT JOIN v_ingredient_expired_stock x ON x.ingredient_id = i.id
          WHERE i.id = ?
         """,
         (pk,),
@@ -2053,49 +2210,6 @@ def list_ledger(
     return {"entries": rows(c.execute(sql, params)), "total": total}
 
 
-def _annotate_batch_expiry(b: dict) -> dict | None:
-    """Shared with ingredient_detail's batch list below, so there is exactly
-    one place that turns a batch's raw expiry_mode/expires_at/received_at
-    into a usable date — not two independently-maintained copies of the
-    same arithmetic. Mutates and returns `b` with tracking/days_to_expiry/
-    expired/storage_status added, or returns None when this batch has no
-    computable expiry at all (not on a shelf-life estimate, and either
-    missing or an unparseable expires_at) — the caller decides what that
-    means for it: expiry_monitor drops it (it isn't an expiry signal to
-    monitor), the drawer keeps it (it's still real stock the owner should
-    see, just with nothing to say about when it turns).
-
-    Pops shelf_life_days/expiry_mode off `b` — they're inputs to this
-    calculation, not part of what either caller wants back.
-    """
-    import datetime as _dt
-    shelf_life_days = b.pop("shelf_life_days")
-    mode = b.pop("expiry_mode")
-    if mode == "shelf_life_estimate":
-        try:
-            # The Manila business date the batch was received on, not the
-            # UTC calendar date its timestamp happens to fall on -- a batch
-            # received at, say, UTC 20:00 (Manila 04:00 the next day) is
-            # "received today" to whoever signed for it.
-            received = _dt.date.fromisoformat(timeutil.business_date_of(b["received_at"]))
-        except (ValueError, TypeError):
-            return None
-        exp = received + _dt.timedelta(days=shelf_life_days or 0)
-        b["expires_at"] = exp.isoformat()
-        b["tracking"] = "estimated_shelf_life"
-    else:
-        try:
-            exp = _dt.date.fromisoformat(b["expires_at"])
-        except (ValueError, TypeError):
-            return None
-        b["tracking"] = "exact_date"
-    days = (exp - timeutil.business_today()).days
-    b["days_to_expiry"] = days
-    b["expired"] = days < 0
-    b["storage_status"] = "Expired" if days < 0 else "Use Soon" if days <= 2 else "Normal"
-    return b
-
-
 @app.get("/console/expiry", tags=["console"])
 def expiry_monitor(
     within_days: int = Query(90, description="only batches expiring/estimated within this many days"),
@@ -2378,7 +2492,7 @@ def _forecast_preview(c: sqlite3.Connection, horizon_days: int = 7, lookback_day
 
 @app.get("/dashboard/summary", tags=["console"])
 def dashboard_summary(
-    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+    c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("inventory.read")),
 ):
     """The Today screen's single aggregation payload.
 
@@ -2655,6 +2769,34 @@ def dashboard_summary(
         for b in batches[:8]
     ]
 
+    # ---- messages: the Owner<->Admin task board, not a technical forecast
+    # chart -- this replaced the old "Demand Forecast" preview on the Today
+    # screen (2026-09-30 UX/IA redesign) precisely because it is a decision
+    # a reader acts on today, not a model output. A shared board (see
+    # wt/instructions.py's own docstring): both roles see the identical
+    # list, never a per-user inbox. "Awaiting you" is caller-specific --
+    # only an update posted by the OTHER role can ever be acknowledged by
+    # this caller (wt/updates.acknowledge()'s own rule), so counting any
+    # other way would show a number this caller could never act on.
+    open_instructions = rows(c.execute(
+        "SELECT id, title, status, priority, created_by, created_at FROM owner_instruction "
+        "WHERE status NOT IN ('completed','cancelled') ORDER BY "
+        "CASE priority WHEN 'urgent' THEN 0 WHEN 'important' THEN 1 ELSE 2 END, created_at DESC "
+        "LIMIT 5"
+    ))
+    unacked_for_caller = c.execute(
+        "SELECT COUNT(*) AS n FROM operational_update "
+        "WHERE acknowledged_at IS NULL AND created_by_role != ?", (p["role"],),
+    ).fetchone()["n"]
+    messages_preview = {
+        "openInstructions": len(open_instructions),
+        "items": [
+            {"id": i["id"], "title": i["title"], "status": i["status"], "priority": i["priority"]}
+            for i in open_instructions
+        ],
+        "unacknowledgedForCaller": unacked_for_caller,
+    }
+
     return {
         "asOf": ing_forecast["asOf"],
         "businessDate": ing_forecast["businessDate"],
@@ -2664,6 +2806,7 @@ def dashboard_summary(
         "kpis": kpis,
         "alerts": attention,
         "forecastPreview": _forecast_preview(c),
+        "messagesPreview": messages_preview,
         "buyToday": buy_today,
         "useFirst": use_first,
         "buckets": buckets,
@@ -2682,6 +2825,33 @@ def dashboard_summary(
             for i in sorted(verify_all, key=lambda i: i["reviewed"])[:6]
         ],
     }
+
+
+@app.get("/console/dashboard/business-overview", tags=["console"])
+def dashboard_business_overview(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """The Owner Overview "business companion" payload (2026-10) — see
+    wt/business_overview.py for the actual period-comparison and trend
+    logic. A SEPARATE call from GET /dashboard/summary above on purpose:
+    that endpoint's five-KPI/three-panel payload is unrelated in shape and
+    already large; this is a second, independent read over the same
+    customer_order/order_line tables (plus one unmodified call into
+    wt.forecasting.store_demand_prophet for the single forecast line),
+    never a second calculation of anything dashboard_summary already
+    computes.
+
+    The forecast line is fetched through forecast_store_demand() below
+    (same function /console/forecasts/store-demand calls), not a direct
+    store_demand_prophet() call -- that keeps this on the SAME
+    _forecast_cache the dedicated route already uses, so a fit that takes
+    several seconds doesn't repeat on every Today page load just because
+    this is a second, independent call site for it."""
+    try:
+        forecast = forecast_store_demand(metric="sales", horizon_days=7, lookback_days=90, c=c, _p=_p)
+    except Exception:
+        forecast = None
+    return business_overview_mod.business_overview(c, forecast=forecast)
 
 
 @app.get("/console/forecasts/depletion", tags=["console"])
@@ -2784,15 +2954,23 @@ def forecast_store_demand(
 
 
 def _demand_model(c: sqlite3.Connection) -> str:
-    """'prophet' or 'ewma' -- which demand model wt/depletion.py's forward
-    chain uses for future-day demand (see build_demand()'s docstring).
-    Backed by the app_setting 'depletion_demand_model' (0=ewma, 1=prophet;
-    app_setting is float-only, see unli.get_setting), defaulting to ewma so
-    installing this code changes nothing until someone deliberately opts in.
-    One setting, one authoritative answer at a time -- never both engines
-    live simultaneously for the same request the way the old
-    forecasting.ingredient_depletion() purchase-quantity duplicate was."""
-    return "prophet" if unli.get_setting(c, "depletion_demand_model", 0.0) >= 1.0 else "ewma"
+    """'ewma', 'prophet', or 'hybrid' -- which demand model wt/depletion.py's
+    forward chain uses for future-day demand (see build_demand()'s
+    docstring). Backed by the app_setting 'depletion_demand_model' (0=ewma,
+    1=prophet, 2=hybrid; app_setting is float-only, see unli.get_setting),
+    defaulting to ewma so installing this code changes nothing until someone
+    deliberately opts in -- the same reasoning 'prophet' shipped under, now
+    extended to 'hybrid' rather than silently reinterpreting an existing
+    value. 'hybrid' is the strategy actually evaluated at 55.69% fleet-mean
+    WAPE (forecasting.evaluate_demand_model()); 'prophet' alone measures
+    57.81% -- worse, because it forces Prophet on every item rather than
+    validating per item. One setting, one authoritative answer at a time --
+    never two engines live simultaneously for the same request the way the
+    old forecasting.ingredient_depletion() purchase-quantity duplicate was."""
+    value = unli.get_setting(c, "depletion_demand_model", 0.0)
+    if value >= 2.0:
+        return "hybrid"
+    return "prophet" if value >= 1.0 else "ewma"
 
 
 def _depletion_fingerprint(c: sqlite3.Connection) -> tuple:
@@ -2897,10 +3075,12 @@ def refresh_prophet_baselines_endpoint(
     realistic menu is tens of seconds to a couple of minutes, which is fine
     for an explicit call (an admin action, or a scheduled task hitting this
     endpoint on a cadence such as nightly) and not fine to block a live page
-    load on. Only takes effect for demand_model='prophet' -- see the
-    'depletion_demand_model' app_setting; with it left at the default
-    ('ewma'), calling this is harmless but has no visible effect. See
-    wt/depletion.refresh_prophet_baselines() for the full reasoning."""
+    load on. Only takes effect for demand_model='prophet' or 'hybrid' -- see
+    the 'depletion_demand_model' app_setting (0=ewma, 1=prophet, 2=hybrid);
+    with it left at the default ('ewma'), calling this is harmless but has
+    no visible effect. See wt/depletion.refresh_prophet_baselines() for the
+    full reasoning, including why 'hybrid' -- not 'prophet' -- is the
+    strategy this thesis's evaluation numbers describe."""
     return refresh_prophet_baselines(c, horizon_days, lookback_days)
 
 
@@ -3012,6 +3192,11 @@ def anomalies(
     )
     if ingredient_id is not None:
         losses = [a for a in losses if a["ingredient_id"] == ingredient_id]
+    # Attach each row's own latest human review, if any -- 2026-09-30, so
+    # the console's Losses & Stock Issues screen can hide Confirm/False
+    # positive on a row someone already reviewed instead of re-asking.
+    review_statuses = latest_review_statuses(c)
+    losses = [{**a, "review_status": review_statuses.get(a["ledger_id"])} for a in losses]
     return {
         "consumption_anomalies": consumption,
         "stock_loss_anomalies": losses,
@@ -3042,6 +3227,161 @@ def review_anomaly(
     )
 
 
+# ===========================================================================
+# Review-sampling / scientific validation (2026-10) — see wt/anomaly.py's
+# own module-level docstring section for why this exists alongside (not
+# instead of) the flagged-row-only review above: that workflow can never
+# produce a False Negative or True Negative, because it can only ever review
+# a row the model's live output currently flags. This is the three-pool
+# (flagged / near-threshold / random-unflagged) sampler and its blind,
+# version-scoped metrics.
+# ===========================================================================
+class SampleForReviewIn(BaseModel):
+    n_flagged: int | None = Field(default=None, ge=0)
+    n_near_threshold: int = Field(default=5, ge=0, le=50)
+    n_random: int = Field(default=5, ge=0, le=50)
+    lookback_days: int = Field(default=90, ge=1, le=365)
+
+
+@app.post("/console/anomalies/sample", tags=["console"])
+def sample_anomalies_for_review(
+    body: SampleForReviewIn, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.write")),
+):
+    """Select real (non-synthetic) stock-loss ledger rows into the blind
+    review queue — see wt/anomaly.py's sample_for_review(). Writes only to
+    anomaly_validation_sample; never touches stock_ledger (append-only
+    regardless) or any inventory quantity. Safe to call repeatedly — a
+    ledger row already sampled (any status) is never selected twice."""
+    return sample_for_review(
+        c, n_flagged=body.n_flagged, n_near_threshold=body.n_near_threshold,
+        n_random=body.n_random, lookback_days=body.lookback_days,
+    )
+
+
+@app.get("/console/anomalies/validation-queue", tags=["console"])
+def validation_queue_endpoint(
+    status: Literal["pending", "confirmed_anomaly", "expected_or_normal"] = "pending",
+    blind: bool = Query(True, description="Must stay true for any labeling UI — see wt/anomaly.py's validation_queue()"),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.write")),
+):
+    """The human review queue. blind=True (the default, and the only mode
+    the labeling screen may request) strips every model-derived field —
+    sample_source, model_prediction, anomaly_score, decision_threshold,
+    model/eligibility version, evaluated_at — so a reviewer judges each
+    record purely on its own operational evidence. blind=False exists for a
+    separate technical/audit read only; it must never back the labeling UI
+    itself, see wt/anomaly.py's validation_queue() docstring."""
+    return {"status": status, "items": validation_queue(c, status=status, blind=blind)}
+
+
+class ValidationLabelIn(BaseModel):
+    human_label: Literal["confirmed_anomaly", "expected_or_normal"]
+    note: str | None = None
+
+
+@app.post("/console/anomalies/validation-queue/{sample_id}/label", tags=["console"])
+def label_validation_sample(
+    sample_id: int, body: ValidationLabelIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")),
+):
+    """A human's one-time ground-truth verdict on a sampled record — see
+    wt/anomaly.py's submit_validation_label(). The question this answers is
+    operational ("was this stock movement expected?"), never "is this a
+    false positive": TP/FP/FN/TN are derived afterward from (model_
+    prediction, human_label), not asked of the reviewer directly."""
+    return submit_validation_label(c, sample_id, body.human_label, body.note, user_id=p["sub"])
+
+
+@app.get("/console/anomalies/validation-metrics", tags=["console"])
+def scientific_validation_metrics_endpoint(
+    c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")), _pg: dict = Depends(needs_page("system")),
+):
+    """Precision/Recall/Specificity/F1 computed ONLY from blind-reviewed
+    anomaly_validation_sample rows, scoped to the current model/eligibility
+    version — see wt/anomaly.py's scientific_validation_metrics(). Reports
+    `available: false` with a stated reason below minimum reviewed evidence,
+    never a number computed from an incomplete or lopsided sample."""
+    return scientific_validation_metrics(c)
+
+
+# ===========================================================================
+# Review-sampling / scientific validation for the CONSUMPTION (Unlimited-
+# Wings) pass — a separate, parallel mechanism from the stock-loss one
+# above, over its own observation unit (a reconciled service-date x stream
+# day). See wt/anomaly.py's own section-12-audit comments for why
+# model_prediction here is always the Isolation Forest's own verdict, never
+# the deterministic large_variance rule's.
+# ===========================================================================
+class SampleConsumptionForReviewIn(BaseModel):
+    n_flagged: int | None = Field(default=None, ge=0)
+    n_near_threshold: int = Field(default=5, ge=0, le=50)
+    n_random: int = Field(default=5, ge=0, le=50)
+    lookback_days: int = Field(default=90, ge=1, le=365)
+
+
+@app.post("/console/anomalies/consumption/sample", tags=["console"])
+def sample_consumption_anomalies_for_review(
+    body: SampleConsumptionForReviewIn, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.write")),
+):
+    """Select genuine reconciled days into the consumption pass's blind
+    review queue — see wt/anomaly.py's sample_consumption_for_review().
+    Returns forest_trained=False with nothing sampled when fewer than
+    MIN_RECONCILED_DAYS genuine reconciled days exist; never substitutes the
+    deterministic rule's catches for an Isolation Forest prediction."""
+    return sample_consumption_for_review(
+        c, n_flagged=body.n_flagged, n_near_threshold=body.n_near_threshold,
+        n_random=body.n_random, lookback_days=body.lookback_days,
+    )
+
+
+@app.get("/console/anomalies/consumption/validation-queue", tags=["console"])
+def consumption_validation_queue_endpoint(
+    status: Literal["pending", "confirmed_anomaly", "expected_or_explained"] = "pending",
+    blind: bool = Query(True, description="Must stay true for any labeling UI"),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.write")),
+):
+    """The human review queue for reconciled consumption days. blind=True
+    strips every model-derived field so a reviewer judges each day on its
+    operational evidence (service date, stream, heads, measured vs.
+    provisional consumption) alone — see wt/anomaly.py's
+    consumption_validation_queue()."""
+    return {"status": status, "items": consumption_validation_queue(c, status=status, blind=blind)}
+
+
+class ConsumptionValidationLabelIn(BaseModel):
+    human_label: Literal["confirmed_anomaly", "expected_or_explained"]
+    note: str | None = None
+
+
+@app.post("/console/anomalies/consumption/validation-queue/{sample_id}/label", tags=["console"])
+def label_consumption_validation_sample(
+    sample_id: int, body: ConsumptionValidationLabelIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")),
+):
+    """A human's one-time ground-truth verdict on a sampled reconciled day —
+    see wt/anomaly.py's submit_consumption_validation_label(). The question
+    is operational ("was this consumption unusually high or low for a real
+    reason worth investigating?"), never "was Isolation Forest correct"."""
+    return submit_consumption_validation_label(c, sample_id, body.human_label, body.note,
+                                               user_id=p["sub"])
+
+
+@app.get("/console/anomalies/consumption/validation-metrics", tags=["console"])
+def scientific_consumption_validation_metrics_endpoint(
+    c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")), _pg: dict = Depends(needs_page("system")),
+):
+    """Precision/Recall/Specificity/F1 for the consumption pass, computed
+    ONLY from blind-reviewed unli_consumption_validation_sample rows, scoped
+    to the current model/eligibility version. Reports `available: false`
+    below minimum reviewed evidence — see wt/anomaly.py's
+    scientific_consumption_validation_metrics()."""
+    return scientific_consumption_validation_metrics(c)
+
+
 @app.get("/console/anomalies/{ledger_id}/reviews", tags=["console"])
 def anomaly_review_history_endpoint(
     ledger_id: int, c: sqlite3.Connection = Depends(conn),
@@ -3053,7 +3393,7 @@ def anomaly_review_history_endpoint(
 
 @app.get("/console/combinations", tags=["console"])
 def combinations(
-    lookback_days: int = Query(90, ge=1, le=365),
+    lookback_days: int = Query(365, ge=1, le=365),
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
 ):
     """Which menu items real customers actually order together, via FP-growth

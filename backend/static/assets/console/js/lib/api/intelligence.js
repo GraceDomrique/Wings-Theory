@@ -104,6 +104,11 @@ export async function getReplenishment() {
       suggestedReorderPoint: d.suggestedReorderPoint ?? null,
       suggestedOrderQty: d.suggestedOrderQty ?? null,
       suggestedOrderUnit: d.suggestedOrderUnit ?? null,
+      // Additive for the Purchasing page (2026-09-30): the same
+      // ingredient_forecast() row already carries this -- REVIEW_CYCLE_DAYS
+      // of forecast demand held as a buffer beyond lead time -- it just
+      // wasn't surfaced to any caller yet. Not recomputed here.
+      safetyStockBase: d.safetyStockBase ?? null,
       belowReorderPoint: !!d.belowReorderPoint,
       status: severityFromDepletionStatus(d.status),
       risk: d.status,
@@ -143,11 +148,18 @@ export async function getAnomalies(lookbackDays = 90, ingredientPk = null) {
       amount: a.delta_base ?? null,
       baseUnit: a.base_unit,
       reasonCode: a.wastage_reason || a.reason,
+      // Coarse ledger reason (wastage / spoilage / count_adjustment) kept
+      // separate from reasonCode above -- reasonCode prefers the free-text
+      // sub-reason when one exists, which is too granular to group/filter
+      // by. `category` is always one of the three ledger reasons, so the
+      // Losses & Stock Issues screen can offer a stable category filter.
+      category: a.reason,
       flaggedBecause: a.why,
       priority: a.severity === 'high' ? 'review_soon' : 'worth_a_look',
       severity: severityFromAnomaly(a.severity),
       score: a.score ?? null,
       note: a.note || null,
+      reviewStatus: a.review_status || null,
     })),
     consumption: out.consumption_anomalies || [],
     // The raw lists too: the ingredient drawer leads with the model's own
@@ -155,6 +167,124 @@ export async function getAnomalies(lookbackDays = 90, ingredientPk = null) {
     stock_loss_anomalies: out.stock_loss_anomalies || [],
     consumption_anomalies: out.consumption_anomalies || [],
   };
+}
+
+/**
+ * Record a human reviewer's classification of one flagged stock-loss
+ * ledger row (POST /console/anomalies/{ledger_id}/review, `inventory.write`
+ * -- admin only). This is the ground truth wt/anomaly.py's
+ * validation_metrics() computes Precision/Recall/F1 from; a flag alone is
+ * never itself confirmed_anomaly. `status` is one of 'confirmed_anomaly'
+ * or 'false_positive' from this screen (the fuller flagged/under_review/
+ * resolved lifecycle exists server-side but isn't exposed as separate
+ * buttons here -- a two-way call is what a reviewer actually makes).
+ */
+export function reviewAnomaly(ledgerId, status, note) {
+  return api.post(`/console/anomalies/${ledgerId}/review`, {
+    status, note: note || null, client_request_id: `anomaly-review-${ledgerId}-${Date.now()}`,
+  });
+}
+
+// ===========================================================================
+// Review-sampling / scientific validation (2026-10) — see wt/anomaly.py's
+// sample_for_review()/validation_queue()/submit_validation_label()/
+// scientific_validation_metrics(). Separate from reviewAnomaly() above,
+// which only ever reviews a row the model's LIVE output currently flags —
+// this is what makes False Negatives and True Negatives measurable.
+// ===========================================================================
+
+/** POST /console/anomalies/sample — pull new candidates into the blind
+ * review queue. Never writes to the ledger or any inventory quantity. */
+export function sampleAnomaliesForReview({ nFlagged, nNearThreshold = 5, nRandom = 5, lookbackDays = 90 } = {}) {
+  return api.post('/console/anomalies/sample', {
+    n_flagged: nFlagged ?? null, n_near_threshold: nNearThreshold,
+    n_random: nRandom, lookback_days: lookbackDays,
+  });
+}
+
+/**
+ * GET /console/anomalies/validation-queue — the blind labeling queue.
+ * blind is always true here on purpose: this adapter backs the labeling
+ * screen, which must never see sample_source/model_prediction/score/
+ * threshold/version. A separate technical/audit read (not wired to any UI
+ * yet) would pass blind=false server-side if one is ever built.
+ */
+export async function getValidationQueue(status = 'pending') {
+  const out = await api.get('/console/anomalies/validation-queue', { status, blind: true });
+  return (out.items || []).map((r) => ({
+    sampleId: r.sample_id,
+    ledgerId: r.ledger_id,
+    ingredientName: r.ingredient_name,
+    baseUnit: r.base_unit,
+    reason: r.reason,
+    wastageReason: r.wastage_reason,
+    deltaBase: r.delta_base,
+    balanceBeforeBase: r.balance_before_base,
+    balanceAfterBase: r.balance_after_base,
+    note: r.note,
+    eventAt: r.event_at,
+    humanLabel: r.human_label,
+  }));
+}
+
+/** POST /console/anomalies/validation-queue/{id}/label — one human verdict,
+ * asked as an operational question, never as "is this a false positive". */
+export function submitValidationLabel(sampleId, humanLabel, note) {
+  return api.post(`/console/anomalies/validation-queue/${sampleId}/label`, {
+    human_label: humanLabel, note: note || null,
+  });
+}
+
+/** GET /console/anomalies/validation-metrics — version-scoped Precision/
+ * Recall/Specificity/F1, or `available:false` below minimum reviewed
+ * evidence. See wt/anomaly.py's scientific_validation_metrics(). */
+export function getScientificValidationMetrics() {
+  return api.get('/console/anomalies/validation-metrics');
+}
+
+// ===========================================================================
+// Same review-sampling / scientific validation shape, for the Unlimited-
+// Wings consumption pass — a separate, parallel mechanism over reconciled
+// service-date x stream days. See wt/anomaly.py's consumption-pass
+// functions; the four adapters below mirror the stock-loss ones exactly,
+// just against the /consumption/ endpoint family and the pass's own human
+// label ('expected_or_explained', not 'expected_or_normal').
+// ===========================================================================
+
+export function sampleConsumptionAnomaliesForReview({ nFlagged, nNearThreshold = 5, nRandom = 5, lookbackDays = 90 } = {}) {
+  return api.post('/console/anomalies/consumption/sample', {
+    n_flagged: nFlagged ?? null, n_near_threshold: nNearThreshold,
+    n_random: nRandom, lookback_days: lookbackDays,
+  });
+}
+
+export async function getConsumptionValidationQueue(status = 'pending') {
+  const out = await api.get('/console/anomalies/consumption/validation-queue', { status, blind: true });
+  return (out.items || []).map((r) => ({
+    sampleId: r.sample_id,
+    reconciliationId: r.reconciliation_id,
+    serviceDate: r.service_date,
+    label: r.label,
+    ingredientName: r.ingredient_name,
+    baseUnit: r.base_unit,
+    heads: r.heads,
+    theoreticalBase: r.theoretical_base,
+    actualBase: r.actual_base,
+    actualPerHead: r.actual_per_head,
+    varianceBase: r.variance_base,
+    variancePct: r.variance_pct,
+    humanLabel: r.human_label,
+  }));
+}
+
+export function submitConsumptionValidationLabel(sampleId, humanLabel, note) {
+  return api.post(`/console/anomalies/consumption/validation-queue/${sampleId}/label`, {
+    human_label: humanLabel, note: note || null,
+  });
+}
+
+export function getScientificConsumptionValidationMetrics() {
+  return api.get('/console/anomalies/consumption/validation-metrics');
 }
 
 /** Reconciliation: today's streams plus the coefficients that size them. */

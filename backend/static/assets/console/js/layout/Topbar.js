@@ -7,6 +7,7 @@ import { h, icon } from '../lib/dom.js';
  * the callback the shell installs. Cmd/Ctrl-K focuses it from anywhere.
  */
 export function Topbar({ title, sub, onSearch }) {
+  const crumbEl = h('div', { class: 'breadcrumb', style: { display: 'none' } });
   const h1 = h('h1', {}, title);
   const subEl = h('div', { class: 'sub' }, sub);
 
@@ -21,7 +22,7 @@ export function Topbar({ title, sub, onSearch }) {
   }, icon('<path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v6h-6"/>', 15));
 
   const el = h('div', { class: 'topbar' },
-    h('div', {}, h1, subEl),
+    h('div', {}, crumbEl, h1, subEl),
     h('div', { class: 'topbar-right' },
       h('div', { class: 'search' },
         icon('<circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>', 14),
@@ -37,6 +38,14 @@ export function Topbar({ title, sub, onSearch }) {
   });
 
   el.setCopy = (t, s) => { h1.textContent = t; subEl.textContent = s; };
+  /** Location context (spec section 49) — "Inventory / Losses & Variance".
+   * `group` is null for a standalone top-level page (Today, Messages), which
+   * hides the line entirely rather than showing a crumb to nowhere. */
+  el.setBreadcrumb = (group) => {
+    if (!group) { crumbEl.style.display = 'none'; return; }
+    crumbEl.style.display = '';
+    crumbEl.textContent = group;
+  };
   el.setSearchVisible = (visible) => {
     el.querySelector('.search').style.visibility = visible ? '' : 'hidden';
     if (!visible) input.value = '';

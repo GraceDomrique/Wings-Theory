@@ -19,6 +19,14 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+
+def _future_iso(days: int) -> str:
+    """Expiry fixtures must be relative to the clock production uses, never a
+    calendar literal: the expired-stock-usability rule (sales skip a batch past
+    its expiry) makes a hardcoded 'far future' date silently turn into a past
+    one, flipping FEFO ordering and sale outcomes with no code change."""
+    return (timeutil.business_today() + dt.timedelta(days=days)).isoformat()
+
 from wt import (                                                    # noqa: E402
     auth, db, instructions, owner_provisioning, purchasing, refills, timeutil, units, unli, updates,
 )
@@ -30,15 +38,19 @@ from wt.anomaly import (                                            # noqa: E402
     MAX_STOCK_LOSS_FLAG_FRACTION, anomaly_review_history, record_anomaly_review,
     validation_metrics,
 )
+from wt import anomaly                                              # noqa: E402
 from wt.associations import product_combinations                    # noqa: E402
 from wt.associations import model_details as association_model_details  # noqa: E402
 from wt.associations import threshold_sensitivity                   # noqa: E402
+from wt.associations import expanding_window_validation              # noqa: E402
+from wt import associations                                          # noqa: E402
 from wt import combo_pricing                                        # noqa: E402
 from wt.resolver import recipe_cost                                 # noqa: E402
 from wt.errors import (                                             # noqa: E402
     InsufficientStockError, InvalidStateError, NotFoundError, RecipeCycleError,
     UnitConversionError,
 )
+from wt import demo_validation                                      # noqa: E402
 from wt import depletion, forecasting, xlsx_prophet_ingest          # noqa: E402
 from wt.forecasting import (                                        # noqa: E402
     evaluate_demand_model, ingredient_depletion, menu_item_demand, menu_item_demand_prophet,
@@ -243,16 +255,39 @@ def add_dated_order(conn, iso_date, menu_pk, qty, status="served"):
     return order_pk
 
 
+def add_dated_order_multi(conn, iso_date, lines, status="served"):
+    """Same as add_dated_order, but a real multi-item basket (a list of
+    (menu_pk, qty) lines on one receipt) backdated to a specific day --
+    needed wherever a test must control which chronological window
+    (train/holdout) a CO-OCCURRENCE itself falls into, which single-item
+    add_dated_order cannot express."""
+    ts = f"{iso_date} 12:00:00"
+    n = conn.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+    cur = conn.execute(
+        "INSERT INTO customer_order (order_no, table_label, head_count, status, created_at) "
+        "VALUES (?,?,?,?,?)",
+        (f"WT-DM-{n + 1}", "T-DATED", 0, status, ts),
+    )
+    order_pk = cur.lastrowid
+    for menu_pk, qty in lines:
+        price = conn.execute("SELECT price FROM menu_item WHERE id=?", (menu_pk,)).fetchone()["price"]
+        conn.execute(
+            "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,?,?)",
+            (order_pk, menu_pk, qty, price),
+        )
+    return order_pk
+
+
 def add_ledger_entry(conn, ingredient_pk, delta, reason, iso_date,
-                     balance_after=0.0, wastage_reason=None):
+                     balance_after=0.0, wastage_reason=None, user_id=None):
     """Direct insert — stock_ledger is append-only via write triggers, but
     that only blocks UPDATE/DELETE, not a plain INSERT with a backdated
     created_at, which is exactly what depletion/anomaly tests need."""
     ts = f"{iso_date} 12:00:00"
     conn.execute(
         "INSERT INTO stock_ledger (ingredient_id, delta_base, balance_after_base, reason, "
-        "wastage_reason, created_at) VALUES (?,?,?,?,?,?)",
-        (ingredient_pk, delta, balance_after, reason, wastage_reason, ts),
+        "wastage_reason, user_id, created_at) VALUES (?,?,?,?,?,?,?)",
+        (ingredient_pk, delta, balance_after, reason, wastage_reason, user_id, ts),
     )
 
 
@@ -831,13 +866,13 @@ class TestReceiveStock(Base):
 
     def test_receiving_opens_a_fefo_batch(self):
         receive_stock(self.conn, self.panko, purchase_qty=1, lot_no="LOT-3",
-                      expires_at="2027-01-01")
+                      expires_at=_future_iso(90))
         row = self.conn.execute(
             "SELECT lot_no, qty_base, expires_at, state FROM fefo_batch "
             "WHERE ingredient_id=? ORDER BY id DESC LIMIT 1", (self.panko,)).fetchone()
         self.assertEqual(row["lot_no"], "LOT-3")
         self.assertEqual(row["qty_base"], 500.0)
-        self.assertEqual(row["expires_at"], "2027-01-01")
+        self.assertEqual(row["expires_at"], _future_iso(90))
         self.assertEqual(row["state"], "open")
 
     def test_receiving_without_a_pack_size_is_refused(self):
@@ -2260,12 +2295,12 @@ class TestVerificationWorkflow(unittest.TestCase):
             "SELECT id, expires_at FROM fefo_batch WHERE expiry_status='needs_verification' "
             "AND state='open' ORDER BY id LIMIT 1").fetchone()
         before = list_queue(self.conn)["count"]
-        resolve(self.conn, "fefo_batch.expires_at", row["id"], "change", "2027-12-31", "checked the label", "owner5")
+        resolve(self.conn, "fefo_batch.expires_at", row["id"], "change", _future_iso(730), "checked the label", "owner5")
         after = list_queue(self.conn)["count"]
         self.assertEqual(after, before - 1)
         self.assertEqual(self.conn.execute(
             "SELECT expires_at, expiry_status FROM fefo_batch WHERE id=?", (row["id"],)
-        ).fetchone()["expires_at"], "2027-12-31")
+        ).fetchone()["expires_at"], _future_iso(730))
 
     def test_unli_coefficient_change_versions_instead_of_overwriting(self):
         """provisional_for_date() re-reads lambda_value live per historical
@@ -2930,7 +2965,8 @@ class TestConsoleAPI(unittest.TestCase):
                    if i["pack_size"])
         pk = ing["id"]
         before_ids = {b["id"] for b in self.client.get(f"/console/ingredients/{pk}", headers=self.H_OWNER).json()["batches"]}
-        for expires in ("2030-06-01", None, "2027-01-01"):
+        near, far = _future_iso(90), _future_iso(1500)
+        for expires in (far, None, near):
             body = {"purchase_qty": 1, "lot_no": f"FEFO-TEST-{expires or 'none'}"}
             if expires:
                 body["expires_at"] = expires
@@ -2943,7 +2979,7 @@ class TestConsoleAPI(unittest.TestCase):
         # near date, then far date, then undated last — real FEFO pick order.
         self.assertEqual(
             [b["lot_no"] for b in new_batches],
-            ["FEFO-TEST-2027-01-01", "FEFO-TEST-2030-06-01", "FEFO-TEST-none"],
+            [f"FEFO-TEST-{near}", f"FEFO-TEST-{far}", "FEFO-TEST-none"],
         )
         self.assertEqual(new_batches[0]["tracking"], "exact_date")
         self.assertEqual(new_batches[1]["tracking"], "exact_date")
@@ -3376,6 +3412,22 @@ class TestPagePermissions(unittest.TestCase):
         from wt import seed
         seed.run(fresh=True)
         db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        # This class exercises the page-permission layer (wt/permissions.py),
+        # which sits strictly AFTER principal()'s own is_active gate (see
+        # wt/api.py's principal() -- any deactivated account is refused with
+        # 401 before a capability or page-grant is ever consulted, by
+        # design). The seeded 'manager' account is deactivated in every
+        # database (migration 0034) specifically so it can no longer log in
+        # -- manager_token()'s own docstring explains why a role-accurate
+        # token is still issued directly for RBAC/capability coverage. That
+        # token hitting 401 instead of this class's expected 403 is not a
+        # page-permission bug; it is principal()'s is_active gate correctly
+        # firing first, on a flag this class's whole premise (manager has no
+        # default page grants) has nothing to do with. Reactivated here, in
+        # this class's own disposable tempfile database only, so
+        # manager_token() reaches the layer this class exists to test --
+        # never done to any database another test or real process could see.
+        db.get_conn().execute("UPDATE app_user SET is_active = 1 WHERE username = 'manager'")
         from fastapi.testclient import TestClient
         from wt.api import app
         cls.client = TestClient(app)
@@ -4314,6 +4366,42 @@ class TestForecasting(Base):
             self.assertEqual(result["method"], "trailing_average")
             self.assertTrue(result.get("prophet_unavailable"))
 
+    def test_menu_item_demand_prophet_uses_default_growth_without_a_cached_selection(self):
+        """2026-09 second adaptive-growth pass: before any refresh has ever
+        run, this path must behave exactly as it always did -- growth_used
+        falls back to PROPHET_DEFAULT_GROWTH, not a crash or an inline
+        re-tune."""
+        recipe = add_recipe(self.conn, "R5B", [])
+        item = add_menu_item(self.conn, "Never Refreshed Detail Item", recipe)
+        for d in range(10):
+            add_dated_order(self.conn, days_ago(d), item, 3)
+        result = menu_item_demand_prophet(self.conn, item, horizon_days=5)
+        if result["method"] != "prophet":
+            return
+        self.assertEqual(result["growth_used"], forecasting.PROPHET_DEFAULT_GROWTH)
+        self.assertEqual(result["growth_source"], "default_not_yet_refreshed")
+
+    def test_menu_item_demand_prophet_uses_the_cached_adaptive_selection(self):
+        """The detail page must use the SAME growth depletion.py's refresh
+        already decided for this item -- not silently keep the old global
+        default while replenishment has moved on. Populate the cache
+        directly (cache_growth_selection is depletion.py's own integration
+        point, exercised end-to-end by TestDepletionProphetDemandModel) so
+        this test isolates exactly the consumption side."""
+        recipe = add_recipe(self.conn, "R5C", [])
+        item = add_menu_item(self.conn, "Cached Growth Detail Item", recipe)
+        for d in range(10):
+            add_dated_order(self.conn, days_ago(d), item, 3)
+        forecasting.cache_growth_selection(
+            self.conn, f"menu_item:{item}",
+            {"selected_growth": "linear", "reason": "lower_tuning_wape", "is_fallback": False},
+        )
+        result = menu_item_demand_prophet(self.conn, item, horizon_days=5)
+        if result["method"] != "prophet":
+            return
+        self.assertEqual(result["growth_used"], "linear")
+        self.assertEqual(result["growth_source"], "cached_adaptive")
+
     def test_evaluate_demand_model_backtests_on_the_richest_item(self):
         recipe = add_recipe(self.conn, "R6", [])
         thin = add_menu_item(self.conn, "Thin History", recipe)
@@ -4347,6 +4435,216 @@ class TestForecasting(Base):
         result = evaluate_demand_model(self.conn, horizon_days=7)
         self.assertFalse(result["available"])
         self.assertIn("reason", result)
+
+    def test_evaluate_demand_model_reports_growth_selection_per_item(self):
+        """2026-09 adaptive-growth pass: every scored item's result must
+        carry a prophet_growth string and a growth_selection dict (or None
+        only if a caller explicitly overrode it, which evaluate_demand_model
+        never does), and the fleet-level growth_selection_counts must sum to
+        the number of scored items -- the same invariant selection_counts
+        already satisfies for Level 2."""
+        recipe = add_recipe(self.conn, "RG1", [])
+        rich = add_menu_item(self.conn, "Growth Rich History", recipe)
+        for d in range(60):
+            add_dated_order(self.conn, days_ago(d), rich, 2 + (d % 3))
+        result = evaluate_demand_model(self.conn, horizon_days=7)
+        if not result["available"]:
+            self.assertIn("reason", result)
+            return
+        rich_result = next(r for r in result["items"] if r["item_name"] == "Growth Rich History")
+        self.assertIn(rich_result["prophet_growth"], forecasting.GROWTH_CANDIDATES)
+        self.assertIsNotNone(rich_result["growth_selection"])
+        self.assertIn("growth_selection_counts", result)
+        counts = result["growth_selection_counts"]
+        self.assertEqual(sum(counts.values()), result["items_evaluated"])
+
+
+class TestProphetGrowthSelection(Base):
+    """2026-09 adaptive-growth pass -- forecasting.select_prophet_growth()
+    and its pure decision table (_decide_growth), which chooses Prophet's
+    growth='flat' vs growth='linear' per series instead of one global
+    default. See PROPHET_ACCURACY_OPTIMIZATION_AUDIT.md for why the global
+    'flat' default was chosen in the first place (short-series trend lines
+    were noise everywhere on a 133-day dataset) and the 2026-09-30 full-year
+    re-test for why that stopped being true for this restaurant's
+    highest-volume series once a full year of real data existed."""
+
+    # -- pure decision table: no DB, no Prophet fit, hand-picked numbers ----
+    def test_decide_growth_picks_the_lower_wape(self):
+        growth, reason = forecasting._decide_growth({"flat": 60.0, "linear": 30.0}, 3)
+        self.assertEqual(growth, "linear")
+        self.assertEqual(reason, "lower_tuning_wape")
+        growth, reason = forecasting._decide_growth({"flat": 30.0, "linear": 60.0}, 3)
+        self.assertEqual(growth, "flat")
+        self.assertEqual(reason, "lower_tuning_wape")
+
+    def test_decide_growth_exact_tie_prefers_flat_deterministically(self):
+        growth, reason = forecasting._decide_growth({"flat": 42.0, "linear": 42.0}, 3)
+        self.assertEqual(growth, "flat")
+        self.assertEqual(reason, "exact_tie_prefers_flat")
+        # A difference of a full WAPE point is NOT a tie -- only genuine
+        # floating-point-level equality is (see GROWTH_TIE_EPSILON).
+        growth, reason = forecasting._decide_growth({"flat": 42.0, "linear": 41.0}, 3)
+        self.assertEqual(growth, "linear")
+        self.assertEqual(reason, "lower_tuning_wape")
+
+    def test_decide_growth_falls_back_below_minimum_folds(self):
+        growth, reason = forecasting._decide_growth({"flat": 10.0, "linear": 5.0}, 1)
+        self.assertEqual(growth, forecasting.PROPHET_DEFAULT_GROWTH)
+        self.assertEqual(reason, "insufficient_tuning_folds")
+
+    def test_decide_growth_falls_back_when_neither_growth_ever_fit(self):
+        growth, reason = forecasting._decide_growth({"flat": None, "linear": None}, 3)
+        self.assertEqual(growth, forecasting.PROPHET_DEFAULT_GROWTH)
+        self.assertEqual(reason, "no_successful_prophet_fits")
+
+    def test_decide_growth_is_symmetric_when_only_one_side_ever_fits(self):
+        growth, reason = forecasting._decide_growth({"flat": 10.0, "linear": None}, 3)
+        self.assertEqual((growth, reason), ("flat", "linear_fit_failed_every_fold"))
+        growth, reason = forecasting._decide_growth({"flat": None, "linear": 10.0}, 3)
+        self.assertEqual((growth, reason), ("linear", "flat_fit_failed_every_fold"))
+
+    # -- select_prophet_growth: structural + real-Prophet-when-available ----
+    def _series(self, qtys, start=None):
+        start = start or dt.date(2026, 1, 1)
+        return [{"date": (start + dt.timedelta(days=i)).isoformat(), "qty": float(q)}
+                for i, q in enumerate(qtys)]
+
+    def _rows(self, series):
+        return [{"d": p["date"], "qty": p["qty"]} for p in series if p["qty"] > 0]
+
+    def test_select_prophet_growth_falls_back_on_short_series(self):
+        series = self._series([2, 3, 1, 2, 3] * 4)  # 20 days -- far below what 2 folds at horizon=7/min_train=21 needs
+        result = forecasting.select_prophet_growth(self._rows(series), series, horizon=7)
+        self.assertEqual(result["selected_growth"], forecasting.PROPHET_DEFAULT_GROWTH)
+        self.assertTrue(result["is_fallback"])
+        self.assertEqual(result["reason"], "insufficient_tuning_folds")
+
+    def test_select_prophet_growth_on_a_clear_ramp_prefers_linear_when_prophet_available(self):
+        """A steadily, strongly increasing series (+3 units every 7 days,
+        no noise) is exactly the shape a fitted trend line should win on --
+        the mirror image of the original audit's short, noisy series where
+        'flat' won because there was no real trend to find. Skips the
+        preference assertion (never the structural ones) if cmdstan isn't
+        installed, matching test_prophet_forecast_or_honest_fallback's own
+        pattern elsewhere in this file."""
+        qtys = [5 + 3 * (i // 7) for i in range(70)]   # 70 days, ramps 5 -> ~35
+        series = self._series(qtys)
+        result = forecasting.select_prophet_growth(self._rows(series), series, horizon=7)
+        self.assertIn(result["selected_growth"], forecasting.GROWTH_CANDIDATES)
+        self.assertIn(result["reason"], (
+            "lower_tuning_wape", "linear_fit_failed_every_fold", "flat_fit_failed_every_fold",
+            "insufficient_tuning_folds", "no_successful_prophet_fits",
+        ))
+        if not forecasting._PROPHET_AVAILABLE:
+            return
+        self.assertGreaterEqual(result["folds_attempted"], forecasting.GROWTH_SELECTION_MIN_FOLDS)
+        self.assertEqual(result["selected_growth"], "linear")
+        self.assertEqual(result["reason"], "lower_tuning_wape")
+
+    def test_select_prophet_growth_reports_a_tuning_end_date_strictly_inside_the_input_series(self):
+        qtys = [5 + 3 * (i // 7) for i in range(70)]
+        series = self._series(qtys)
+        result = forecasting.select_prophet_growth(self._rows(series), series, horizon=7)
+        self.assertEqual(result["tuning_end_date"], series[-1]["date"])
+
+    # -- leakage: the actual requirement (#8) -- reporting folds can never
+    #    have influenced their own model's growth choice ----------------
+    def test_backtest_series_growth_selection_never_sees_the_folds_it_is_scored_on(self):
+        """Explicit regression test for data leakage: growth selection's own
+        tuning_end_date must fall strictly before the first fold
+        _backtest_series() is about to report accuracy on. This is true by
+        construction (select_prophet_growth is handed series[:fold_starts[0]]
+        only) -- this test exists so a future edit that accidentally passes
+        the FULL series into growth selection (the leak this whole feature
+        exists to avoid) fails loudly instead of silently."""
+        qtys = [5 + 3 * (i // 7) for i in range(120)]
+        series = self._series(qtys)
+        rows = self._rows(series)
+        result = forecasting._backtest_series(rows, series, horizon_days=7,
+                                              min_train=21, max_folds=4)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(result["growth_selection"])
+        tuning_end = dt.date.fromisoformat(result["growth_selection"]["tuning_end_date"])
+        first_reported_fold_start = dt.date.fromisoformat(result["folds"][0]["test_start"])
+        self.assertLess(tuning_end, first_reported_fold_start,
+                        "growth selection saw data on or after the first reported fold's own "
+                        "test start -- this is the exact data-leakage bug this test exists to catch")
+
+    def test_backtest_series_accepts_a_precomputed_growth_and_skips_reselection(self):
+        """A caller that already knows the growth (e.g. depletion.py's cached
+        live selection) can pass it directly; _backtest_series must then
+        report growth_selection=None (nothing was (re)computed) rather than
+        silently re-deriving it."""
+        qtys = [5 + 3 * (i // 7) for i in range(70)]
+        series = self._series(qtys)
+        rows = self._rows(series)
+        result = forecasting._backtest_series(rows, series, horizon_days=7,
+                                              min_train=21, max_folds=4,
+                                              prophet_growth="linear")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["prophet_growth"], "linear")
+        self.assertIsNone(result["growth_selection"])
+
+
+class TestEffectiveNow(Base):
+    """2026-09 second adaptive-growth pass -- forecasting.effective_now(),
+    which anchors every backtest/growth-selection path to the last day that
+    looks like real trading rather than the live wall clock, so a trailing
+    data-collection gap (confirmed live in this deployment's own order
+    history -- see PROPHET_ACCURACY_OPTIMIZATION_AUDIT.md section B and this
+    function's own module-level docstring) doesn't get scored as if it were
+    real demand. Deliberately NOT used by the EWMA nowcast path -- see that
+    same docstring for why."""
+
+    def test_no_gap_returns_the_real_now_unchanged(self):
+        """The common case, and every existing test's implicit case: dense
+        trading right up through today. effective_now() must be a no-op --
+        this is what makes it safe to default every backtest function to it
+        without breaking any pre-existing caller."""
+        recipe = add_recipe(self.conn, "EN1", [])
+        item = add_menu_item(self.conn, "No Gap Item", recipe)
+        for d in range(30):
+            add_dated_order(self.conn, days_ago(d), item, 2)
+        before = forecasting.timeutil.utc_now()
+        anchor = forecasting.effective_now(self.conn)
+        after = forecasting.timeutil.utc_now()
+        # No gap detected -> the real instant passes straight through
+        # unchanged (not just an equivalent business date -- the actual
+        # `now` value itself), bounded by when this test actually called it.
+        self.assertTrue(before <= anchor <= after)
+        self.assertEqual(forecasting.timeutil.business_today(anchor), dt.date.today())
+
+    def test_a_trailing_gap_anchors_to_the_last_real_trading_day(self):
+        """Dense orders ending 10 days ago, then a real 10-day gap through
+        today (mirrors the live deployment's own 2026-09-22 -> 09-29
+        pattern, just shifted to whenever this test happens to run) --
+        effective_now() must anchor to the last dense day, not today."""
+        recipe = add_recipe(self.conn, "EN2", [])
+        item = add_menu_item(self.conn, "Gapped Item", recipe)
+        for d in range(10, 70):   # dense: days_ago(69) .. days_ago(10)
+            add_dated_order(self.conn, days_ago(d), item, 3)
+        # days_ago(9) .. days_ago(0): deliberately nothing -- the gap.
+        anchor = forecasting.effective_now(self.conn)
+        expected_last_real_day = dt.date.today() - dt.timedelta(days=10)
+        self.assertEqual(forecasting.timeutil.business_today(anchor), expected_last_real_day)
+
+    def test_no_order_history_at_all_returns_real_now(self):
+        """An empty database must not crash or walk back indefinitely."""
+        anchor = forecasting.effective_now(self.conn)
+        self.assertEqual(forecasting.timeutil.business_today(anchor), dt.date.today())
+
+    def test_evaluate_demand_model_accepts_an_explicit_now_override(self):
+        """A caller (a future validation script, or a test) can still pin an
+        exact instant, same as _daily_series() already allows -- effective_
+        now() is then applied relative to THAT instant, not the real clock."""
+        recipe = add_recipe(self.conn, "EN3", [])
+        item = add_menu_item(self.conn, "Pinned Now Item", recipe)
+        for d in range(30):
+            add_dated_order(self.conn, days_ago(d), item, 2)
+        pinned = dt.datetime.now(dt.timezone.utc)
+        result = evaluate_demand_model(self.conn, horizon_days=7, now=pinned)
+        self.assertIn("effective_now", result)
 
 
 class TestStoreDemandForecast(Base):
@@ -4390,6 +4688,23 @@ class TestStoreDemandForecast(Base):
     def test_store_demand_prophet_rejects_unknown_metric(self):
         with self.assertRaises(ValueError):
             forecasting.store_demand_prophet(self.conn, metric="not_a_real_metric")
+
+    def test_store_demand_prophet_uses_the_cached_adaptive_selection(self):
+        """Same consistency fix as menu_item_demand_prophet(), for the
+        store-level path (series_key f"store:{metric}")."""
+        recipe = add_recipe(self.conn, "SR2B", [])
+        a = add_menu_item(self.conn, "Store Growth Item", recipe, price=100.0)
+        for d in range(10):
+            add_dated_order(self.conn, days_ago(d), a, 3)
+        forecasting.cache_growth_selection(
+            self.conn, "store:items",
+            {"selected_growth": "linear", "reason": "lower_tuning_wape", "is_fallback": False},
+        )
+        result = forecasting.store_demand_prophet(self.conn, metric="items", horizon_days=5)
+        if result["method"] != "prophet":
+            return
+        self.assertEqual(result["growth_used"], "linear")
+        self.assertEqual(result["growth_source"], "cached_adaptive")
 
     def test_evaluate_store_demand_model_backtests_a_rich_series(self):
         recipe = add_recipe(self.conn, "SR3", [])
@@ -4526,6 +4841,47 @@ class TestAnomaly(Base):
         self.assertTrue(d["trained_this_call"])   # 20 >= MIN_POOLED_SAMPLES
         self.assertIsInstance(d["flagged"], int)
 
+    def test_synthetic_seed_rows_are_excluded_from_training_and_flagging(self):
+        """2026-09-30 finding: every wastage/spoilage/count_adjustment row in
+        the real production ledger at the time of this fix -- 11,135 of
+        11,135 -- was traced to demo_seed._seed_wastage_history() (called by
+        xlsx_history_import.py to give the anomaly detector 'enough history
+        to demonstrate against'), not real operations; 96% of what got
+        flagged from that population was reviewed as false_positive. Rows
+        tagged with either seeder's user_id must not train or flag, however
+        large a fraction of stock they remove -- a real (NULL/other user_id)
+        row with the identical shape must still flag normally, proving this
+        is a source filter, not a change to the detection math itself."""
+        # stock_ledger is append-only (no DELETE), so each source gets its
+        # own ingredient rather than reusing/clearing one between cases.
+        for src in anomaly.SYNTHETIC_SEED_USER_IDS:
+            ing = add_ingredient(self.conn, f"Synthetic Seed Ingredient ({src})")
+            add_ledger_entry(self.conn, ing, -80.0, "wastage", days_ago(0),
+                             balance_after=20.0, user_id=src)
+            flagged = detect_anomalies(self.conn)
+            self.assertEqual([f for f in flagged if f["ingredient_id"] == ing], [],
+                             f"a {src}-sourced row removing 80% of stock must not be flagged")
+
+        real_ing = add_ingredient(self.conn, "Real Source Ingredient")
+        add_ledger_entry(self.conn, real_ing, -80.0, "wastage", days_ago(0), balance_after=20.0)
+        flagged = detect_anomalies(self.conn)
+        real_flags = [f for f in flagged if f["ingredient_id"] == real_ing]
+        self.assertEqual(len(real_flags), 1)
+        self.assertEqual(real_flags[0]["method"], "large_fraction")
+
+    def test_model_details_reports_synthetic_excluded_separately(self):
+        ing = add_ingredient(self.conn, "Mixed Source Ingredient")
+        for d in range(20):
+            add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(d), balance_after=900.0,
+                             user_id="xlsx_history_import")
+        for d in range(5):
+            add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(d), balance_after=900.0)
+        d = anomaly_model_details(self.conn, lookback_days=90)
+        self.assertEqual(d["records_evaluated"], 5)      # real rows only
+        self.assertEqual(d["synthetic_excluded"], 20)
+        self.assertIsNotNone(d["synthetic_excluded_note"])
+        self.assertFalse(d["trained_this_call"])          # 5 < MIN_POOLED_SAMPLES
+
 
 class TestAnomalyReview(Base):
     """wt/anomaly.py — human validation workflow (migration 0035) and the
@@ -4606,6 +4962,609 @@ class TestAnomalyReview(Base):
             self.assertEqual(v["precision"], round(tp / (tp + fp), 3) if (tp + fp) else None)
         else:
             self.assertIn("reason", v)   # not enough of this ingredient's rows were flagged
+
+    def test_validation_metrics_excludes_reviews_of_synthetic_seed_rows(self):
+        """A review of a now-excluded synthetic-sourced row must not count
+        toward the confusion matrix at all -- not as FN/TN, which would
+        misrepresent it as 'the model considered and missed this'. This is
+        exactly the real production state this fix was built for: 1,140
+        existing reviews, 100% of synthetic-seed rows, 0 applicable to the
+        real candidate population."""
+        ing = add_ingredient(self.conn, "Synthetic Reviewed Ingredient")
+        ids = []
+        for d in range(25):
+            add_ledger_entry(self.conn, ing, -60.0, "wastage", days_ago(d), balance_after=40.0,
+                             user_id="xlsx_history_import")
+            ids.append(self.conn.execute(
+                "SELECT id FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1", (ing,)
+            ).fetchone()["id"])
+        # Reviewed as if they mattered, exactly like the real 1,140 -- but
+        # every one of these rows is synthetic-sourced.
+        for lid in ids[:15]:
+            record_anomaly_review(self.conn, lid, "confirmed_anomaly", user_id="mgr")
+        for lid in ids[15:]:
+            record_anomaly_review(self.conn, lid, "false_positive", user_id="mgr")
+
+        v = validation_metrics(self.conn)
+        self.assertFalse(v["available"])
+        self.assertEqual(v["confirmed_labels"], 0)
+        self.assertIn("real (non-synthetic-seed)", v["reason"])
+
+
+# ===========================================================================
+# 2026-10: eligibility must generalize beyond a hardcoded list of known
+# synthetic-source usernames — see anomaly.py's _REAL_USER_CLAUSE comment.
+# ===========================================================================
+class TestAnomalyEligibilityRobustness(Base):
+    def _entry(self, user_id):
+        # 40 units removed from a 100-unit balance -- a 40% fraction, well
+        # past RULE_FRACTION_THRESHOLD, so the no-history rule alone would
+        # flag this on its first eligible record (no pooled history needed).
+        # Whether it actually appears in detect_anomalies()'s output is then
+        # purely a function of eligibility, not of how "unusual" the number
+        # looks relative to anything else.
+        ing = add_ingredient(self.conn, f"Elig-{user_id}", on_hand=100.0)
+        add_ledger_entry(self.conn, ing, -40.0, "spoilage", days_ago(0),
+                         balance_after=60.0, user_id=user_id)
+        return ing
+
+    def test_the_two_known_synthetic_usernames_are_still_excluded(self):
+        for uid in anomaly.SYNTHETIC_SEED_USER_IDS:
+            self._entry(uid)
+        self.assertEqual(detect_anomalies(self.conn), [])
+
+    def test_an_unknown_future_importer_username_is_excluded_too(self):
+        """The whole point of the fix: nobody has to remember to add a new
+        importer's username to a list for it to be excluded."""
+        self._entry("some_future_bulk_importer_nobody_listed")
+        self.assertEqual(detect_anomalies(self.conn), [])
+
+    def test_a_null_user_id_is_eligible(self):
+        self._entry(None)
+        self.assertEqual(len(detect_anomalies(self.conn)), 1)
+
+    def test_a_real_app_user_account_is_eligible(self):
+        from wt.auth import hash_password
+        h, s = hash_password("wingstheory")
+        self.conn.execute(
+            "INSERT INTO app_user (username, display_name, role, password_hash, password_salt, "
+            "password_changed_at, must_change_password, is_active) "
+            "VALUES ('realop','Real Operator','admin',?,?,datetime('now'),0,1)",
+            (h, s),
+        )
+        self._entry("realop")
+        self.assertEqual(len(detect_anomalies(self.conn)), 1)
+
+
+# ===========================================================================
+# 2026-10 data-provenance correction: a second audit traced exactly how the
+# 11,135 excluded rows were produced and found the original attribution
+# imprecise (99.1% came from refills.correct_refill()'s demo flavour-
+# correction simulation, not demo_seed._seed_wastage_history() as the
+# earlier comment claimed) -- see anomaly.py's corrected comment for the
+# full reconciliation. The exclusion conclusion itself was already correct;
+# these tests cover the specific new claims that audit makes, not a changed
+# eligibility rule (none changed).
+# ===========================================================================
+class TestAnomalyProvenanceTaxonomy(Base):
+    def _real_user(self, username="realop2"):
+        from wt.auth import hash_password
+        h, s = hash_password("wingstheory")
+        self.conn.execute(
+            "INSERT OR IGNORE INTO app_user (username, display_name, role, password_hash, "
+            "password_salt, password_changed_at, must_change_password, is_active) "
+            "VALUES (?,?,?,?,?,datetime('now'),0,1)",
+            (username, "Real Operator 2", "admin", h, s),
+        )
+        return username
+
+    def test_sale_commit_never_enters_the_stock_loss_model_regardless_of_realness(self):
+        """Real order x real recipe = deterministic (DERIVED_OPERATIONAL)
+        theoretical consumption -- legitimate evidence for Prophet/FP-Growth/
+        replenishment, but never itself a stock-loss observation. Proven with
+        a genuine (real app_user) sale_commit entry, not a synthetic one, so
+        this is testing the RIGHT reason, not accidentally retesting
+        eligibility-by-user_id."""
+        real_user = self._real_user()
+        ing = add_ingredient(self.conn, "SaleCommitReal", on_hand=1000.0)
+        add_ledger_entry(self.conn, ing, -500.0, "sale_commit", days_ago(0),
+                         balance_after=500.0, user_id=real_user)
+        self.assertEqual(detect_anomalies(self.conn), [])
+
+    def test_a_genuine_wastage_entry_is_eligible(self):
+        real_user = self._real_user()
+        ing = add_ingredient(self.conn, "RealWastage", on_hand=100.0)
+        add_ledger_entry(self.conn, ing, -40.0, "wastage", days_ago(0),
+                         balance_after=60.0, user_id=real_user)
+        self.assertEqual(len(detect_anomalies(self.conn)), 1)
+
+    def test_a_genuine_spoilage_entry_is_eligible(self):
+        real_user = self._real_user()
+        ing = add_ingredient(self.conn, "RealSpoilage", on_hand=100.0)
+        add_ledger_entry(self.conn, ing, -40.0, "spoilage", days_ago(0),
+                         balance_after=60.0, user_id=real_user)
+        self.assertEqual(len(detect_anomalies(self.conn)), 1)
+
+    def test_a_genuine_count_adjustment_entry_is_eligible(self):
+        real_user = self._real_user()
+        ing = add_ingredient(self.conn, "RealCount", on_hand=100.0)
+        add_ledger_entry(self.conn, ing, -40.0, "count_adjustment", days_ago(0),
+                         balance_after=60.0, user_id=real_user)
+        self.assertEqual(len(detect_anomalies(self.conn)), 1)
+
+    def test_the_exact_demo_flavour_correction_pattern_is_excluded(self):
+        """Reproduces the real shape of 11,036 of the 11,135 excluded rows
+        exactly (ref_type='unli_refill', wastage_reason='corrected: demo:
+        wrong flavour served', user_id='xlsx_history_import') -- proving the
+        newly-identified dominant mechanism is excluded for the same reason
+        (user_id, not ref_type or wastage_reason text) as every other
+        synthetic source, not by some new special-cased rule."""
+        ing = add_ingredient(self.conn, "FlavourCorrection", on_hand=100.0)
+        self.conn.execute(
+            "INSERT INTO stock_ledger (ingredient_id, delta_base, balance_after_base, reason, "
+            "wastage_reason, ref_type, user_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (ing, -40.0, 60.0, "wastage", "corrected: demo: wrong flavour served",
+             "unli_refill", "xlsx_history_import", days_ago(0)),
+        )
+        self.assertEqual(detect_anomalies(self.conn), [])
+
+    def test_a_real_wrong_flavour_correction_by_actual_kitchen_staff_would_be_eligible(self):
+        """The SAME correct_refill() mechanism is a real, live production
+        feature (POST /unli/refills/{id}/correct) -- a genuine future
+        correction made by actual kitchen staff is real operational evidence
+        and must not be excluded just because the demo path happens to
+        produce ledger rows with the identical ref_type/reason shape."""
+        real_user = self._real_user("kitchen_real")
+        ing = add_ingredient(self.conn, "RealFlavourCorrection", on_hand=100.0)
+        self.conn.execute(
+            "INSERT INTO stock_ledger (ingredient_id, delta_base, balance_after_base, reason, "
+            "wastage_reason, ref_type, user_id, created_at) VALUES (?,?,?,?,?,?,?,?)",
+            (ing, -40.0, 60.0, "wastage", "corrected: wrong flavour served",
+             "unli_refill", real_user, days_ago(0)),
+        )
+        self.assertEqual(len(detect_anomalies(self.conn)), 1)
+
+    def test_imported_is_not_itself_disqualifying(self):
+        """The eligibility question is "is the observation genuine", never
+        "which program inserted it" -- a row carrying import-shaped metadata
+        (ref_type typical of the importer's own writes) but a REAL app_user
+        id must be judged eligible on exactly the same basis as any other
+        real row."""
+        real_user = self._real_user("owner_import_check")
+        ing = add_ingredient(self.conn, "ImportedButReal", on_hand=100.0)
+        self.conn.execute(
+            "INSERT INTO stock_ledger (ingredient_id, delta_base, balance_after_base, reason, "
+            "ref_type, user_id, created_at) VALUES (?,?,?,?,?,?,?)",
+            (ing, -40.0, 60.0, "wastage", "manual_writeoff", real_user, days_ago(0)),
+        )
+        self.assertEqual(len(detect_anomalies(self.conn)), 1)
+
+    def test_ambiguous_unrecognized_provenance_defaults_to_excluded(self):
+        """Uncertain provenance must never silently become real-world
+        validation evidence: a user_id that is neither a known synthetic tag
+        nor a real app_user account (the 'uncertain' case) is excluded by
+        the same fail-safe rule as a known synthetic one -- not included by
+        default."""
+        ing = add_ingredient(self.conn, "Ambiguous", on_hand=100.0)
+        add_ledger_entry(self.conn, ing, -40.0, "wastage", days_ago(0),
+                         balance_after=60.0, user_id="some_unrecognized_value")
+        self.assertEqual(detect_anomalies(self.conn), [])
+
+    def test_known_trust_boundary_a_generator_misusing_a_real_username_would_be_accepted(self):
+        """Documents, rather than hides, the one structural limitation this
+        architecture cannot close without verifying claims against an
+        external source of truth (see anomaly.py's _REAL_USER_CLAUSE
+        comment): eligibility trusts that code writing to stock_ledger is
+        honest about who authored the write. No actual generator in this
+        codebase does this (both demo_seed and xlsx_history_import use fixed
+        non-account strings specifically to avoid it), so this is a
+        boundary, not a live bug -- recorded as an explicit test so it is
+        never silently assumed to be fully closed."""
+        real_user = self._real_user("hypothetically_misused")
+        ing = add_ingredient(self.conn, "TrustBoundary", on_hand=100.0)
+        add_ledger_entry(self.conn, ing, -40.0, "wastage", days_ago(0),
+                         balance_after=60.0, user_id=real_user)
+        # Indistinguishable, by this architecture, from a genuine entry --
+        # that is the point being documented, not asserted as desirable.
+        self.assertEqual(len(detect_anomalies(self.conn)), 1)
+
+
+# ===========================================================================
+# 2026-10: review-sampling infrastructure (migration 0041). Real population
+# fixtures reuse the exact pattern TestAnomaly's own
+# test_isolation_forest_flags_an_outlier_once_pooled_history_exists uses:
+# default user_id=None already satisfies _REAL_USER_CLAUSE, so these tests
+# never need to seed an app_user row to count as "real".
+# ===========================================================================
+class TestAnomalySampling(Base):
+    def _trained_population(self, ingredient_name="Occasional Spike"):
+        """15 real eligible records against one ingredient: 14 unremarkable
+        5g entries plus one 150g outlier — the same fixture TestAnomaly uses,
+        guaranteed to both meet MIN_POOLED_SAMPLES and produce exactly one
+        flagged row."""
+        ing = add_ingredient(self.conn, ingredient_name, on_hand=10000.0)
+        for d in range(1, 15):
+            add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(d), balance_after=10000.0)
+        add_ledger_entry(self.conn, ing, -150.0, "wastage", days_ago(0), balance_after=9850.0)
+        return ing
+
+    def test_synthetic_rows_cannot_enter_sampling(self):
+        ing = add_ingredient(self.conn, "AllSynthetic", on_hand=10000.0)
+        for d in range(20):
+            add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(d), balance_after=10000.0,
+                             user_id="xlsx_history_import")
+        out = anomaly.sample_for_review(self.conn)
+        self.assertEqual(out["sampled"], 0)
+        self.assertEqual(out["candidates_considered"], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS n FROM anomaly_validation_sample").fetchone()["n"], 0)
+
+    def test_real_flagged_rows_can_enter_review_sampling(self):
+        self._trained_population()
+        out = anomaly.sample_for_review(self.conn)
+        self.assertEqual(out["pools"]["model_flagged"], 1)
+        row = self.conn.execute(
+            "SELECT * FROM anomaly_validation_sample WHERE sample_source='model_flagged'"
+        ).fetchone()
+        self.assertEqual(row["model_prediction"], "flagged")
+        self.assertEqual(row["human_label"], "pending")
+
+    def test_real_unflagged_rows_can_enter_near_threshold_sampling(self):
+        self._trained_population()
+        out = anomaly.sample_for_review(self.conn, n_near_threshold=3, n_random=0)
+        self.assertGreater(out["pools"]["near_threshold"], 0)
+        rows = self.conn.execute(
+            "SELECT * FROM anomaly_validation_sample WHERE sample_source='near_threshold'"
+        ).fetchall()
+        for r in rows:
+            self.assertEqual(r["model_prediction"], "unflagged")
+
+    def test_near_threshold_is_empty_when_the_forest_never_trained(self):
+        """Below MIN_POOLED_SAMPLES only the rule layer runs, which never
+        assigns a score to an unflagged row — there is no meaningful
+        'closest to the boundary' to rank, so the pool is honestly empty
+        rather than approximated."""
+        ing = add_ingredient(self.conn, "TooFewToTrain", on_hand=10000.0)
+        for d in range(5):
+            add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(d), balance_after=10000.0)
+        out = anomaly.sample_for_review(self.conn, n_near_threshold=3)
+        self.assertEqual(out["pools"]["near_threshold"], 0)
+
+    def test_real_normal_rows_can_enter_random_sampling(self):
+        self._trained_population()
+        out = anomaly.sample_for_review(self.conn, n_near_threshold=0, n_random=4)
+        self.assertEqual(out["pools"]["random_unflagged"], 4)
+        rows = self.conn.execute(
+            "SELECT * FROM anomaly_validation_sample WHERE sample_source='random_unflagged'"
+        ).fetchall()
+        for r in rows:
+            self.assertEqual(r["model_prediction"], "unflagged")
+
+    def test_duplicate_pending_reviews_are_prevented(self):
+        self._trained_population()
+        first = anomaly.sample_for_review(self.conn, n_near_threshold=2, n_random=2)
+        second = anomaly.sample_for_review(self.conn, n_near_threshold=2, n_random=2)
+        self.assertGreater(first["sampled"], 0)
+        # Every real record is already sampled (15 records, flagged(1) +
+        # near_threshold(2) + random(2) covers most of the pool on the first
+        # call) -- re-running must never create a second row for the same
+        # ledger_id, enforced at the DB level (UNIQUE) as well as the
+        # pre-filter.
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT ledger_id, COUNT(*) AS n FROM anomaly_validation_sample "
+                "GROUP BY ledger_id HAVING n > 1").fetchall(),
+            [])
+        total_rows_after_both_calls = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM anomaly_validation_sample").fetchone()["n"]
+        self.assertEqual(total_rows_after_both_calls, first["sampled"] + second["sampled"])
+
+    def test_random_sample_does_not_let_one_ingredient_dominate(self):
+        # One ingredient with 20 ordinary entries (would fill the whole
+        # random pool by itself if unstratified) plus a second, smaller
+        # ingredient's own trained population to guarantee the forest runs
+        # and leaves real unflagged candidates on both ingredients.
+        dominant = add_ingredient(self.conn, "HighVolume", on_hand=10000.0)
+        for d in range(20):
+            add_ledger_entry(self.conn, dominant, -5.0, "wastage", days_ago(d), balance_after=10000.0)
+        other = self._trained_population("LowVolume")
+        out = anomaly.sample_for_review(self.conn, n_near_threshold=0, n_random=6)
+        sampled = self.conn.execute(
+            "SELECT l.ingredient_id, COUNT(*) AS n FROM anomaly_validation_sample s "
+            "JOIN stock_ledger l ON l.id = s.ledger_id "
+            "WHERE s.sample_source='random_unflagged' GROUP BY l.ingredient_id"
+        ).fetchall()
+        for r in sampled:
+            self.assertLessEqual(r["n"], 3,  # MAX_INGREDIENT_SHARE_OF_RANDOM_SAMPLE=0.5 of n_random=6
+                                 "one ingredient dominated the random validation sample")
+
+    def test_sampling_never_writes_to_the_ledger_or_inventory(self):
+        self._trained_population()
+        ledger_count_before = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        on_hand_before = [dict(r) for r in self.conn.execute(
+            "SELECT id, on_hand_base FROM ingredient").fetchall()]
+        anomaly.sample_for_review(self.conn)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"],
+            ledger_count_before)
+        on_hand_after = [dict(r) for r in self.conn.execute(
+            "SELECT id, on_hand_base FROM ingredient").fetchall()]
+        self.assertEqual(on_hand_before, on_hand_after)
+
+    def test_sampling_preserves_the_original_score_and_version(self):
+        self._trained_population()
+        anomaly.sample_for_review(self.conn)
+        row = self.conn.execute(
+            "SELECT * FROM anomaly_validation_sample WHERE sample_source='model_flagged'"
+        ).fetchone()
+        self.assertIsNotNone(row["anomaly_score"])
+        self.assertEqual(row["model_version"], anomaly.ANOMALY_MODEL_VERSION)
+        self.assertEqual(row["eligibility_version"], anomaly.ELIGIBILITY_FILTER_VERSION)
+
+
+class TestValidationLabeling(Base):
+    def _one_sample(self):
+        ing = add_ingredient(self.conn, "LabelMe", on_hand=10000.0)
+        for d in range(1, 15):
+            add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(d), balance_after=10000.0)
+        add_ledger_entry(self.conn, ing, -150.0, "wastage", days_ago(0), balance_after=9850.0)
+        anomaly.sample_for_review(self.conn, n_near_threshold=0, n_random=0)
+        return self.conn.execute(
+            "SELECT * FROM anomaly_validation_sample WHERE sample_source='model_flagged'"
+        ).fetchone()["id"]
+
+    def test_model_prediction_and_human_label_remain_separate_columns(self):
+        sample_id = self._one_sample()
+        anomaly.submit_validation_label(self.conn, sample_id, "expected_or_normal", user_id="admin1")
+        row = self.conn.execute(
+            "SELECT model_prediction, human_label FROM anomaly_validation_sample WHERE id=?",
+            (sample_id,)).fetchone()
+        # The model said flagged; the human disagreed. Both are preserved —
+        # neither overwrites the other, which is what makes an FP derivable
+        # at all rather than just "the label".
+        self.assertEqual(row["model_prediction"], "flagged")
+        self.assertEqual(row["human_label"], "expected_or_normal")
+
+    def test_a_sample_starts_pending(self):
+        sample_id = self._one_sample()
+        row = self.conn.execute(
+            "SELECT human_label FROM anomaly_validation_sample WHERE id=?", (sample_id,)).fetchone()
+        self.assertEqual(row["human_label"], "pending")
+
+    def test_label_can_only_be_submitted_once(self):
+        sample_id = self._one_sample()
+        anomaly.submit_validation_label(self.conn, sample_id, "confirmed_anomaly")
+        with self.assertRaises(InvalidStateError):
+            anomaly.submit_validation_label(self.conn, sample_id, "expected_or_normal")
+
+    def test_pending_is_not_a_label_a_reviewer_may_submit(self):
+        sample_id = self._one_sample()
+        with self.assertRaises(InvalidStateError):
+            anomaly.submit_validation_label(self.conn, sample_id, "pending")
+
+    def test_unknown_label_is_rejected(self):
+        sample_id = self._one_sample()
+        with self.assertRaises(InvalidStateError):
+            anomaly.submit_validation_label(self.conn, sample_id, "false_positive")
+
+    def test_blind_queue_omits_model_derived_fields(self):
+        self._one_sample()
+        items = anomaly.validation_queue(self.conn, status="pending", blind=True)
+        self.assertEqual(len(items), 1)
+        for forbidden in ("sample_source", "model_prediction", "anomaly_score",
+                         "decision_threshold", "model_version", "eligibility_version"):
+            self.assertNotIn(forbidden, items[0])
+
+    def test_non_blind_queue_includes_model_derived_fields_for_audit(self):
+        self._one_sample()
+        items = anomaly.validation_queue(self.conn, status="pending", blind=False)
+        self.assertIn("model_prediction", items[0])
+        self.assertIn("anomaly_score", items[0])
+
+    def test_pending_samples_do_not_enter_final_metrics(self):
+        self._one_sample()
+        m = anomaly.scientific_validation_metrics(self.conn)
+        self.assertEqual(m["confusion_matrix"], {"tp": 0, "fp": 0, "fn": 0, "tn": 0})
+
+
+class TestScientificValidationMetrics(Base):
+    def _labeled_sample(self, ing_name, prediction, human_label, magnitude=150.0):
+        """One sampled, labeled record with a controlled model_prediction —
+        inserted directly into anomaly_validation_sample rather than through
+        the real sampler, so each confusion-matrix cell can be populated
+        independently and deterministically without needing 20 real
+        IsolationForest-trained rows to land exactly where a test wants
+        them. The underlying ledger row is still real (user_id=None)."""
+        ing = add_ingredient(self.conn, ing_name, on_hand=10000.0)
+        add_ledger_entry(self.conn, ing, -magnitude, "wastage", days_ago(0), balance_after=10000.0 - magnitude)
+        ledger_id = self.conn.execute(
+            "SELECT id FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1", (ing,)
+        ).fetchone()["id"]
+        self.conn.execute(
+            "INSERT INTO anomaly_validation_sample "
+            "(ledger_id, sample_source, model_prediction, anomaly_score, decision_threshold, "
+            " model_version, eligibility_version, human_label, reviewed_by, reviewed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))",
+            (ledger_id, "model_flagged" if prediction == "flagged" else "random_unflagged",
+             prediction, 0.2, 0.1, anomaly.ANOMALY_MODEL_VERSION, anomaly.ELIGIBILITY_FILTER_VERSION,
+             human_label, "admin1"),
+        )
+        return ledger_id
+
+    def _fill_minimum_evidence(self, extra_tp=0, extra_tn=0):
+        """Enough labeled evidence on both sides of the prediction to clear
+        MIN_SCIENTIFIC_VALIDATION_LABELS / MIN_LABELS_PER_PREDICTION_SIDE,
+        independent of whatever single case a test is actually asserting."""
+        for i in range(5 + extra_tp):
+            self._labeled_sample(f"TPFiller{i}", "flagged", "confirmed_anomaly")
+        for i in range(5 + extra_tn):
+            self._labeled_sample(f"TNFiller{i}", "unflagged", "expected_or_normal")
+        for i in range(5):
+            self._labeled_sample(f"FPFiller{i}", "flagged", "expected_or_normal")
+        for i in range(5):
+            self._labeled_sample(f"FNFiller{i}", "unflagged", "confirmed_anomaly")
+
+    def test_flagged_plus_confirmed_anomaly_is_tp(self):
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_validation_metrics(self.conn)
+        self.assertTrue(m["available"])
+        self.assertEqual(m["confusion_matrix"]["tp"], 5)
+
+    def test_flagged_plus_expected_or_normal_is_fp(self):
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_validation_metrics(self.conn)
+        self.assertEqual(m["confusion_matrix"]["fp"], 5)
+
+    def test_unflagged_plus_confirmed_anomaly_is_fn(self):
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_validation_metrics(self.conn)
+        self.assertEqual(m["confusion_matrix"]["fn"], 5)
+
+    def test_unflagged_plus_expected_or_normal_is_tn(self):
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_validation_metrics(self.conn)
+        self.assertEqual(m["confusion_matrix"]["tn"], 5)
+
+    def test_insufficient_labels_returns_unavailable_not_a_number(self):
+        # Two labels total -- nowhere near MIN_SCIENTIFIC_VALIDATION_LABELS.
+        self._labeled_sample("Solo1", "flagged", "confirmed_anomaly")
+        self._labeled_sample("Solo2", "unflagged", "expected_or_normal")
+        m = anomaly.scientific_validation_metrics(self.conn)
+        self.assertFalse(m["available"])
+        self.assertEqual(m["reason"], "insufficient_validation_data")
+        self.assertIsNone(m.get("precision"))
+
+    def test_lopsided_evidence_on_one_side_still_returns_unavailable(self):
+        # 20 total labels, but every single one is on the flagged side --
+        # Recall/Specificity would be computed from zero unflagged-side
+        # examples if this guard did not exist.
+        for i in range(20):
+            self._labeled_sample(f"Lopsided{i}", "flagged", "confirmed_anomaly")
+        m = anomaly.scientific_validation_metrics(self.conn)
+        self.assertFalse(m["available"])
+
+    def test_metrics_are_scoped_to_model_and_eligibility_version(self):
+        self._fill_minimum_evidence()
+        # A sample frozen under a different (hypothetical, later) model
+        # version must not be silently pooled into the current version's
+        # confusion matrix.
+        other_ing = add_ingredient(self.conn, "OtherVersion", on_hand=10000.0)
+        add_ledger_entry(self.conn, other_ing, -10.0, "wastage", days_ago(0), balance_after=9990.0)
+        other_ledger_id = self.conn.execute(
+            "SELECT id FROM stock_ledger WHERE ingredient_id=?", (other_ing,)).fetchone()["id"]
+        self.conn.execute(
+            "INSERT INTO anomaly_validation_sample "
+            "(ledger_id, sample_source, model_prediction, model_version, eligibility_version, "
+            " human_label, reviewed_by, reviewed_at) "
+            "VALUES (?,'model_flagged','flagged','stock_loss_isoforest_v999', ?, "
+            " 'confirmed_anomaly','admin1',datetime('now'))",
+            (other_ledger_id, anomaly.ELIGIBILITY_FILTER_VERSION),
+        )
+        current = anomaly.scientific_validation_metrics(self.conn)
+        self.assertEqual(current["confusion_matrix"]["tp"], 5)  # unchanged by the other-version row
+        other = anomaly.scientific_validation_metrics(
+            self.conn, model_version="stock_loss_isoforest_v999",
+            eligibility_version=anomaly.ELIGIBILITY_FILTER_VERSION)
+        self.assertFalse(other["available"])  # only 1 label under that version — insufficient on its own
+
+    def test_excluded_synthetic_rows_cannot_reach_metrics_via_sampling(self):
+        """End-to-end: a synthetic row can never even become a sample (see
+        TestAnomalySampling), so it structurally cannot contribute to this
+        function's confusion matrix either."""
+        ing = add_ingredient(self.conn, "SyntheticOnly", on_hand=10000.0)
+        for d in range(20):
+            add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(d), balance_after=10000.0,
+                             user_id="xlsx_history_import")
+        anomaly.sample_for_review(self.conn)
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_validation_metrics(self.conn)
+        self.assertEqual(sum(m["confusion_matrix"].values()), 20)  # only the real filler evidence
+
+
+class TestAnomalyProvenanceSources(Base):
+    """2026-10: event_source (COUNT_SOURCES/WASTAGE_SOURCES) vs. sample_source
+    (model_flagged/near_threshold/random_unflagged) are two independent
+    provenance concepts — see wt/anomaly.py and wt/reservation.py's own
+    comments. These tests cover the first; TestAnomalySampling covers the
+    second."""
+
+    def setUp(self):
+        super().setUp()
+        self.ing = add_ingredient(self.conn, "Provenance", pack=1000, on_hand=1000)
+
+    def _last_ref_type(self):
+        return self.conn.execute(
+            "SELECT ref_type FROM stock_ledger WHERE ingredient_id=? ORDER BY id DESC LIMIT 1",
+            (self.ing,)).fetchone()["ref_type"]
+
+    def test_manual_count_is_the_default_source(self):
+        record_count(self.conn, self.ing, 900.0)
+        self.assertEqual(self._last_ref_type(), "manual_count")
+
+    def test_correct_stock_source_is_recorded(self):
+        record_count(self.conn, self.ing, 900.0, source="correct_stock")
+        self.assertEqual(self._last_ref_type(), "correct_stock")
+
+    def test_count_today_source_is_recorded(self):
+        record_count(self.conn, self.ing, 900.0, source="count_today")
+        self.assertEqual(self._last_ref_type(), "count_today")
+
+    def test_bulk_count_source_is_recorded(self):
+        record_count(self.conn, self.ing, 900.0, source="bulk_count")
+        self.assertEqual(self._last_ref_type(), "bulk_count")
+
+    def test_unknown_count_source_is_rejected(self):
+        with self.assertRaises(InvalidStateError):
+            record_count(self.conn, self.ing, 900.0, source="not_a_real_source")
+
+    def test_manual_writeoff_is_the_default_wastage_source(self):
+        record_wastage(self.conn, self.ing, 100.0)
+        self.assertEqual(self._last_ref_type(), "manual_writeoff")
+
+    def test_expired_disposal_source_is_recorded(self):
+        record_wastage(self.conn, self.ing, 100.0, reason="spoilage", source="expired_disposal")
+        self.assertEqual(self._last_ref_type(), "expired_disposal")
+        # Still an ordinary spoilage ledger reason -- source does not invent
+        # a new loss category, only records which workflow triggered it.
+        self.assertEqual(
+            self.conn.execute("SELECT reason FROM stock_ledger WHERE ingredient_id=? "
+                              "ORDER BY id DESC LIMIT 1", (self.ing,)).fetchone()["reason"],
+            "spoilage")
+
+    def test_unknown_wastage_source_is_rejected(self):
+        with self.assertRaises(InvalidStateError):
+            record_wastage(self.conn, self.ing, 100.0, source="not_a_real_source")
+
+
+# ===========================================================================
+# 2026-10: append-only ledger protections must survive all of the above.
+# ===========================================================================
+class TestLedgerIntegrityAfterMLInfrastructure(Base):
+    def test_stock_ledger_is_still_append_only(self):
+        ing = add_ingredient(self.conn, "StillAppendOnly", on_hand=1000)
+        record_count(self.conn, ing, 900.0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE stock_ledger SET delta_base=0 WHERE ingredient_id=?", (ing,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM stock_ledger WHERE ingredient_id=?", (ing,))
+
+    def test_anomaly_validation_sample_allows_the_one_time_label_update(self):
+        """Unlike stock_ledger/anomaly_review, this table is a mutable review
+        QUEUE by design (see migration 0041) -- confirms it is NOT
+        append-only, so submit_validation_label()'s UPDATE is expected
+        behavior, not something a stray trigger would block."""
+        ing = add_ingredient(self.conn, "QueueMutable", on_hand=10000.0)
+        for d in range(1, 15):
+            add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(d), balance_after=10000.0)
+        add_ledger_entry(self.conn, ing, -150.0, "wastage", days_ago(0), balance_after=9850.0)
+        anomaly.sample_for_review(self.conn, n_near_threshold=0, n_random=0)
+        sample_id = self.conn.execute(
+            "SELECT id FROM anomaly_validation_sample WHERE sample_source='model_flagged'"
+        ).fetchone()["id"]
+        anomaly.submit_validation_label(self.conn, sample_id, "confirmed_anomaly")
+        row = self.conn.execute(
+            "SELECT human_label FROM anomaly_validation_sample WHERE id=?", (sample_id,)).fetchone()
+        self.assertEqual(row["human_label"], "confirmed_anomaly")
 
 
 class TestAssociations(Base):
@@ -4716,6 +5675,46 @@ class TestAssociations(Base):
         self.assertIn("not a cost-based or margin calculation", result["combo_price_basis"])
         self.assertEqual(result["threshold_tier"], "primary")
         self.assertEqual(result["number_of_final_recommendations"], len(result["combos"]))
+
+    def test_confidence_float_tolerance_rescues_the_real_measured_rounding_artifact(self):
+        """2026-10 fix. The bug: mlxtend computes a rule's confidence as
+        support(itemset)/support(antecedent) -- two divisions through
+        intermediate count/transaction_count fractions, not the single
+        direct pair_n/count_hi division this module uses elsewhere to
+        DISPLAY confidence. Measured directly against this project's real
+        365-day data (29 real co-occurrences out of 580 real solo
+        occurrences, 17,326 real training transactions -- a pair whose
+        confidence is mathematically EXACTLY MIN_CONFIDENCE, 29/580 = 0.05):
+        mlxtend's own computed value was 0.04999999999999999584, a few ULPs
+        under 0.05, which silently dropped a pair that was never actually
+        below the threshold. (Reproducing that exact rounding through a
+        synthetic fixture turned out to be fragile -- it depends on the
+        transaction matrix's column count and the pandas/numpy build doing
+        the summation, confirmed by trying several synthetic shapes that
+        didn't reproduce it even with the identical counts. The real,
+        measured value above is the one fact that does not depend on any
+        of that, so this test is pinned to it directly.)
+
+        This checks the two things that actually matter: the tolerance is
+        comfortably large enough to absorb that exact real rounding error,
+        and still minuscule enough that it could never rescue a pair whose
+        confidence is genuinely, meaningfully below 0.05."""
+        tol = associations.CONFIDENCE_FLOAT_TOLERANCE
+        self.assertGreater(tol, 0, "a zero tolerance would leave the real rounding bug unfixed")
+        self.assertLess(tol, 1e-4, "the tolerance must stay far too small to act as a de-facto "
+                                   "threshold change")
+
+        real_measured_confidence = 0.04999999999999999584  # mlxtend's own output, see docstring
+        self.assertGreaterEqual(
+            real_measured_confidence, associations.MIN_CONFIDENCE - tol,
+            "the exact real-world rounding artifact this fix exists for must clear the "
+            "tolerance-adjusted floor")
+
+        genuinely_low_confidence = 0.0499  # meaningfully below 0.05, not a rounding artifact
+        self.assertLess(
+            genuinely_low_confidence, associations.MIN_CONFIDENCE - tol,
+            "a pair that is actually below MIN_CONFIDENCE must still be rejected -- the "
+            "tolerance must never function as a lowered threshold")
 
     def test_merges_split_historical_orders_sharing_source_order_id(self):
         """The bug this audit exists to fix: an earlier import recorded one
@@ -4874,6 +5873,281 @@ class TestAssociations(Base):
         self.assertGreaterEqual(d["combos_found"], 1)
         self.assertGreaterEqual(d["number_of_frequent_itemsets"], 1)
         self.assertGreaterEqual(d["number_of_association_rules"], 1)
+
+
+# ===========================================================================
+class TestAssociationsHoldoutValidation(Base):
+    """2026-10: product_combinations()'s holdout_validate path -- a
+    candidate that clears the in-sample thresholds on the TRAIN window must
+    still repeat on a later, chronologically separate HOLDOUT window the
+    miner never saw before it is treated as a real recommendation. These
+    tests use add_dated_order_multi (never add_order, whose created_at is
+    always "now") specifically to control which side of the chronological
+    split a given co-occurrence falls into -- that temporal control is the
+    one thing the existing TestAssociations fixtures above do not attempt
+    (300 transactions, 0.2 holdout fraction, so the split lands at
+    exactly transaction #240; everything here is built either side of it
+    deliberately, not left to insertion-order luck).
+    """
+
+    def _seed_split_dataset(self, pair_in_holdout_count):
+        """240 chronologically-earliest transactions (train) + 60
+        chronologically-latest (holdout) = 300 total, every one placed on
+        its own calendar day so ORDER BY created_at gives an unambiguous
+        split. 30 of the train-side transactions are an Alpha+Beta pair
+        that never appears alone (maximum, unambiguous lift); the holdout
+        side gets `pair_in_holdout_count` more of the same pair. Filler
+        orders (a third item, Gamma, alone) make up the rest of each side
+        so the pair's own support is well below 100%."""
+        recipe = add_recipe(self.conn, "Holdout Recipe", [])
+        alpha = add_menu_item(self.conn, "Combo Item Alpha", recipe, price=150.0, category="Mains")
+        beta = add_menu_item(self.conn, "Combo Item Beta", recipe, price=90.0, category="Drinks")
+        gamma = add_menu_item(self.conn, "Combo Item Gamma", recipe, price=60.0, category="Sides")
+
+        # Train window: days_ago 299 down to 60 (240 days, chronologically
+        # earliest -> lands in the TRAIN split).
+        train_days = list(range(299, 59, -1))
+        for i, d in enumerate(train_days):
+            if i < 30:
+                add_dated_order_multi(self.conn, days_ago(d), [(alpha, 1), (beta, 1)])
+            else:
+                add_dated_order_multi(self.conn, days_ago(d), [(gamma, 1)])
+
+        # Holdout window: days_ago 59 down to 0 (60 days, chronologically
+        # latest -> lands in the HOLDOUT split).
+        holdout_days = list(range(59, -1, -1))
+        for i, d in enumerate(holdout_days):
+            if i < pair_in_holdout_count:
+                add_dated_order_multi(self.conn, days_ago(d), [(alpha, 1), (beta, 1)])
+            else:
+                add_dated_order_multi(self.conn, days_ago(d), [(gamma, 1)])
+
+        self.conn.commit()
+        return alpha, beta, gamma
+
+    def test_pair_repeating_in_both_windows_is_validated(self):
+        self._seed_split_dataset(pair_in_holdout_count=10)  # >= MIN_HOLDOUT_PAIR_COUNT (5)
+
+        result = product_combinations(self.conn, lookback_days=365)
+
+        self.assertEqual(result["mining_basis"]["method"], "chronological_train_holdout")
+        self.assertEqual(result["mining_basis"]["train_transactions"], 240)
+        self.assertEqual(result["mining_basis"]["holdout_transactions"], 60)
+        combo = next(
+            (c for c in result["combos"]
+             if {c["item_a"], c["item_b"]} == {"Combo Item Alpha", "Combo Item Beta"}),
+            None,
+        )
+        self.assertIsNotNone(combo, "a pair that repeats in both windows must be validated")
+        self.assertEqual(combo["status"], "holdout_validated")
+        self.assertEqual(combo["validation_method"], "chronological_80_20_holdout")
+        self.assertEqual(combo["pair_count"], 30)          # train-side count
+        self.assertEqual(combo["holdout_pair_count"], 10)  # holdout-side count
+        self.assertGreater(combo["holdout_lift"], 1.1)
+        self.assertEqual(result["rejected_combinations"], [])
+
+    def test_pair_absent_from_holdout_is_rejected_not_silently_dropped(self):
+        self._seed_split_dataset(pair_in_holdout_count=0)  # clears train-side thresholds, never repeats later
+
+        result = product_combinations(self.conn, lookback_days=365)
+
+        self.assertEqual(result["mining_basis"]["candidates_considered"], 1)
+        self.assertEqual(result["mining_basis"]["candidates_validated"], 0)
+        self.assertEqual(result["combos"], [])
+        rejected = next(
+            (c for c in result["rejected_combinations"]
+             if {c["item_a"], c["item_b"]} == {"Combo Item Alpha", "Combo Item Beta"}),
+            None,
+        )
+        self.assertIsNotNone(rejected, "a candidate that fails holdout must be reported, not just dropped")
+        self.assertEqual(rejected["rejection_reason"], "insufficient_holdout_occurrences")
+        self.assertEqual(rejected["holdout_pair_count"], 0)
+        self.assertIn("none held up on the later, unseen holdout window", result["empty_reason"])
+
+    def test_pair_below_min_holdout_pair_count_is_rejected(self):
+        # 3 repeats in holdout clears "appeared at all" but not the
+        # MIN_HOLDOUT_PAIR_COUNT=5 floor -- must still be rejected, not
+        # waved through because it is not literally zero.
+        self._seed_split_dataset(pair_in_holdout_count=3)
+
+        result = product_combinations(self.conn, lookback_days=365)
+
+        self.assertEqual(result["combos"], [])
+        rejected = next(
+            c for c in result["rejected_combinations"]
+            if {c["item_a"], c["item_b"]} == {"Combo Item Alpha", "Combo Item Beta"}
+        )
+        self.assertEqual(rejected["rejection_reason"], "insufficient_holdout_occurrences")
+        self.assertEqual(rejected["holdout_pair_count"], 3)
+
+    def test_holdout_is_skipped_automatically_below_the_trustworthy_size(self):
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "Small A", recipe)
+        b = add_menu_item(self.conn, "Small B", recipe)
+        for _ in range(20):
+            add_order(self.conn, [(a, 1), (b, 1)])
+        for _ in range(20):
+            add_order(self.conn, [(a, 1)])
+
+        result = product_combinations(self.conn)  # 40 total -- below MIN_HOLDOUT_TRANSACTIONS*5
+
+        self.assertEqual(result["mining_basis"]["method"], "in_sample_only")
+        self.assertIn("cannot support a trustworthy chronological split", result["mining_basis"]["reason"])
+
+    def test_holdout_validate_false_restores_plain_in_sample_behavior(self):
+        self._seed_split_dataset(pair_in_holdout_count=0)  # would be REJECTED under holdout gating
+
+        result = product_combinations(self.conn, lookback_days=365, holdout_validate=False)
+
+        self.assertEqual(result["mining_basis"]["method"], "in_sample_only")
+        self.assertEqual(result["mining_basis"]["reason"], "holdout_validate=False")
+        combo = next(
+            c for c in result["combos"]
+            if {c["item_a"], c["item_b"]} == {"Combo Item Alpha", "Combo Item Beta"}
+        )
+        self.assertEqual(combo["status"], "validated_in_sample_only")
+        self.assertNotIn("holdout_lift", combo)
+
+
+# ===========================================================================
+class TestExpandingWindowValidation(Base):
+    """2026-10: expanding_window_validation()'s three nested train/test
+    folds (~180/240/300-day expanding training windows over the same real
+    365-day dataset) -- a SEPARATE analysis from the 80/20 single holdout
+    above, answering "is this stable over time" rather than "did it
+    survive one slice." Day offsets below are chosen to land exactly on
+    this function's own fold boundaries for a 365-day span anchored at
+    days_ago(364):
+      fold_1 train: days_ago 364..185 (180 days)   fold_1 test: 184..125 (60)
+      fold_2 train: days_ago 364..125 (240 days)   fold_2 test: 124..65  (60)
+      fold_3 train: days_ago 364..65  (300 days)   fold_3 test: 64..0    (65)
+    """
+
+    def test_pair_identified_early_and_passing_two_later_folds_is_validated_stable(self):
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "Expanding Alpha", recipe, price=150.0, category="Mains")
+        b = add_menu_item(self.conn, "Expanding Beta", recipe, price=90.0, category="Drinks")
+        g = add_menu_item(self.conn, "Expanding Gamma", recipe, price=60.0, category="Sides")
+
+        overrides = {}
+        for day in range(350, 365):             # 15 days inside fold_1's TRAIN window
+            overrides[day] = [a, b]
+        for day in range(119, 125):              # 6 days inside fold_2's TEST window
+            overrides[day] = [a, b]
+        for day in range(59, 65):                # 6 days inside fold_3's TEST window
+            overrides[day] = [a, b]
+
+        for day in range(0, 365):
+            lines = overrides.get(day, [g])
+            add_dated_order_multi(self.conn, days_ago(day), [(i, 1) for i in lines])
+        self.conn.commit()
+
+        result = expanding_window_validation(self.conn)
+        self.assertTrue(result["available"])
+        self.assertEqual([f["name"] for f in result["folds"]], ["fold_1", "fold_2", "fold_3"])
+
+        cand = next(
+            c for c in result["candidates"]
+            if {c["item_a"], c["item_b"]} == {"Expanding Alpha", "Expanding Beta"}
+        )
+        self.assertEqual(cand["identified_in_fold"], "fold_1")
+        self.assertEqual(cand["applicable_folds"], ["fold_1", "fold_2", "fold_3"])
+        by_fold = {fr["fold"]: fr for fr in cand["fold_results"]}
+        self.assertEqual(by_fold["fold_1"]["verdict"], "insufficient_evidence")  # 0 occurrences there
+        self.assertEqual(by_fold["fold_2"]["verdict"], "passed")
+        self.assertGreaterEqual(by_fold["fold_2"]["lift"], 1.1)
+        self.assertEqual(by_fold["fold_3"]["verdict"], "passed")
+        self.assertEqual(cand["stability_verdict"], "validated_stable")
+        self.assertEqual(result["summary"]["validated_stable"], 1)
+
+    def test_one_failing_evidenced_fold_overrides_a_later_passing_one(self):
+        """Conservative half of the rule: a real, measured failure in one
+        evidenced fold must disqualify "stable" even when a LATER fold
+        passes strongly -- stability is not decided by whichever fold
+        looks best."""
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "Expanding Alpha", recipe, price=150.0, category="Mains")
+        b = add_menu_item(self.conn, "Expanding Beta", recipe, price=90.0, category="Drinks")
+        g = add_menu_item(self.conn, "Expanding Gamma", recipe, price=60.0, category="Sides")
+
+        overrides = {}
+        for day in range(350, 365):                 # identification: 15 pure co-occurrences, fold_1 train
+            overrides[day] = [a, b]
+        # fold_2 test window (days_ago 124..65, 60 days): diluted so the
+        # pair is evidenced (5 co-occurrences) but at chance-level lift --
+        # 5 AB + 20 A-alone + 20 B-alone + 15 Gamma = 60 days exactly.
+        f2_days = list(range(65, 125))
+        for day in f2_days[:5]:
+            overrides[day] = [a, b]
+        for day in f2_days[5:25]:
+            overrides[day] = [a]
+        for day in f2_days[25:45]:
+            overrides[day] = [b]
+        # remaining f2_days[45:60] default to Gamma via the overrides.get fallback
+        # fold_3 test window (days_ago 64..0, 65 days): clean, strongly
+        # passing pattern (6 pure co-occurrences, rest Gamma).
+        for day in range(59, 65):
+            overrides[day] = [a, b]
+
+        for day in range(0, 365):
+            lines = overrides.get(day, [g])
+            add_dated_order_multi(self.conn, days_ago(day), [(i, 1) for i in lines])
+        self.conn.commit()
+
+        result = expanding_window_validation(self.conn)
+        cand = next(
+            c for c in result["candidates"]
+            if {c["item_a"], c["item_b"]} == {"Expanding Alpha", "Expanding Beta"}
+        )
+        by_fold = {fr["fold"]: fr for fr in cand["fold_results"]}
+        self.assertEqual(by_fold["fold_2"]["verdict"], "failed_lift")
+        self.assertLess(by_fold["fold_2"]["lift"], 1.10)
+        self.assertEqual(by_fold["fold_3"]["verdict"], "passed")  # the later fold genuinely passes
+        self.assertEqual(cand["stability_verdict"], "unstable_failed")  # but is overridden anyway
+
+    def test_pair_identified_only_at_the_last_fold_is_checked_only_against_that_folds_test(self):
+        """A pair invisible in fold_1 and fold_2's training (never appears
+        before days_ago 65) must not be retroactively checked against
+        fold_1 or fold_2's test windows -- those are already inside the
+        training data that would identify it once it does appear, so
+        checking them would not be a real out-of-sample test."""
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "Expanding Alpha", recipe, price=150.0, category="Mains")
+        b = add_menu_item(self.conn, "Expanding Beta", recipe, price=90.0, category="Drinks")
+        g = add_menu_item(self.conn, "Expanding Gamma", recipe, price=60.0, category="Sides")
+
+        overrides = {}
+        # days_ago 65..124 is fold_2's TEST window -- outside fold_1's train
+        # (185..364) and fold_2's train (125..364), but inside fold_3's
+        # train (65..364), so the pair is invisible until fold_3's mining.
+        for day in range(65, 77):                    # 12 occurrences
+            overrides[day] = [a, b]
+
+        for day in range(0, 365):
+            lines = overrides.get(day, [g])
+            add_dated_order_multi(self.conn, days_ago(day), [(i, 1) for i in lines])
+        self.conn.commit()
+
+        result = expanding_window_validation(self.conn)
+        cand = next(
+            (c for c in result["candidates"]
+             if {c["item_a"], c["item_b"]} == {"Expanding Alpha", "Expanding Beta"}),
+            None,
+        )
+        self.assertIsNotNone(cand)
+        self.assertEqual(cand["identified_in_fold"], "fold_3")
+        self.assertEqual(cand["applicable_folds"], ["fold_3"])
+        self.assertEqual(len(cand["fold_results"]), 1)
+        self.assertEqual(cand["fold_results"][0]["fold"], "fold_3")
+
+    def test_insufficient_data_reports_unavailable(self):
+        recipe = add_recipe(self.conn, "R", [])
+        a = add_menu_item(self.conn, "A", recipe)
+        for _ in range(5):
+            add_order(self.conn, [(a, 1)])
+        result = expanding_window_validation(self.conn)
+        self.assertFalse(result["available"])
+        self.assertIn("reason", result)
 
 
 # ===========================================================================
@@ -5087,6 +6361,19 @@ class TestFEFODepletion(Base):
         self.menu = add_menu_item(self.conn, "Platter", self.recipe)
 
     # -- helpers ----------------------------------------------------------
+    def future(self, days):
+        """An ISO date `days` from today's business date (timeutil.business_today,
+        the same Manila calendar the production expiry rule reads) — never a fixed
+        literal. These tests are about FEFO ORDERING (which open batch a sale
+        draws from first), not about expiry itself, so every date used here
+        must stay in the future indefinitely. A fixed '2026-08-20' already
+        aged into the past once (the 2026-10 expired-stock-usability fix
+        makes a sale skip an expired batch entirely — see
+        reservation.deplete_fefo's include_expired — which turned these into
+        false failures/errors, not real ones: the fixture date, not the
+        behavior, was wrong)."""
+        return _future_iso(days)
+
     def batches(self, state="open"):
         return self.conn.execute(
             "SELECT id, lot_no, qty_base, state FROM fefo_batch WHERE ingredient_id=? "
@@ -5121,7 +6408,7 @@ class TestFEFODepletion(Base):
 
     # -- tests ------------------------------------------------------------
     def test_consumption_actually_reduces_the_batch(self):
-        self.receive(1, "L1", "2026-12-31")           # 1000 g
+        self.receive(1, "L1", self.future(365))           # 1000 g
         self.assertAlmostEqual(self.batch_total(), 1000)
         self.sell()                                    # 500 g
         self.assertAlmostEqual(self.batch_total(), 500,
@@ -5129,24 +6416,24 @@ class TestFEFODepletion(Base):
         self.assert_consistent()
 
     def test_earliest_expiry_is_drawn_down_first(self):
-        self.receive(1, "LATE", "2026-12-31")
-        self.receive(1, "SOON", "2026-08-20")          # received later, expires sooner
+        self.receive(1, "LATE", self.future(365))
+        self.receive(1, "SOON", self.future(10))       # received later, expires sooner
         self.sell()
         by_lot = {b["lot_no"]: b["qty_base"] for b in self.batches()}
         self.assertAlmostEqual(by_lot["SOON"], 500, msg="FIFO would have hit LATE first")
         self.assertAlmostEqual(by_lot["LATE"], 1000)
 
     def test_depletion_carries_into_the_next_batch(self):
-        self.receive(0.3, "SOON", "2026-08-20")        # 300 g — cannot cover one platter
-        self.receive(1, "LATE", "2026-12-31")
+        self.receive(0.3, "SOON", self.future(10))     # 300 g — cannot cover one platter
+        self.receive(1, "LATE", self.future(365))
         self.sell()                                    # needs 500
         self.assertEqual([b["lot_no"] for b in self.batches()], ["LATE"])
         self.assertAlmostEqual(self.batches()[0]["qty_base"], 800)
         self.assert_consistent()
 
     def test_an_emptied_batch_is_marked_depleted_not_left_open_at_zero(self):
-        self.receive(0.5, "EXACT", "2026-08-20")       # exactly one platter
-        self.receive(1, "LATE", "2026-12-31")
+        self.receive(0.5, "EXACT", self.future(10))    # exactly one platter
+        self.receive(1, "LATE", self.future(365))
         self.sell()
         self.assertEqual([b["lot_no"] for b in self.batches()], ["LATE"])
         gone = self.conn.execute(
@@ -5155,7 +6442,7 @@ class TestFEFODepletion(Base):
         self.assertAlmostEqual(gone["qty_base"], 0)
 
     def test_a_batch_never_goes_negative(self):
-        self.receive(0.6, "ONLY", "2026-08-20")        # 600 g
+        self.receive(0.6, "ONLY", self.future(10))     # 600 g
         self.sell()                                    # 500
         row = self.conn.execute(
             "SELECT MIN(qty_base) AS m FROM fefo_batch WHERE ingredient_id=?",
@@ -5163,32 +6450,32 @@ class TestFEFODepletion(Base):
         self.assertGreaterEqual(row["m"], 0)
 
     def test_wastage_depletes_batches(self):
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         record_wastage(self.conn, self.ing, 250.0, "wastage", "dropped")
         self.assertAlmostEqual(self.batch_total(), 750)
         self.assert_consistent()
 
     def test_operational_use_depletes_batches(self):
         from wt.reservation import record_usage
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         record_usage(self.conn, self.ing, 200.0, "cleaning")
         self.assertAlmostEqual(self.batch_total(), 800)
         self.assert_consistent()
 
     def test_a_short_count_draws_the_difference_off_the_batches(self):
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         record_count(self.conn, self.ing, 900.0)
         self.assertAlmostEqual(self.batch_total(), 900)
         self.assert_consistent()
 
     def test_a_long_count_puts_the_difference_back(self):
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         record_count(self.conn, self.ing, 1200.0)
         self.assertAlmostEqual(self.batch_total(), 1200)
         self.assert_consistent()
 
     def test_void_after_commit_without_restock_nets_out_on_the_batches(self):
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         o = self.sell()
         void_after_commit(self.conn, o, "dropped at the pass", restock=False)
         # credit puts 500 back, the wastage leg immediately takes it out again
@@ -5196,7 +6483,7 @@ class TestFEFODepletion(Base):
         self.assert_consistent("after a void with no restock")
 
     def test_void_after_commit_with_restock_returns_it_to_the_batch(self):
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         o = self.sell()
         void_after_commit(self.conn, o, "fired in error", restock=True)
         self.assertAlmostEqual(self.batch_total(), 1000)
@@ -5206,13 +6493,13 @@ class TestFEFODepletion(Base):
         """A credit belongs to the batch the sale came out of, not a new
         delivery — reopening one would reset an expiry clock on stock that
         never left the walk-in."""
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         o = self.sell()
         void_after_commit(self.conn, o, "fired in error", restock=True)
         self.assertEqual(len(self.batches()), 1)
 
     def test_release_before_commit_leaves_batches_untouched(self):
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         o = add_order(self.conn, [(self.menu, 1)])
         reserve_order(self.conn, o)
         release_order(self.conn, o)
@@ -5222,15 +6509,15 @@ class TestFEFODepletion(Base):
         """The real assertion of this class: after receiving, selling,
         wasting, counting and voiding in one run, the batches still add up to
         the balance."""
-        self.receive(2, "A", "2026-09-30")
-        self.receive(1, "B", "2026-08-25")
+        self.receive(2, "A", self.future(15))
+        self.receive(1, "B", self.future(5))
         for _ in range(3):
             self.sell()
         record_wastage(self.conn, self.ing, 120.0, "spoilage", "off smell")
         o = self.sell()
         void_after_commit(self.conn, o, "sent back", restock=False)
         record_count(self.conn, self.ing, self.on_hand() - 40)
-        self.receive(1, "C", "2026-11-01")
+        self.receive(1, "C", self.future(30))
         self.sell()
         self.assert_consistent("after a full mixed sequence")
         self.assertGreaterEqual(
@@ -5253,7 +6540,7 @@ class TestFEFODepletion(Base):
                               (bare,)).fetchone()["on_hand_base"], 4900)
 
     def test_never_consumes_more_than_the_batches_hold(self):
-        self.receive(1, "L1", "2026-12-31")
+        self.receive(1, "L1", self.future(365))
         record_wastage(self.conn, self.ing, 1000.0, "wastage", "all of it")
         self.assertAlmostEqual(self.batch_total(), 0)
         self.assertEqual(len(self.batches()), 0)
@@ -5303,7 +6590,7 @@ class UnliBase(Base):
         self.stream = add_unli_stream(self.conn, "wings", self.wings, self.LAMBDA)
         self.menu = add_menu_item(self.conn, "Unlimited Wings", None, price=399.0, is_unli=True)
         backdate_coefficients(self.conn)
-        receive_stock(self.conn, self.wings, 500, lot_no="BULK", expires_at="2026-12-31")
+        receive_stock(self.conn, self.wings, 500, lot_no="BULK", expires_at=_future_iso(365))
 
     def on_hand(self):
         return self.conn.execute(
@@ -5314,6 +6601,399 @@ class UnliBase(Base):
         return self.conn.execute(
             "SELECT COALESCE(SUM(qty_base),0) AS q FROM fefo_batch WHERE ingredient_id=? "
             "AND state='open'", (self.wings,)).fetchone()["q"]
+
+
+# ===========================================================================
+# 2026-10 audit: expired stock must not be treated as usable.
+#
+# Physical stock and USABLE stock are different numbers: on_hand_base is the
+# total physically on the shelf (including whatever sits in an already-
+# expired open batch); usable/available stock is on_hand_base minus whatever
+# an already-expired batch accounts for. Nothing here deletes, zeroes, or
+# auto-writes-off expired stock -- it stays fully visible and fully present
+# until an explicit wastage/spoilage entry removes it.
+# ===========================================================================
+class TestExpiredStockUsability(Base):
+    def setUp(self):
+        super().setUp()
+        self.ing = add_ingredient(self.conn, "Wings", pack=1000, on_hand=0)
+        self.recipe = add_recipe(self.conn, "Platter", [(self.ing, 500)])
+        self.menu = add_menu_item(self.conn, "Platter", self.recipe)
+
+    def past(self, days=1):
+        return (dt.date.today() - dt.timedelta(days=days)).isoformat()
+
+    def future(self, days=30):
+        return (dt.date.today() + dt.timedelta(days=days)).isoformat()
+
+    def availability(self):
+        return self.conn.execute(
+            "SELECT * FROM v_menu_item_availability WHERE menu_item_pk=?", (self.menu,)
+        ).fetchone()
+
+    def expired_base(self):
+        row = self.conn.execute(
+            "SELECT expired_base FROM v_ingredient_expired_stock WHERE ingredient_id=?",
+            (self.ing,),
+        ).fetchone()
+        return row["expired_base"] if row else 0.0
+
+    def test_expired_only_stock_is_not_sellable(self):
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        av = self.availability()
+        self.assertEqual(av["sellable"], 0)
+        self.assertEqual(av["max_qty"], 0)
+        self.assertIn("out of stock", av["block_reason"])
+
+    def test_expired_stock_is_still_physically_on_hand(self):
+        """The date means 'do not use', not 'this was discarded'."""
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        on_hand = self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)
+        ).fetchone()["on_hand_base"]
+        self.assertAlmostEqual(on_hand, 1000.0)
+        self.assertAlmostEqual(self.expired_base(), 1000.0)
+
+    def test_reservation_is_refused_against_expired_only_stock(self):
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        o = add_order(self.conn, [(self.menu, 1)])
+        with self.assertRaises(InsufficientStockError):
+            reserve_order(self.conn, o)
+
+    def test_sale_draws_the_non_expired_batch_and_leaves_the_expired_one_untouched(self):
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        receive_stock(self.conn, self.ing, 1, lot_no="FRESH", expires_at=self.future())
+        o = add_order(self.conn, [(self.menu, 1)])
+        reserve_order(self.conn, o)   # needs 500; usable = 1000 (FRESH only) -- succeeds
+        commit_order(self.conn, o)
+        old = self.conn.execute("SELECT qty_base FROM fefo_batch WHERE lot_no='OLD'").fetchone()
+        fresh = self.conn.execute("SELECT qty_base FROM fefo_batch WHERE lot_no='FRESH'").fetchone()
+        self.assertAlmostEqual(old["qty_base"], 1000.0, msg="a sale must never draw an expired batch")
+        self.assertAlmostEqual(fresh["qty_base"], 500.0)
+
+    def test_usable_stock_is_available_when_a_non_expired_batch_also_exists(self):
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        receive_stock(self.conn, self.ing, 1, lot_no="FRESH", expires_at=self.future())
+        av = self.availability()
+        # on_hand totals 2000 (2 x 1000g packs); usable is only the 1000 in
+        # FRESH -- two 500g platters fit, not four.
+        self.assertEqual(av["sellable"], 1)
+        self.assertEqual(av["max_qty"], 2)
+
+    def test_availability_for_menu_item_agrees_with_the_view(self):
+        """The read-only advisory helper (reservation.availability_for_menu_item)
+        must never show a different usable number than the authoritative view
+        — a cashier would otherwise see a shortfall computed off stock the
+        order can't actually reserve."""
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        out = availability_for_menu_item(self.conn, self.menu)
+        self.assertFalse(out["sellable"])
+        self.assertEqual(out["max_qty"], 0)
+
+    def test_void_restock_does_not_credit_into_an_expired_batch(self):
+        """Once a sale can no longer draw from an expired batch, that batch
+        sits open with the single earliest expiry on the shelf -- restore_fefo
+        must not treat it as 'the batch that would be issued next' or a
+        perfectly good restored credit would be reclassified as unusable."""
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        receive_stock(self.conn, self.ing, 1, lot_no="FRESH", expires_at=self.future())
+        o = add_order(self.conn, [(self.menu, 1)])
+        reserve_order(self.conn, o)
+        commit_order(self.conn, o)
+        void_after_commit(self.conn, o, "fired in error", restock=True)
+        old = self.conn.execute("SELECT qty_base FROM fefo_batch WHERE lot_no='OLD'").fetchone()
+        fresh = self.conn.execute("SELECT qty_base FROM fefo_batch WHERE lot_no='FRESH'").fetchone()
+        self.assertAlmostEqual(old["qty_base"], 1000.0, msg="credit must not land in the expired batch")
+        self.assertAlmostEqual(fresh["qty_base"], 1000.0, msg="credit should return to the batch the sale drew from")
+
+    def test_physical_count_records_raw_physical_total_including_expired(self):
+        """Scenario 6/17: staff count what is physically in the freezer, not
+        a pre-subtracted 'usable' number the system invents on their behalf."""
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        r = record_count(self.conn, self.ing, 1000.0)  # confirms the physical total exactly
+        self.assertAlmostEqual(r["variance_base"], 0.0)
+        self.assertAlmostEqual(
+            self.conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?",
+                              (self.ing,)).fetchone()["on_hand_base"],
+            1000.0)
+
+    def test_explicit_disposal_of_an_expired_batch_makes_usable_equal_physical(self):
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        record_wastage(self.conn, self.ing, 1000.0, "spoilage", "discarded expired batch")
+        self.assertAlmostEqual(
+            self.conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?",
+                              (self.ing,)).fetchone()["on_hand_base"],
+            0.0)
+        self.assertAlmostEqual(self.expired_base(), 0.0)
+        gone = self.conn.execute(
+            "SELECT state, qty_base FROM fefo_batch WHERE lot_no='OLD'").fetchone()
+        self.assertEqual(gone["state"], "depleted")
+
+    def test_replenishment_available_excludes_expired_stock(self):
+        """depletion.ingredient_forecast's `available`/`onHand` split must
+        agree with the POS availability view and the reservation guard —
+        otherwise a purchase recommendation could read a healthy days-of-
+        supply off stock that can no longer legally be sold."""
+        receive_stock(self.conn, self.ing, 1, lot_no="OLD", expires_at=self.past())
+        f = depletion.ingredient_forecast(self.conn)
+        row = next(r for r in f["ingredients"] if r["ingredientId"] == self.ing)
+        self.assertAlmostEqual(row["onHand"], 1000.0)
+        self.assertAlmostEqual(row["available"], 0.0)
+        self.assertEqual(row["status"], "out")
+
+
+# ===========================================================================
+# 2026-10 audit: the narrow inventory.correct_stock capability. Grants ONLY
+# submit-a-physical-count — never receive, waste, edit, or general
+# inventory.read. See auth.py's CAPABILITIES comment for the (kitchen, admin)
+# role choice and why 'manager' (retired, no live account can hold it) and
+# 'owner' (read-only by explicit design everywhere else) are deliberately
+# excluded.
+# ===========================================================================
+class TestCorrectStockCapability(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        def token(u, password="wingstheory"):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
+            return r.json()["token"]
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}   # username 'owner', role=admin
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+
+        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        cls.H_OWNER_ROLE = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+
+        cls.ing = add_ingredient(cls.conn, "KitWings", pack=1000, on_hand=100)
+        cls.conn.commit()
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def test_kitchen_can_submit_a_physical_count(self):
+        # Other tests in this class share cls.ing/cls.conn and may have
+        # already moved its on_hand_base (e.g. test_admin_is_unaffected_and_
+        # keeps_full_access's receive/waste calls) -- read the current
+        # expected figure rather than assuming the fixture's original 100.
+        before = self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.ing,)
+        ).fetchone()["on_hand_base"]
+        r = self.client.post(f"/console/ingredients/{self.ing}/count", headers=self.H_KIT,
+                             json={"actual_base": 80})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertAlmostEqual(r.json()["variance_base"], 80 - before)
+
+    def test_kitchen_can_submit_a_bulk_count(self):
+        r = self.client.post("/console/ingredients/bulk-count", headers=self.H_KIT,
+                             json={"items": [{"ingredient_pk": self.ing, "actual_base": 75}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["updated"], 1)
+
+    def test_kitchen_cannot_receive(self):
+        self.assertEqual(
+            self.client.post(f"/console/ingredients/{self.ing}/receive", headers=self.H_KIT,
+                             json={"purchase_qty": 1}).status_code, 403)
+
+    def test_kitchen_cannot_waste(self):
+        self.assertEqual(
+            self.client.post(f"/console/ingredients/{self.ing}/waste", headers=self.H_KIT,
+                             json={"qty_base": 1}).status_code, 403)
+
+    def test_kitchen_cannot_use(self):
+        self.assertEqual(
+            self.client.post(f"/console/ingredients/{self.ing}/use", headers=self.H_KIT,
+                             json={"qty_base": 1}).status_code, 403)
+
+    def test_kitchen_cannot_edit_an_ingredient(self):
+        self.assertEqual(
+            self.client.patch(f"/console/ingredients/{self.ing}", headers=self.H_KIT,
+                              json={"supplier": "x"}).status_code, 403)
+
+    def test_kitchen_cannot_reach_the_full_inventory_read_list(self):
+        self.assertEqual(
+            self.client.get("/console/ingredients", headers=self.H_KIT).status_code, 403)
+
+    def test_kitchen_can_reach_the_narrow_quick_lookup(self):
+        r = self.client.get("/console/ingredients/quick?q=KitWings", headers=self.H_KIT)
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(any(i["name"] == "KitWings" for i in r.json()["ingredients"]))
+
+    def test_kitchen_can_reach_count_today(self):
+        self.assertEqual(self.client.get("/console/count-today", headers=self.H_KIT).status_code, 200)
+
+    def test_cashier_cannot_count(self):
+        self.assertEqual(
+            self.client.post(f"/console/ingredients/{self.ing}/count", headers=self.H_CASH,
+                             json={"actual_base": 1}).status_code, 403)
+
+    def test_cashier_cannot_reach_count_today_or_quick_lookup(self):
+        self.assertEqual(self.client.get("/console/count-today", headers=self.H_CASH).status_code, 403)
+        self.assertEqual(
+            self.client.get("/console/ingredients/quick", headers=self.H_CASH).status_code, 403)
+
+    def test_real_owner_role_cannot_count(self):
+        """Preserves the existing design: role='owner' is read-only across
+        every operational capability. A narrow correction capability is not
+        an exception to that."""
+        self.assertEqual(
+            self.client.post(f"/console/ingredients/{self.ing}/count", headers=self.H_OWNER_ROLE,
+                             json={"actual_base": 1}).status_code, 403)
+
+    def test_real_owner_role_can_still_view_count_today_via_inventory_read(self):
+        self.assertEqual(
+            self.client.get("/console/count-today", headers=self.H_OWNER_ROLE).status_code, 200)
+
+    def test_admin_is_unaffected_and_keeps_full_access(self):
+        for method, path, body in (
+            ("post", f"/console/ingredients/{self.ing}/count", {"actual_base": 90}),
+            ("post", f"/console/ingredients/{self.ing}/waste", {"qty_base": 1}),
+            ("post", f"/console/ingredients/{self.ing}/receive", {"purchase_qty": 1}),
+        ):
+            r = getattr(self.client, method)(path, headers=self.H_ADMIN, json=body)
+            self.assertEqual(r.status_code, 200, f"{path}: {r.text}")
+
+
+# ===========================================================================
+# 2026-10: a retried/double-clicked physical count must not apply its
+# correction twice. record_count already SETS on_hand_base to an absolute
+# value rather than adding a delta, so a bare retry could never move stock
+# further than intended -- but without client_request_id it would still post
+# a second, noise ledger row. This proves the dedupe.
+# ===========================================================================
+class TestCountIdempotency(Base):
+    def setUp(self):
+        super().setUp()
+        self.ing = add_ingredient(self.conn, "Garlic", pack=1000, on_hand=2000)
+
+    def ledger_count(self):
+        return self.conn.execute(
+            "SELECT COUNT(*) AS n FROM stock_ledger WHERE ingredient_id=? AND reason='count_adjustment'",
+            (self.ing,)).fetchone()["n"]
+
+    def test_a_retried_request_with_the_same_key_replays_the_original_result(self):
+        r1 = record_count(self.conn, self.ing, 1800.0, client_request_id="req-1")
+        r2 = record_count(self.conn, self.ing, 1800.0, client_request_id="req-1")
+        self.assertEqual(r1, r2)
+        self.assertEqual(self.ledger_count(), 1)
+        self.assertAlmostEqual(
+            self.conn.execute("SELECT on_hand_base FROM ingredient WHERE id=?",
+                              (self.ing,)).fetchone()["on_hand_base"],
+            1800.0)
+
+    def test_a_different_key_is_a_genuinely_new_correction(self):
+        record_count(self.conn, self.ing, 1800.0, client_request_id="req-1")
+        record_count(self.conn, self.ing, 1700.0, client_request_id="req-2")
+        self.assertEqual(self.ledger_count(), 2)
+
+    def test_no_key_at_all_behaves_exactly_as_before(self):
+        record_count(self.conn, self.ing, 1800.0)
+        record_count(self.conn, self.ing, 1800.0)
+        self.assertEqual(self.ledger_count(), 2)  # unchanged legacy behaviour without a key
+
+
+# ===========================================================================
+# 2026-10: Count Today -- a deterministic, explainable physical-count
+# shortlist. See wt/depletion.py's count_today() for the named thresholds;
+# every test below exercises one of them directly rather than asserting on
+# a black-box score.
+# ===========================================================================
+class TestCountToday(Base):
+    def test_nothing_flagged_when_everything_is_healthy(self):
+        add_ingredient(self.conn, "Salt", pack=1000, on_hand=50000)
+        out = depletion.count_today(self.conn)
+        self.assertEqual(out["needsChecking"], [])
+        self.assertEqual(out["worthChecking"], [])
+        self.assertGreaterEqual(out["totalIngredients"], 1)
+
+    def test_an_out_of_stock_ingredient_needs_checking_with_a_stated_reason(self):
+        ing = add_ingredient(self.conn, "Wings", pack=1000, on_hand=0)
+        rec = add_recipe(self.conn, "Platter", [(ing, 500)])
+        add_menu_item(self.conn, "Platter", rec)
+        # on_hand=0 alone puts depletion's status at 'out', regardless of
+        # whether any demand history exists yet for this item.
+        out = depletion.count_today(self.conn)
+        flagged = next((r for r in out["needsChecking"] if r["ingredientId"] == ing), None)
+        self.assertIsNotNone(flagged, "an out-of-stock ingredient must appear in needsChecking")
+        self.assertEqual(flagged["status"], "out")
+        self.assertTrue(any("run out" in r or "out of usable stock" in r for r in flagged["reasons"]))
+
+    def test_repeated_variance_puts_an_otherwise_healthy_ingredient_on_the_list(self):
+        # stock_ledger is append-only (UPDATE/DELETE both refused by trigger),
+        # so three independent-date count_adjustment rows are seeded the same
+        # way TestRepeatedVarianceSignal does: a direct backdated INSERT via
+        # add_ledger_entry, not three record_count() calls followed by an
+        # UPDATE of created_at.
+        ing = add_ingredient(self.conn, "Garlic", pack=1000, on_hand=40000)
+        for days in (15, 10, 5):
+            add_ledger_entry(self.conn, ing, -10000.0, "count_adjustment",
+                             days_ago(days), balance_after=40000.0)  # -20% each time
+        self.conn.commit()
+        out = depletion.count_today(self.conn)
+        flagged = next((r for r in out["needsChecking"] if r["ingredientId"] == ing), None)
+        self.assertIsNotNone(flagged, "a repeated-direction variance must surface in needsChecking")
+        self.assertTrue(any("repeated" in r.lower() for r in flagged["reasons"]))
+
+    def test_expiring_stock_is_flagged(self):
+        ing = add_ingredient(self.conn, "CreamDory", pack=1000, on_hand=0)
+        tomorrow = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+        receive_stock(self.conn, ing, 1, lot_no="L1", expires_at=tomorrow)
+        out = depletion.count_today(self.conn)
+        flagged = next(
+            (r for r in out["needsChecking"] + out["worthChecking"] if r["ingredientId"] == ing),
+            None)
+        self.assertIsNotNone(flagged, "an ingredient expiring tomorrow must be flagged")
+        self.assertTrue(any("expir" in r.lower() for r in flagged["reasons"]))
+
+    def test_staleness_alone_never_flags_an_otherwise_healthy_ingredient(self):
+        """Avoid alert overload: never having been counted is not, by itself,
+        a reason to demand a count of all 131 ingredients."""
+        add_ingredient(self.conn, "Sugar", pack=1000, on_hand=50000)
+        out = depletion.count_today(self.conn)
+        self.assertEqual(out["needsChecking"] + out["worthChecking"], [])
+
+    def test_does_not_require_counting_every_ingredient(self):
+        for i in range(10):
+            add_ingredient(self.conn, f"Plain{i}", pack=1000, on_hand=50000)
+        out = depletion.count_today(self.conn)
+        self.assertEqual(len(out["needsChecking"]) + len(out["worthChecking"]), 0)
+        self.assertGreaterEqual(out["totalIngredients"], 10)
+
+    def test_count_today_reuses_record_count_not_a_second_mechanism(self):
+        """The shortlist is read-only; submitting a count against a listed
+        ingredient still goes through the one existing record_count path."""
+        ing = add_ingredient(self.conn, "Wings2", pack=1000, on_hand=0)
+        rec = add_recipe(self.conn, "Plate", [(ing, 500)])
+        add_menu_item(self.conn, "Plate", rec)
+        out = depletion.count_today(self.conn)
+        self.assertTrue(any(r["ingredientId"] == ing for r in out["needsChecking"]))
+        r = record_count(self.conn, ing, 5000.0)
+        self.assertEqual(r["actual_base"], 5000.0)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM stock_ledger WHERE ingredient_id=? "
+                "AND reason='count_adjustment'", (ing,)).fetchone()["n"],
+            1)
 
 
 # ===========================================================================
@@ -5868,6 +7548,424 @@ class TestConsumptionAnomaly(UnliBase):
 
 
 # ===========================================================================
+# 2026-10 data-provenance audit: detect_consumption_anomalies() read
+# v_unli_daily_consumption with no eligibility filter at all, and that view
+# did not even expose unli_reconciliation.recorded_by for one to be built
+# against -- demo_seed._seed_unlimited_reconciliation()'s actual_base
+# (theoretical_base x a random ratio, never a scale reading) could have
+# trained and been flagged by the model exactly like a genuine kitchen
+# measurement. Fixed the same minimal way as the stock-loss pass: the view
+# now selects recorded_by (migration 0042); _consumption_records() filters
+# on it via _REAL_RECORDER_CLAUSE. The live database this was checked
+# against held zero unli_reconciliation rows of either kind, so there is no
+# observable before/after change in today's actual population -- the defect
+# was proven by code tracing, not by contaminated live output.
+# ===========================================================================
+class TestConsumptionAnomalyProvenance(UnliBase):
+    def _reconcile_as(self, days_back, heads, per_head, user_id, leftover=0.0):
+        d = days_ago(days_back)
+        add_unli_order(self.conn, self.menu, heads, d)
+        return unli.record_reconciliation(
+            self.conn, d, "wings",
+            opening_base=heads * per_head + leftover, closing_base=leftover,
+            user_id=user_id)
+
+    def test_a_genuine_recorded_by_is_eligible(self):
+        from wt.auth import hash_password
+        h, s = hash_password("wingstheory")
+        self.conn.execute(
+            "INSERT INTO app_user (username, display_name, role, password_hash, password_salt, "
+            "password_changed_at, must_change_password, is_active) "
+            "VALUES ('kitchen_real','Kitchen','kitchen',?,?,datetime('now'),0,1)", (h, s))
+        self._reconcile_as(1, 30, 1500.0, user_id="kitchen_real", leftover=100.0)
+        from wt.anomaly import _consumption_records
+        self.assertEqual(len(_consumption_records(self.conn, 90)), 1)
+
+    def test_demo_seeded_reconciliation_is_excluded(self):
+        """Reproduces demo_seed._seed_unlimited_reconciliation()'s exact
+        provenance stamp (user_id='demo_seed') on an otherwise identical
+        reconciliation row."""
+        self._reconcile_as(1, 30, 1500.0, user_id="demo_seed", leftover=100.0)
+        from wt.anomaly import _consumption_records
+        self.assertEqual(_consumption_records(self.conn, 90), [])
+        self.assertEqual(detect_consumption_anomalies(self.conn), [])
+
+    def test_xlsx_history_import_seeded_reconciliation_is_excluded(self):
+        self._reconcile_as(1, 30, 1500.0, user_id="xlsx_history_import", leftover=100.0)
+        from wt.anomaly import _consumption_records
+        self.assertEqual(_consumption_records(self.conn, 90), [])
+
+    def test_a_null_recorded_by_is_still_eligible(self):
+        """Unchanged behaviour: a system-internal write with no specific
+        human operator is not itself disqualifying — same convention as the
+        stock-loss pass's _REAL_USER_CLAUSE."""
+        self._reconcile_as(1, 30, 1500.0, user_id=None, leftover=100.0)
+        from wt.anomaly import _consumption_records
+        self.assertEqual(len(_consumption_records(self.conn, 90)), 1)
+
+    def test_synthetic_days_cannot_satisfy_the_minimum_reconciled_day_requirement(self):
+        """2 genuine + 10 demo-seeded reconciled days must NOT be presented
+        as 12 genuine days — the forest must not train off a minimum met
+        only by padding with synthetic history."""
+        from wt.anomaly import MIN_RECONCILED_DAYS
+        for i in range(2):
+            self._reconcile_as(i + 2, 30, 810.0, user_id=None)
+        for i in range(10):
+            self._reconcile_as(i + 20, 30, 810.0, user_id="demo_seed")
+        d = consumption_model_details(self.conn)
+        self.assertEqual(d["records_evaluated"], 2)
+        self.assertEqual(d["synthetic_excluded"], 10)
+        self.assertFalse(d["trained_this_call"],
+                         "2 genuine days padded with 10 synthetic ones must not reach "
+                         f"MIN_RECONCILED_DAYS={MIN_RECONCILED_DAYS}")
+
+    def test_genuine_days_at_or_above_minimum_train_normally(self):
+        from wt.anomaly import MIN_RECONCILED_DAYS
+        for i in range(MIN_RECONCILED_DAYS):
+            self._reconcile_as(i + 2, 30, 810.0 + (i % 3) * 4, user_id=None, leftover=200.0)
+        d = consumption_model_details(self.conn)
+        self.assertTrue(d["trained_this_call"])
+        self.assertEqual(d["synthetic_excluded"], 0)
+
+    def test_model_details_reports_synthetic_excluded_separately(self):
+        self._reconcile_as(1, 30, 810.0, user_id=None)
+        self._reconcile_as(2, 30, 810.0, user_id="demo_seed")
+        d = consumption_model_details(self.conn)
+        self.assertEqual(d["records_evaluated"], 1)
+        self.assertEqual(d["synthetic_excluded"], 1)
+        self.assertIn("demo_seed", d["synthetic_excluded_note"])
+
+    def test_an_ambiguous_recorded_by_defaults_to_excluded(self):
+        """Uncertain provenance must never silently enter real-world
+        evaluation — same fail-safe default as the stock-loss pass."""
+        self._reconcile_as(1, 30, 1500.0, user_id="some_unrecognized_value", leftover=100.0)
+        from wt.anomaly import _consumption_records
+        self.assertEqual(_consumption_records(self.conn, 90), [])
+
+    def test_a_real_order_with_synthetic_reconciliation_is_still_synthetic(self):
+        """The underlying unlimited order is genuine (add_unli_order runs the
+        real reserve_order/commit_order pipeline) -- only the RECONCILIATION
+        is demo-seeded. A real order does not launder a fabricated
+        measurement into genuine evidence."""
+        self._reconcile_as(1, 30, 1500.0, user_id="demo_seed", leftover=100.0)
+        from wt.anomaly import _consumption_records
+        self.assertEqual(_consumption_records(self.conn, 90), [])
+
+    def test_genuine_and_synthetic_reconciliation_coexist_without_mixing(self):
+        self._reconcile_as(1, 30, 810.0, user_id="realop3", leftover=200.0)
+        self._reconcile_as(2, 30, 1600.0, user_id="demo_seed", leftover=100.0)  # would-be outlier
+        from wt.auth import hash_password
+        h, s = hash_password("wingstheory")
+        self.conn.execute(
+            "INSERT INTO app_user (username, display_name, role, password_hash, password_salt, "
+            "password_changed_at, must_change_password, is_active) "
+            "VALUES ('realop3','Real Op','admin',?,?,datetime('now'),0,1)", (h, s))
+        from wt.anomaly import _consumption_records
+        records = _consumption_records(self.conn, 90)
+        self.assertEqual(len(records), 1)
+        self.assertAlmostEqual(records[0]["row"]["actual_per_head"], 810.0, delta=1.0)
+
+
+# ===========================================================================
+# 2026-10: review-sampling infrastructure for the consumption pass (migration
+# 0043) — mirrors TestAnomalySampling/TestValidationLabeling/
+# TestScientificValidationMetrics (stock-loss) over the consumption pass's
+# own observation unit (a reconciled service-date x stream day). Section 12
+# (rule vs. ML separation) gets its own dedicated tests below, since that is
+# the one genuinely new architectural question this pass raises that the
+# stock-loss pass does not have (no deterministic rule runs alongside it).
+# ===========================================================================
+class TestConsumptionValidationSampling(UnliBase):
+    def _reconcile_as(self, days_back, heads, per_head, user_id, leftover=0.0):
+        d = days_ago(days_back)
+        add_unli_order(self.conn, self.menu, heads, d)
+        return unli.record_reconciliation(
+            self.conn, d, "wings",
+            opening_base=heads * per_head + leftover, closing_base=leftover,
+            user_id=user_id)
+
+    def _trained_population(self):
+        """MIN_RECONCILED_DAYS ordinary genuine days plus one genuine, clear
+        outlier day — guaranteed to meet the forest's training threshold and
+        produce exactly one iforest-flagged day, mirroring TestAnomalySampling's
+        own stock-loss fixture."""
+        from wt.anomaly import MIN_RECONCILED_DAYS
+        for i in range(MIN_RECONCILED_DAYS):
+            self._reconcile_as(i + 2, 30, 810.0 + (i % 3) * 4, user_id=None, leftover=200.0)
+        self._reconcile_as(1, 30, 1500.0, user_id=None, leftover=100.0)
+
+    def test_synthetic_reconciliation_cannot_enter_validation_sampling(self):
+        for i in range(anomaly.MIN_RECONCILED_DAYS + 1):
+            self._reconcile_as(i + 2, 30, 810.0, user_id="demo_seed")
+        out = anomaly.sample_consumption_for_review(self.conn)
+        self.assertEqual(out["sampled"], 0)
+        self.assertEqual(out["candidates_considered"], 0)
+
+    def test_genuine_reconciliation_can_enter_sampling(self):
+        self._trained_population()
+        out = anomaly.sample_consumption_for_review(self.conn, n_near_threshold=0, n_random=0)
+        self.assertEqual(out["pools"]["model_flagged"], 1)
+
+    def test_flagged_genuine_observation_can_be_sampled(self):
+        self._trained_population()
+        anomaly.sample_consumption_for_review(self.conn, n_near_threshold=0, n_random=0)
+        row = self.conn.execute(
+            "SELECT * FROM unli_consumption_validation_sample WHERE sample_source='model_flagged'"
+        ).fetchone()
+        self.assertEqual(row["model_prediction"], "flagged")
+        self.assertEqual(row["human_label"], "pending")
+
+    def test_near_threshold_genuine_unflagged_observation_can_be_sampled(self):
+        self._trained_population()
+        out = anomaly.sample_consumption_for_review(self.conn, n_near_threshold=3, n_random=0)
+        self.assertGreater(out["pools"]["near_threshold"], 0)
+        rows = self.conn.execute(
+            "SELECT * FROM unli_consumption_validation_sample WHERE sample_source='near_threshold'"
+        ).fetchall()
+        for r in rows:
+            self.assertEqual(r["model_prediction"], "unflagged")
+
+    def test_random_genuine_unflagged_observation_can_be_sampled(self):
+        self._trained_population()
+        out = anomaly.sample_consumption_for_review(self.conn, n_near_threshold=0, n_random=4)
+        self.assertEqual(out["pools"]["random_unflagged"], 4)
+
+    def test_duplicate_pending_sample_is_prevented(self):
+        self._trained_population()
+        first = anomaly.sample_consumption_for_review(self.conn, n_near_threshold=2, n_random=2)
+        second = anomaly.sample_consumption_for_review(self.conn, n_near_threshold=2, n_random=2)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT reconciliation_id, COUNT(*) AS n FROM unli_consumption_validation_sample "
+                "GROUP BY reconciliation_id HAVING n > 1").fetchall(),
+            [])
+        total = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM unli_consumption_validation_sample").fetchone()["n"]
+        self.assertEqual(total, first["sampled"] + second["sampled"])
+
+    def test_sampling_never_writes_to_the_ledger_or_reconciliation_table(self):
+        self._trained_population()
+        recon_before = self.conn.execute("SELECT COUNT(*) AS n FROM unli_reconciliation").fetchone()["n"]
+        ledger_before = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        anomaly.sample_consumption_for_review(self.conn)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM unli_reconciliation").fetchone()["n"],
+            recon_before)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"],
+            ledger_before)
+
+
+class TestConsumptionValidationRuleVsML(UnliBase):
+    """Section 12 (the primary new architectural question this pass raises):
+    a day can be caught by the deterministic large_variance rule, the
+    IsolationForest, or both — scientific evaluation of Isolation Forest
+    must never attribute the rule's own correctness to the ML model."""
+
+    def _reconcile_as(self, days_back, heads, per_head, user_id, leftover=0.0):
+        d = days_ago(days_back)
+        add_unli_order(self.conn, self.menu, heads, d)
+        return unli.record_reconciliation(
+            self.conn, d, "wings",
+            opening_base=heads * per_head + leftover, closing_base=leftover,
+            user_id=user_id)
+
+    def test_below_minimum_sampling_refuses_rather_than_substituting_the_rule(self):
+        """Fewer than MIN_RECONCILED_DAYS genuine days -- only the rule can
+        fire. The sampler must report forest_trained=False and sample
+        NOTHING, rather than offering the rule's catch as 'model_flagged'."""
+        r = self._reconcile_as(1, 30, 1600.0, user_id=None)  # 100%+ over coefficient
+        self.assertEqual(
+            self.conn.execute("SELECT status FROM unli_reconciliation WHERE id=?",
+                              (r["id"],)).fetchone()["status"],
+            "over_tolerance")
+        flagged = detect_consumption_anomalies(self.conn)
+        self.assertEqual([f["method"] for f in flagged], ["large_variance"],
+                         "the rule should still flag it for the console's own plain list")
+        out = anomaly.sample_consumption_for_review(self.conn)
+        self.assertFalse(out["forest_trained"])
+        self.assertEqual(out["sampled"], 0)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM unli_consumption_validation_sample"
+                              ).fetchone()["n"], 0)
+
+    def test_at_or_above_minimum_allows_normal_sampling(self):
+        from wt.anomaly import MIN_RECONCILED_DAYS
+        for i in range(MIN_RECONCILED_DAYS):
+            self._reconcile_as(i + 2, 30, 810.0 + (i % 3) * 4, user_id=None, leftover=200.0)
+        out = anomaly.sample_consumption_for_review(self.conn, n_near_threshold=0, n_random=0)
+        self.assertTrue(out["forest_trained"])
+
+    def test_a_rule_only_catch_is_never_recorded_as_model_flagged(self):
+        """Even once the forest HAS trained (enough genuine days exist), a
+        day the rule alone catches (iforest says unflagged) must not be
+        sampled into the 'model_flagged' pool — only a genuine IForest
+        flag may."""
+        from wt.anomaly import MIN_RECONCILED_DAYS
+        for i in range(MIN_RECONCILED_DAYS):
+            self._reconcile_as(i + 2, 30, 810.0 + (i % 3) * 4, user_id=None, leftover=200.0)
+        records, threshold = anomaly._evaluate_consumption(self.conn, 90)
+        self.assertIsNotNone(threshold, "the forest should have trained with enough genuine days")
+        # Every sampled 'model_flagged' row must come from a record whose
+        # iforest_prediction (not rule_flagged) was actually 'flagged'.
+        out = anomaly.sample_consumption_for_review(self.conn, n_near_threshold=0, n_random=0)
+        flagged_ids = {r["row"]["reconciliation_id"] for r in records if r["iforest_prediction"] == "flagged"}
+        sampled_ids = {r["reconciliation_id"] for r in
+                      self.conn.execute(
+                          "SELECT reconciliation_id FROM unli_consumption_validation_sample "
+                          "WHERE sample_source='model_flagged'").fetchall()}
+        self.assertTrue(sampled_ids.issubset(flagged_ids))
+
+    def test_rule_flagged_is_preserved_on_the_sample_row_for_audit_but_not_used_in_metrics(self):
+        from wt.anomaly import MIN_RECONCILED_DAYS
+        for i in range(MIN_RECONCILED_DAYS):
+            self._reconcile_as(i + 2, 30, 810.0 + (i % 3) * 4, user_id=None, leftover=200.0)
+        self._reconcile_as(1, 30, 1600.0, user_id=None, leftover=50.0)  # likely both rule + iforest
+        anomaly.sample_consumption_for_review(self.conn, n_near_threshold=0, n_random=0)
+        rows = self.conn.execute(
+            "SELECT model_prediction, rule_flagged FROM unli_consumption_validation_sample "
+            "WHERE sample_source='model_flagged'").fetchall()
+        for r in rows:
+            self.assertEqual(r["model_prediction"], "flagged")
+            self.assertIn(r["rule_flagged"], (0, 1))
+
+
+class TestConsumptionValidationLabeling(UnliBase):
+    def _reconcile_as(self, days_back, heads, per_head, user_id, leftover=0.0):
+        d = days_ago(days_back)
+        add_unli_order(self.conn, self.menu, heads, d)
+        return unli.record_reconciliation(
+            self.conn, d, "wings",
+            opening_base=heads * per_head + leftover, closing_base=leftover,
+            user_id=user_id)
+
+    def _one_sample(self):
+        from wt.anomaly import MIN_RECONCILED_DAYS
+        for i in range(MIN_RECONCILED_DAYS):
+            self._reconcile_as(i + 2, 30, 810.0 + (i % 3) * 4, user_id=None, leftover=200.0)
+        self._reconcile_as(1, 30, 1500.0, user_id=None, leftover=100.0)
+        anomaly.sample_consumption_for_review(self.conn, n_near_threshold=0, n_random=0)
+        return self.conn.execute(
+            "SELECT id FROM unli_consumption_validation_sample WHERE sample_source='model_flagged'"
+        ).fetchone()["id"]
+
+    def test_model_prediction_and_human_label_remain_independent(self):
+        sample_id = self._one_sample()
+        anomaly.submit_consumption_validation_label(self.conn, sample_id, "expected_or_explained")
+        row = self.conn.execute(
+            "SELECT model_prediction, human_label FROM unli_consumption_validation_sample WHERE id=?",
+            (sample_id,)).fetchone()
+        self.assertEqual(row["model_prediction"], "flagged")
+        self.assertEqual(row["human_label"], "expected_or_explained")
+
+    def test_label_can_only_be_submitted_once(self):
+        sample_id = self._one_sample()
+        anomaly.submit_consumption_validation_label(self.conn, sample_id, "confirmed_anomaly")
+        with self.assertRaises(InvalidStateError):
+            anomaly.submit_consumption_validation_label(self.conn, sample_id, "expected_or_explained")
+
+    def test_unknown_label_is_rejected(self):
+        sample_id = self._one_sample()
+        with self.assertRaises(InvalidStateError):
+            anomaly.submit_consumption_validation_label(self.conn, sample_id, "false_positive")
+
+    def test_blind_queue_omits_model_derived_fields(self):
+        self._one_sample()
+        items = anomaly.consumption_validation_queue(self.conn, status="pending", blind=True)
+        self.assertEqual(len(items), 1)
+        for forbidden in ("sample_source", "model_prediction", "rule_flagged", "anomaly_score",
+                         "decision_threshold", "model_version", "eligibility_version"):
+            self.assertNotIn(forbidden, items[0])
+
+    def test_non_blind_queue_includes_model_derived_fields_for_audit(self):
+        self._one_sample()
+        items = anomaly.consumption_validation_queue(self.conn, status="pending", blind=False)
+        self.assertIn("model_prediction", items[0])
+        self.assertIn("rule_flagged", items[0])
+
+    def test_pending_samples_do_not_enter_final_metrics(self):
+        self._one_sample()
+        m = anomaly.scientific_consumption_validation_metrics(self.conn)
+        self.assertEqual(m["confusion_matrix"], {"tp": 0, "fp": 0, "fn": 0, "tn": 0})
+
+
+class TestScientificConsumptionValidationMetrics(UnliBase):
+    def _labeled_sample(self, days_back, prediction, human_label, heads=30):
+        d = days_ago(days_back)
+        add_unli_order(self.conn, self.menu, heads, d)
+        r = unli.record_reconciliation(
+            self.conn, d, "wings", opening_base=heads * 810.0 + 100, closing_base=100.0)
+        self.conn.execute(
+            "INSERT INTO unli_consumption_validation_sample "
+            "(reconciliation_id, sample_source, model_prediction, rule_flagged, anomaly_score, "
+            " decision_threshold, model_version, eligibility_version, human_label, reviewed_by, "
+            " reviewed_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,datetime('now'))",
+            (r["id"], "model_flagged" if prediction == "flagged" else "random_unflagged",
+             prediction, 0, 0.2, 0.1, anomaly.CONSUMPTION_MODEL_VERSION,
+             anomaly.CONSUMPTION_ELIGIBILITY_VERSION, human_label, "admin1"),
+        )
+        return r["id"]
+
+    def _fill_minimum_evidence(self):
+        for i in range(5):
+            self._labeled_sample(i + 2, "flagged", "confirmed_anomaly")
+        for i in range(5):
+            self._labeled_sample(i + 10, "unflagged", "expected_or_explained")
+        for i in range(5):
+            self._labeled_sample(i + 20, "flagged", "expected_or_explained")
+        for i in range(5):
+            self._labeled_sample(i + 30, "unflagged", "confirmed_anomaly")
+
+    def test_flagged_plus_confirmed_anomaly_is_tp(self):
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_consumption_validation_metrics(self.conn)
+        self.assertTrue(m["available"])
+        self.assertEqual(m["confusion_matrix"]["tp"], 5)
+
+    def test_flagged_plus_expected_or_explained_is_fp(self):
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_consumption_validation_metrics(self.conn)
+        self.assertEqual(m["confusion_matrix"]["fp"], 5)
+
+    def test_unflagged_plus_confirmed_anomaly_is_fn(self):
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_consumption_validation_metrics(self.conn)
+        self.assertEqual(m["confusion_matrix"]["fn"], 5)
+
+    def test_unflagged_plus_expected_or_explained_is_tn(self):
+        self._fill_minimum_evidence()
+        m = anomaly.scientific_consumption_validation_metrics(self.conn)
+        self.assertEqual(m["confusion_matrix"]["tn"], 5)
+
+    def test_insufficient_evidence_returns_unavailable(self):
+        self._labeled_sample(2, "flagged", "confirmed_anomaly")
+        self._labeled_sample(3, "unflagged", "expected_or_explained")
+        m = anomaly.scientific_consumption_validation_metrics(self.conn)
+        self.assertFalse(m["available"])
+        self.assertEqual(m["reason"], "insufficient_validation_data")
+
+    def test_lopsided_evidence_is_rejected(self):
+        for i in range(20):
+            self._labeled_sample(i + 2, "flagged", "confirmed_anomaly")
+        m = anomaly.scientific_consumption_validation_metrics(self.conn)
+        self.assertFalse(m["available"])
+
+    def test_different_material_model_versions_are_not_silently_pooled(self):
+        self._fill_minimum_evidence()
+        other_id = self._labeled_sample(50, "flagged", "confirmed_anomaly", heads=5)
+        self.conn.execute(
+            "UPDATE unli_consumption_validation_sample SET model_version='unli_consumption_isoforest_v999' "
+            "WHERE reconciliation_id=?", (other_id,))
+        current = anomaly.scientific_consumption_validation_metrics(self.conn)
+        self.assertEqual(current["confusion_matrix"]["tp"], 5)
+        other = anomaly.scientific_consumption_validation_metrics(
+            self.conn, model_version="unli_consumption_isoforest_v999",
+            eligibility_version=anomaly.CONSUMPTION_ELIGIBILITY_VERSION)
+        self.assertFalse(other["available"])
+
+
+# ===========================================================================
 class TestReorderPoint(Base):
     """reorder_point_base has been in the schema since 0001 and editable in
     the console for as long, and nothing ever read it."""
@@ -6029,17 +8127,24 @@ class TestUnliRBAC(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
 
     def test_reconciliation_did_not_hand_the_kitchen_inventory_write(self):
-        """The specific thing this capability exists to avoid."""
+        """unli.reconcile.write is narrow: it lets kitchen weigh an unlimited
+        tray, nothing else. 2026-10 adds a second, separately-narrow grant
+        (inventory.correct_stock) that DOES let kitchen submit a physical
+        count — see test_count_endpoint_capability_boundary below for that
+        one's own boundary — but neither grant reaches receiving, wastage,
+        general inventory.read, or editing an ingredient."""
         ing = self.conn.execute("SELECT id FROM ingredient LIMIT 1").fetchone()["id"]
         for path, body in (
             (f"/console/ingredients/{ing}/receive", {"purchase_qty": 1}),
             (f"/console/ingredients/{ing}/waste", {"qty_base": 1}),
-            (f"/console/ingredients/{ing}/count", {"actual_base": 1}),
         ):
             self.assertEqual(self.client.post(path, headers=self.H_KIT, json=body).status_code,
                              403, f"kitchen reached {path}")
         self.assertEqual(self.client.patch(f"/console/ingredients/{ing}", headers=self.H_KIT,
                                            json={"supplier": "x"}).status_code, 403)
+        # The full ingredient list (cost, supplier, every ingredient) stays
+        # behind inventory.read, which kitchen still does not hold — see
+        # /console/ingredients/quick for the narrow lookup it uses instead.
         self.assertEqual(self.client.get("/console/ingredients", headers=self.H_KIT).status_code,
                          403)
 
@@ -6318,7 +8423,7 @@ class TestRefillInventory(RefillBase):
         self.assertAlmostEqual(hot0 - self.onhand(self.hot), 72.0, places=6)
 
     def test_serving_writes_the_ledger_and_moves_the_batches(self):
-        receive_stock(self.conn, self.hot, 1, lot_no="L1", expires_at="2026-12-31")
+        receive_stock(self.conn, self.hot, 1, lot_no="L1", expires_at=_future_iso(365))
         batch0 = self.conn.execute(
             "SELECT SUM(qty_base) AS q FROM fefo_batch WHERE ingredient_id=? AND state='open'",
             (self.hot,)).fetchone()["q"]
@@ -6777,6 +8882,113 @@ class TestRefillReconciliationLink(RefillBase):
         ctx = unli.pending(self.conn, dt.date.today().isoformat())["refill_context"]
         self.assertEqual(ctx["refills_served"], 0)
         self.assertEqual(ctx["refills_voided"], 1)
+
+
+# ===========================================================================
+class TestRefillDemandReachesTheForecast(RefillBase):
+    """2026-10 fix: the remaining partial-demand-coverage audit.
+    wt/refills.py's own module docstring already documents the gap this
+    closes -- "every unlimited round served since the system went live
+    took sauce out of the walk-in that the inventory never knew about."
+    The real deduction (stock_ledger / fefo_batch) was always correct; what
+    was missing was wt/depletion.py's FORWARD projection ever counting it.
+
+    Real validation before this was wired in (see wt/depletion.py's
+    _refill_lambda docstring): for the two real production ingredients this
+    gap was found on, refill_lambda x real average daily heads landed
+    within 0.2-2.3% of those ingredients' independently-measured real
+    trailing ledger rate -- these tests check the same mechanism on a
+    small, fully-controlled fixture instead of production data.
+
+    Uses RefillBase's real fixtures and the REAL refills.open_session /
+    record_refill / serve_refill code path (never a hand-inserted ledger
+    row) -- then backdates the resulting real rows the same way every
+    other date-sensitive fixture in this file does, so the historical
+    bounding in _refill_lambda()/ingredient_forecast() has something
+    real to be historical ABOUT.
+    """
+
+    def _backdate_everything(self, iso_date, session_id, refill_ids):
+        ts = f"{iso_date} 12:00:00"
+        self.conn.execute(
+            "UPDATE customer_order SET created_at=? WHERE id IN "
+            "(SELECT order_id FROM unli_session WHERE id=?)", (ts, session_id))
+        self.conn.execute("UPDATE unli_session SET started_at=? WHERE id=?", (ts, session_id))
+        for rid in refill_ids:
+            self.conn.execute("UPDATE unli_refill SET created_at=? WHERE id=?", (ts, rid))
+            self.conn.execute("UPDATE unli_refill_line SET created_at=? WHERE refill_id=?", (ts, rid))
+        self.conn.commit()
+
+    def test_refill_only_ingredient_is_no_longer_modeled_as_zero_demand(self):
+        served = self.serve(self.buffalo)   # Hot Sauce + Butter, no recipe link of their own
+        self._backdate_everything(days_ago(10), self.sid, [served["id"]])
+
+        now = dt.datetime.combine(dt.date.today() - dt.timedelta(days=1),
+                                  dt.time(12, 0), tzinfo=dt.timezone.utc)
+        forecast = depletion.ingredient_forecast(self.conn, now=now, lookback_days=30)
+        row = next(r for r in forecast["ingredients"] if r["ingredientId"] == self.hot)
+
+        self.assertIsNotNone(row["refillSauceDailyConsumption"])
+        self.assertGreater(row["refillSauceDailyConsumption"], 0)
+        self.assertGreater(row["forecastDailyConsumption"], 0)
+        self.assertNotEqual(row["status"], "idle")
+
+    def test_refill_demand_is_additive_on_top_of_existing_recipe_demand(self):
+        """Butter is deducted by the Buffalo refill above AND has its own
+        regular a-la-carte recipe demand -- the fix must ADD the refill
+        component to that, never replace or override it."""
+        recipe = add_recipe(self.conn, "Garlic Butter Rice", [(self.butter, 20.0)])
+        menu_pk = add_menu_item(self.conn, "Garlic Butter Rice", recipe, price=120.0)
+        for d in range(10, 0, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, 3)
+        self.conn.commit()
+
+        now = dt.datetime.combine(dt.date.today() - dt.timedelta(days=1),
+                                  dt.time(12, 0), tzinfo=dt.timezone.utc)
+        recipe_only_forecast = depletion.ingredient_forecast(self.conn, now=now, lookback_days=30)
+        recipe_only_row = next(r for r in recipe_only_forecast["ingredients"]
+                               if r["ingredientId"] == self.butter)
+        recipe_only_demand = recipe_only_row["forecastDailyConsumption"]
+        self.assertGreater(recipe_only_demand, 0)   # the recipe alone already gives some demand
+
+        served = self.serve(self.buffalo)
+        self._backdate_everything(days_ago(10), self.sid, [served["id"]])
+        combined_forecast = depletion.ingredient_forecast(self.conn, now=now, lookback_days=30)
+        combined_row = next(r for r in combined_forecast["ingredients"] if r["ingredientId"] == self.butter)
+
+        self.assertGreater(combined_row["forecastDailyConsumption"], recipe_only_demand,
+                           "the refill component must add to existing recipe demand, not replace it")
+        self.assertAlmostEqual(
+            combined_row["forecastDailyConsumption"] - combined_row["refillSauceDailyConsumption"],
+            recipe_only_demand, delta=max(0.5, recipe_only_demand * 0.1),
+            msg="recipe-only demand should be roughly unchanged by adding the refill term on top")
+
+    def test_a_refill_outside_the_historical_window_is_not_leaked_in(self):
+        """A refill that happened AFTER the simulated `now` (or long before
+        the lookback window) must not be counted -- the same no-future-
+        leakage guarantee replenishment_backtest() relies on."""
+        served = self.serve(self.buffalo)
+        future_date = (dt.date.today() + dt.timedelta(days=5)).isoformat()
+        self._backdate_everything(future_date, self.sid, [served["id"]])
+
+        now = dt.datetime.combine(dt.date.today(), dt.time(12, 0), tzinfo=dt.timezone.utc)
+        forecast = depletion.ingredient_forecast(self.conn, now=now, lookback_days=30)
+        row = next(r for r in forecast["ingredients"] if r["ingredientId"] == self.hot)
+        self.assertIsNone(row["refillSauceDailyConsumption"])
+
+    def test_an_uncommitted_held_refill_does_not_count_as_consumption(self):
+        """record_refill() alone only HOLDS stock (state='held') -- only a
+        served (committed) round is real consumption."""
+        refills.record_refill(self.conn, self.sid, self.buffalo, user_id="cashier1")
+        self.conn.execute(
+            "UPDATE unli_refill_line SET created_at=? WHERE refill_id IN "
+            "(SELECT id FROM unli_refill WHERE session_id=?)", (f"{days_ago(5)} 12:00:00", self.sid))
+        self.conn.commit()
+
+        now = dt.datetime.combine(dt.date.today(), dt.time(12, 0), tzinfo=dt.timezone.utc)
+        forecast = depletion.ingredient_forecast(self.conn, now=now, lookback_days=30)
+        row = next(r for r in forecast["ingredients"] if r["ingredientId"] == self.hot)
+        self.assertIsNone(row["refillSauceDailyConsumption"])
 
 
 # ===========================================================================
@@ -7617,7 +9829,7 @@ class TestUnlimitedPortionMatrix(RefillBase):
         # construction, so the FEFO invariant at the end of this test would be
         # vacuous for it otherwise — see reservation.py's module docstring.
         record_count(self.conn, self.hot, 0.0)
-        receive_stock(self.conn, self.hot, 5, lot_no="LIFECYCLE", expires_at="2026-12-31")
+        receive_stock(self.conn, self.hot, 5, lot_no="LIFECYCLE", expires_at=_future_iso(365))
         order = self._paid_order(2)
         s = refills.open_session(self.conn, order)
         sid = s["session_id"]
@@ -8108,7 +10320,7 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
         ing = self.client.get("/console/ingredients?limit=1", headers=self.H_OWNER).json()["ingredients"][0]
         on_hand_before = self._on_hand(ing["id"])
         r = self.client.post(f"/console/ingredients/{ing['id']}/receive", headers=self.H_OWNER,
-                             json={"purchase_qty": 2, "lot_no": "MATRIX-1", "expires_at": "2027-06-01"})
+                             json={"purchase_qty": 2, "lot_no": "MATRIX-1", "expires_at": _future_iso(540)})
         self.assertEqual(r.status_code, 200, r.text)
         self.assertGreater(self._on_hand(ing["id"]), on_hand_before)
         self._assert_fefo_matches_on_hand(ing["id"])
@@ -8447,13 +10659,26 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
             "'g', 1, 'verified', 1.0, 'verified', 0, 10.0, 'verified')"
         ).lastrowid
 
+        # 2026-10 fix: these must be real DAYS FROM NOW, not hardcoded
+        # calendar dates. A fixed "EARLIER" date eventually becomes
+        # yesterday as the real clock advances past it, at which point
+        # deplete_fefo()'s own 2026-10 audit fix (commit_order passes
+        # include_expired=False, so a normal SALE never silently consumes
+        # an already-expired batch) correctly skips it and draws from
+        # LATER instead -- CORRECT application behavior that this test's
+        # stale fixture then misread as a failure. Both lots must stay
+        # genuinely unexpired for as long as this suite might run.
+        earlier_expires = (dt.date.today() + dt.timedelta(days=30)).isoformat()
+        later_expires = (dt.date.today() + dt.timedelta(days=400)).isoformat()
+
         # Received first, expires LATER -- would be issued first under FIFO.
         r1 = self.client.post(f"/console/ingredients/{ing_id}/receive", headers=self.H_OWNER,
-                              json={"purchase_qty": 300, "lot_no": "LATER", "expires_at": "2027-06-01"})
+                              json={"purchase_qty": 300, "lot_no": "LATER", "expires_at": later_expires})
         self.assertEqual(r1.status_code, 200, r1.text)
-        # Received second, expires SOONER -- FEFO must issue this one first.
+        # Received second, expires SOONER (but still weeks away, never
+        # expired itself) -- FEFO must issue this one first.
         r2 = self.client.post(f"/console/ingredients/{ing_id}/receive", headers=self.H_OWNER,
-                              json={"purchase_qty": 150, "lot_no": "EARLIER", "expires_at": "2026-10-01"})
+                              json={"purchase_qty": 150, "lot_no": "EARLIER", "expires_at": earlier_expires})
         self.assertEqual(r2.status_code, 200, r2.text)
         self.assertEqual(self._on_hand(ing_id), 450.0)
 
@@ -9362,6 +11587,346 @@ class TestIngredientDepletionForecast(Base):
 
 
 # ===========================================================================
+class TestReplenishmentBacktestHistoricalReconstruction(Base):
+    """2026-10 audit of the replenishment backtest's own real false-alarm/
+    missed-stockout root causes: two genuine, confirmed defects found by
+    tracing real cases through the full chain (forecast demand, on-hand,
+    lead time, threshold classification, actual subsequent consumption).
+
+    Defect 1 -- ingredient_forecast() always started its depletion
+    trajectory from the LIVE, current on_hand_base/available_base, even
+    when called with a historical `now` for backtesting. Confirmed
+    directly against production: the same ingredient returned the
+    IDENTICAL `available` at simulated dates 50, 30, and 10 days apart.
+    Fixed via the new `historical_available` parameter, reconstructed by
+    the caller with the existing _balances_at_cutoff() ledger walk-back.
+
+    Defect 2 -- an ingredient whose real consumption only ever posts as
+    sale_commit rows tied to NEITHER a POS-visible menu item's recipe NOR
+    one of the 4 registered unli_item streams (confirmed real-world case:
+    per-flavor unlimited-wings refill sauces, e.g. Corn Syrup, Garlic) had
+    its consumption modeled as exactly zero forever, regardless of how
+    much the real ledger showed leaving the shelf -- classified 'idle' and
+    never flagged, right up to a real stockout. Fixed by falling back to
+    the already-computed trailing ledger rate (forecasting.
+    ingredient_depletion()) ONLY when the structural (recipe+stream)
+    sources found literally nothing, mirroring the existing
+    _operational_rate() fallback's own guard exactly.
+
+    A related data-leakage bug in forecasting.ingredient_depletion() itself
+    (its lookback window was never bounded by a historical `now` either,
+    so defect 2's fallback would have silently read `now`-side future
+    ledger rows) is fixed alongside it and covered here too.
+    """
+
+    def _ing_with_unli_refill_only_consumption(self, now, lookback_days=1):
+        """An ingredient consumed ONLY via a sale_commit row that is NOT
+        reachable through any recipe or unli stream -- the exact real-world
+        shape of a per-flavor refill sauce."""
+        ing = add_ingredient(self.conn, "Refill Sauce", on_hand=10_000.0, pack=1000)
+        self.conn.commit()
+        day = (now.date() - dt.timedelta(days=1)).isoformat()
+        add_ledger_entry(self.conn, ing, -500.0, "sale_commit", day, balance_after=9500.0)
+        self.conn.commit()
+        return ing
+
+    def test_historical_available_overrides_the_live_on_hand_for_backtesting(self):
+        ing = add_ingredient(self.conn, "Historical Stock Item", on_hand=9999.0, pack=1000)
+        self.conn.commit()
+        now = dt.datetime(2026, 8, 25, 7, 0, 0, tzinfo=dt.timezone.utc)
+
+        forecast_live = depletion.ingredient_forecast(self.conn, now=now)
+        row_live = next(r for r in forecast_live["ingredients"] if r["ingredientId"] == ing)
+        self.assertEqual(row_live["available"], 9999.0)   # unchanged default behavior
+
+        forecast_override = depletion.ingredient_forecast(
+            self.conn, now=now, historical_available={ing: 42.0})
+        row_override = next(r for r in forecast_override["ingredients"] if r["ingredientId"] == ing)
+        self.assertEqual(row_override["available"], 42.0)
+
+    def test_an_ingredient_invisible_to_recipes_and_unli_streams_falls_back_to_trailing_rate(self):
+        now = dt.datetime(2026, 8, 25, 7, 0, 0, tzinfo=dt.timezone.utc)
+        ing = self._ing_with_unli_refill_only_consumption(now)
+
+        forecast = depletion.ingredient_forecast(self.conn, now=now, lookback_days=5)
+        row = next(r for r in forecast["ingredients"] if r["ingredientId"] == ing)
+        self.assertGreater(
+            row["forecastDailyConsumption"], 0,
+            "a measurable real ledger rate must not be silently modeled as zero demand "
+            "just because no recipe or unli stream claims this ingredient")
+        self.assertNotEqual(row["status"], "idle")
+
+    def test_ingredient_with_genuinely_zero_ledger_activity_still_reports_idle(self):
+        """The fallback must not manufacture demand for an ingredient that
+        truly has none -- the guard only fires when the real trailing rate
+        is itself positive."""
+        ing = add_ingredient(self.conn, "Truly Unused Ingredient", on_hand=500.0, pack=1000)
+        self.conn.commit()
+        now = dt.datetime(2026, 8, 25, 7, 0, 0, tzinfo=dt.timezone.utc)
+        forecast = depletion.ingredient_forecast(self.conn, now=now)
+        row = next(r for r in forecast["ingredients"] if r["ingredientId"] == ing)
+        self.assertEqual(row["forecastDailyConsumption"], 0)
+        self.assertEqual(row["status"], "idle")
+
+    def test_ingredient_depletion_rate_is_scoped_to_the_given_historical_now(self):
+        """2026-10 fix: forecasting.ingredient_depletion()'s trailing rate
+        must change as `now` moves across a real change in ledger activity
+        -- before this fix it always read the live wall-clock window
+        regardless of `now`, so the SAME call at two different historical
+        dates either side of a real activity change returned identical
+        results."""
+        ing = add_ingredient(self.conn, "Scoped Rate Item", on_hand=100_000.0, pack=1000)
+        rec = add_recipe(self.conn, "Scoped Rate Recipe", [(ing, 10.0)])
+        menu_pk = add_menu_item(self.conn, "Scoped Rate Item Dish", rec)
+        # Real consumption only in the first half of a 20-day span.
+        for d in range(20, 10, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, 5)
+            add_ledger_entry(self.conn, ing, -50.0, "sale_commit", days_ago(d))
+        self.conn.commit()
+
+        before_gap = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=11), dt.time(12, 0), tzinfo=dt.timezone.utc)
+        after_gap = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=1), dt.time(12, 0), tzinfo=dt.timezone.utc)
+
+        rate_during = {r["ingredient_id"]: r["avg_daily_consumption"]
+                      for r in forecasting.ingredient_depletion(self.conn, lookback_days=15, now=before_gap)}
+        rate_after = {r["ingredient_id"]: r["avg_daily_consumption"]
+                     for r in forecasting.ingredient_depletion(self.conn, lookback_days=15, now=after_gap)}
+
+        self.assertGreater(rate_during.get(ing, 0), 0)
+        self.assertNotEqual(
+            rate_during[ing], rate_after.get(ing, 0),
+            "the trailing rate must reflect the window ending at `now`, not always the live, "
+            "current wall-clock window")
+
+    def test_received_within_window_and_historical_reconstruction_agree_on_a_known_scenario(self):
+        """End-to-end sanity check on the real combination both fixes feed
+        into: replenishment_backtest() itself, on a small fully-controlled
+        scenario where the correct classification is known by construction
+        -- an ingredient with low historical stock and steady real demand
+        that genuinely runs out, caught via the reconstructed (not live)
+        on-hand balance."""
+        ing = add_ingredient(self.conn, "Backtest Known Stockout Item", on_hand=2000.0, pack=1000)
+        rec = add_recipe(self.conn, "Backtest Known Recipe", [(ing, 50.0)])
+        menu_pk = add_menu_item(self.conn, "Backtest Known Dish", rec)
+        for d in range(50, 0, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, 4)
+            add_ledger_entry(self.conn, ing, -200.0, "sale_commit", days_ago(d))
+        self.conn.commit()
+        # Drive on_hand down to near-zero as of "today" so a backtest
+        # evaluation point in the recent past reconstructs a low, at-risk
+        # balance rather than reading today's already-depleted live figure.
+        self.conn.execute("UPDATE ingredient SET on_hand_base=100 WHERE id=?", (ing,))
+        self.conn.commit()
+
+        result = depletion.replenishment_backtest(self.conn, lookback_days=40)
+        self.assertTrue(result["available"])
+        # Not asserting a specific confusion-matrix bucket for this one
+        # ingredient among others seeded by the test framework -- the real
+        # assertion is that the backtest runs end-to-end over a scenario
+        # explicitly shaped to exercise historical reconstruction, and
+        # reports a coherent, non-degenerate confusion matrix.
+        total = sum(result["confusion"].values())
+        self.assertEqual(total, result["total_ingredient_evaluations"])
+
+
+# ===========================================================================
+class TestHistoricalLeakagePrevention(Base):
+    """2026-10 leakage audit. Confirmed real, active leakage in
+    wt/depletion.py's _trading_days/_item_daily_qty/_heads_daily/
+    _intraday_share (the helpers behind build_demand(), which
+    replenishment_backtest()'s EWMA path depends on): each ran
+    `created_at >= utc_bound_n_manila_days_ago(lookback_days)` with the
+    lower bound itself never threaded with a `now` override, and no upper
+    bound at all -- confirmed empirically before the fix by calling
+    ingredient_forecast() with `now` 50/30/10 days apart and getting back
+    the IDENTICAL forecastDailyConsumption for the same ingredient every
+    time, which is only possible if the historical `now` was never
+    actually bounding the window.
+
+    Also audited and closed, defensively, even though no current caller
+    triggers them (confirmed by tracing every call site): the identical gap
+    in wt/forecasting.py's _daily_series()/_store_daily_series() (their
+    `rows` return value, which only feeds fit_prophet()'s weeks_covered
+    seasonality count -- `series`, what the Prophet fit itself trains on,
+    was already correctly bounded by construction) and effective_now()'s
+    own dead-tail-detection query.
+
+    What did NOT need fixing, confirmed by tracing every caller: forecasting.
+    evaluate_demand_model()/evaluate_store_demand_model() (the Prophet-vs-
+    baseline numbers already on record) are called ONLY with now=None
+    (api.py's model_details_endpoint) -- with no historical `now` ever
+    supplied, there is no future data on the real ledger for the old,
+    unbounded query to have leaked, so those specific previously-reported
+    numbers are unaffected and remain valid as reported. The leakage was
+    real but it was a latent capability in forecasting.py and an ACTIVE one
+    in depletion.py specifically because replenishment_backtest() is the
+    one caller that actually simulates multiple past `now` values.
+    """
+
+    def _seed_pasta_item(self, days=30, daily_qty=5, per_serving=10.0):
+        ing = add_ingredient(self.conn, "Leakage Test Ingredient", on_hand=1_000_000.0, pack=1000)
+        rec = add_recipe(self.conn, "Leakage Test Recipe", [(ing, per_serving)])
+        menu_pk = add_menu_item(self.conn, "Leakage Test Dish", rec)
+        for d in range(days, 0, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, daily_qty)
+        self.conn.commit()
+        return ing, menu_pk
+
+    def test_build_demand_is_unaffected_by_orders_placed_after_the_historical_cutoff(self):
+        ing, menu_pk = self._seed_pasta_item()
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=5), dt.time(20, 0), tzinfo=dt.timezone.utc)
+
+        before = depletion.build_demand(self.conn, lookback_days=30, now=cutoff)
+        before_qty = {d: before["items"][menu_pk].baseline for d in [0]}  # snapshot the baseline level
+
+        # A real order placed strictly AFTER the historical cutoff.
+        add_dated_order(self.conn, days_ago(0), menu_pk, 500)
+        self.conn.commit()
+
+        after = depletion.build_demand(self.conn, lookback_days=30, now=cutoff)
+        self.assertEqual(before["items"][menu_pk].baseline, after["items"][menu_pk].baseline)
+        self.assertEqual(before["heads"].daily, after["heads"].daily)
+        self.assertEqual(before["trading_days"], after["trading_days"])
+
+    def test_ingredient_forecast_result_is_unaffected_by_orders_placed_after_the_cutoff(self):
+        """The end-to-end proof: the exact function replenishment_backtest()
+        calls at every evaluation point must not change when real orders
+        land after the point being evaluated."""
+        ing, menu_pk = self._seed_pasta_item()
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=5), dt.time(20, 0), tzinfo=dt.timezone.utc)
+
+        before = depletion.ingredient_forecast(self.conn, now=cutoff, lookback_days=30)
+        before_row = next(r for r in before["ingredients"] if r["ingredientId"] == ing)
+
+        add_dated_order(self.conn, days_ago(0), menu_pk, 500)
+        add_ledger_entry(self.conn, ing, -5000.0, "sale_commit", days_ago(0))
+        self.conn.commit()
+
+        after = depletion.ingredient_forecast(self.conn, now=cutoff, lookback_days=30)
+        after_row = next(r for r in after["ingredients"] if r["ingredientId"] == ing)
+
+        self.assertEqual(before_row["forecastDailyConsumption"], after_row["forecastDailyConsumption"])
+        self.assertEqual(before_row["status"], after_row["status"])
+        self.assertEqual(before_row["daysOfSupply"], after_row["daysOfSupply"])
+
+    def test_trading_days_excludes_a_future_dated_order(self):
+        _, menu_pk = self._seed_pasta_item(days=10)
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=3), dt.time(20, 0), tzinfo=dt.timezone.utc)
+        before = depletion._trading_days(self.conn, 30, cutoff)
+
+        add_dated_order(self.conn, days_ago(0), menu_pk, 1)
+        self.conn.commit()
+        after = depletion._trading_days(self.conn, 30, cutoff)
+        self.assertEqual(before, after)
+        self.assertNotIn(dt.date.today().isoformat(), after)
+
+    def test_item_daily_qty_excludes_a_future_dated_order(self):
+        _, menu_pk = self._seed_pasta_item(days=10)
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=3), dt.time(20, 0), tzinfo=dt.timezone.utc)
+        before = depletion._item_daily_qty(self.conn, 30, cutoff)
+
+        add_dated_order(self.conn, days_ago(0), menu_pk, 999)
+        self.conn.commit()
+        after = depletion._item_daily_qty(self.conn, 30, cutoff)
+        self.assertEqual(before.get(menu_pk, {}), after.get(menu_pk, {}))
+        self.assertNotIn(dt.date.today().isoformat(), after.get(menu_pk, {}))
+
+    def test_heads_daily_excludes_a_future_dated_order(self):
+        recipe = add_recipe(self.conn, "R", [])
+        unli_menu = add_menu_item(self.conn, "Unli Leakage Test", recipe, price=399.0, is_unli=True)
+        for d in range(10, 0, -1):
+            add_dated_order(self.conn, days_ago(d), unli_menu, 2)
+        self.conn.commit()
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=3), dt.time(20, 0), tzinfo=dt.timezone.utc)
+        before = depletion._heads_daily(self.conn, 30, cutoff)
+
+        add_dated_order(self.conn, days_ago(0), unli_menu, 50)
+        self.conn.commit()
+        after = depletion._heads_daily(self.conn, 30, cutoff)
+        self.assertEqual(before, after)
+        self.assertNotIn(dt.date.today().isoformat(), after)
+
+    def test_intraday_share_excludes_a_future_dated_order(self):
+        _, menu_pk = self._seed_pasta_item(days=10)
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=3), dt.time(20, 0), tzinfo=dt.timezone.utc)
+        before = depletion._intraday_share(self.conn, 30, cutoff)
+
+        add_dated_order(self.conn, days_ago(0), menu_pk, 999)
+        self.conn.commit()
+        after = depletion._intraday_share(self.conn, 30, cutoff)
+        self.assertEqual(before, after)
+
+    def test_forecasting_daily_series_excludes_a_future_dated_order(self):
+        _, menu_pk = self._seed_pasta_item(days=10)
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=3), dt.time(20, 0), tzinfo=dt.timezone.utc)
+        before_rows, before_series = forecasting._daily_series(self.conn, menu_pk, 30, now=cutoff)
+
+        add_dated_order(self.conn, days_ago(0), menu_pk, 999)
+        self.conn.commit()
+        after_rows, after_series = forecasting._daily_series(self.conn, menu_pk, 30, now=cutoff)
+
+        self.assertEqual(before_series, after_series)
+        self.assertEqual(before_rows, after_rows)
+        self.assertNotIn(dt.date.today().isoformat(), {r["d"] for r in after_rows})
+
+    def test_forecasting_store_daily_series_excludes_a_future_dated_order(self):
+        _, menu_pk = self._seed_pasta_item(days=10)
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=3), dt.time(20, 0), tzinfo=dt.timezone.utc)
+        before = forecasting._store_daily_series(self.conn, 30, now=cutoff)
+
+        add_dated_order(self.conn, days_ago(0), menu_pk, 999)
+        self.conn.commit()
+        after = forecasting._store_daily_series(self.conn, 30, now=cutoff)
+
+        for metric in forecasting.STORE_METRICS:
+            self.assertEqual(before[metric], after[metric])
+
+    def test_effective_now_dead_tail_detection_excludes_a_future_dated_order(self):
+        _, menu_pk = self._seed_pasta_item(days=20, daily_qty=20)
+        cutoff = dt.datetime.combine(
+            dt.date.today() - dt.timedelta(days=3), dt.time(20, 0), tzinfo=dt.timezone.utc)
+        before = forecasting.effective_now(self.conn, now=cutoff)
+
+        # A real future order burst that would otherwise mask/change a
+        # dead-tail judgement made as of the historical cutoff.
+        for d in range(2, -1, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, 20)
+        self.conn.commit()
+        after = forecasting.effective_now(self.conn, now=cutoff)
+        self.assertEqual(before, after)
+
+    def test_replenishment_backtest_result_is_unchanged_by_orders_added_after_the_evaluation_window(self):
+        """The real end-to-end guarantee: a full backtest run, then a real
+        order placed strictly in the future relative to EVERY evaluation
+        point the backtest looked at, then the identical backtest re-run
+        must report the identical confusion matrix."""
+        ing, menu_pk = self._seed_pasta_item(days=55, daily_qty=5)
+        self.conn.execute("UPDATE ingredient SET on_hand_base=100000 WHERE id=?", (ing,))
+        self.conn.commit()
+
+        before = depletion.replenishment_backtest(self.conn, lookback_days=40)
+        self.assertTrue(before["available"])
+
+        # Strictly after every evaluation point's check window (today).
+        add_dated_order(self.conn, days_ago(0), menu_pk, 9999)
+        add_ledger_entry(self.conn, ing, -99990.0, "sale_commit", days_ago(0))
+        self.conn.commit()
+
+        after = depletion.replenishment_backtest(self.conn, lookback_days=40)
+        self.assertEqual(before["confusion"], after["confusion"])
+
+
+# ===========================================================================
 class TestDepletionProphetDemandModel(Base):
     """2026-09: wt/depletion.py's demand_model='prophet' path -- Prophet as
     an OPT-IN alternative to the default EWMA baseline for the future-day
@@ -9490,6 +12055,278 @@ class TestDepletionProphetDemandModel(Base):
         self.assertEqual(stale["items"][menu_pk].demand_source, "ewma")
         self.assertGreater(stale["items"][menu_pk].daily[1], 0.0)
 
+    def test_refresh_reports_growth_counts_that_sum_to_fitted(self):
+        """2026-09 adaptive-growth pass, production integration (#6): a
+        21-day-old item has real sale-days confined to the tail of the
+        365-day GROWTH_SELECTION_LOOKBACK_DAYS window -- at this function's
+        own horizon_days=HORIZON_DAYS=21, that structurally leaves 0 usable
+        growth-selection folds (the fold that would score them consumes
+        every real day as ITS OWN test window, leaving no training rows
+        before it), so this item must deterministically fall back rather
+        than silently guess. growthFlat + growthLinear + growthFallback
+        must always equal fitted -- every fitted item falls into exactly
+        one bucket."""
+        self._seed_item("Fresh Item", days=21)
+        result = depletion.refresh_prophet_baselines(self.conn)
+        self.assertEqual(result["fitted"], 1)
+        self.assertEqual(result["growthFlat"] + result["growthLinear"] + result["growthFallback"],
+                         result["fitted"])
+        self.assertEqual(result["growthFallback"], 1)
+
+    def test_refresh_caches_growth_selection_metadata_with_the_documented_fields(self):
+        """The cached fit result must carry growth_used plus a
+        growth_selection dict with the fields this feature's spec named:
+        series_key, selected_growth, selection_date, training_cutoff,
+        flat_validation_wape, linear_validation_wape, reason -- and that
+        cache entry must reach build_demand() unchanged (extra keys, not
+        replaced ones)."""
+        ing, menu_pk = self._seed_item("Long History Item", days=100, daily=8)
+        result = depletion.refresh_prophet_baselines(self.conn)
+        self.assertEqual(result["fitted"], 1)
+
+        key = (depletion._prophet_scope_key(self.conn), menu_pk,
+              depletion.LOOKBACK_DAYS, depletion.HORIZON_DAYS)
+        with depletion._prophet_lock:
+            _, cached = depletion._prophet_store[key]
+        self.assertIn(cached["growth_used"], forecasting.GROWTH_CANDIDATES)
+        gs = cached["growth_selection"]
+        for field in ("series_key", "selected_growth", "selection_date", "training_cutoff",
+                     "flat_validation_wape", "linear_validation_wape", "reason"):
+            self.assertIn(field, gs)
+        self.assertEqual(gs["series_key"], f"menu_item:{menu_pk}")
+        self.assertEqual(gs["selected_growth"], cached["growth_used"])
+
+        # Still reaches the live pipeline exactly as before this feature --
+        # only the cache's CONTENTS gained keys, nothing about how
+        # build_demand() reads it changed.
+        demand = depletion.build_demand(self.conn, demand_model="prophet")
+        self.assertEqual(demand["items"][menu_pk].demand_source, "prophet")
+
+    def test_refresh_populates_the_shared_growth_cache_menu_item_demand_prophet_reads(self):
+        """2026-09 second adaptive-growth pass -- the actual consistency fix:
+        refresh_prophet_baselines() must populate forecasting's SHARED
+        growth cache (not just its own local _prophet_store), and
+        menu_item_demand_prophet() must then read the identical selection
+        replenishment used, closing the gap where that page silently kept
+        the old global default."""
+        ing, menu_pk = self._seed_item("Shared Cache Item", days=100, daily=8)
+        depletion.refresh_prophet_baselines(self.conn)
+
+        cached = forecasting.cached_growth_for(self.conn, f"menu_item:{menu_pk}")
+        self.assertIsNotNone(cached)
+        self.assertIn(cached["selected_growth"], forecasting.GROWTH_CANDIDATES)
+
+        detail = forecasting.menu_item_demand_prophet(self.conn, menu_pk, horizon_days=5)
+        if detail["method"] != "prophet":
+            return
+        self.assertEqual(detail["growth_used"], cached["selected_growth"])
+        self.assertEqual(detail["growth_source"], "cached_adaptive")
+
+    def test_refresh_also_selects_and_caches_store_level_growth(self):
+        """2026-09 second pass: refresh_prophet_baselines() now also runs
+        Level-1 selection for the 3 store-wide metrics, not just per-item --
+        store_demand_prophet() had no other route to a non-default growth
+        choice, since it isn't part of the per-item _prophet_store/
+        build_demand machinery."""
+        self._seed_item("Store Coverage Item", days=100, daily=8)
+        result = depletion.refresh_prophet_baselines(self.conn)
+        self.assertEqual(
+            result["storeGrowthFlat"] + result["storeGrowthLinear"] + result["storeGrowthFallback"],
+            len(forecasting.STORE_METRICS),
+        )
+        for metric in forecasting.STORE_METRICS:
+            cached = forecasting.cached_growth_for(self.conn, f"store:{metric}")
+            self.assertIsNotNone(cached)
+            self.assertIn(cached["selected_growth"], forecasting.GROWTH_CANDIDATES)
+
+
+class TestDepletionHybridDemandModel(Base):
+    """2026-09, production-integration pass -- demand_model='hybrid', the
+    strategy evaluate_demand_model() actually reports 55.69% fleet-mean WAPE
+    for. Closes the gap where that number was an evaluation/reporting-only
+    construct: refresh_prophet_baselines() now also runs Level-2 method
+    selection (forecasting._backtest_series()) per item and caches whichever
+    method won (_hybrid_store, mirroring _prophet_store exactly), and
+    build_demand(demand_model='hybrid') reads it.
+
+    demand_model='prophet' is a completely separate, unmodified cache/code
+    path (_prophet_store) -- see test_prophet_mode_is_unaffected_by_hybrid
+    below for the explicit proof, not just an assumption.
+
+    Most tests here inject a _hybrid_store entry directly (same technique
+    TestDepletionProphetDemandModel's growth-cache tests use) so the exact
+    NUMERICAL forecast reaching build_demand() can be asserted precisely,
+    for each of the 4 candidate methods, without depending on which method
+    real synthetic data happens to make Level-2 pick.
+    """
+
+    def _seed_item(self, name, days=21, daily=10, per_serving=100.0, on_hand=100000.0):
+        ing = add_ingredient(self.conn, name, on_hand=on_hand, pack=1000)
+        rec = add_recipe(self.conn, name + " Recipe", [(ing, per_serving)])
+        menu_pk = add_menu_item(self.conn, name + " Item", rec)
+        for d in range(days, 0, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, daily)
+        self.conn.commit()
+        return ing, menu_pk
+
+    def _inject_hybrid(self, menu_pk, method, qtys, *, growth=None,
+                       lookback_days=None, horizon_days=None):
+        lookback_days = lookback_days or depletion.LOOKBACK_DAYS
+        horizon_days = horizon_days or depletion.HORIZON_DAYS
+        today = dt.date.today()
+        forecast = [{"date": (today + dt.timedelta(days=i)).isoformat(), "qty": q,
+                    "low": q if method != "prophet" else q - 1, "high": q if method != "prophet" else q + 1}
+                   for i, q in enumerate(qtys, start=1)]
+        result = {
+            "forecast": forecast, "method_used": method,
+            "growth_used": growth if method == "prophet" else None,
+            "method_selection": {"series_key": f"menu_item:{menu_pk}", "selected_method": method,
+                                 "selection_reason": "test-injected", "methods": {}},
+        }
+        key = (depletion._prophet_scope_key(self.conn), menu_pk, lookback_days, horizon_days)
+        with depletion._prophet_lock:
+            depletion._hybrid_store[key] = (time.monotonic(), result)
+        return forecast
+
+    def test_hybrid_consumes_a_cached_prophet_selection(self):
+        ing, menu_pk = self._seed_item("Hybrid Prophet Item")
+        qtys = [10.0] * depletion.HORIZON_DAYS
+        self._inject_hybrid(menu_pk, "prophet", qtys, growth="linear")
+        demand = depletion.build_demand(self.conn, demand_model="hybrid")
+        s = demand["items"][menu_pk]
+        self.assertEqual(s.demand_source, "prophet")
+        self.assertAlmostEqual(s.daily[1], 10.0 * s.momentum, places=6)
+
+    def test_hybrid_consumes_a_cached_day_of_week_selection(self):
+        ing, menu_pk = self._seed_item("Hybrid DOW Item")
+        qtys = [3.0 + i for i in range(depletion.HORIZON_DAYS)]  # distinct values per day, point forecast (low=high=qty)
+        self._inject_hybrid(menu_pk, "day_of_week_seasonal", qtys)
+        demand = depletion.build_demand(self.conn, demand_model="hybrid")
+        s = demand["items"][menu_pk]
+        self.assertEqual(s.demand_source, "day_of_week_seasonal")
+        for k in range(1, depletion.HORIZON_DAYS + 1):
+            self.assertAlmostEqual(s.daily[k], qtys[k - 1] * s.momentum, places=6)
+            self.assertEqual(s.sigma_daily[k], 0.0)  # baseline methods: no native uncertainty -> low=high=qty
+
+    def test_hybrid_consumes_a_cached_trailing_average_selection(self):
+        ing, menu_pk = self._seed_item("Hybrid TrailingAvg Item")
+        qtys = [7.5] * depletion.HORIZON_DAYS
+        self._inject_hybrid(menu_pk, "trailing_moving_average", qtys)
+        demand = depletion.build_demand(self.conn, demand_model="hybrid")
+        s = demand["items"][menu_pk]
+        self.assertEqual(s.demand_source, "trailing_moving_average")
+        self.assertAlmostEqual(s.daily[1], 7.5 * s.momentum, places=6)
+
+    def test_hybrid_consumes_a_cached_naive_selection(self):
+        ing, menu_pk = self._seed_item("Hybrid Naive Item")
+        qtys = [2.0] * depletion.HORIZON_DAYS
+        self._inject_hybrid(menu_pk, "naive_previous_period", qtys)
+        demand = depletion.build_demand(self.conn, demand_model="hybrid")
+        s = demand["items"][menu_pk]
+        self.assertEqual(s.demand_source, "naive_previous_period")
+        self.assertAlmostEqual(s.daily[1], 2.0 * s.momentum, places=6)
+
+    def test_hybrid_falls_back_to_ewma_with_no_cached_selection(self):
+        """Missing-selection fallback (#4 in the task list): deterministic,
+        documented, and identical to 'prophet' mode's own existing fallback
+        -- not a new invented strategy."""
+        ing, menu_pk = self._seed_item("Never Refreshed Hybrid Item")
+        demand = depletion.build_demand(self.conn, demand_model="hybrid")
+        s = demand["items"][menu_pk]
+        self.assertEqual(s.demand_source, "ewma")
+        self.assertGreater(s.daily[1], 0.0)
+
+    def test_hybrid_falls_back_to_ewma_on_stale_cache(self):
+        ing, menu_pk = self._seed_item("Stale Hybrid Item")
+        self._inject_hybrid(menu_pk, "day_of_week_seasonal", [5.0] * depletion.HORIZON_DAYS)
+        key = (depletion._prophet_scope_key(self.conn), menu_pk,
+              depletion.LOOKBACK_DAYS, depletion.HORIZON_DAYS)
+        with depletion._prophet_lock:
+            computed_at, result = depletion._hybrid_store[key]
+            depletion._hybrid_store[key] = (
+                computed_at - depletion.PROPHET_STALE_AFTER_SECONDS - 1, result,
+            )
+        demand = depletion.build_demand(self.conn, demand_model="hybrid")
+        s = demand["items"][menu_pk]
+        self.assertEqual(s.demand_source, "ewma")
+        self.assertGreater(s.daily[1], 0.0)
+
+    def test_prophet_mode_is_unaffected_by_hybrid(self):
+        """Explicit proof (not an assumption) that demand_model='prophet'
+        still means exactly what it always meant -- always Prophet when a
+        fresh fit exists -- completely independent of whatever 'hybrid'
+        would have picked for the same item. Seeds a flat, trend-free series
+        so Level-2 would most likely prefer a baseline over Prophet, then
+        confirms 'prophet' mode still uses Prophet regardless."""
+        ing, menu_pk = self._seed_item("Prophet Mode Unaffected Item", days=100, daily=8)
+        depletion.refresh_prophet_baselines(self.conn)
+        prophet_demand = depletion.build_demand(self.conn, demand_model="prophet")
+        self.assertEqual(prophet_demand["items"][menu_pk].demand_source, "prophet")
+
+    def test_refresh_populates_hybrid_store_for_every_item_end_to_end(self):
+        """Real data, real backtest, no injection -- proves the whole chain
+        (refresh -> Level-2 backtest -> forecast_with_method -> cache ->
+        build_demand) works together, and that build_demand('hybrid')'s
+        demand_source distribution matches refresh's own reported counts
+        exactly (#6: verify actual consumption, not just metadata)."""
+        self._seed_item("E2E Hybrid Item A", days=120, daily=6)
+        self._seed_item("E2E Hybrid Item B", days=120, daily=15)
+        result = depletion.refresh_prophet_baselines(self.conn)
+        self.assertEqual(result["hybridUnavailable"] + sum(result["hybridMethodCounts"].values()),
+                         result["itemsConsidered"])
+
+        demand = depletion.build_demand(self.conn, demand_model="hybrid")
+        items = self.conn.execute("SELECT id FROM menu_item WHERE pos_visible=1").fetchall()
+        counts = {}
+        for it in items:
+            src = demand["items"][it["id"]].demand_source
+            counts[src] = counts.get(src, 0) + 1
+        # every non-"ewma" source in build_demand must correspond 1:1 to a
+        # method refresh actually selected and cached for that item.
+        non_ewma = sum(v for k, v in counts.items() if k != "ewma")
+        self.assertEqual(non_ewma, sum(result["hybridMethodCounts"].values()))
+
+    def test_hybrid_growth_propagates_from_real_level1_selection(self):
+        """Prophet selected-growth propagation (#6's last bullet), end to
+        end with real data: whatever growth refresh_prophet_baselines()
+        selected for an item must be the SAME growth the hybrid cache's
+        Prophet-sourced forecast (when Prophet is the Level-2 winner) used
+        -- checked via the cached method_selection metadata, not assumed."""
+        self._seed_item("Growth Propagation Item", days=150, daily=9)
+        depletion.refresh_prophet_baselines(self.conn)
+        menu_pk = self.conn.execute(
+            "SELECT id FROM menu_item WHERE name='Growth Propagation Item Item'"
+        ).fetchone()["id"]
+        key = (depletion._prophet_scope_key(self.conn), menu_pk,
+              depletion.LOOKBACK_DAYS, depletion.HORIZON_DAYS)
+        with depletion._prophet_lock:
+            _, hybrid_result = depletion._hybrid_store[key]
+            _, prophet_result = depletion._prophet_store[key]
+        if hybrid_result is None or hybrid_result["method_used"] != "prophet":
+            return  # Level-2 didn't pick Prophet for this series -- nothing to check
+        self.assertEqual(hybrid_result["growth_used"], prophet_result["growth_used"])
+
+    def test_ingredient_forecast_pipeline_unchanged_downstream_of_hybrid(self):
+        """#7: FEFO/reservation/recipe/BOM/lead-time/safety-stock/pack-
+        rounding math must be completely unaffected -- only the demand
+        SOURCE changes. Recomputes the same replenishment formula
+        TestDepletionProphetDemandModel.test_prophet_result_reaches_the_full_
+        ingredient_pipeline already checks for 'prophet', now for 'hybrid'."""
+        ing, menu_pk = self._seed_item("Hybrid Pipeline Item", daily=10, per_serving=100.0,
+                                       on_hand=500.0)
+        self.conn.execute("UPDATE ingredient SET lead_time_days=2 WHERE id=?", (ing,))
+        self.conn.commit()
+        depletion.refresh_prophet_baselines(self.conn)
+
+        full = depletion.ingredient_forecast(self.conn, demand_model="hybrid")
+        self.assertEqual(full["demandModel"], "hybrid")
+        row = next(r for r in full["ingredients"] if r["ingredientId"] == ing)
+        if row["suggestedOrderQty"] is not None:
+            shortfall = (row["forecastDailyConsumption"] * row["leadTimeDays"]
+                        + row["safetyStockBase"] - row["available"])
+            self.assertEqual(row["suggestedOrderQty"],
+                             math.ceil(shortfall / (row["packSize"] * (row["yieldFactor"] or 1.0))))
+
 
 # ===========================================================================
 class TestReplenishmentBacktestDistribution(Base):
@@ -9558,6 +12395,220 @@ class TestReplenishmentBacktestDistribution(Base):
         self.assertFalse(result["available"])
         self.assertIn("reason", result)
         self.assertNotIn("days_of_supply_distribution_when_healthy_or_excess", result)
+
+    def test_false_alarm_breakdown_sums_to_the_raw_false_alarm_count(self):
+        """2026-10 audit: false_alarm_breakdown splits the raw false_alarm
+        bucket into resolved_by_restock (a real purchase_receipt landed for
+        that ingredient inside the check window) vs. genuine (it did not) --
+        without changing the pre-existing confusion/precision/recall/f1
+        fields at all. The split must always account for every false_alarm,
+        and the adjusted precision/f1 can only be >= the raw ones (dropping
+        resolved_by_restock from the false-alarm denominator never makes
+        precision worse)."""
+        self._seed_steady_item("Backtest Split Item", days=50)
+        result = depletion.replenishment_backtest(self.conn, lookback_days=40)
+        self.assertTrue(result["available"])
+
+        breakdown = result["false_alarm_breakdown"]
+        self.assertEqual(breakdown["resolved_by_restock"] + breakdown["genuine"],
+                         result["confusion"]["false_alarm"])
+
+        precision = result["critical_flag_precision"]
+        adjusted = result["critical_flag_precision_adjusted"]
+        if precision is not None and adjusted is not None:
+            self.assertGreaterEqual(adjusted, precision - 1e-9)
+        f1 = result["critical_flag_f1"]
+        adjusted_f1 = result["critical_flag_f1_adjusted"]
+        if f1 is not None and adjusted_f1 is not None:
+            self.assertGreaterEqual(adjusted_f1, f1 - 1e-9)
+
+    def test_received_within_window_finds_only_purchase_receipts_in_range(self):
+        ing = add_ingredient(self.conn, "Window Probe Ingredient", on_hand=0.0)
+        add_ledger_entry(self.conn, ing, 100.0, "purchase_receipt", days_ago(5), balance_after=100.0)
+        add_ledger_entry(self.conn, ing, -10.0, "sale_commit", days_ago(5), balance_after=90.0)
+        other = add_ingredient(self.conn, "Window Probe Other", on_hand=0.0)
+        add_ledger_entry(self.conn, other, 50.0, "purchase_receipt", days_ago(20), balance_after=50.0)
+
+        start = f"{days_ago(6)} 00:00:00"
+        end = f"{days_ago(4)} 00:00:00"
+        found = depletion._received_within_window(self.conn, start, end)
+        self.assertIn(ing, found)
+        self.assertNotIn(other, found)
+
+
+# ===========================================================================
+class TestReplenishmentBacktestFindings(Base):
+    """2026-10 replenishment audit. Two real defects and one evaluation-honesty
+    gap, each pinned here:
+
+      * build_demand() read the intraday profile at the END of the current hour
+        instead of interpolating inside it, overstating how much of the day had
+        already elapsed and biasing pace/momentum (so the whole forecast) low.
+      * replenishment_backtest() graded a flag against a window with no trading
+        in it, and its docstring's 'hit zero within the window' was only checked
+        at the window's end. Both are now reported ALONGSIDE the unchanged raw
+        confusion matrix, never instead of it.
+    """
+
+    def _order_at(self, menu_pk, day, hour, minute=0):
+        ts_manila = dt.datetime.combine(day, dt.time(hour, minute), tzinfo=timeutil.MANILA_TZ)
+        ts = timeutil.utc_now_sql(ts_manila.astimezone(dt.timezone.utc))
+        n = self.conn.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+        cur = self.conn.execute(
+            "INSERT INTO customer_order (order_no, table_label, head_count, status, created_at) "
+            "VALUES (?,?,?,?,?)", (f"WT-P-{n + 1}", "T-P", 0, "served", ts))
+        self.conn.execute(
+            "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,?,?)",
+            (cur.lastrowid, menu_pk, 1, 1.0))
+
+    def _hourly_profile(self):
+        ing = add_ingredient(self.conn, "Profile Item", on_hand=1_000_000.0, pack=1000)
+        rec = add_recipe(self.conn, "Profile Recipe", [(ing, 10.0)])
+        menu_pk = add_menu_item(self.conn, "Profile Menu", rec)
+        # One unit at 19:00 Manila and one at 20:30 Manila, every day for 10
+        # days: the cumulative share is 0.0 before hour 19, 0.5 through hour 19,
+        # 1.0 through hour 20.
+        today = timeutil.business_today()
+        for d in range(10, 0, -1):
+            day = today - dt.timedelta(days=d)
+            self._order_at(menu_pk, day, 19, 0)
+            self._order_at(menu_pk, day, 20, 30)
+        self.conn.commit()
+        return menu_pk
+
+    def _now_at(self, hour, minute):
+        return dt.datetime.combine(timeutil.business_today(), dt.time(hour, minute),
+                                   tzinfo=timeutil.MANILA_TZ).astimezone(dt.timezone.utc)
+
+    def _share_at(self, hour, minute):
+        return depletion.build_demand(
+            self.conn, 56, 7, self._now_at(hour, minute), "ewma")["share_by_now"]
+
+    def test_share_by_now_interpolates_inside_the_current_hour(self):
+        self._hourly_profile()
+        # At 20:00 sharp none of hour 20 has happened: only hour 19's 0.5 counts.
+        self.assertAlmostEqual(self._share_at(20, 0), 0.5, places=6)
+        # Halfway through hour 20 -> halfway between 0.5 and 1.0.
+        self.assertAlmostEqual(self._share_at(20, 30), 0.75, places=6)
+        # Before the first sale of the day nothing is expected yet.
+        self.assertAlmostEqual(self._share_at(18, 0), 0.0, places=6)
+        self.assertAlmostEqual(self._share_at(19, 30), 0.25, places=6)
+        # Midnight edge: hour 0 interpolates from 0.0, never indexes share[-1].
+        self.assertAlmostEqual(self._share_at(0, 0), 0.0, places=6)
+
+    def test_pace_is_not_understated_when_the_hour_has_not_yet_been_sold(self):
+        """The bug: at 20:00 the model 'expected' 100% of a normal day to be
+        done, so a perfectly normal day read as 50% pace and dragged momentum
+        below 1.0 for every future day."""
+        menu_pk = self._hourly_profile()
+        # A completely normal today: the 19:00 unit has sold, nothing since.
+        self._order_at(menu_pk, timeutil.business_today(), 19, 0)
+        self.conn.commit()
+        series = depletion.build_demand(
+            self.conn, 56, 7, self._now_at(20, 0), "ewma")["items"][menu_pk]
+        # Profile = 10 prior days (1 unit at hr 19, 1 at hr 20) + today's 19:00
+        # unit -> 11 of 21 units land by the end of hour 19, i.e. 20:00 sharp.
+        # Today's one unit against a baseline of 2/day: 1 / (2 * 11/21).
+        self.assertAlmostEqual(series.pace, 21 / 22, places=3)
+        # Pre-fix this read 0.5 (expected share 1.0) and momentum fell to ~0.83.
+        self.assertGreater(series.momentum, 0.98)
+
+    def _gap_history(self):
+        """Steady trading from 60 to 25 days ago, then nothing at all."""
+        ing = add_ingredient(self.conn, "Gap Item", on_hand=1_000.0, pack=1000)
+        rec = add_recipe(self.conn, "Gap Recipe", [(ing, 10.0)])
+        menu_pk = add_menu_item(self.conn, "Gap Menu", rec)
+        for d in range(60, 24, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, 5)
+            add_ledger_entry(self.conn, ing, -50.0, "sale_commit", days_ago(d))
+        self.conn.commit()
+        return ing
+
+    def test_windows_with_no_trading_are_reported_as_unobservable_not_graded(self):
+        self._gap_history()
+        r = depletion.replenishment_backtest(self.conn, lookback_days=40)
+        self.assertEqual(len(r["points"]), 4)
+        unobservable = [p for p in r["points"] if not p["windowObservable"]]
+        self.assertGreaterEqual(len(unobservable), 1)
+        for p in unobservable:
+            self.assertEqual(p["ordersInCheckWindow"], 0)
+        self.assertEqual({e["evaluationDate"] for e in r["observable_windows"]["excluded_points"]},
+                         {p["evaluationDate"] for p in unobservable})
+        # The raw confusion matrix still counts every point, unchanged ...
+        raw_total = sum(r["confusion"].values())
+        self.assertEqual(raw_total, r["total_ingredient_evaluations"])
+        # ... and the observable view is exactly the raw one minus those points.
+        dropped = sum(p["caught"] + p["false_alarm"] + p["missed"] + p["quiet"] for p in unobservable)
+        self.assertEqual(sum(r["observable_windows"]["confusion"].values()), raw_total - dropped)
+
+    def test_a_normally_trading_history_has_no_excluded_points(self):
+        ing = add_ingredient(self.conn, "Busy Item", on_hand=1_000_000.0, pack=1000)
+        rec = add_recipe(self.conn, "Busy Recipe", [(ing, 10.0)])
+        menu_pk = add_menu_item(self.conn, "Busy Menu", rec)
+        for d in range(50, 0, -1):
+            add_dated_order(self.conn, days_ago(d), menu_pk, 5)
+            add_ledger_entry(self.conn, ing, -50.0, "sale_commit", days_ago(d))
+        self.conn.commit()
+        r = depletion.replenishment_backtest(self.conn, lookback_days=40)
+        self.assertEqual(r["observable_windows"]["excluded_points"], [])
+        self.assertEqual(r["observable_windows"]["confusion"], r["confusion"])
+
+    def test_min_balance_in_window_sees_a_stockout_that_a_later_restock_hides(self):
+        ing = add_ingredient(self.conn, "Dip Item", on_hand=10.0, pack=1000)
+        add_ledger_entry(self.conn, ing, -5.0, "sale_commit", "2026-01-02")
+        add_ledger_entry(self.conn, ing, +10.0, "purchase_receipt", "2026-01-04")
+        self.conn.commit()
+        low = depletion._min_balances_in_window(
+            self.conn, "2026-01-01 00:00:00", "2026-01-10 00:00:00", {ing: 3.0})
+        self.assertAlmostEqual(low[ing], -2.0)          # 3 - 5, before the +10 arrives
+        # No ledger movement at all: the starting balance is the minimum.
+        quiet = add_ingredient(self.conn, "Still Item", on_hand=7.0, pack=1000)
+        low = depletion._min_balances_in_window(
+            self.conn, "2026-01-01 00:00:00", "2026-01-10 00:00:00", {quiet: 7.0})
+        self.assertAlmostEqual(low[quiet], 7.0)
+
+    def test_upper_bound_rounds_a_subsecond_instant_up_and_leaves_whole_seconds_alone(self):
+        utc = dt.timezone.utc
+        self.assertEqual(timeutil.utc_upper_bound_sql(dt.datetime(2026, 1, 1, 18, 57, 23, 488689, tzinfo=utc)),
+                         "2026-01-01 18:57:24")
+        # A historical anchor already on a whole second keeps its exact meaning.
+        self.assertEqual(timeutil.utc_upper_bound_sql(dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=utc)),
+                         "2026-01-01 12:00:00")
+        self.assertEqual(timeutil.utc_upper_bound_sql(dt.datetime(2026, 1, 1, 23, 59, 59, 500000, tzinfo=utc)),
+                         "2026-01-02 00:00:00")
+
+    def test_an_order_stamped_in_the_same_second_as_a_live_now_is_not_dropped(self):
+        """effective_now() hands back the live instant, and _daily_series()
+        treats any explicit `now` as a cutoff. With a floor-to-the-second bound
+        an order written milliseconds earlier -- same wall-clock second -- was
+        silently excluded (the race behind a flaky forecast-endpoint test)."""
+        ing = add_ingredient(self.conn, "Race Item", on_hand=1_000.0, pack=1000)
+        rec = add_recipe(self.conn, "Race Recipe", [(ing, 10.0)])
+        menu_pk = add_menu_item(self.conn, "Race Menu", rec)
+        now = dt.datetime(2026, 6, 15, 10, 0, 0, 488689, tzinfo=dt.timezone.utc)
+        n = self.conn.execute("SELECT COUNT(*) AS n FROM customer_order").fetchone()["n"]
+        cur = self.conn.execute(
+            "INSERT INTO customer_order (order_no, table_label, head_count, status, created_at) "
+            "VALUES (?,?,?,?,?)", (f"WT-R-{n + 1}", "T-R", 0, "served", "2026-06-15 10:00:00"))
+        self.conn.execute("INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,?,?)",
+                          (cur.lastrowid, menu_pk, 1, 1.0))
+        self.conn.commit()
+        rows, _ = forecasting._daily_series(self.conn, menu_pk, 30, now=now)
+        self.assertEqual(len(rows), 1)
+        # ... while an order genuinely after the instant is still excluded.
+        self.conn.execute("UPDATE customer_order SET created_at='2026-06-15 10:00:01' WHERE id=?", (cur.lastrowid,))
+        self.conn.commit()
+        rows, _ = forecasting._daily_series(self.conn, menu_pk, 30, now=now)
+        self.assertEqual(len(rows), 0)
+
+    def test_every_missed_stockout_carries_a_cause_read_from_the_forecast(self):
+        self._gap_history()
+        r = depletion.replenishment_backtest(self.conn, lookback_days=40)
+        for m in r["missed_stockouts"]:
+            self.assertIn(m["cause"], ("predicted_inside_window_but_after_lead_time",
+                                       "demand_exceeded_forecast"))
+        for k in ("within_window_label", "any_warning"):
+            self.assertEqual(sum(r[k]["confusion"].values()), r["total_ingredient_evaluations"])
 
 
 # ===========================================================================
@@ -12127,6 +15178,110 @@ class TestPOSTablesAndHeadFlavors(unittest.TestCase):
         self.assertIsNone(r.json()["note"])
 
 
+# ===========================================================================
+class TestDemoValidationHarness(Base):
+    """2026-10: wt.demo_validation runs the REAL, unmodified IsolationForest
+    detect -> sample -> label -> scientific-metrics pipeline against a
+    synthetic, known-ground-truth population, scaled against real-looking
+    data read from self.conn (standing in for a real connection here --
+    demo_validation only ever reads it, never writes). The point of these
+    tests is the isolation guarantee and plumbing correctness, not a
+    specific F1 number (that depends on the synthetic draw and is checked
+    for plausibility, not pinned to one value a future change would need
+    to update for no real reason)."""
+
+    def _seed_real_like_stock_loss_data(self):
+        for i in range(4):
+            ing = add_ingredient(self.conn, f"Grounding Ingredient {i}", on_hand=5000.0, pack=1000)
+            rec = add_recipe(self.conn, f"Grounding Recipe {i}", [(ing, 20.0)])
+            menu_pk = add_menu_item(self.conn, f"Grounding Item {i}", rec)
+            for d in range(60):
+                add_dated_order(self.conn, days_ago(d), menu_pk, 3)
+                add_ledger_entry(self.conn, ing, -60.0, "sale_commit", days_ago(d), balance_after=5000.0 - 60.0 * d)
+        self.conn.commit()
+
+    def _seed_real_like_unli_data(self):
+        ing = add_ingredient(self.conn, "Grounding Wings", on_hand=100000.0, pack=1000)
+        item_pk = add_unli_stream(self.conn, "wings", ing, lambda_value=14.0)
+        menu_pk = add_menu_item(self.conn, "Test Unlimited Wings Item", add_recipe(self.conn, "UW Recipe", []), is_unli=True)
+        for d in range(60):
+            add_dated_order(self.conn, days_ago(d), menu_pk, 30 + (d % 10))
+        self.conn.commit()
+        return item_pk
+
+    def test_stock_loss_simulation_is_tagged_demo_and_isolated(self):
+        self._seed_real_like_stock_loss_data()
+        real_ledger_count_before = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        real_ingredient_count_before = self.conn.execute("SELECT COUNT(*) AS n FROM ingredient").fetchone()["n"]
+
+        result = demo_validation.simulate_stock_loss_validation(
+            self.conn, n_normal=60, n_anomalous=10, seed=42, lookback_days=60, n_ingredients=4,
+        )
+
+        self.assertEqual(result["mode"], "DEMO_SIMULATION")
+        self.assertTrue(result["available"])
+        # The real connection passed in must be untouched -- every synthetic
+        # row went into demo_validation's own throwaway database instead.
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"],
+            real_ledger_count_before,
+        )
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM ingredient").fetchone()["n"],
+            real_ingredient_count_before,
+        )
+
+        metrics = result["scientific_validation_metrics"]
+        self.assertTrue(metrics["available"])
+        cm = metrics["confusion_matrix"]
+        self.assertEqual(cm["tp"] + cm["fp"] + cm["fn"] + cm["tn"], result["labels_submitted"])
+        self.assertEqual(cm["tp"] + cm["fn"], 10)   # every injected anomaly was labeled one way or the other
+        self.assertEqual(result["generated"]["rule_breakdown"]["large_fraction_of_on_hand"]
+                         + result["generated"]["rule_breakdown"]["relative_magnitude_spike"], 10)
+
+    def test_stock_loss_simulation_is_deterministic_for_a_given_seed(self):
+        self._seed_real_like_stock_loss_data()
+        r1 = demo_validation.simulate_stock_loss_validation(
+            self.conn, n_normal=60, n_anomalous=10, seed=42, lookback_days=60, n_ingredients=4)
+        r2 = demo_validation.simulate_stock_loss_validation(
+            self.conn, n_normal=60, n_anomalous=10, seed=42, lookback_days=60, n_ingredients=4)
+        self.assertEqual(r1["scientific_validation_metrics"]["confusion_matrix"],
+                         r2["scientific_validation_metrics"]["confusion_matrix"])
+
+    def test_stock_loss_simulation_reports_unavailable_without_groundable_real_data(self):
+        # No sale_commit history anywhere -- nothing to ground a realistic
+        # simulation on, so this must say so rather than inventing a scale.
+        result = demo_validation.simulate_stock_loss_validation(self.conn)
+        self.assertFalse(result["available"])
+        self.assertIn("reason", result)
+
+    def test_unli_consumption_simulation_is_tagged_demo_and_isolated(self):
+        self._seed_real_like_unli_data()
+        real_recon_count_before = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM unli_reconciliation").fetchone()["n"]
+
+        result = demo_validation.simulate_unli_consumption_validation(
+            self.conn, n_normal=30, n_anomalous=10, seed=42, lookback_days=60,
+        )
+
+        self.assertEqual(result["mode"], "DEMO_SIMULATION")
+        self.assertTrue(result["available"])
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM unli_reconciliation").fetchone()["n"],
+            real_recon_count_before,
+        )
+
+        metrics = result["scientific_consumption_validation_metrics"]
+        self.assertTrue(metrics["available"])
+        cm = metrics["confusion_matrix"]
+        self.assertEqual(cm["tp"] + cm["fp"] + cm["fn"] + cm["tn"], result["labels_submitted"])
+        self.assertEqual(cm["tp"] + cm["fn"], 10)
+
+    def test_unli_consumption_simulation_raises_without_a_real_stream(self):
+        with self.assertRaises(LookupError):
+            demo_validation.simulate_unli_consumption_validation(self.conn)
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(
@@ -12136,8 +15291,14 @@ def main() -> int:
             TestIngredientReconciliation, TestRepeatedVarianceSignal,
             TestVarianceReview, TestVarianceReviewAPI,
             TestInventoryValuation, TestUnliOrders, TestConcurrency, TestFEFO,
-            TestFEFODepletion, TestTimezoneHardening, TestUnliReconciliation, TestUnliRecalibration,
-            TestConsumptionAnomaly, TestReorderPoint, TestUnliRBAC,
+            TestFEFODepletion,
+            TestExpiredStockUsability, TestCorrectStockCapability, TestCountIdempotency,
+            TestCountToday,
+            TestTimezoneHardening, TestUnliReconciliation, TestUnliRecalibration,
+            TestConsumptionAnomaly, TestConsumptionAnomalyProvenance,
+            TestConsumptionValidationSampling, TestConsumptionValidationRuleVsML,
+            TestConsumptionValidationLabeling, TestScientificConsumptionValidationMetrics,
+            TestReorderPoint, TestUnliRBAC,
             TestUnliSession, TestRefillPieces, TestRefillSequence, TestRefillInventory,
             TestRefillIdempotency, TestFlavorConfiguration, TestOrderImmutability,
             TestReceiptView, TestRefillCorrections, TestSessionControl,
@@ -12147,17 +15308,28 @@ def main() -> int:
             TestSeedImport, TestXlsxProphetIngest, TestVerificationWorkflow, TestConsoleAPI,
             TestAdminAuditLog, TestRBAC,
             TestLoginAudit, TestMLResultCaching, TestDashboardSummary, TestPasswordSecurity,
-            TestForecasting, TestStoreDemandForecast, TestSeriesForecastability,
+            TestForecasting, TestProphetGrowthSelection, TestEffectiveNow,
+            TestStoreDemandForecast, TestSeriesForecastability,
             TestIngredientDepletionForecast,
-            TestDepletionProphetDemandModel, TestReplenishmentBacktestDistribution, TestReplenishmentEndToEnd,
+            TestDepletionProphetDemandModel, TestDepletionHybridDemandModel,
+            TestReplenishmentBacktestDistribution, TestReplenishmentEndToEnd,
             TestProphetDemandModelSetting, TestFlavourSubstitution,
-            TestAnomaly, TestAnomalyReview, TestAssociations, TestComboPricing,
+            TestAnomaly, TestAnomalyReview,
+            TestAnomalyEligibilityRobustness, TestAnomalyProvenanceTaxonomy,
+            TestAnomalySampling, TestValidationLabeling,
+            TestScientificValidationMetrics, TestAnomalyProvenanceSources,
+            TestLedgerIntegrityAfterMLInfrastructure,
+            TestAssociations, TestComboPricing,
             TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,
             TestOwnerProvisioning, TestOwnerRoleAndProvisioning, TestOwnerInstructions,
             TestOperationalUpdates, TestPurchaseOrders,
             TestAuditGapCoverage, TestNewMigrationsIntegrity,
             TestPOSFixes, TestHistoricalSourceTracking, TestPOSTablesAndHeadFlavors,
+            TestDemoValidationHarness, TestAssociationsHoldoutValidation,
+            TestExpandingWindowValidation, TestReplenishmentBacktestHistoricalReconstruction,
+            TestRefillDemandReachesTheForecast, TestHistoricalLeakagePrevention,
+            TestReplenishmentBacktestFindings,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

@@ -69,8 +69,23 @@ export function getReplenishmentBacktest() {
   return api.get('/console/replenishment/backtest');
 }
 
-export function getDataQuality() {
-  return api.get('/console/data-quality');
+/**
+ * Structural data-integrity audit (wt/data_quality.py) — a set of
+ * read-only, deterministic SQL checks (duplicate orders, orphaned rows,
+ * missing links) over the raw tables the ML layer reads. Each check's own
+ * `examples` rows are left exactly as the backend shaped them (their
+ * columns differ check to check — id/order_id for one, name/pack_size for
+ * another — so there is no single field set to rename here).
+ */
+export async function getDataQuality() {
+  const out = await api.get('/console/data-quality');
+  return {
+    generatedAt: out.generated_at,
+    lookbackDays: out.lookback_days,
+    checksRun: out.checks_run,
+    checksWithFindings: out.checks_with_findings,
+    checks: out.checks || [],
+  };
 }
 
 /**

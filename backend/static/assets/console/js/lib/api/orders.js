@@ -8,13 +8,22 @@ import { api } from './client.js';
  * admin and owner hold order.read.
  *
  * status='open' returns tables currently in play (punched/in_progress/
- * ready); status='all' additionally returns everything from the last
- * rolling 3 Manila-calendar months (a query-level cap only — see
- * list_orders' own docstring — not a data deletion).
+ * ready). status='all' defaults to the till's own rolling 3-Manila-calendar-
+ * month window (right for a till screen) — the console's Order History page
+ * is BI, not a till screen, so it passes `allTime: true` or a `startDate`/
+ * `endDate` range to see the full ledger; see list_orders' own docstring.
+ * `opts` also accepts the backend's own param names (`start_date`,
+ * `end_date`, `all_time`) passed straight through, same pattern as
+ * getSales() in ./reports.js.
  */
-export async function listOrders({ status = 'all', limit = 200 } = {}) {
-  const out = await api.get('/pos/orders', { status, limit });
+export async function listOrders({ status = 'all', limit = 200, allTime = false, startDate = null, endDate = null } = {}) {
+  const params = { status, limit };
+  if (allTime) params.all_time = true;
+  if (startDate) params.start_date = startDate;
+  if (endDate) params.end_date = endDate;
+  const out = await api.get('/pos/orders', params);
   return {
+    totalCount: out.total_count ?? null,
     orders: (out.orders || []).map((o) => ({
       id: o.id,
       orderNo: o.order_no,

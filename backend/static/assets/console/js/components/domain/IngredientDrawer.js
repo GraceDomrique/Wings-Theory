@@ -25,12 +25,20 @@ import { severityFromDays } from '../../lib/severity.js';
  * a new on-hand quantity, a new ledger balance, or a new FEFO batch; the
  * response is re-fetched from the server and that is what's shown.
  *
- * @param {{pk:number, onChanged:Function}} opts onChanged fires after any
- *        successful write, so the caller (OnHand's table) can refresh.
+ * @param {{pk:number, onChanged:Function, initialAction?:string, prefill?:object}} opts
+ *        onChanged fires after any successful write, so the caller (OnHand's
+ *        table) can refresh. initialAction/prefill let a caller land directly
+ *        on a specific action pane with fields already filled in — e.g.
+ *        Expiry's "Discard" link opens straight to Wastage with the expired
+ *        batch's own quantity and reason='spoilage' already entered, instead
+ *        of making the owner re-find the ingredient and re-type a number
+ *        the expiry card already showed them.
  */
-export function openIngredientDrawer({ pk, onChanged }) {
+export function openIngredientDrawer({
+  pk, onChanged, initialAction = null, prefill = null,
+}) {
   let detail = null;
-  let activeAction = null; // 'receive' | 'count' | 'waste' | 'use' | 'edit' | null
+  let activeAction = initialAction; // 'receive' | 'count' | 'waste' | 'use' | 'edit' | null
   const body = h('div');
 
   const modal = Modal({ title: 'Loading…', wide: true, onClose: () => {} }, body);
@@ -55,11 +63,20 @@ export function openIngredientDrawer({ pk, onChanged }) {
 
   function buildBody() {
     const ing = detail.ingredient;
+    const hasExpiredStock = (ing.expiredBaseQty || 0) > 0.001;
 
     const summary = h('div', {
-      class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '10px', marginBottom: '14px' },
+      class: 'grid', style: { gridTemplateColumns: `repeat(${hasExpiredStock ? 5 : 4},1fr)`, gap: '10px', marginBottom: '14px' },
     },
     summaryTile('On hand', str(ing.onHandDisplay, 'not counted')),
+    // Only shown when some of what's on hand is already expired — for
+    // everything else, "On hand" already IS the usable figure, and a second
+    // identical tile would just be noise.
+    hasExpiredStock
+      ? summaryTile('Usable', qty(ing.usableBaseQty, ing.baseUnit),
+        h('div', { class: 't-xs t-crit', style: { marginTop: '2px' } },
+          `${qty(ing.expiredBaseQty, ing.baseUnit).textContent} expired`))
+      : null,
     summaryTile('Cost / unit', money(ing.costPerUnit)),
     summaryTile('Confidence',
       ing.confidence === 'confirmed' ? Pill('good', 'confirmed') : Pill('warn', 'unverified')),
@@ -94,10 +111,11 @@ export function openIngredientDrawer({ pk, onChanged }) {
     mount(host, panes[activeAction]());
   }
 
-  function summaryTile(label, value) {
+  function summaryTile(label, value, ...extra) {
     return h('div', { class: 'card card-sunk', style: { padding: '10px 12px' } },
       h('div', { class: 't-xs t-faint' }, label),
-      h('div', { class: 't-strong', style: { marginTop: '3px' } }, value));
+      h('div', { class: 't-strong', style: { marginTop: '3px' } }, value),
+      ...extra);
   }
 
   function recentBatches() {
@@ -155,31 +173,47 @@ export function openIngredientDrawer({ pk, onChanged }) {
     const noteInput = h('input', { type: 'text', placeholder: 'optional' });
     const err = ModalError();
     const submit = Button({ variant: 'primary', size: 'sm' }, 'Record count');
+    // One key per open form, not per click — a double-click or a retried
+    // request replays the same correction instead of posting it twice (see
+    // reservation.record_count's client_request_id handling).
+    const requestId = (window.crypto && crypto.randomUUID)
+      ? crypto.randomUUID() : `ct-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     submit.addEventListener('click', () => runWrite({
       err, submit,
       validate: () => (actualInput.value !== '' && Number(actualInput.value) >= 0
         ? null : 'Enter the physically counted quantity.'),
-      call: () => countStock(pk, { actualBase: Number(actualInput.value), note: noteInput.value.trim() || null }),
-      successMsg: (r) => `Count recorded.${r && r.variance_base != null
-        ? ` Variance ${r.variance_base > 0 ? '+' : ''}${Number(r.variance_base).toFixed(2)} ${ing.baseUnit}.`
+      call: () => countStock(pk, {
+        actualBase: Number(actualInput.value), note: noteInput.value.trim() || null,
+        clientRequestId: requestId,
+      }),
+      successMsg: (r) => `${ing.name} corrected to ${Number(actualInput.value).toFixed(2)} ${ing.baseUnit}.${r && r.variance_base != null
+        ? ` Difference ${r.variance_base > 0 ? '+' : ''}${Number(r.variance_base).toFixed(2)} ${ing.baseUnit}.`
         : ''}`,
     }));
     return actionForm(
       `Physically counted quantity, in ${ing.baseUnit} (system currently expects ${currentLabel})`,
       actualInput, 'Note (optional)', noteInput, err, submit,
       h('div', { class: 'callout callout-info', style: { marginBottom: '10px' } },
-        h('p', {}, 'This posts a stock-count correction through the same ledger every sale uses — it does not overwrite on-hand directly.')),
+        h('p', {}, 'This updates the expected quantity to match what you counted and keeps a permanent record of the difference. You don’t need to explain why — only enter a reason if you already know what happened (use Wastage for that instead).')),
     );
   }
 
   // ---- Waste ----
   function wastePane() {
     const ing = detail.ingredient;
-    const qtyInput = h('input', { type: 'number', step: '0.01', min: '0.01', placeholder: '0.00' });
+    const pf = prefill || {};
+    const qtyInput = h('input', {
+      type: 'number', step: '0.01', min: '0.01', placeholder: '0.00',
+      value: pf.qtyBase != null ? String(pf.qtyBase) : undefined,
+    });
     const reasonSelect = h('select', {},
       h('option', { value: 'wastage' }, 'Wastage'),
       h('option', { value: 'spoilage' }, 'Spoilage'));
-    const noteInput = h('input', { type: 'text', placeholder: 'what happened (optional)' });
+    if (pf.reason) reasonSelect.value = pf.reason;
+    const noteInput = h('input', {
+      type: 'text', placeholder: 'what happened (optional)',
+      value: pf.note || undefined,
+    });
     const err = ModalError();
     const submit = Button({ variant: 'primary', size: 'sm' }, 'Log wastage');
     submit.addEventListener('click', () => runWrite({
@@ -187,6 +221,7 @@ export function openIngredientDrawer({ pk, onChanged }) {
       validate: () => (Number(qtyInput.value) > 0 ? null : 'Enter how much was lost.'),
       call: () => wasteStock(pk, {
         qtyBase: Number(qtyInput.value), reason: reasonSelect.value, note: noteInput.value.trim() || null,
+        source: pf.source || 'manual_writeoff',
       }),
       successMsg: () => `${reasonSelect.value === 'spoilage' ? 'Spoilage' : 'Wastage'} logged for ${ing.name}.`,
     }));

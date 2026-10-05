@@ -58,6 +58,16 @@ from .units import purchase_to_base
 # should never fail a reservation.
 EPS = 1e-6
 
+# SQL fragment: true when an open batch's expires_at falls before the current
+# Manila business day. Mirrors migrations/0040_expired_stock_usability.sql's
+# v_ingredient_expired_stock view and timeutil.py's +8h Manila shift exactly
+# (a batch expiring *today* is not yet "expired" -- same rule
+# depletion.annotate_batch_expiry applies via days_to_expiry < 0). Kept as one
+# literal rather than built from timeutil.sql_business_date(), which shifts a
+# COLUMN, not the literal 'now' a guarded UPDATE/SELECT needs here -- the two
+# must be changed together if Manila's offset ever does.
+_EXPIRED_BATCH = "expires_at IS NOT NULL AND expires_at < date('now', '+8 hours')"
+
 
 @dataclass(frozen=True)
 class Shortfall:
@@ -118,7 +128,8 @@ def _ledger(
     )
 
 
-def deplete_fefo(conn: sqlite3.Connection, ingredient_id: int, qty_base: float) -> float:
+def deplete_fefo(conn: sqlite3.Connection, ingredient_id: int, qty_base: float,
+                 include_expired: bool = True) -> float:
     """Take `qty_base` out of the open batches, earliest expiry first.
 
     Until now the only code that touched fefo_batch was receive_stock, which
@@ -132,13 +143,25 @@ def deplete_fefo(conn: sqlite3.Connection, ingredient_id: int, qty_base: float) 
     ties so the pick is deterministic between two batches expiring the same
     day.
 
+    include_expired=False (2026-10 audit fix) excludes a batch whose
+    expires_at has already passed from the draw entirely — a normal SALE
+    must never silently consume stock that is sitting in the expiry queue as
+    unusable. commit_order is the one caller that passes this. Every other
+    caller (record_wastage, record_usage, record_count's downward sync,
+    void_after_commit's wastage leg) keeps the default: an explicit write-off
+    or a physical count is describing what is ACTUALLY leaving the shelf, and
+    an already-expired batch is, if anything, the most likely place that
+    physically came from — the default ordering already drains it first
+    since it has the earliest expiry of anything open.
+
     Returns how much was actually drawn from batches, which is normally
-    `qty_base` and is less only when batch coverage is short of on_hand_base.
-    That is not an error: a database seeded (or unit-tested) by writing
-    on_hand_base directly has stock with no batch behind it, and refusing the
-    sale for a bookkeeping gap would be a worse answer than depleting what
-    batches exist. Never goes negative and never takes more than is there —
-    both enforced by the guarded UPDATE, not by arithmetic done in Python.
+    `qty_base` and is less only when batch coverage is short of on_hand_base
+    (or, with include_expired=False, short of USABLE batch coverage). That is
+    not an error: a database seeded (or unit-tested) by writing on_hand_base
+    directly has stock with no batch behind it, and refusing the sale for a
+    bookkeeping gap would be a worse answer than depleting what batches
+    exist. Never goes negative and never takes more than is there — both
+    enforced by the guarded UPDATE, not by arithmetic done in Python.
 
     Caller must already hold the write transaction; this writes no ledger row
     of its own, because a batch movement is not a stock movement — it is the
@@ -147,14 +170,14 @@ def deplete_fefo(conn: sqlite3.Connection, ingredient_id: int, qty_base: float) 
     remaining = qty_base
     if remaining <= EPS:
         return 0.0
-    batches = conn.execute(
-        """
-        SELECT id, qty_base FROM fefo_batch
-         WHERE ingredient_id = ? AND state = 'open' AND qty_base > 0
-         ORDER BY (expires_at IS NULL), expires_at, id
-        """,
-        (ingredient_id,),
-    ).fetchall()
+    sql = (
+        "SELECT id, qty_base FROM fefo_batch "
+        " WHERE ingredient_id = ? AND state = 'open' AND qty_base > 0"
+    )
+    if not include_expired:
+        sql += f" AND NOT ({_EXPIRED_BATCH})"
+    sql += " ORDER BY (expires_at IS NULL), expires_at, id"
+    batches = conn.execute(sql, (ingredient_id,)).fetchall()
 
     drawn = 0.0
     for b in batches:
@@ -190,13 +213,24 @@ def restore_fefo(conn: sqlite3.Connection, ingredient_id: int, qty_base: float,
     those either does it open a new batch — with no expiry date and status
     'unset', because nobody measured one and inventing a date here would put
     a fabricated constant into the very queue that exists to catch them.
+
+    2026-10 audit fix: the "earliest expiry open batch" candidate excludes a
+    batch that has already expired. Once commit_order stopped drawing from
+    expired batches (see deplete_fefo's include_expired), an expired batch
+    would otherwise sit open indefinitely with the single earliest expiry of
+    anything on the shelf — making it the "next to be issued" pick on every
+    single void-restock or upward count correction, silently reclassifying
+    perfectly good restored/found stock as unusable. A void or a found
+    surplus is being credited back as usable stock; it must not land
+    somewhere the availability view (migrations/0040) will then subtract
+    straight back out.
     """
     if qty_base <= EPS:
         return
     target = conn.execute(
-        """
+        f"""
         SELECT id FROM fefo_batch
-         WHERE ingredient_id = ? AND state = 'open'
+         WHERE ingredient_id = ? AND state = 'open' AND NOT ({_EXPIRED_BATCH})
          ORDER BY (expires_at IS NULL), expires_at, id LIMIT 1
         """,
         (ingredient_id,),
@@ -234,14 +268,28 @@ def _sync_fefo(conn: sqlite3.Connection, ingredient_id: int, delta_base: float) 
 
 
 def _try_hold(conn: sqlite3.Connection, ingredient_id: int, qty: float) -> bool:
-    """The guarded UPDATE. True if the hold was taken."""
+    """The guarded UPDATE. True if the hold was taken.
+
+    2026-10 audit fix: the guard now subtracts whatever is sitting in an
+    already-expired open batch from on_hand_base before comparing against
+    reserved_base, via a correlated subquery against fefo_batch rather than a
+    second round trip — the test-and-write stays the single atomic statement
+    the module docstring explains the whole reservation design depends on.
+    Before this, on_hand_base alone could hold a reservation against stock
+    that v_menu_item_availability (migrations/0040) already refuses to call
+    sellable, which would have let reserve_order succeed on a POS path that
+    bypassed the advisory availability check.
+    """
     cur = conn.execute(
-        """
+        f"""
         UPDATE ingredient
            SET reserved_base = reserved_base + :qty,
                updated_at    = datetime('now')
          WHERE id = :id
-           AND (on_hand_base - reserved_base) >= :qty - :eps
+           AND (on_hand_base - reserved_base - (
+                 SELECT COALESCE(SUM(qty_base), 0) FROM fefo_batch
+                  WHERE ingredient_id = :id AND state = 'open' AND ({_EXPIRED_BATCH})
+               )) >= :qty - :eps
         """,
         {"id": ingredient_id, "qty": qty, "eps": EPS},
     )
@@ -312,9 +360,22 @@ def reserve_order(conn: sqlite3.Connection, order_pk: int, user_id: str | None =
                     (order_pk, ingredient_id, qty),
                 )
             else:
+                # available_base mirrors exactly what _try_hold's own guard just
+                # tested against -- on_hand minus reserved minus whatever is
+                # sitting in an already-expired open batch -- not plain
+                # on_hand-reserved. Reporting the unadjusted figure here would
+                # UNDERSTATE the real shortfall whenever expired stock is
+                # inflating on_hand_base, which misleads both a human reading
+                # the error and any caller (e.g. demo_seed._restock_shortfalls)
+                # that sizes a top-up purchase from this number.
                 row = conn.execute(
-                    "SELECT name, base_unit, on_hand_base, reserved_base "
-                    "FROM ingredient WHERE id=?",
+                    f"""
+                    SELECT name, base_unit, on_hand_base, reserved_base,
+                           (SELECT COALESCE(SUM(qty_base), 0) FROM fefo_batch
+                             WHERE ingredient_id = ingredient.id AND state = 'open'
+                               AND ({_EXPIRED_BATCH})) AS expired_base
+                      FROM ingredient WHERE id=?
+                    """,
                     (ingredient_id,),
                 ).fetchone()
                 shortfalls.append(
@@ -322,7 +383,7 @@ def reserve_order(conn: sqlite3.Connection, order_pk: int, user_id: str | None =
                         ingredient_id=ingredient_id,
                         name=row["name"],
                         needed_base=qty,
-                        available_base=row["on_hand_base"] - row["reserved_base"],
+                        available_base=row["on_hand_base"] - row["reserved_base"] - row["expired_base"],
                         base_unit=row["base_unit"],
                     )
                 )
@@ -391,10 +452,12 @@ def commit_order(conn: sqlite3.Connection, order_pk: int, user_id: str | None = 
                     "reservation no longer matches held stock",
                     ingredient_id=h["ingredient_id"],
                 )
-            # The sale physically leaves the earliest-expiring batch. Same
-            # transaction as the on_hand write above, so the two can never be
-            # observed disagreeing.
-            deplete_fefo(conn, h["ingredient_id"], h["qty_base"])
+            # The sale physically leaves the earliest-expiring USABLE batch —
+            # include_expired=False, since a sale must never draw from a
+            # batch the expiry queue already calls unusable (see deplete_fefo
+            # and migrations/0040). Same transaction as the on_hand write
+            # above, so the two can never be observed disagreeing.
+            deplete_fefo(conn, h["ingredient_id"], h["qty_base"], include_expired=False)
             _ledger(
                 conn,
                 h["ingredient_id"],
@@ -652,12 +715,25 @@ def _receive_stock_locked(
     }
 
 
+# Where a physical count was actually entered from — distinct operational
+# circumstances that are useful to tell apart later (e.g. for ML review
+# provenance, see wt/anomaly.py's event_source-vs-sample_source distinction)
+# even though every one of them runs through this exact same function and
+# writes the exact same 'count_adjustment' ledger reason. Stored in the
+# ledger row's existing ref_type column — no schema change, since ref_type
+# already means "what kind of thing caused this movement" for every other
+# reason (e.g. 'purchase', 'order', 'manual_writeoff').
+COUNT_SOURCES = ("manual_count", "correct_stock", "count_today", "bulk_count")
+
+
 def record_count(
     conn: sqlite3.Connection,
     ingredient_pk: int,
     actual_base: float,
     note: str | None = None,
     user_id: str | None = None,
+    client_request_id: str | None = None,
+    source: str = "manual_count",
 ) -> dict:
     """Reconcile what the system expects is on hand against a real physical
     count. This is the "compare expected vs. actual" half of the recipe-based
@@ -665,6 +741,12 @@ def record_count(
     accounted for by a recipe; this is how the difference (spillage, an
     over-generous scoop, an unlogged loss) gets surfaced and corrected,
     without silently editing on_hand_base and losing the discrepancy.
+
+    `source` records which workflow this count came through (the ingredient
+    drawer's manual Count tab, the KDS Correct Stock fast-entry sheet, the
+    KDS/console Count Today shortlist, or a bulk stock-take) — see
+    COUNT_SOURCES. Every one of them is equally a real physical count; this
+    is provenance for later analysis, never a different code path.
 
     Always writes a ledger entry, even when the count matches exactly (delta
     0) — a confirmed count is itself worth a record, not just a correction.
@@ -680,7 +762,43 @@ def record_count(
     find — and it must surface as a named shortfall for a person to resolve
     (release or void the order) rather than either being hidden behind
     MAX(0, ...) or crashing the request as a raw database error.
+
+    client_request_id (2026-10, same convention as purchase_order_receipt and
+    record_variance_review): a retried submission of the SAME request (a
+    double-tap on a touch screen, a dropped response that the client resends)
+    replays the original result instead of posting a second ledger row.
+    `on_hand_base = actual_base` is already an absolute set rather than a
+    delta, so a bare retry could never move stock twice — the number it sets
+    is the same both times — but without this it would still write a second,
+    noise count_adjustment row (delta_base=0 the second time, since the first
+    call already moved on_hand_base to actual_base). stock_ledger carries no
+    dedicated client_request_id column of its own (unlike
+    ingredient_variance_review/purchase_order_receipt); count_adjustment rows
+    reuse the existing ref_id column for it instead of a schema migration —
+    ref_id is otherwise always NULL for this reason, so there is no
+    collision with anything a real count would have recorded there.
     """
+    if source not in COUNT_SOURCES:
+        raise InvalidStateError(f"unknown count source {source!r}")
+    if client_request_id:
+        existing = conn.execute(
+            "SELECT * FROM stock_ledger WHERE ingredient_id=? AND reason='count_adjustment' "
+            "AND ref_id=? ORDER BY id DESC LIMIT 1",
+            (ingredient_pk, client_request_id),
+        ).fetchone()
+        if existing:
+            name_row = conn.execute(
+                "SELECT name, base_unit FROM ingredient WHERE id=?", (ingredient_pk,)
+            ).fetchone()
+            return {
+                "ingredient_id": ingredient_pk,
+                "name": name_row["name"] if name_row else None,
+                "base_unit": name_row["base_unit"] if name_row else None,
+                "expected_base": round(existing["balance_after_base"] - existing["delta_base"], 4),
+                "actual_base": round(existing["balance_after_base"], 4),
+                "variance_base": round(existing["delta_base"], 4),
+            }
+
     with write_tx(conn):
         row = conn.execute(
             "SELECT name, base_unit, on_hand_base, reserved_base FROM ingredient WHERE id=?",
@@ -713,8 +831,8 @@ def record_count(
         # follow the sign of the variance: a short count draws the missing
         # amount off the oldest batches, a long count puts it back.
         _sync_fefo(conn, ingredient_pk, delta)
-        _ledger(conn, ingredient_pk, delta, "count_adjustment", "manual_count", None,
-               user_id, note=note)
+        _ledger(conn, ingredient_pk, delta, "count_adjustment", source,
+               client_request_id, user_id, note=note)
         audit.log(
             conn, "ingredient", ingredient_pk, "count", user_id,
             field="on_hand_base", previous_value=round(expected, 4),
@@ -731,6 +849,30 @@ def record_count(
     }
 
 
+def last_count_dates(conn: sqlite3.Connection) -> dict[int, str]:
+    """The timestamp of the most recent physical count (count_adjustment
+    ledger row) for every ingredient that has ever had one. No new history
+    table — stock_ledger already is the permanent record of every count ever
+    taken; this is one read over it, grouped down to the latest row per
+    ingredient. Used by depletion.count_today() to show "last checked N days
+    ago" and to let a stale check count toward a risk tier, without
+    duplicating what the ledger already records."""
+    rows = conn.execute(
+        "SELECT ingredient_id, MAX(created_at) AS last_counted_at FROM stock_ledger "
+        "WHERE reason = 'count_adjustment' GROUP BY ingredient_id"
+    ).fetchall()
+    return {r["ingredient_id"]: r["last_counted_at"] for r in rows}
+
+
+# See COUNT_SOURCES's comment — same idea, for write-offs: 'manual_writeoff'
+# (the ordinary Wastage pane) vs. 'expired_disposal' (Expiry's "Discard"
+# action on a specific already-expired batch). Both still post reason=
+# 'wastage'/'spoilage' exactly as before; this only distinguishes WHICH
+# workflow triggered the write-off, stored in the already-existing ref_type
+# column.
+WASTAGE_SOURCES = ("manual_writeoff", "expired_disposal")
+
+
 def record_wastage(
     conn: sqlite3.Connection,
     ingredient_pk: int,
@@ -738,6 +880,7 @@ def record_wastage(
     reason: str = "wastage",
     note: str | None = None,
     user_id: str | None = None,
+    source: str = "manual_writeoff",
 ) -> dict:
     """Book stock out as thrown away or spoiled.
 
@@ -759,9 +902,17 @@ def record_wastage(
     invariant commit_order relies on (reserved_base <= on_hand_base) and let
     an order's kitchen ticket commit against ingredients that no longer
     physically exist.
+
+    `source` (2026-10): see WASTAGE_SOURCES. Does not change the reason enum
+    or any arithmetic — expired-stock disposal still posts reason='spoilage'
+    exactly like any other spoilage call; this is provenance for later
+    analysis (e.g. documenting expired-disposal's Isolation Forest
+    eligibility precisely — see wt/anomaly.py), not a new category of loss.
     """
     if reason not in ("wastage", "spoilage"):
         raise InvalidStateError("reason must be 'wastage' or 'spoilage'")
+    if source not in WASTAGE_SOURCES:
+        raise InvalidStateError(f"unknown wastage source {source!r}")
 
     with write_tx(conn):
         row = conn.execute(
@@ -789,7 +940,7 @@ def record_wastage(
             {"qty": qty_base, "id": ingredient_pk},
         )
         deplete_fefo(conn, ingredient_pk, qty_base)
-        _ledger(conn, ingredient_pk, -qty_base, reason, "manual_writeoff", None,
+        _ledger(conn, ingredient_pk, -qty_base, reason, source, None,
                user_id, wastage_reason=note or reason, note=note)
         new_on_hand = conn.execute(
             "SELECT on_hand_base FROM ingredient WHERE id=?", (ingredient_pk,)
@@ -1309,11 +1460,19 @@ def availability_for_menu_item(conn: sqlite3.Connection, menu_item_pk: int, qty:
             "shortfall": None,
         }
 
+    # available excludes whatever sits in an already-expired open batch, the
+    # same usable-stock definition v_menu_item_availability/v_recipe_capacity
+    # (migrations/0040) and _try_hold's reservation guard use — this function
+    # is read-only/advisory (see the module docstring above) but must still
+    # agree with the authoritative check, or a cashier would be shown a
+    # shortfall number computed from stock the order can't actually reserve.
     leaves = conn.execute(
         """
         SELECT l.ingredient_id, l.qty_base, i.name, i.base_unit,
-               (i.on_hand_base - i.reserved_base) AS available
-          FROM v_recipe_leaf l JOIN ingredient i ON i.id = l.ingredient_id
+               (i.on_hand_base - i.reserved_base - COALESCE(x.expired_base, 0)) AS available
+          FROM v_recipe_leaf l
+          JOIN ingredient i ON i.id = l.ingredient_id
+          LEFT JOIN v_ingredient_expired_stock x ON x.ingredient_id = i.id
          WHERE l.recipe_id = ?
         """,
         (row["recipe_id"],),

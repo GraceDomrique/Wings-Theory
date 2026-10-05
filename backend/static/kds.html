@@ -667,13 +667,17 @@
    A full-screen overlay rather than a fifth column: it is not a live board,
    it is a task the kitchen does once at close, and it needs room for the
    numbers and their arithmetic to be legible on a wall-mounted tablet. */
-      #recScrim {
+      #recScrim,
+      #csScrim,
+      #ctScrim {
         position: fixed;
         inset: 0;
         background: rgba(0, 0, 0, 0.6);
         z-index: 40;
       }
-      #recSheet {
+      #recSheet,
+      #csSheet,
+      #ctSheet {
         position: fixed;
         inset: auto 0 0 0;
         max-height: 92vh;
@@ -685,7 +689,9 @@
         box-shadow: var(--sh-3);
       }
       @media (min-width: 760px) {
-        #recSheet {
+        #recSheet,
+        #csSheet,
+        #ctSheet {
           inset: 5vh 50% auto auto;
           transform: translateX(50%);
           width: min(720px, 94vw);
@@ -693,18 +699,96 @@
           max-height: 90vh;
         }
       }
-      #recSheet h2 {
+      #recSheet h2,
+      #csSheet h2,
+      #ctSheet h2 {
         font-family: var(--font-display);
         margin: 0 0 4px;
         font-size: 19px;
         font-weight: 600;
         color: var(--text-0);
       }
-      #recSheet .sub {
+      #recSheet .sub,
+      #csSheet .sub,
+      #ctSheet .sub {
         color: var(--text-2);
         font-size: 13px;
         margin: 0 0 16px;
         line-height: 1.5;
+      }
+      /* --- Correct Stock / Count Today (2026-10) -----------------------------
+   Same visual language as the reconciliation sheet above, reused rather than
+   reinvented: rec-row/rec-in/rec-calc/rec-f already express "a row with a
+   couple of fields and a calculated line underneath", which is exactly the
+   shape a stock correction needs too. */
+      .cs-search {
+        height: 44px;
+        font-size: 16px;
+        margin-bottom: 12px;
+      }
+      .cs-results {
+        max-height: 260px;
+        overflow-y: auto;
+        margin-bottom: 4px;
+      }
+      .cs-result {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        margin-bottom: 8px;
+        cursor: pointer;
+        background: var(--ink-2);
+      }
+      .cs-result:hover {
+        border-color: var(--accent, var(--ok));
+      }
+      .cs-result .m {
+        color: var(--text-2);
+        font-size: 12.5px;
+      }
+      .ct-section-h {
+        font-family: var(--font-display);
+        font-size: 14.5px;
+        font-weight: 600;
+        color: var(--text-0);
+        margin: 18px 0 8px;
+      }
+      .ct-section-h:first-of-type {
+        margin-top: 0;
+      }
+      .ct-reasons {
+        margin: 2px 0 10px;
+        padding-left: 18px;
+        font-size: 13px;
+        color: var(--text-2);
+        line-height: 1.5;
+      }
+      .ct-checked {
+        opacity: 0.55;
+      }
+      .ct-empty {
+        color: var(--text-2);
+        font-size: 14px;
+        padding: 20px 4px;
+      }
+      .wt-toast {
+        position: fixed;
+        left: 50%;
+        bottom: 28px;
+        transform: translateX(-50%);
+        background: var(--ok-wash);
+        color: var(--ok-text);
+        border-radius: 10px;
+        padding: 12px 18px;
+        font-size: 13.5px;
+        font-weight: 600;
+        box-shadow: var(--sh-3);
+        z-index: 120;
+        max-width: min(92vw, 520px);
+        text-align: center;
       }
       .rec-row {
         border: 1px solid var(--line);
@@ -1009,6 +1093,8 @@
         <div class="stat">Queue <b id="nQueue">0</b></div>
         <div class="stat">Cooking <b id="nCook">0</b></div>
         <div class="r">
+          <button class="btn btn-s btn-sm" id="csBtn">Correct Stock</button>
+          <button class="btn btn-s btn-sm" id="ctBtn">Count Today</button>
           <button class="btn btn-s btn-sm" id="recBtn">
             End-of-service reconciliation
           </button>
@@ -1856,8 +1942,320 @@
       }
 
       document.getElementById("recBtn").onclick = () => openRec();
+
+      /* ===================== CORRECT STOCK =====================
+   "The system says X, the shelf says Y — fix it now." Gated server-side on
+   inventory.correct_stock (kitchen, admin), which grants ONLY this: see a
+   current expected quantity, submit a physical count, optionally add a
+   note. It cannot receive stock, write off a known loss (use the till /
+   admin console's Wastage action for that), or edit an ingredient. A
+   corrected quantity is NEVER automatically called wastage — see
+   reservation.record_count; this sheet only ever posts a count_adjustment. */
+      function newIdempotencyKey() {
+        if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+        return "k-" + Date.now() + "-" + Math.random().toString(16).slice(2);
+      }
+
+      function showToast(msg) {
+        document.querySelectorAll(".wt-toast").forEach((t) => t.remove());
+        const t = document.createElement("div");
+        t.className = "wt-toast";
+        t.textContent = msg;
+        document.body.appendChild(t);
+        setTimeout(() => t.remove(), 4000);
+      }
+
+      let CS = null;
+
+      function closeCS() {
+        const s = document.getElementById("csScrim");
+        if (s) s.remove();
+        const b = document.getElementById("csSheet");
+        if (b) b.remove();
+        CS = null;
+      }
+
+      function openCS() {
+        closeCS();
+        CS = { selected: null, requestId: null };
+        const scrim = document.createElement("div");
+        scrim.id = "csScrim";
+        scrim.addEventListener("click", closeCS);
+        document.body.appendChild(scrim);
+        const sheet = document.createElement("div");
+        sheet.id = "csSheet";
+        document.body.appendChild(sheet);
+        paintCS();
+      }
+
+      async function searchCS(q) {
+        const box = document.getElementById("csResults");
+        if (!box) return;
+        box.innerHTML = `<div class="empty-col">Searching…</div>`;
+        let data;
+        try {
+          data = await api(
+            "/console/ingredients/quick?q=" +
+              encodeURIComponent(q) +
+              "&limit=15",
+          );
+        } catch (e) {
+          box.innerHTML = `<div class="empty-col">${esc2(e.message)}</div>`;
+          return;
+        }
+        if (!CS || CS.selected) return; // the sheet moved on while this was in flight
+        const items = data.ingredients || [];
+        box.innerHTML = items.length
+          ? items
+              .map(
+                (it) => `<div class="cs-result" data-pick="${it.ingredientId}">
+            <span>${esc2(it.name)}</span>
+            <span class="m">${n0(it.expectedBase)} ${esc2(it.baseUnit)}</span>
+          </div>`,
+              )
+              .join("")
+          : `<div class="empty-col">No match.</div>`;
+        box.querySelectorAll("[data-pick]").forEach((row) => {
+          row.onclick = () => {
+            const it = items.find(
+              (x) => String(x.ingredientId) === row.dataset.pick,
+            );
+            CS.selected = {
+              pk: it.ingredientId,
+              name: it.name,
+              baseUnit: it.baseUnit,
+              expectedBase: it.expectedBase,
+            };
+            CS.requestId = null;
+            paintCS();
+          };
+        });
+      }
+
+      function paintCS() {
+        const sheet = document.getElementById("csSheet");
+        if (!CS.selected) {
+          sheet.innerHTML = `
+        <h2>Correct Stock</h2>
+        <p class="sub">Type an ingredient name, then enter what's actually there. No reason needed — add a note only if you already know what happened.</p>
+        <input class="field cs-search" id="csSearch" type="text" placeholder="Search ingredient…" autocomplete="off">
+        <div class="cs-results" id="csResults"></div>
+        <div class="rec-f"><button class="btn btn-s" id="csClose">Close</button></div>`;
+          document.getElementById("csClose").onclick = closeCS;
+          const input = document.getElementById("csSearch");
+          input.focus();
+          let t = null;
+          input.addEventListener("input", () => {
+            clearTimeout(t);
+            t = setTimeout(() => searchCS(input.value), 200);
+          });
+          searchCS("");
+          return;
+        }
+        const s = CS.selected;
+        sheet.innerHTML = `
+      <h2>Correct Stock</h2>
+      <p class="sub">${esc2(s.name)}</p>
+      <div class="rec-row">
+        <div class="rh"><b>System expects</b><span class="m">${n0(s.expectedBase)} ${esc2(s.baseUnit)}</span></div>
+        <div class="rec-in" style="grid-template-columns:1fr">
+          <div><label>Actual amount (${esc2(s.baseUnit)})</label>
+            <input class="field" type="number" inputmode="decimal" min="0" step="1" id="csActual" value="${n0(s.expectedBase)}"></div>
+        </div>
+        <div class="rec-calc" id="csCalc"></div>
+        <div style="margin-top:10px"><label style="display:block;font-size:11.5px;color:var(--text-2);margin-bottom:3px;font-weight:600">Note (optional)</label>
+          <input class="field" type="text" id="csNote" placeholder="only if you already know what happened"></div>
+      </div>
+      <div id="csErr"></div>
+      <div class="rec-f">
+        <button class="btn btn-s" id="csBack">Change ingredient</button>
+        <button class="btn btn-p" id="csConfirm">Confirm Stock</button>
+      </div>`;
+        document.getElementById("csBack").onclick = () => {
+          CS.selected = null;
+          paintCS();
+        };
+        const actual = document.getElementById("csActual");
+        const calc = document.getElementById("csCalc");
+        function updateCalc() {
+          const v = parseFloat(actual.value);
+          if (isNaN(v)) {
+            calc.textContent = "Enter the actual amount.";
+            calc.className = "rec-calc";
+            return;
+          }
+          const diff = v - s.expectedBase;
+          calc.className =
+            "rec-calc " + (Math.abs(diff) < 0.001 ? "ok" : "warn");
+          calc.innerHTML = `Difference: <b>${diff > 0 ? "+" : ""}${n0(diff)} ${esc2(s.baseUnit)}</b>`;
+        }
+        actual.addEventListener("input", updateCalc);
+        updateCalc();
+        actual.focus();
+        actual.select();
+        document.getElementById("csConfirm").onclick = async () => {
+          const v = parseFloat(actual.value);
+          const errEl = document.getElementById("csErr");
+          errEl.textContent = "";
+          if (isNaN(v) || v < 0) {
+            errEl.textContent = "Enter the actual amount.";
+            errEl.style.color = "#D92D20";
+            return;
+          }
+          document.getElementById("csConfirm").disabled = true;
+          if (!CS.requestId) CS.requestId = newIdempotencyKey();
+          try {
+            const r = await api(`/console/ingredients/${s.pk}/count`, {
+              method: "POST",
+              body: JSON.stringify({
+                actual_base: v,
+                note: document.getElementById("csNote").value.trim() || null,
+                client_request_id: CS.requestId,
+                source: "correct_stock",
+              }),
+            });
+            closeCS();
+            showToast(
+              `${s.name} corrected to ${n0(v)} ${s.baseUnit}.` +
+                (r.variance_base != null
+                  ? ` Difference ${r.variance_base > 0 ? "+" : ""}${n0(r.variance_base)} ${s.baseUnit}.`
+                  : ""),
+            );
+          } catch (e) {
+            errEl.textContent = e.message;
+            errEl.style.color = "#D92D20";
+            document.getElementById("csConfirm").disabled = false;
+          }
+        };
+      }
+
+      document.getElementById("csBtn").onclick = () => openCS();
+
+      /* ===================== COUNT TODAY =====================
+   A short, explainable shortlist of what's worth a physical count right
+   now — not all 131 ingredients. See wt/depletion.py's count_today() for
+   the deterministic rules behind each `reasons` line; nothing here
+   recomputes them. Submitting a row here is the exact same
+   inventory.correct_stock-gated count endpoint Correct Stock uses. */
+      let CT = null;
+
+      function closeCT() {
+        const s = document.getElementById("ctScrim");
+        if (s) s.remove();
+        const b = document.getElementById("ctSheet");
+        if (b) b.remove();
+        CT = null;
+      }
+
+      async function openCT() {
+        closeCT();
+        let data;
+        try {
+          data = await api("/console/count-today");
+        } catch (e) {
+          alert(e.message);
+          return;
+        }
+        CT = { data };
+        const scrim = document.createElement("div");
+        scrim.id = "ctScrim";
+        scrim.addEventListener("click", closeCT);
+        document.body.appendChild(scrim);
+        const sheet = document.createElement("div");
+        sheet.id = "ctSheet";
+        document.body.appendChild(sheet);
+        paintCT();
+      }
+
+      function ctRow(item) {
+        return `
+      <div class="rec-row" data-ct-ing="${item.ingredientId}">
+        <div class="rh"><b>${esc2(item.name)}</b>
+          <span class="m">System expects ${n0(item.expectedBase)} ${esc2(item.baseUnit)}</span></div>
+        <ul class="ct-reasons">${item.reasons.map((r) => `<li>${esc2(r)}</li>`).join("")}</ul>
+        <div class="rec-in" style="grid-template-columns:1fr auto">
+          <div><label>Actual amount (${esc2(item.baseUnit)})</label>
+            <input class="field" type="number" inputmode="decimal" min="0" step="1" data-ct-actual value="${n0(item.expectedBase)}"></div>
+          <div><label>&nbsp;</label><button class="btn btn-p" data-ct-confirm style="height:44px;width:auto;padding:0 18px">Confirm</button></div>
+        </div>
+        <div class="rec-calc" data-ct-calc></div>
+      </div>`;
+      }
+
+      function paintCT() {
+        const sheet = document.getElementById("ctSheet");
+        const { needsChecking, worthChecking, totalIngredients } = CT.data;
+        const count = needsChecking.length + worthChecking.length;
+        const body =
+          count === 0
+            ? `<div class="ct-empty">Nothing needs checking right now. (${totalIngredients} ingredients tracked.)</div>`
+            : `
+          ${needsChecking.length ? `<div class="ct-section-h">Needs checking (${needsChecking.length})</div>${needsChecking.map(ctRow).join("")}` : ""}
+          ${worthChecking.length ? `<div class="ct-section-h">Worth checking (${worthChecking.length})</div>${worthChecking.map(ctRow).join("")}` : ""}
+        `;
+        sheet.innerHTML = `
+      <h2>Count Today</h2>
+      <p class="sub">${count} item${count === 1 ? "" : "s"} worth a quick physical check, out of ${totalIngredients} tracked. Looking for something else not listed here? Use Correct Stock instead.</p>
+      ${body}
+      <div class="rec-f"><button class="btn btn-s" id="ctClose">Close</button></div>`;
+        document.getElementById("ctClose").onclick = closeCT;
+        sheet.querySelectorAll("[data-ct-ing]").forEach(wireCTRow);
+      }
+
+      function wireCTRow(row) {
+        const id = row.dataset.ctIng;
+        const all = [...CT.data.needsChecking, ...CT.data.worthChecking];
+        const item = all.find((x) => String(x.ingredientId) === id);
+        const actual = row.querySelector("[data-ct-actual]");
+        const calc = row.querySelector("[data-ct-calc]");
+        const btn = row.querySelector("[data-ct-confirm]");
+        function update() {
+          const v = parseFloat(actual.value);
+          if (isNaN(v)) {
+            calc.textContent = "";
+            return;
+          }
+          const diff = v - item.expectedBase;
+          calc.className =
+            "rec-calc " + (Math.abs(diff) < 0.001 ? "ok" : "warn");
+          calc.innerHTML = `Difference: <b>${diff > 0 ? "+" : ""}${n0(diff)} ${esc2(item.baseUnit)}</b>`;
+        }
+        actual.addEventListener("input", update);
+        update();
+        let requestId = null;
+        btn.onclick = async () => {
+          const v = parseFloat(actual.value);
+          if (isNaN(v) || v < 0) return;
+          btn.disabled = true;
+          if (!requestId) requestId = newIdempotencyKey();
+          try {
+            const r = await api(`/console/ingredients/${id}/count`, {
+              method: "POST",
+              body: JSON.stringify({
+                actual_base: v,
+                note: null,
+                client_request_id: requestId,
+                source: "count_today",
+              }),
+            });
+            row.classList.add("ct-checked");
+            row.innerHTML = `<div class="rh"><b>${esc2(item.name)}</b><span class="chip ok">Checked just now</span></div>
+          <div class="m">Corrected to ${n0(v)} ${esc2(item.baseUnit)}${r.variance_base != null ? ` (difference ${r.variance_base > 0 ? "+" : ""}${n0(r.variance_base)} ${esc2(item.baseUnit)})` : ""}.</div>`;
+            showToast(`${item.name} updated to ${n0(v)} ${item.baseUnit}.`);
+          } catch (e) {
+            calc.className = "rec-calc bad";
+            calc.textContent = e.message;
+            btn.disabled = false;
+          }
+        };
+      }
+
+      document.getElementById("ctBtn").onclick = () => openCT();
+
       document.addEventListener("keydown", (e) => {
         if (e.key === "Escape" && REC) closeRec();
+        if (e.key === "Escape" && CS) closeCS();
+        if (e.key === "Escape" && CT) closeCT();
       });
 
       document.addEventListener("click", async (e) => {

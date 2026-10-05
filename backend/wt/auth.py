@@ -100,6 +100,35 @@ CAPABILITIES = {
     "menu.read":          ("cashier", "kitchen", "manager", "admin", "owner"),
     "inventory.read":     ("manager", "admin", "owner"),
     "inventory.write":    ("admin",),
+    # 2026-10 audit: inventory.write alone meant the only person on-site who
+    # could correct a physical stock count was 'admin' — a back-office role,
+    # not whoever is actually standing in front of the shortage. This is
+    # deliberately narrow: it grants ONLY what POST /console/ingredients/
+    # {pk}/count and /bulk-count need (submit a physical count, see the
+    # current expected quantity, optionally add a note) — never receive,
+    # waste/spoilage, manual use, recipe/ingredient editing, or purchasing,
+    # all of which stay inventory.write-only exactly as before. 'kitchen' is
+    # the station that actually discovers a shortage mid-service (see
+    # kds.html's Correct Stock sheet) and already holds one other narrow
+    # operational-write capability with the same shape (unli.reconcile.write,
+    # just above order.void). 'admin' is listed explicitly for the same
+    # reason order.void lists every role that can reach it directly, rather
+    # than relying on inventory.write's separate role list to cover it.
+    #
+    # Deliberately NOT granted to 'manager' or 'owner' despite both being
+    # plausible-sounding candidates: 'manager' is a retired role (migration
+    # 0034 deactivated the one seeded account; create_user refuses it for
+    # new accounts — see this file's own CAPABILITIES comment above and
+    # api.py's create_user) and granting it a capability no live account can
+    # use is dead configuration, not a safeguard. 'owner' is read-only by
+    # explicit design everywhere in this table (instruction.create and
+    # purchase_order.create are the only two exceptions, and both are
+    # owner-to-admin workflows, not a direct operational mutation) — adding
+    # inventory write access of any shape here would be the first capability
+    # to break that invariant. Not granted to 'cashier' either: the POS, not
+    # the till, is where a shortage is discovered, and nothing in this phase
+    # demonstrated a cashier-specific need for it.
+    "inventory.correct_stock": ("kitchen", "admin"),
     "recipe.read":        ("manager", "admin", "owner"),
     "recipe.write":       ("admin",),
     # Whether a service charge applies at all, and which of the

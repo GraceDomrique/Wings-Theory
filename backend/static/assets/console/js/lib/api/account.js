@@ -55,6 +55,7 @@ export async function listUsers() {
     mustChangePassword: !!u.must_change_password,
     lockedUntil: u.locked_until || null,
     isActive: !!u.is_active,
+    lastLoginAt: u.last_login_at || null,
   }));
 }
 

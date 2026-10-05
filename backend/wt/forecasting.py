@@ -33,6 +33,8 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import sqlite3
+import threading
+import time
 
 from . import timeutil
 from .errors import NotFoundError
@@ -108,14 +110,15 @@ REVIEW_CYCLE_DAYS = 3   # buffer beyond lead time before the next check-in, not 
 ROP_BREACH_MIN_RISK = "warning"
 
 
-def _elapsed_days(first_day_iso: str | None) -> int:
+def _elapsed_days(first_day_iso: str | None, now: _dt.datetime | None = None) -> int:
     if not first_day_iso:
         return 0
     first = _dt.date.fromisoformat(first_day_iso)
-    return max(1, (timeutil.business_today() - first).days + 1)
+    return max(1, (timeutil.business_today(now) - first).days + 1)
 
 
-def ingredient_depletion(conn: sqlite3.Connection, lookback_days: int = 30) -> list[dict]:
+def ingredient_depletion(conn: sqlite3.Connection, lookback_days: int = 30,
+                         now: _dt.datetime | None = None) -> list[dict]:
     """One row per deductable ingredient: real avg daily consumption from the
     ledger, projected days remaining at that rate, and a risk tier relative
     to the ingredient's own lead time (set on the ingredient record, used
@@ -142,6 +145,20 @@ def ingredient_depletion(conn: sqlite3.Connection, lookback_days: int = 30) -> l
     where a screen wants an at-a-glance figure without the cost of the full
     forward model (see api.py's forecast_depletion and listIngredients'
     withRunway).
+
+    now: 2026-10 fix -- every real caller before this one omitted it, which
+    meant the "trailing N days" window was always bounded by the real
+    wall-clock moment the call happened to run at, never by the historical
+    instant a backtest is actually asking about. depletion.ingredient_
+    forecast()'s own replenishment_backtest() caller passes its `now`
+    through here now, so a rate computed for a date in the past only ever
+    reads ledger rows that existed as of THAT date -- confirmed directly:
+    before this fix, this function returned the IDENTICAL avg_daily_
+    consumption for the same ingredient at every one of six different
+    simulated dates spanning two months, which is only possible if the
+    historical `now` was never actually being used to bound the window.
+    Every other caller still omits `now` (real current-moment behavior,
+    unchanged) and gets back exactly what it always has.
     """
     ingredients = conn.execute(
         """
@@ -154,6 +171,9 @@ def ingredient_depletion(conn: sqlite3.Connection, lookback_days: int = 30) -> l
         """
     ).fetchall()
 
+    upper_bound_clause = " AND created_at < ?" if now is not None else ""
+    upper_bound_params = (timeutil.utc_upper_bound_sql(now),) if now is not None else ()
+
     out = []
     for ing in ingredients:
         consumption_reason = "operational_use" if ing["inventory_type"] == "operational_supply" else "sale_commit"
@@ -165,8 +185,10 @@ def ingredient_depletion(conn: sqlite3.Connection, lookback_days: int = 30) -> l
               FROM stock_ledger
              WHERE ingredient_id = ? AND reason = ?
                AND created_at >= ?
+               {upper_bound_clause}
             """,
-            (ing["id"], consumption_reason, timeutil.utc_bound_n_manila_days_ago(lookback_days)),
+            (ing["id"], consumption_reason, timeutil.utc_bound_n_manila_days_ago(lookback_days, now),
+             *upper_bound_params),
         ).fetchone()
 
         consumed = row["consumed"] or 0.0
@@ -174,7 +196,7 @@ def ingredient_depletion(conn: sqlite3.Connection, lookback_days: int = 30) -> l
         # The rate is spread over the window actually elapsed since the first
         # sale, not just the days something sold — a slow mover that sold on
         # 2 of the last 30 days still has a 30-day rate, not a 2-day one.
-        span_days = min(lookback_days, _elapsed_days(row["first_day"]))
+        span_days = min(lookback_days, _elapsed_days(row["first_day"], now))
         avg_daily = (consumed / span_days) if span_days > 0 else 0.0
 
         available = ing["available_base"]
@@ -226,6 +248,103 @@ def _item_or_404(conn: sqlite3.Connection, menu_item_pk: int) -> sqlite3.Row:
     return item
 
 
+# ===========================================================================
+# Dead-tail-aware "now" -- 2026-09 second adaptive-growth pass
+#
+# PROPHET_ACCURACY_OPTIMIZATION_AUDIT.md manually identified (section B) that
+# this deployment's order history can carry a trailing DATA-COLLECTION gap:
+# dense real trading, then a period of near-zero orders that reflects a
+# recording gap, not a real demand collapse -- and explicitly flagged
+# (section N) that evaluate_demand_model()/evaluate_store_demand_model()
+# still read the live wall clock with no defense against this, "until...
+# given the same now override this audit added... not done in this pass".
+#
+# Confirmed still live and consequential just now: calling
+# depletion.refresh_prophet_baselines() unanchored (today's real wall
+# clock, which currently sits a few days past this dataset's own such gap)
+# selects growth='linear' for only 3/32 items and 1/3 store metrics --
+# against an anchored, leakage-free evaluation that (correctly, per Level 1's
+# own tuning-fold WAPE) selects 'linear' for the store's own aggregate
+# orders/items/sales AND its highest-volume item. The gap silently
+# corrupts whichever recent fold lands inside it.
+#
+# effective_now() automates the same judgment the audit made by hand:
+# compare each recent day's real order count against the MEDIAN of the
+# last DEAD_TAIL_MEDIAN_WINDOW_DAYS days (robust to a gap that is short
+# relative to that window), then walk backward from the true wall clock
+# until a day clears DEAD_TAIL_MIN_FRACTION_OF_MEDIAN of that median. A
+# deployment with no such gap gets back the real wall clock unchanged --
+# this is a no-op on healthy, continuous data, self-healing the moment real
+# trading resumes past whatever gap triggered it. Nothing is deleted or
+# hidden: only which date backtest/growth-selection code treats as "today"
+# for windowing changes; the sparse/gap rows stay in the database untouched.
+#
+# Deliberately scoped to backtest/growth-selection/reporting paths only
+# (evaluate_demand_model, evaluate_store_demand_model, and
+# refresh_prophet_baselines' growth selection + live fit) -- NOT the EWMA
+# nowcast path in depletion.py, which legitimately needs the real wall
+# clock to answer "how is today, already partway done, actually going".
+# Anchoring that path to a stale date would be actively wrong, not safer.
+# ===========================================================================
+DEAD_TAIL_MEDIAN_WINDOW_DAYS = 90
+DEAD_TAIL_MIN_FRACTION_OF_MEDIAN = 0.25
+
+
+def effective_now(conn: sqlite3.Connection, *, now: _dt.datetime | None = None) -> _dt.datetime:
+    """See the module section above this function for the full rationale.
+    Returns `now` (or the real wall clock if `now` is omitted) unchanged
+    whenever recent trading looks healthy; otherwise returns an instant
+    whose Manila business date is the most recent day that cleared the
+    activity bar, so every `_daily_series`/`_store_daily_series` caller
+    downstream treats that day as "today" instead of a trailing gap.
+    """
+    # 2026-10 leakage audit: upper-bounded by `now`, but ONLY when a caller
+    # explicitly supplied a historical one -- captured as `was_given` BEFORE
+    # resolving the live-clock default below, because once resolved the two
+    # cases are indistinguishable. An always-on upper bound (tried first)
+    # broke a real existing test: test fixtures commonly stamp "today" at a
+    # fixed example time (e.g. noon UTC) that can be LATER than the actual
+    # wall-clock instant a test happens to run at, which `created_at <
+    # real_utc_now()` would then wrongly exclude -- a test-fixture-timing
+    # artifact, not a real production concern (a real order's created_at is
+    # always <= the real moment it was inserted, by construction). Bounding
+    # only the genuinely-historical-`now` case avoids that false positive
+    # while still closing the same latent leak _daily_series() closes for
+    # that case.
+    was_given = now is not None
+    now = now or timeutil.utc_now()
+    upper = " AND created_at < ?" if was_given else ""
+    params = [timeutil.utc_bound_n_manila_days_ago(DEAD_TAIL_MEDIAN_WINDOW_DAYS, now)]
+    if was_given:
+        params.append(timeutil.utc_upper_bound_sql(now))
+    rows = conn.execute(
+        f"""
+        SELECT {timeutil.sql_business_date("created_at")} AS d, COUNT(*) AS n
+          FROM customer_order
+         WHERE status != 'void' AND created_at >= ?{upper}
+         GROUP BY d
+        """,
+        params,
+    ).fetchall()
+    if not rows:
+        return now
+    counts = sorted(r["n"] for r in rows)
+    mid = len(counts) // 2
+    median = counts[mid] if len(counts) % 2 else (counts[mid - 1] + counts[mid]) / 2
+    if median <= 0:
+        return now
+    threshold = median * DEAD_TAIL_MIN_FRACTION_OF_MEDIAN
+    by_day = {r["d"]: r["n"] for r in rows}
+    d = timeutil.business_today(now)
+    for _ in range(DEAD_TAIL_MEDIAN_WINDOW_DAYS):
+        if by_day.get(d.isoformat(), 0) >= threshold:
+            if d == timeutil.business_today(now):
+                return now  # today itself already clears the bar -- no gap, real now unchanged
+            return _dt.datetime.combine(d, _dt.time(12, 0), tzinfo=timeutil.MANILA_TZ)
+        d -= _dt.timedelta(days=1)
+    return now  # no day in the whole window cleared the bar -- give up rather than walk back indefinitely
+
+
 def _daily_series(conn: sqlite3.Connection, menu_item_pk: int, lookback_days: int,
                   now: _dt.datetime | None = None):
     """Real daily sold-qty rows plus the same series zero-filled across every
@@ -239,17 +358,36 @@ def _daily_series(conn: sqlite3.Connection, menu_item_pk: int, lookback_days: in
     anchor a window to a specific reference date rather than the live
     system clock (e.g. the 2026-09 accuracy-optimization experiment,
     which anchors to this dataset's own last real trading day rather than
-    a system clock that has since moved past it)."""
+    a system clock that has since moved past it).
+
+    2026-10 leakage audit: `rows` (unlike `series`, which was already safe
+    by construction -- the zero-fill loop below never asks for a day past
+    `today`) had no upper bound on created_at, so a caller handed a
+    historical `now` could still read real order rows dated AFTER it.
+    `series`/the Prophet fit itself (which trains on `series`, never
+    `rows` -- see fit_prophet()) were never affected; the one real consumer
+    of raw `rows` is fit_prophet()'s own weeks_covered seasonality count,
+    which could have overcounted distinct ISO weeks for a historical `now`
+    with real future data on the live clock. No current caller in this
+    codebase passes a historical `now` into anything that reaches this
+    function (confirmed by audit), so this was latent, not an active
+    cause of any previously reported number -- closed anyway, on the same
+    "every historical evaluation must reproduce exactly what the system
+    could have known" principle the rest of this audit applies."""
     bd = timeutil.sql_business_date("o.created_at")
+    upper = " AND o.created_at < ?" if now is not None else ""
+    params = [menu_item_pk, timeutil.utc_bound_n_manila_days_ago(lookback_days, now)]
+    if now is not None:
+        params.append(timeutil.utc_upper_bound_sql(now))
     rows = conn.execute(
         f"""
         SELECT {bd} AS d, SUM(ol.qty) AS qty
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
          WHERE ol.menu_item_id = ? AND o.status != 'void'
-           AND o.created_at >= ?
+           AND o.created_at >= ?{upper}
          GROUP BY {bd}
         """,
-        (menu_item_pk, timeutil.utc_bound_n_manila_days_ago(lookback_days, now)),
+        params,
     ).fetchall()
     by_day = {r["d"]: r["qty"] for r in rows}
     today = timeutil.business_today(now)
@@ -330,13 +468,28 @@ def menu_item_demand_prophet(
     reason (not installed, or a runtime failure) — a forecast page that
     hard-500s because a subprocess-backed sampler hiccuped is worse than one
     that quietly uses the simpler method and says so.
+
+    Growth: uses whatever growth depletion.refresh_prophet_baselines() most
+    recently cached for this item via cache_growth_selection() (see that
+    cache's own docstring) -- the same validated per-item choice
+    replenishment fits with, so this detail page and replenishment can no
+    longer silently disagree. A cache miss (never refreshed yet) or a stale
+    entry falls back to PROPHET_DEFAULT_GROWTH, never an inline re-tune —
+    this stays a single fit, not a backtest, exactly as before.
+
+    Window: anchored to effective_now() (see that function), not the live
+    wall clock, so a trailing data-collection gap isn't fit as if it were
+    real recent demand. The non-Prophet fallback below (prophet_unavailable
+    or insufficient_data) deliberately keeps reading the real wall clock via
+    menu_item_demand()'s own default -- that cheap path is shared by many
+    other callers and out of scope for this fix.
     """
     if not _PROPHET_AVAILABLE:
         return {**menu_item_demand(conn, menu_item_pk, horizon_days, lookback_days),
                "method": "trailing_average", "prophet_unavailable": True}
 
     item = _item_or_404(conn, menu_item_pk)
-    rows, series = _daily_series(conn, menu_item_pk, lookback_days)
+    rows, series = _daily_series(conn, menu_item_pk, lookback_days, now=effective_now(conn))
     active_days = len(rows)
     total_qty = sum(r["qty"] for r in rows)
 
@@ -347,7 +500,9 @@ def menu_item_demand_prophet(
             "series": series, "forecast": [], "method": "prophet",
         }
 
-    fitted_model = fit_prophet(series, rows, horizon_days)
+    cached_growth = cached_growth_for(conn, f"menu_item:{menu_item_pk}")
+    growth = cached_growth["selected_growth"] if cached_growth else PROPHET_DEFAULT_GROWTH
+    fitted_model = fit_prophet(series, rows, horizon_days, growth=growth)
     if fitted_model is None:
         fallback = menu_item_demand(conn, menu_item_pk, horizon_days, lookback_days)
         return {**fallback, "method": "trailing_average", "prophet_unavailable": True}
@@ -363,6 +518,8 @@ def menu_item_demand_prophet(
         "series": series, "forecast": fitted_model["forecast"],
         "fitted": fitted_model["fitted"], "outliers": fitted_model["outliers"],
         "method": "prophet",
+        "growth_used": growth,
+        "growth_source": "cached_adaptive" if cached_growth else "default_not_yet_refreshed",
     }
 
 
@@ -466,7 +623,19 @@ EVAL_METHOD_VERSION = "2026-09-rolling-backtest-v1"
 # forecast page load, so a slower, thorough run here is the right trade.
 ROLLING_MIN_TRAIN_DAYS = 21     # 3 weeks minimum before the first fold is scored
 ROLLING_MAX_FOLDS = 4           # most recent N expanding-window folds per item, not all of them
-ROLLING_MAX_ITEMS = 8           # items with the most real history, evaluated fully
+# 2026-10 audit: raised 8 -> 16. All 32 real menu items clear
+# ROLLING_MIN_TRAIN_DAYS + horizon_days of real sale-days (items_insufficient_
+# history is 0 at every value tried, including 32) -- the earlier cap was a
+# request-latency trade-off, not a reflection of real data being scarce.
+# Measured on the live DB before raising this: 8 items ~2s/call, 16 items
+# ~34s/call, 32 items ~69s/call, with the fleet-level conclusion identical
+# at every size (Prophet within ~1-1.5 WAPE pts of the best baseline, never
+# ahead) -- so the cap was never hiding a different answer. 16 doubles real
+# coverage of the technical panel while staying well inside the 30-minute
+# cache TTL (_model_details_cache) and typical request timeouts; 32 was left
+# out specifically because a cold cache would make whichever request
+# triggers the recompute wait over a minute.
+ROLLING_MAX_ITEMS = 16          # items with the most real history, evaluated fully
 BASELINE_METHODS = ("naive_previous_period", "trailing_moving_average", "day_of_week_seasonal")
 ALL_METHODS = BASELINE_METHODS + ("prophet",)
 
@@ -591,8 +760,192 @@ def _rolling_fold_starts(n_days: int, min_train: int, horizon: int, max_folds: i
     return starts[-max_folds:] if starts else []
 
 
+# ===========================================================================
+# Level 1 -- per-series adaptive Prophet growth selection (2026-09 adaptive-
+# growth pass)
+#
+# The 2026-09 accuracy-optimization audit picked growth='flat' as a single
+# GLOBAL default (PROPHET_DEFAULT_GROWTH, above) from a 133-day dataset,
+# where a fitted trend line was noise everywhere it was tried. A full-year
+# re-test against the live database (2025-01-01 -> 2026-09-21) found that
+# conclusion no longer holds uniformly: growth='linear' now clearly wins for
+# this restaurant's highest-volume series (store-wide orders/items/sales,
+# and the flagship Unlimited Wings item -- roughly half the WAPE of 'flat'
+# on those specifically), while most lower-volume items still prefer or tie
+# with 'flat' (25 of 35 series in that re-test). Forcing one global choice
+# is therefore now measurably wrong for a real minority of series. This
+# section replaces the single global default with a per-series choice, fed
+# into _backtest_series()'s existing method-selection machinery as a new
+# "Level 1" that runs BEFORE the existing baseline-vs-Prophet "Level 2"
+# selection below -- not a second, parallel selection system.
+# ===========================================================================
+GROWTH_CANDIDATES = ("flat", "linear")
+GROWTH_SELECTION_MIN_FOLDS = 2     # need at least 2 independent tuning folds before trusting any WAPE difference at all
+GROWTH_SELECTION_MAX_FOLDS = 3     # deliberately fewer than a reporting backtest's own fold count (ROLLING_MAX_FOLDS/a caller's max_folds) -- see select_prophet_growth()'s docstring for why this keeps growth-selection folds and whatever folds a caller reports accuracy on chronologically disjoint
+GROWTH_TIE_EPSILON = 1e-6          # a WAPE-point difference below this is treated as a genuine tie (never a real signal, never broken randomly)
+
+
+def _decide_growth(mean_wape: dict[str, float | None], folds_attempted: int) -> tuple[str, str]:
+    """The actual decision table, isolated from fold-scoring/Prophet-fitting
+    so it can be tested with hand-picked numbers rather than depending on a
+    real Prophet fit producing an exact tie or an exact fold count. Returns
+    (selected_growth, reason). Deterministic, never random -- see the six
+    named reasons below, checked in this fixed order:
+
+      1. insufficient_tuning_folds   -- fewer than GROWTH_SELECTION_MIN_FOLDS
+         usable folds exist (too little history). Conservative default.
+      2. no_successful_prophet_fits  -- neither growth ever fit successfully
+         across every fold tried (Prophet unavailable, or every fit failed).
+      3. linear_fit_failed_every_fold / flat_fit_failed_every_fold -- only
+         one growth ever produced a usable fit; that one wins by default,
+         reported symmetrically (a genuine fit failure is evidence, not an
+         automatic vote for 'flat').
+      4. exact_tie_prefers_flat      -- both fit, and their mean tuning WAPE
+         differs by less than GROWTH_TIE_EPSILON.
+      5. lower_tuning_wape           -- otherwise, whichever mean tuning WAPE
+         is lower wins.
+    """
+    if folds_attempted < GROWTH_SELECTION_MIN_FOLDS:
+        return PROPHET_DEFAULT_GROWTH, "insufficient_tuning_folds"
+    flat_w, linear_w = mean_wape.get("flat"), mean_wape.get("linear")
+    if flat_w is None and linear_w is None:
+        return PROPHET_DEFAULT_GROWTH, "no_successful_prophet_fits"
+    if linear_w is None:
+        return "flat", "linear_fit_failed_every_fold"
+    if flat_w is None:
+        return "linear", "flat_fit_failed_every_fold"
+    if abs(flat_w - linear_w) < GROWTH_TIE_EPSILON:
+        return "flat", "exact_tie_prefers_flat"
+    return ("flat" if flat_w < linear_w else "linear"), "lower_tuning_wape"
+
+
+def select_prophet_growth(rows: list[dict], series: list[dict], *,
+                          horizon: int = 7, min_train: int = ROLLING_MIN_TRAIN_DAYS,
+                          max_folds: int = GROWTH_SELECTION_MAX_FOLDS) -> dict:
+    """Per-series Level-1 decision: does THIS series' own recent history
+    favor Prophet growth='flat' or growth='linear'? Always returns a usable
+    decision plus a `reason` -- never raises, never leaves a caller without
+    a growth string to fit with.
+
+    LEAKAGE: uses only chronological expanding-window folds carved from the
+    `series`/`rows` it is given (_rolling_fold_starts, unmodified, same
+    mechanism _backtest_series() itself uses for its own folds). It is the
+    CALLER's responsibility to pass a slice that excludes whatever period
+    will later be evaluated or forecast:
+      - _backtest_series() passes series[:fold_starts[0]] -- everything
+        strictly before the first fold IT is about to report accuracy on,
+        so those reported folds can never have influenced their own
+        model's growth choice.
+      - refresh_prophet_baselines() (live replenishment) passes the item's
+        full available history -- there is no held-out period to protect
+        there, because the forecast this selection feeds targets genuinely
+        future days that no fold here, or anywhere, has ever seen.
+
+    See _decide_growth() for the exact, deterministic fallback/tie rules.
+    """
+    fold_starts = _rolling_fold_starts(len(series), min_train, horizon, max_folds)
+    wape: dict[str, list[float]] = {g: [] for g in GROWTH_CANDIDATES}
+    folds_attempted = 0
+    for start in fold_starts:
+        train = series[:start]
+        test = series[start:start + horizon]
+        if len(test) < horizon:
+            continue
+        test_start_date = test[0]["date"]
+        train_rows = [r for r in rows if r["d"] < test_start_date]
+        if len(train_rows) < MIN_DEMAND_SAMPLE_DAYS:
+            continue
+        folds_attempted += 1
+        actual = [p["qty"] for p in test]
+        for g in GROWTH_CANDIDATES:
+            fitted = fit_prophet(train, train_rows, horizon, growth=g)
+            if fitted is None:
+                continue
+            pred = [p["qty"] for p in fitted["forecast"]]
+            w = _wape(actual, pred)
+            if w is not None:
+                wape[g].append(w)
+
+    folds_scored = {g: len(v) for g, v in wape.items()}
+    mean_wape = {g: (round(sum(v) / len(v), 2) if v else None) for g, v in wape.items()}
+    selected_growth, reason = _decide_growth(mean_wape, folds_attempted)
+
+    return {
+        "selected_growth": selected_growth,
+        "reason": reason,
+        "is_fallback": reason in ("insufficient_tuning_folds", "no_successful_prophet_fits"),
+        "folds_attempted": folds_attempted,
+        "folds_scored": folds_scored,
+        "mean_wape": mean_wape,
+        "horizon": horizon,
+        "min_train": min_train,
+        "max_folds": max_folds,
+        "tuning_end_date": series[-1]["date"] if series else None,
+    }
+
+
+# ===========================================================================
+# Live growth-selection cache -- shared by every LIVE Prophet-fitting path
+# (menu_item_demand_prophet, store_demand_prophet, and, via
+# depletion.refresh_prophet_baselines(), ingredient-level replenishment) so
+# a per-item/per-metric growth decision is made ONCE by the batch refresh
+# and reused everywhere, rather than each live path either re-tuning inline
+# (too slow -- see refresh_prophet_baselines()'s own ~1.8s/fit measurement,
+# and select_prophet_growth() needs up to 2x that many fits again) or
+# silently keeping the old global PROPHET_DEFAULT_GROWTH forever (the
+# inconsistency this cache exists to close). A cache miss or a stale entry
+# both fall back to PROPHET_DEFAULT_GROWTH -- the same conservative
+# behavior _prophet_daily_for_item() already uses for the Prophet FIT cache
+# in depletion.py; this is that same pattern, one level up, for the growth
+# DECISION rather than the fit result.
+#
+# Deliberately NOT keyed by horizon_days: growth is a structural choice
+# (does this series have a real, estimable trend, or not) decided once from
+# whatever horizon the batch refresh actually used (production replenishment's
+# own horizon), and reused for whatever horizon a live detail-page request
+# happens to ask for. Making this horizon-specific would need the batch
+# refresh to run once per distinct horizon requested live, which no caller
+# of this cache currently needs.
+# ===========================================================================
+GROWTH_SELECTION_STALE_AFTER_SECONDS = 48 * 3600   # matches depletion.PROPHET_STALE_AFTER_SECONDS
+_growth_selection_store: dict[tuple, tuple[float, dict]] = {}
+_growth_selection_lock = threading.Lock()
+
+
+def _scope_key(conn: sqlite3.Connection) -> str:
+    """Mirrors depletion._prophet_scope_key() exactly -- same PRAGMA
+    database_list technique, for the same thread/connection-reuse safety
+    reasoning documented there. Duplicated rather than imported the other
+    direction because forecasting.py is the lower-level module depletion.py
+    already depends on, never the reverse."""
+    return conn.execute("PRAGMA database_list").fetchone()[2] or "memory"
+
+
+def cache_growth_selection(conn: sqlite3.Connection, series_key: str, selection: dict) -> None:
+    """Called by whatever batch job just computed a fresh growth decision
+    for this series (today, only depletion.refresh_prophet_baselines()) --
+    never by a live request."""
+    with _growth_selection_lock:
+        _growth_selection_store[(_scope_key(conn), series_key)] = (time.monotonic(), selection)
+
+
+def cached_growth_for(conn: sqlite3.Connection, series_key: str) -> dict | None:
+    """Whatever the last refresh cached for this series, or None if it was
+    never cached or has gone stale. Callers must treat None as "use
+    PROPHET_DEFAULT_GROWTH" -- never fit an ad-hoc selection inline here."""
+    with _growth_selection_lock:
+        hit = _growth_selection_store.get((_scope_key(conn), series_key))
+    if hit is None:
+        return None
+    computed_at, selection = hit
+    if time.monotonic() - computed_at > GROWTH_SELECTION_STALE_AFTER_SECONDS:
+        return None
+    return selection
+
+
 def _backtest_series(rows: list[dict], series: list[dict],
-                     horizon_days: int, min_train: int, max_folds: int) -> dict | None:
+                     horizon_days: int, min_train: int, max_folds: int,
+                     *, prophet_growth: str | None = None) -> dict | None:
     """The entity-agnostic core of a chronological rolling backtest: every
     method in ALL_METHODS, scored across the same expanding-window folds,
     with per-fold and fold-averaged scores plus a WAPE-based selection.
@@ -606,7 +959,16 @@ def _backtest_series(rows: list[dict], series: list[dict],
     is the zero-filled daily series used for every method's actual
     arithmetic. Returns None when there isn't enough history for even one
     fold — the caller decides how to report that (it needs entity-specific
-    fields the core result does not carry)."""
+    fields the core result does not carry).
+
+    `prophet_growth`: the Level-1 growth choice (see select_prophet_growth())
+    to use for every fold's 'prophet' method here. None (the default) means
+    THIS function selects it itself, using only the data strictly before the
+    first fold this function is about to report accuracy on -- so those
+    reported folds can never have influenced their own model's growth
+    choice. A caller that already made this decision elsewhere (e.g.
+    depletion.py's cached live selection) may pass it directly to skip
+    re-deriving it."""
     # `series` is zero-filled across the whole calendar lookback (see
     # _daily_series), so its length alone cannot distinguish "365 days of
     # real trading" from "3 real observations padded out to 365 zeros" -- a
@@ -616,6 +978,22 @@ def _backtest_series(rows: list[dict], series: list[dict],
     fold_starts = _rolling_fold_starts(len(series), min_train, horizon_days, max_folds)
     if not fold_starts or len(rows) < MIN_DEMAND_SAMPLE_DAYS:
         return None
+
+    growth_selection = None
+    if prophet_growth is None:
+        # Level 1, leakage-free: derive this series' growth choice using
+        # ONLY series[:tuning_cutoff] / rows before that date -- strictly
+        # before fold_starts[0], the earliest fold Level 2 below reports
+        # accuracy on. See select_prophet_growth()'s own leakage note and
+        # TestProphetGrowthSelectionLeakage for the regression test that
+        # would catch this boundary moving.
+        tuning_cutoff = fold_starts[0]
+        tuning_series = series[:tuning_cutoff]
+        tuning_cutoff_date = series[tuning_cutoff]["date"]
+        tuning_rows = [r for r in rows if r["d"] < tuning_cutoff_date]
+        growth_selection = select_prophet_growth(tuning_rows, tuning_series,
+                                                  horizon=horizon_days, min_train=min_train)
+        prophet_growth = growth_selection["selected_growth"]
 
     by_method: dict[str, list[dict]] = {m: [] for m in ALL_METHODS}
     folds_meta = []
@@ -635,7 +1013,7 @@ def _backtest_series(rows: list[dict], series: list[dict],
 
         train_rows = [r for r in rows if r["d"] < test_start_date]
         if _PROPHET_AVAILABLE and len(train_rows) >= MIN_DEMAND_SAMPLE_DAYS:
-            fitted = fit_prophet(train, train_rows, horizon_days)
+            fitted = fit_prophet(train, train_rows, horizon_days, growth=prophet_growth)
             if fitted is not None:
                 preds["prophet"] = [p["qty"] for p in fitted["forecast"]]
 
@@ -680,7 +1058,67 @@ def _backtest_series(rows: list[dict], series: list[dict],
                              f"rolling backtest fold(s)" if selected_scores.get("wape") is not None
                              else "no method produced a defined WAPE (no real demand in any test "
                                   "fold); selected by lowest MAE instead"),
+        "prophet_growth": prophet_growth,
+        "growth_selection": growth_selection,
     }
+
+
+# ===========================================================================
+# Level 2, live: turning a validated selected_method into an actual forecast
+# -- 2026-09 second adaptive-growth pass, production-integration follow-up.
+#
+# _backtest_series() above answers "which method should this series use" by
+# scoring all four candidates on historical rolling-backtest folds. It never
+# produces a live, forward-looking forecast itself (every fold's "forecast"
+# is scored against already-known history, not future days). This function
+# is the other half: given a method _backtest_series() already selected,
+# apply that SAME method to the FULL available series to get the real
+# forecast for genuinely future days -- the step depletion.
+# refresh_prophet_baselines() needs to turn Level 2's selection into
+# something build_demand() can actually consume.
+# ===========================================================================
+def forecast_with_method(series: list[dict], rows: list[dict], horizon_days: int,
+                         method: str, *, growth: str | None = None) -> list[dict] | None:
+    """Forward forecast for `horizon_days` days past series[-1], using
+    exactly the named method (one of ALL_METHODS) -- no fitting/tuning here,
+    this reuses the SAME baseline forecaster functions/fit_prophet()
+    _backtest_series() already scored `method` with, just applied to the
+    whole series instead of one fold's training slice.
+
+    Returns the same shape fit_prophet()['forecast'] already uses --
+    [{date, qty, low, high}, ...] -- so every caller downstream (build_demand)
+    handles a Prophet-sourced or baseline-sourced forecast identically. The
+    three baseline methods have no native uncertainty model, so low=high=qty
+    for those (a documented point forecast, not a missing value) -- Prophet
+    is the only method here with a real interval.
+
+    Returns None only when method='prophet' and the fit itself fails (empty/
+    insufficient series, or a transient cmdstan failure) -- callers already
+    treat a None forecast as "fall back to EWMA for this item", the same
+    fallback 'prophet'-only mode has always used.
+    """
+    if not series:
+        return None
+    if method == "prophet":
+        fitted = fit_prophet(series, rows, horizon_days, growth=growth or PROPHET_DEFAULT_GROWTH)
+        return fitted["forecast"] if fitted is not None else None
+    if method not in BASELINE_METHODS:
+        raise ValueError(f"unknown forecasting method {method!r}; expected one of {ALL_METHODS}")
+
+    last_date = _dt.date.fromisoformat(series[-1]["date"])
+    if method == "naive_previous_period":
+        values = _naive_forecast(series, horizon_days)
+    elif method == "trailing_moving_average":
+        values = _trailing_avg_forecast(series, horizon_days)
+    else:  # day_of_week_seasonal
+        values = _seasonal_naive_forecast(series, horizon_days, last_date)
+
+    out = []
+    for i, v in enumerate(values, start=1):
+        d = last_date + _dt.timedelta(days=i)
+        q = round(max(0.0, v), 2)
+        out.append({"date": d.isoformat(), "qty": q, "low": q, "high": q})
+    return out
 
 
 def _backtest_item(item_id: int, item_name: str, rows: list[dict], series: list[dict],
@@ -698,7 +1136,8 @@ def _backtest_item(item_id: int, item_name: str, rows: list[dict], series: list[
     return {"item_id": item_id, "item_name": item_name, "insufficient_history": False, **core}
 
 
-def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7) -> dict:
+def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
+                          now: _dt.datetime | None = None) -> dict:
     """A real chronological rolling backtest across multiple menu items,
     scoring Prophet against three simple baselines on data none of them saw
     while fitting -- not a single 83/7 split on one representative item.
@@ -721,6 +1160,12 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7) -> di
         never assumed superior; see fleet_summary.prophet_vs_baseline for
         whether it measurably is on THIS data.
 
+    `now`: passed straight to effective_now() -- omitted (the default) by
+    every real caller, which anchors to the dead-tail-aware "now" (see that
+    function's own section) rather than blindly trusting the live wall
+    clock. A test may pin an exact instant the same way _daily_series()
+    already allows.
+
     Backs the technical panel under System Check (api.py caches this --
     see _model_details_cache -- since a full rolling backtest with Prophet
     fits is too slow to redo on every page load).
@@ -728,6 +1173,8 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7) -> di
     items = conn.execute("SELECT id, name FROM menu_item WHERE pos_visible=1").fetchall()
     if not items:
         return {"available": False, "reason": "no menu items", "method_version": EVAL_METHOD_VERSION}
+
+    anchor = effective_now(conn, now=now)
 
     # Full available history per item (not capped at 90 days -- more folds
     # is a more convincing backtest), then keep the ROLLING_MAX_ITEMS with
@@ -738,7 +1185,7 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7) -> di
     LOOKBACK_FOR_BACKTEST = 365
     candidates = []
     for it in items:
-        rows, series = _daily_series(conn, it["id"], LOOKBACK_FOR_BACKTEST)
+        rows, series = _daily_series(conn, it["id"], LOOKBACK_FOR_BACKTEST, now=anchor)
         candidates.append((it, rows, series))
     candidates.sort(key=lambda c: len(c[1]), reverse=True)
 
@@ -787,6 +1234,20 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7) -> di
     for r in scored_items:
         selection_counts[r["selected_method"]] = selection_counts.get(r["selected_method"], 0) + 1
 
+    # Level-1 growth-selection tally, alongside Level 2's selection_counts
+    # above -- "how many series picked flat/linear/fell back" for the
+    # per-item growth_selection field each result already carries via
+    # _backtest_series().
+    growth_selection_counts: dict[str, int] = {"flat": 0, "linear": 0, "fallback": 0}
+    for r in scored_items:
+        gs = r.get("growth_selection")
+        if gs is None:
+            continue
+        if gs.get("is_fallback"):
+            growth_selection_counts["fallback"] += 1
+        else:
+            growth_selection_counts[gs["selected_growth"]] = growth_selection_counts.get(gs["selected_growth"], 0) + 1
+
     baseline_best_wape = min(
         (fleet_by_method[m]["mean_wape"] for m in BASELINE_METHODS if fleet_by_method[m]["mean_wape"] is not None),
         default=None,
@@ -819,6 +1280,7 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7) -> di
                         f"horizon per fold, minimum {ROLLING_MIN_TRAIN_DAYS}-day initial training "
                         "window. Every fold scored for naive-previous-period, trailing-moving-"
                         "average, day-of-week-seasonal, and Prophet."),
+        "effective_now": timeutil.business_today(anchor).isoformat(),
         "horizon_days": horizon_days,
         "min_train_days": ROLLING_MIN_TRAIN_DAYS,
         "max_folds_per_item": ROLLING_MAX_FOLDS,
@@ -831,6 +1293,7 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7) -> di
         "items": per_item_results,
         "fleet_summary": fleet_by_method,
         "selection_counts": selection_counts,
+        "growth_selection_counts": growth_selection_counts,
         "prophet_vs_baseline": prophet_vs_baseline,
     }
 
@@ -878,7 +1341,14 @@ def _store_daily_series(conn: sqlite3.Connection, lookback_days: int,
     `now`: see _daily_series()'s docstring -- the same optional reference-
     date override, omitted by every live caller.
     """
+    # 2026-10 leakage audit: same upper-bound fix as _daily_series(), same
+    # reasoning -- latent only (no current caller passes a historical
+    # `now` this far), closed on the same principle.
     bd = timeutil.sql_business_date("o.created_at")
+    upper = " AND o.created_at < ?" if now is not None else ""
+    params = [timeutil.utc_bound_n_manila_days_ago(lookback_days, now)]
+    if now is not None:
+        params.append(timeutil.utc_upper_bound_sql(now))
     raw = conn.execute(
         f"""
         SELECT {bd} AS d, COUNT(DISTINCT o.id) AS orders,
@@ -886,10 +1356,10 @@ def _store_daily_series(conn: sqlite3.Connection, lookback_days: int,
                COALESCE(SUM(ol.qty * ol.unit_price), 0) AS sales
           FROM customer_order o
           JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.created_at >= ?
+         WHERE o.status != 'void' AND o.created_at >= ?{upper}
          GROUP BY d
         """,
-        (timeutil.utc_bound_n_manila_days_ago(lookback_days, now),),
+        params,
     ).fetchall()
     by_day = {r["d"]: r for r in raw}
     today = timeutil.business_today(now)
@@ -914,10 +1384,20 @@ def store_demand_prophet(conn: sqlite3.Connection, metric: str = "items",
     (fit_prophet() is the identical function, called on the store's own
     series instead of one item's). Falls back to the trailing-average method
     on any Prophet/cmdstan failure, same as every other caller of
-    fit_prophet() in this module."""
+    fit_prophet() in this module.
+
+    Growth: reads whatever growth was last cached for this metric via
+    cache_growth_selection() under series_key f"store:{metric}" -- see
+    menu_item_demand_prophet()'s identical note and cached_growth_for()'s
+    own docstring. Falls back to PROPHET_DEFAULT_GROWTH on a cache miss,
+    never re-tunes inline.
+
+    Window: anchored to effective_now(), same reasoning and same scope
+    boundary as menu_item_demand_prophet()'s identical note."""
     if metric not in STORE_METRICS:
         raise ValueError(f"unknown store metric {metric!r}; expected one of {STORE_METRICS}")
-    rows, series = _store_daily_series(conn, lookback_days)[metric]
+    anchor = effective_now(conn)
+    rows, series = _store_daily_series(conn, lookback_days, now=anchor)[metric]
     active_days = len(rows)
     total_qty = sum(r["qty"] for r in rows)
     label = STORE_METRIC_LABELS[metric]
@@ -931,10 +1411,12 @@ def store_demand_prophet(conn: sqlite3.Connection, metric: str = "items",
 
     trailing = series[-14:]
     trailing_avg = sum(p["qty"] for p in trailing) / len(trailing)
-    fitted_model = fit_prophet(series, rows, horizon_days)
+    cached_growth = cached_growth_for(conn, f"store:{metric}")
+    growth = cached_growth["selected_growth"] if cached_growth else PROPHET_DEFAULT_GROWTH
+    fitted_model = fit_prophet(series, rows, horizon_days, growth=growth)
 
     if fitted_model is None:
-        today = timeutil.business_today()
+        today = timeutil.business_today(anchor)
         flat = _trailing_avg_forecast(series, horizon_days)
         return {
             "metric": metric, "label": label, "insufficient_data": False,
@@ -953,6 +1435,8 @@ def store_demand_prophet(conn: sqlite3.Connection, metric: str = "items",
         "series": series, "forecast": fitted_model["forecast"],
         "fitted": fitted_model["fitted"], "outliers": fitted_model["outliers"],
         "method": "prophet",
+        "growth_used": growth,
+        "growth_source": "cached_adaptive" if cached_growth else "default_not_yet_refreshed",
     }
 
 
@@ -971,12 +1455,16 @@ def _backtest_store_metric(metric: str, rows: list[dict], series: list[dict],
            "insufficient_history": False, **core}
 
 
-def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7) -> dict:
+def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
+                                now: _dt.datetime | None = None) -> dict:
     """The same chronological rolling-backtest methodology as
     evaluate_demand_model(), applied to the store's own aggregate daily
     series (orders taken, items sold, gross sales) instead of one menu item
     at a time -- see that function's docstring for the full methodology,
     shared unchanged via _backtest_series().
+
+    `now`: see evaluate_demand_model()'s identical parameter -- anchors to
+    effective_now() by default.
 
     Backs the technical panel's store-level demand card and the ML
     integration audit -- this is the evidence for whether Prophet has
@@ -984,7 +1472,8 @@ def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7)
     never forced to win here any more than it is per item: a baseline
     scoring lower WAPE on the store's own aggregate series IS the selection.
     """
-    per_metric = _store_daily_series(conn, STORE_LOOKBACK_FOR_BACKTEST)
+    anchor = effective_now(conn, now=now)
+    per_metric = _store_daily_series(conn, STORE_LOOKBACK_FOR_BACKTEST, now=anchor)
     results = {
         metric: _backtest_store_metric(metric, rows, series, horizon_days,
                                        ROLLING_MIN_TRAIN_DAYS, ROLLING_MAX_FOLDS)
@@ -1003,6 +1492,16 @@ def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7)
     for r in scored.values():
         selection_counts[r["selected_method"]] = selection_counts.get(r["selected_method"], 0) + 1
 
+    growth_selection_counts: dict[str, int] = {"flat": 0, "linear": 0, "fallback": 0}
+    for r in scored.values():
+        gs = r.get("growth_selection")
+        if gs is None:
+            continue
+        if gs.get("is_fallback"):
+            growth_selection_counts["fallback"] += 1
+        else:
+            growth_selection_counts[gs["selected_growth"]] = growth_selection_counts.get(gs["selected_growth"], 0) + 1
+
     return {
         "available": True,
         "method_version": EVAL_METHOD_VERSION,
@@ -1012,6 +1511,7 @@ def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7)
                         f"day forecast horizon per fold, minimum {ROLLING_MIN_TRAIN_DAYS}-day initial "
                         "training window. Every fold scored for naive-previous-period, trailing-"
                         "moving-average, day-of-week-seasonal, and Prophet."),
+        "effective_now": timeutil.business_today(anchor).isoformat(),
         "horizon_days": horizon_days,
         "min_train_days": ROLLING_MIN_TRAIN_DAYS,
         "max_folds": ROLLING_MAX_FOLDS,
@@ -1019,6 +1519,7 @@ def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7)
         "metrics_insufficient_history": sum(1 for r in results.values() if r["insufficient_history"]),
         "metrics": results,
         "selection_counts": selection_counts,
+        "growth_selection_counts": growth_selection_counts,
     }
 
 

@@ -36,8 +36,16 @@ BACKUP_DIR = BACKEND_DIR / "backups"
 # caller might import it; nothing outside this module does.
 PRODUCTION_DB = BACKEND_DIR / "wings_theory.db"
 DEFAULT_DB = PRODUCTION_DB  # noqa: same path, kept as an alias for clarity at call sites
+# 2026-10: the demonstration database. Deliberately its own file, not a
+# second "development" database and not a flag on the production one — see
+# wt/demo_mode.py's module docstring for the full reasoning. Same hard
+# env<->path pairing as PRODUCTION_DB below: WT_ENV=demo may only open this
+# file, and this file may only be opened under WT_ENV=demo, so "demo mode
+# pointed at the wrong database" and "real mode accidentally pointed at the
+# demo database" are both structurally impossible, not just discouraged.
+DEMO_DB = BACKEND_DIR / "wings_theory_demo.db"
 
-VALID_ENVIRONMENTS = ("production", "development", "test")
+VALID_ENVIRONMENTS = ("production", "development", "test", "demo")
 
 _local = threading.local()
 
@@ -83,11 +91,13 @@ def db_path() -> Path:
     this function had any opinion about the pairing.
 
     The pairing itself is validated, not just presence: WT_ENV=production
-    must point at PRODUCTION_DB and nothing else, and WT_ENV=development or
-    WT_ENV=test must point anywhere BUT PRODUCTION_DB. This is what makes
-    "production database opened by a non-production process" structurally
-    impossible rather than a matter of remembering to set WT_DB correctly --
-    the two variables cross-check each other.
+    must point at PRODUCTION_DB and nothing else, WT_ENV=demo must point at
+    DEMO_DB and nothing else, and neither database may be opened under any
+    other environment. This is what makes "production database opened by a
+    non-production process" AND "demo database opened by a non-demo
+    process" (or vice versa) structurally impossible rather than a matter of
+    remembering to set WT_DB correctly -- the two variables cross-check each
+    other on both special databases, not just the production one.
     """
     env = environment()
     raw = os.environ.get("WT_DB")
@@ -99,6 +109,7 @@ def db_path() -> Path:
     path = Path(raw)
     is_memory = str(path) == ":memory:"
     is_prod_path = (not is_memory) and path.resolve() == PRODUCTION_DB.resolve()
+    is_demo_path = (not is_memory) and path.resolve() == DEMO_DB.resolve()
     if env == "production" and not is_prod_path:
         raise ConfigurationError(
             f"WT_ENV=production but WT_DB={path} is not the production "
@@ -109,6 +120,19 @@ def db_path() -> Path:
             f"WT_ENV={env} but WT_DB points at the production database "
             f"({PRODUCTION_DB}). Refusing to open the production database "
             "outside WT_ENV=production."
+        )
+    if env == "demo" and not is_demo_path:
+        raise ConfigurationError(
+            f"WT_ENV=demo but WT_DB={path} is not the demo database "
+            f"({DEMO_DB}). Refusing to start -- demo mode must never run "
+            "against any other database."
+        )
+    if env != "demo" and is_demo_path:
+        raise ConfigurationError(
+            f"WT_ENV={env} but WT_DB points at the demo database "
+            f"({DEMO_DB}). Refusing to open the demo database outside "
+            "WT_ENV=demo, so a real-mode process can never silently read "
+            "or write demonstration data."
         )
     return path
 
@@ -444,6 +468,17 @@ def reset(path: str | Path | None = None) -> sqlite3.Connection:
 
       production  -> always refused, unconditionally. Neither WT_ALLOW_
                      DESTRUCTIVE nor an explicit path override this.
+      demo        -> proceeds freely, but ONLY when the resolved target is
+                     actually DEMO_DB -- see the check below. Demo
+                     initialization is meant to be rebuildable on demand
+                     (wt/demo_mode.py's init_demo() calls this every time,
+                     for idempotency -- see that module), so this
+                     deliberately does not require WT_ALLOW_DESTRUCTIVE the
+                     way development does: the blast radius is hard-limited
+                     to one file that can never be the production database
+                     (db_path()'s own env<->path pairing already guarantees
+                     that), so there is nothing here an opt-in flag would be
+                     protecting beyond what the path check already does.
       development -> refused unless WT_ALLOW_DESTRUCTIVE=1 is set.
       test        -> proceeds freely; this is what the test suite needs on
                      every run and must not be made to require an opt-in.
@@ -452,7 +487,11 @@ def reset(path: str | Path | None = None) -> sqlite3.Connection:
     (environment() == "production" refuses outright) and once via the
     resolved target path actually being PRODUCTION_DB, even if a caller
     passed that path explicitly while WT_ENV was something else. Either
-    condition alone is enough to refuse.
+    condition alone is enough to refuse. The demo check below follows the
+    identical shape against DEMO_DB, for the identical reason: a typo or a
+    caller passing an explicit path must not be enough to reset (or,
+    worse, have this function silently treat as resettable) some other
+    database just because WT_ENV happened to say "demo".
 
     The rebuilt connection is registered as this thread's connection. Returning
     an unregistered one would leave a later get_conn() opening a *second*
@@ -462,11 +501,24 @@ def reset(path: str | Path | None = None) -> sqlite3.Connection:
     target = Path(path or db_path())
     env = environment()
     is_prod_path = str(target) != ":memory:" and target.resolve() == PRODUCTION_DB.resolve()
+    is_demo_path = str(target) != ":memory:" and target.resolve() == DEMO_DB.resolve()
     if env == "production" or is_prod_path:
         raise ConfigurationError(
             f"refusing to reset {target}: this is the production database "
             "and/or WT_ENV=production. db.reset() can never run against "
             "production, regardless of how it was called."
+        )
+    if env == "demo" and not is_demo_path:
+        raise ConfigurationError(
+            f"refusing to reset {target}: WT_ENV=demo but this is not the "
+            f"demo database ({DEMO_DB}). db.reset() under WT_ENV=demo can "
+            "only ever target the demo database."
+        )
+    if is_demo_path and env != "demo":
+        raise ConfigurationError(
+            f"refusing to reset {target}: this is the demo database but "
+            "WT_ENV is not 'demo'. db.reset() can only reset the demo "
+            "database under WT_ENV=demo."
         )
     if env == "development" and os.environ.get("WT_ALLOW_DESTRUCTIVE") != "1":
         raise ConfigurationError(

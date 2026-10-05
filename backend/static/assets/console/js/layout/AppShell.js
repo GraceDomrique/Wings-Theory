@@ -1,7 +1,9 @@
 import { h, mount } from '../lib/dom.js';
 import { Sidebar } from './Sidebar.js';
 import { Topbar } from './Topbar.js';
-import { PAGE_COPY, ROUTE_IDS } from './nav.js';
+import {
+  PAGE_SUB, ROUTE_IDS, routeRoles, breadcrumbFor,
+} from './nav.js';
 import { destroyAllCharts } from '../components/charts/base.js';
 import { Loading, ErrorState } from '../components/ui/Feedback.js';
 import { session, setUnauthorizedHandler } from '../lib/api/client.js';
@@ -10,13 +12,16 @@ import { session, setUnauthorizedHandler } from '../lib/api/client.js';
  * The grid: Sidebar + Main. Owns routing and is the only thing that mounts
  * a route.
  *
- * Routing is on the hash (#/inventory/batches) so a sub-tab is linkable and
- * survives a reload — the prototype toggled `.active` classes on pre-rendered
- * divs, which cannot do that. Visually it is the same shell; only the address
- * bar knows the difference.
+ * Routing is on the hash (#/losses) — one segment per route now (2026-10-01:
+ * the old #/id/tab sub-tab convention is gone along with the in-page Tabbar
+ * it served; every former sub-tab is its own top-level route id, reached
+ * through the sidebar accordion instead). This keeps a direct link/reload
+ * working exactly as before, just one level flatter.
  *
  * Every route module exports `render(ctx)` returning a Node (or a Promise of
- * one). `ctx` carries the sub-tab and a `setSearch` hook.
+ * one). Title, subtitle and breadcrumb are derived from nav.js against the
+ * CURRENT role's tree, not stored per-route — the same id can carry a
+ * different label/group depending on who's looking (Owner vs. Admin).
  */
 export function AppShell({ routes, onSignOut }) {
   let current = null;
@@ -25,7 +30,7 @@ export function AppShell({ routes, onSignOut }) {
 
   const topbar = Topbar({
     title: 'Today',
-    sub: PAGE_COPY.today[1],
+    sub: PAGE_SUB.today,
     onSearch: (q) => { if (searchHandler) searchHandler(q); },
   });
 
@@ -41,28 +46,48 @@ export function AppShell({ routes, onSignOut }) {
 
   function parseHash() {
     const raw = (location.hash || '').replace(/^#\/?/, '');
-    const [id, tab] = raw.split('/');
-    return { id: ROUTE_IDS.includes(id) ? id : 'today', tab: tab || null };
+    // A bare id only now — the old "#/id/tab" sub-route is gone with the
+    // in-page Tabbar it served (see this file's own docstring). A stray
+    // "/tab" suffix on an old bookmark is simply ignored rather than
+    // breaking the route lookup.
+    const id = raw.split('/')[0];
+    // Sidebar.js already filters what a role can CLICK; this covers a
+    // typed URL, bookmark, or reload landing directly on a page that role
+    // never sees (e.g. Owner on #/users) — the server would 403 the
+    // underlying call anyway, but redirecting to the home page here avoids
+    // an avoidable error page for something session.user.role already knows.
+    const role = (session.user || {}).role;
+    const valid = ROUTE_IDS.includes(id) && routeRoles(id).includes(role);
+    return valid ? id : 'today';
   }
 
   async function draw() {
-    const { id, tab } = parseHash();
+    const id = parseHash();
     current = id;
 
     // Chart.js holds global references; leaving old instances alive across a
     // route swap is what makes charts come back blank on a second visit.
     destroyAllCharts();
     searchHandler = null;
-    topbar.setCopy(PAGE_COPY[id][0], PAGE_COPY[id][1]);
-    topbar.setSearchVisible(id === 'inventory');
+    const role = (session.user || {}).role;
+    const { groupLabel, leafLabel } = breadcrumbFor(role, id);
+    topbar.setCopy(leafLabel, PAGE_SUB[id] || '');
+    topbar.setBreadcrumb(groupLabel);
+    topbar.setSearchVisible(id === 'onhand');
     sidebar.setActive(id);
     mount(content, Loading());
 
     const ctx = {
-      tab,
       navigate,
       setSearchHandler: (fn) => { searchHandler = fn; },
       refreshBadges,
+      // A handful of older Inventory subviews (Receiving/Movements) still
+      // read ctx.selection.ingredient defensively from the days a click in
+      // On Hand pre-filtered them via a shared in-page tab shell — nothing
+      // sets it anymore (that cross-nav went through Inventory.js's own
+      // Tabbar wrapper, now removed), but the shape must still exist so
+      // that optional-read doesn't throw on an id that's never null.
+      selection: { ingredient: null },
     };
 
     try {
@@ -77,18 +102,31 @@ export function AppShell({ routes, onSignOut }) {
     }
   }
 
-  function navigate(id, tab) {
-    const next = '#/' + id + (tab ? '/' + tab : '');
+  function navigate(id) {
+    const next = '#/' + id;
     if (location.hash === next) draw();
     else location.hash = next;
   }
 
   /** Sidebar counts, refreshed after any action that could change them. */
   async function refreshBadges() {
+    // Data Quality (the 'verify' page) isn't even in Owner's nav, and
+    // Owner holds no queue.read capability at all (wt/auth.py) — fetching
+    // its count for that role is a guaranteed, silently-swallowed 403 on
+    // every single page load. Route id, not capability name, on purpose:
+    // this mirrors Sidebar.js's own role filter rather than re-deriving
+    // authorization here.
+    if (routeRoles('verify').includes((session.user || {}).role)) {
+      try {
+        const { getQueue } = await import('../lib/api/verification.js');
+        const q = await getQueue();
+        sidebar.setBadge('verification', q.count);
+      } catch { /* a badge is not worth surfacing an error for */ }
+    }
     try {
-      const { getQueue } = await import('../lib/api/verification.js');
-      const q = await getQueue();
-      sidebar.setBadge('verification', q.count);
+      const { listInstructions } = await import('../lib/api/instructions.js');
+      const open = await listInstructions('open');
+      sidebar.setBadge('messages', open.count);
     } catch { /* a badge is not worth surfacing an error for */ }
   }
 

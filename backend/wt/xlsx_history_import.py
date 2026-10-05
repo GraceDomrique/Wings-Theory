@@ -276,6 +276,7 @@ def replay_order(conn, o: dict, *, resolve_menu_id, unli_row, flavors_included, 
             head_count=sum(int(l["qty"]) for l in unli_lines), walkout_rate=0.0,
             random_table_label=False,
             extra_lines=lines or None, extra_prices=price_by_id,
+            restock_reference_date=_dt.date.today(),
         )
         if result is not None:
             order_pk = result["order_pk"]
@@ -287,7 +288,11 @@ def replay_order(conn, o: dict, *, resolve_menu_id, unli_row, flavors_included, 
         try:
             reserve_order(conn, order_pk, user_id=USER_ID)
         except InsufficientStockError as e:
-            demo_seed._restock_shortfalls(conn, e.shortfalls, ts, o["date"], rng)
+            # Measured from today, not o["date"] -- see _seed_unlimited_order's
+            # restock_reference_date docstring for why a reactive mid-replay
+            # restock's shelf life must never be measured from the historical
+            # sale date it happens to be triggered by.
+            demo_seed._restock_shortfalls(conn, e.shortfalls, ts, _dt.date.today(), rng)
             reserve_order(conn, order_pk, user_id=USER_ID)
 
         ledger_before = demo_seed._last_ledger_id(conn)
@@ -319,7 +324,19 @@ def replay_order(conn, o: dict, *, resolve_menu_id, unli_row, flavors_included, 
 
 
 def run(conn=None, dry_run: bool = False, verbose: bool = True,
-       source_path: Path = XLSX_PATH) -> dict:
+       source_path: Path = XLSX_PATH, seed_synthetic_history: bool = True) -> dict:
+    """seed_synthetic_history (2026-10, default True — unchanged behavior for
+    every existing caller): whether to run the four demo_seed synthetic
+    generators (_seed_periodic_receiving/_seed_stock_counts/_seed_wastage_
+    history/_seed_unlimited_reconciliation) after replaying the real orders.
+    wt/demo_mode.py's init_demo() passes False — it replays the genuine
+    workbook (legitimate historical sales data, copied into the isolated
+    demo database) but builds its OWN small, deliberate, narratively
+    labeled stock-loss/consumption scenario instead of this module's
+    large, undifferentiated random fill — see that module's own docstring
+    for why "thousands of near-identical synthetic rows" and "a handful of
+    understandable demonstration cases" are different design goals even
+    though both are legitimately synthetic."""
     conn = conn or db.get_conn()
     raw_rows, rejected_rows = _load_rows(source_path)
     orders = _group_orders(raw_rows)
@@ -422,10 +439,11 @@ def run(conn=None, dry_run: bool = False, verbose: bool = True,
 
         if imported_dates:
             start, end = min(imported_dates), max(imported_dates)
-            stats["receiving_events"] = demo_seed._seed_periodic_receiving(conn, start, end, rng)
-            stats["stock_counts"] = demo_seed._seed_stock_counts(conn, start, end, rng)
-            stats["wastage"] = demo_seed._seed_wastage_history(conn, start, end, rng)
-            stats["reconciliation"] = demo_seed._seed_unlimited_reconciliation(conn, start, end, rng)
+            if seed_synthetic_history:
+                stats["receiving_events"] = demo_seed._seed_periodic_receiving(conn, start, end, rng)
+                stats["stock_counts"] = demo_seed._seed_stock_counts(conn, start, end, rng)
+                stats["wastage"] = demo_seed._seed_wastage_history(conn, start, end, rng)
+                stats["reconciliation"] = demo_seed._seed_unlimited_reconciliation(conn, start, end, rng)
             stats["date_range"] = f"{start.isoformat()} to {end.isoformat()}"
     finally:
         conn.execute(demo_seed._LEDGER_NO_UPDATE_TRIGGER)

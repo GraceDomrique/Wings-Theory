@@ -16,6 +16,7 @@
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+$Host.UI.RawUI.WindowTitle = "Wings Theory Server"
 
 # Production database path and environment, made explicit rather than left
 # to any default — wt/db.py's db_path() has no fallback at all any more:

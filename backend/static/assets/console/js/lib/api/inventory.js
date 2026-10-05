@@ -35,6 +35,12 @@ function toIngredient(r, depletion) {
     onHandUnit: r.purchase_unit,
     onHandBaseQty: r.on_hand_base,
     availableBaseQty: r.available_base,
+    // Physical (on_hand_base) vs usable (physical minus whatever sits in an
+    // already-expired open batch) — see migrations/0040_expired_stock_
+    // usability.sql. expiredBaseQty is 0, not missing, when nothing is
+    // expired, so a caller never has to treat undefined as "none".
+    expiredBaseQty: r.expired_base ?? 0,
+    usableBaseQty: r.usable_base ?? r.on_hand_base,
     baseUnit: r.base_unit,
     onHandDisplay: r.on_hand_display || null,
     // Runway and usage rate are NOT computed here — they come from the
@@ -246,9 +252,9 @@ export const LEDGER_REASONS = Object.keys(LEDGER_REASON);
  * physically counted. actual_base is in the ingredient's BASE unit (g/ml/pc),
  * not its purchase unit — the caller must convert before calling this.
  */
-export function countStock(pk, { actualBase, note }) {
+export function countStock(pk, { actualBase, note, clientRequestId }) {
   return api.post(`/console/ingredients/${pk}/count`, {
-    actual_base: actualBase, note: note || null,
+    actual_base: actualBase, note: note || null, client_request_id: clientRequestId || null,
   });
 }
 
@@ -269,9 +275,9 @@ export function bulkCount(items, note) {
  * spoiled, through reservation.record_wastage. qty_base > 0 (the amount lost,
  * not a signed delta — the endpoint decides the sign).
  */
-export function wasteStock(pk, { qtyBase, reason = 'wastage', note }) {
+export function wasteStock(pk, { qtyBase, reason = 'wastage', note, source = 'manual_writeoff' }) {
   return api.post(`/console/ingredients/${pk}/waste`, {
-    qty_base: qtyBase, reason, note: note || null,
+    qty_base: qtyBase, reason, note: note || null, source,
   });
 }
 
@@ -299,4 +305,59 @@ export function updateIngredient(pk, fields) {
 /** POST /console/ingredients — create a new ingredient. */
 export function createIngredient(body) {
   return api.post('/console/ingredients', body);
+}
+
+// ===========================================================================
+// Correct Stock / Count Today (2026-10) — both reachable by the narrow
+// 'inventory.correct_stock' capability as well as 'inventory.read', so a
+// kitchen account with only the former can still search for an ingredient
+// and see what it's being asked to check. Neither endpoint exposes cost,
+// supplier, or anything else inventory.read-only data would carry.
+// ===========================================================================
+
+/**
+ * GET /console/ingredients/quick — minimal ingredient search for the Correct
+ * Stock fast-entry flow: name, expected (on-hand) quantity, and the same
+ * physical/usable/expired split the full list carries, nothing else.
+ */
+export async function quickLookupIngredients(q = '', limit = 20) {
+  const out = await api.get('/console/ingredients/quick', { q, limit });
+  return (out.ingredients || []).map((r) => ({
+    pk: r.ingredientId,
+    name: r.name,
+    baseUnit: r.baseUnit,
+    expectedBase: r.expectedBase,
+    reservedBase: r.reservedBase,
+    expiredBase: r.expiredBase,
+    usableBase: r.usableBase,
+    availableBase: r.availableBase,
+  }));
+}
+
+/**
+ * GET /console/count-today — the risk-based physical-count shortlist. See
+ * wt/depletion.py's count_today() for the full, explainable rule set this
+ * reflects; nothing here recomputes it client-side.
+ */
+export async function getCountToday() {
+  const out = await api.get('/console/count-today');
+  const toRow = (r) => ({
+    pk: r.ingredientId,
+    code: r.ingredientCode,
+    name: r.name,
+    baseUnit: r.baseUnit,
+    expectedBase: r.expectedBase,
+    status: r.status,
+    daysOfSupply: r.daysOfSupply,
+    leadTimeDays: r.leadTimeDays,
+    lastCountedAt: r.lastCountedAt,
+    staleDays: r.staleDays,
+    reasons: r.reasons || [],
+  });
+  return {
+    asOf: out.asOf,
+    totalIngredients: out.totalIngredients,
+    needsChecking: (out.needsChecking || []).map(toRow),
+    worthChecking: (out.worthChecking || []).map(toRow),
+  };
 }

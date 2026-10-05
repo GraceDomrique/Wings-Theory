@@ -33,6 +33,7 @@ export const palette = {
   get faint() { return token('--ink-faint'); },
   get gridline() { return token('--line-soft'); },
   get inkSoft() { return token('--ink-soft'); },
+  get cocoa() { return token('--cocoa'); },
 };
 
 let defaultsApplied = false;
