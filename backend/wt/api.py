@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 from . import (
     audit, auth, business_overview as business_overview_mod, db, instructions, permissions,
-    purchasing, refills, timeutil, unli, updates, verification,
+    purchasing, refills, timeutil, unli, verification,
 )
 from .cache import TTLCache
 from .anomaly import detect_anomalies, detect_consumption_anomalies
@@ -38,6 +38,7 @@ from .combo_pricing import (
     create_draft_combo, estimate_combo_cost, get_combo_pricing_config, list_draft_combos,
     review_draft_combo, set_combo_pricing_config, suggest_price_range,
 )
+from . import combos as combos_mod
 from .errors import (
     AuthenticationError,
     NotFoundError,
@@ -51,11 +52,14 @@ from .depletion import (
     LOOKBACK_DAYS as DEPLETION_LOOKBACK_DAYS,
     annotate_batch_expiry as _annotate_batch_expiry,
     count_today as _count_today,
+    get_refresh_status as _get_prophet_refresh_status,
     ingredient_detail as ingredient_depletion_detail,
     ingredient_forecast,
     prophet_refresh_generation,
     refresh_prophet_baselines,
     replenishment_backtest,
+    run_prophet_refresh_job,
+    start_prophet_refresh_scheduler,
 )
 from .forecasting import (
     MIN_DEMAND_SAMPLE_DAYS, STORE_METRICS, evaluate_demand_model, evaluate_store_demand_model,
@@ -69,12 +73,17 @@ from .anomaly import (
     sample_consumption_for_review, submit_consumption_validation_label,
     consumption_validation_queue, scientific_consumption_validation_metrics,
 )
+from .anomaly import (
+    flavor_anomaly_events, flavor_consumption_model_details, flavor_real_data_readiness,
+    sample_flavor_for_review, submit_flavor_validation_label, flavor_validation_queue,
+    scientific_flavor_validation_metrics,
+)
 from .data_quality import data_quality_report
 from .reservation import (
     availability_for_menu_item, commit_order, ingredient_reconciliation_report,
     inventory_valuation, receive_stock, record_count, record_usage,
     record_variance_review, record_wastage, release_order, reserve_order,
-    variance_review_history, void_after_commit,
+    set_leftover_charge, variance_review_history, void_after_commit,
 )
 from .resolver import expand_recipe, recipe_cost, validate_recipe
 from .units import format_base, normalise_label, to_base
@@ -132,6 +141,15 @@ def _startup() -> None:
     # No-op unless WT_ENV=production is explicitly set — see
     # db.validate_production_startup for why that's the gate.
     db.validate_production_startup(conn)
+    # 2026-10 fix: without this, 'hybrid' was only a label -- nothing ever
+    # called refresh_prophet_baselines() on its own, so every item silently
+    # ran on the EWMA fallback until a human manually hit the refresh
+    # endpoint. This spawns one daemon thread and returns immediately;
+    # fitting itself happens off the request path, on a fixed interval, and
+    # is skipped entirely during the test suite (WT_ENV=test) so running
+    # tests never spends real time fitting Prophet in the background.
+    if os.environ.get("WT_ENV") != "test":
+        start_prophet_refresh_scheduler(db.get_conn)
 
 
 @app.exception_handler(WTError)
@@ -540,13 +558,12 @@ def create_user(
 @app.get("/console/audit/logins", tags=["console"])
 def audit_logins(
     limit: int = Query(100, ge=1, le=500),
-    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage")),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("audit.read")),
 ):
     """Recent login attempts, successful and failed — migration 0017's
-    login_event, written on every /auth/login call. Admin-only (same
-    capability as user administration): who signed in, when, and whether
-    it succeeded is account-security data, not general operational
-    reading."""
+    login_event, written on every /auth/login call. Owner and admin only:
+    who signed in, when, and whether it succeeded is account-security data,
+    not general operational reading."""
     rows = c.execute(
         "SELECT username, role, success, reason, created_at FROM login_event "
         "ORDER BY id DESC LIMIT ?",
@@ -558,17 +575,50 @@ def audit_logins(
 @app.get("/console/audit/actions", tags=["console"])
 def audit_actions(
     limit: int = Query(100, ge=1, le=500),
-    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage")),
+    entity_type: str | None = Query(default=None),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("audit.read")),
 ):
-    """Recent sensitive mutations — migration 0016's admin_audit_log
-    (ingredient edits, recipe creation, menu price changes, admin
-    password resets). Admin-only, same reasoning as audit_logins above."""
-    rows = c.execute(
+    """Every attributable action — migration 0016's admin_audit_log
+    (ingredient edits, recipe creation, menu price changes, admin password
+    resets, instruction/page-view events added 2026-10). Owner and admin
+    only, same reasoning as audit_logins above. `entity_type` optionally
+    narrows the list (e.g. 'page' alone, to see navigation separately from
+    data edits) — the UI is the one place that decides whether to mix them."""
+    sql = (
         "SELECT entity_type, entity_id, action, field, previous_value, new_value, "
-        "user_id, note, created_at FROM admin_audit_log ORDER BY id DESC LIMIT ?",
-        (limit,),
-    ).fetchall()
-    return {"events": [dict(r) for r in rows]}
+        "user_id, note, created_at FROM admin_audit_log"
+    )
+    params: tuple = ()
+    if entity_type:
+        sql += " WHERE entity_type=?"
+        params = (entity_type,)
+    sql += " ORDER BY id DESC LIMIT ?"
+    rows_ = c.execute(sql, params + (limit,)).fetchall()
+    return {"events": [dict(r) for r in rows_]}
+
+
+class PageViewIn(BaseModel):
+    route_id: str = Field(min_length=1, max_length=64)
+    area: str = Field(min_length=1, max_length=200)
+
+
+@app.post("/console/audit/page-view", tags=["console"], status_code=204)
+def audit_page_view(
+    body: PageViewIn, c: sqlite3.Connection = Depends(conn), p: dict = Depends(principal),
+):
+    """Which tab/page a user opened, for the same accountability record as
+    every other entry in admin_audit_log — not a technical access log
+    (there is no endpoint-by-endpoint request logging here, deliberately:
+    that would flood the log with nothing a reader could act on). The
+    frontend calls this once per route the user actually NAVIGATES to
+    (AppShell.js's draw(), guarded against re-firing on a same-route
+    refresh) — never per API call, per render, or per keystroke. Any
+    authenticated role may log its own navigation; this is not a
+    capability-gated action, just attribution of something that already
+    happened."""
+    with db.write_tx(c):
+        audit.log(c, "page", body.route_id, "view", p["sub"], note=body.area)
+    return None
 
 
 # ===========================================================================
@@ -581,6 +631,23 @@ def list_instructions(
 ):
     """Owner and admin see the same shared task board."""
     return instructions.list_for_role(c, status)
+
+
+@app.get("/console/instructions/assignees", tags=["console"])
+def list_instruction_assignees(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("instruction.create")),
+):
+    """Active admin accounts, for the "Assign to" dropdown on the owner's
+    New Instruction form — username + display name only, never
+    password/lockout/last-login fields. A narrower read than GET
+    /console/users (user.manage, admin-only): this exposes just enough for
+    the owner to pick a real admin account instead of typing a username
+    freehand, without granting owner any visibility into account
+    administration itself."""
+    return {"items": rows(c.execute(
+        "SELECT username, display_name FROM app_user "
+        "WHERE role='admin' AND is_active=1 ORDER BY display_name"
+    ))}
 
 
 class InstructionCreateIn(BaseModel):
@@ -643,41 +710,6 @@ def cancel_instruction(
     inside instructions.cancel() itself, same shape as order.void."""
     return instructions.cancel(c, pk, body.reason, p["sub"], p["role"])
 
-
-# ===========================================================================
-# operational updates — the free-text, bidirectional half of Owner/Admin
-# communication instructions' fixed state machine doesn't cover.
-# ===========================================================================
-@app.get("/console/updates", tags=["console"])
-def list_updates(
-    owner_instruction_id: int | None = Query(default=None),
-    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("update.read")),
-):
-    return updates.list_all(c, owner_instruction_id)
-
-
-class UpdateCreateIn(BaseModel):
-    body: str
-    owner_instruction_id: int | None = None
-
-
-@app.post("/console/updates", tags=["console"], status_code=201)
-def create_update(
-    body: UpdateCreateIn, c: sqlite3.Connection = Depends(conn),
-    p: dict = Depends(needs("update.create")),
-):
-    return updates.create(c, body.body, body.owner_instruction_id, p["sub"], p["role"])
-
-
-@app.post("/console/updates/{pk}/acknowledge", tags=["console"])
-def acknowledge_update(
-    pk: int, c: sqlite3.Connection = Depends(conn),
-    p: dict = Depends(needs("update.acknowledge")),
-):
-    """Reachable by both roles — updates.acknowledge() itself refuses when
-    the caller's role matches whoever posted the update, same shape as
-    instruction cancellation above."""
-    return updates.acknowledge(c, pk, p["sub"], p["role"])
 
 
 # ===========================================================================
@@ -848,7 +880,7 @@ def pos_menu(
     prompts for a flavor on the items that actually have one to pick."""
     data = rows(c.execute(
         """
-        SELECT a.*, m.is_unli, m.pos_visible,
+        SELECT a.*, m.is_unli, m.pos_visible, m.image_path, m.is_combo,
                (SELECT COUNT(*) FROM recipe_line rl
                  WHERE rl.recipe_id = m.recipe_id AND rl.display_label LIKE '%flavor%')
                  AS flavor_slots
@@ -1287,6 +1319,31 @@ def void_order(
     return result
 
 
+class LeftoverChargeIn(BaseModel):
+    amount: float = Field(ge=0, description="pesos, the printed-on-the-menu unfinished-food penalty fee")
+
+
+@app.post("/pos/orders/{order_pk}/leftover-charge", tags=["pos"])
+def set_order_leftover_charge(
+    order_pk: int, body: LeftoverChargeIn,
+    c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("order.leftover_charge")),
+):
+    """2026-10 fix: customer_order.leftover_charge_total (migration 0037,
+    the printed "Leftover Charge - Wings/Rice/Fries" penalty fee for
+    unfinished Unlimited Wings food) had a column and a documented intent
+    but no caller anywhere in the app — this is that caller. A human
+    judgment call entered once a table's bill is already totaled (see
+    wt/reservation.set_leftover_charge()); never folded into the frozen
+    subtotal/service_charge/total columns, never touches inventory.
+
+    2026-10-14: gated on its own order.leftover_charge capability
+    (cashier/admin), not order.void — see that capability's own comment in
+    wt/auth.py for why reusing order.void would have incorrectly coupled a
+    billing action to kitchen's unrelated, narrow punched-ticket-release
+    voiding right."""
+    return set_leftover_charge(c, order_pk, body.amount, user_id=p["sub"])
+
+
 @app.get("/pos/orders", tags=["pos"])
 def list_orders(
     status: Literal["open", "all"] = "open",
@@ -1453,6 +1510,7 @@ class IngredientIn(BaseModel):
     shelf_life_days: int | None = None
     max_stock_base: float | None = None
     reorder_point_base: float | None = None
+    minimum_order_qty: float | None = Field(default=None, gt=0)
 
 
 @app.get("/console/ingredients", tags=["console"])
@@ -1560,8 +1618,9 @@ def create_ingredient(
                purchase_unit, pack_size, pack_size_status, yield_factor,
                yield_factor_status, unit_cost, unit_cost_status, supplier,
                supplier_contact, storage_location, lead_time_days, inventory_type,
-               expiry_mode, shelf_life_days, max_stock_base, reorder_point_base)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               expiry_mode, shelf_life_days, max_stock_base, reorder_point_base,
+               minimum_order_qty)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (f"ING-{n + 1:04d}", body.name, body.category, body.kind, body.sub_recipe_mode,
              body.base_unit, body.purchase_unit,
@@ -1570,7 +1629,7 @@ def create_ingredient(
              body.unit_cost, "verified" if body.unit_cost else "unset",
              body.supplier, body.supplier_contact, body.storage_location, body.lead_time_days,
              body.inventory_type, body.expiry_mode, body.shelf_life_days,
-             body.max_stock_base, body.reorder_point_base),
+             body.max_stock_base, body.reorder_point_base, body.minimum_order_qty),
         )
         return {"id": cur.lastrowid, "ingredient_id": f"ING-{n + 1:04d}"}
 
@@ -1755,6 +1814,7 @@ class IngredientEditIn(BaseModel):
     lead_time_days: int | None = Field(default=None, ge=0)
     reorder_point_base: float | None = Field(default=None, ge=0)
     max_stock_base: float | None = Field(default=None, gt=0)
+    minimum_order_qty: float | None = Field(default=None, gt=0)
     inventory_type: Literal["food_ingredient", "sellable_product", "operational_supply"] | None = None
     expiry_mode: Literal["fixed_date", "shelf_life_estimate", "none"] | None = None
     shelf_life_days: int | None = Field(default=None, gt=0)
@@ -1782,7 +1842,7 @@ def edit_ingredient(
     # Starlette's JSONResponse refuses to serialize a non-finite float
     # (allow_nan=False) -- raising ValidationError here instead reaches
     # this project's own WTError handler, which never echoes raw input.
-    for field in ("unit_cost", "reorder_point_base", "max_stock_base"):
+    for field in ("unit_cost", "reorder_point_base", "max_stock_base", "minimum_order_qty"):
         if field in fields and not math.isfinite(fields[field]):
             raise ValidationError(f"{field} must be a finite number")
     set_sql = ", ".join(f"{k} = :{k}" for k in fields)
@@ -2769,32 +2829,24 @@ def dashboard_summary(
         for b in batches[:8]
     ]
 
-    # ---- messages: the Owner<->Admin task board, not a technical forecast
-    # chart -- this replaced the old "Demand Forecast" preview on the Today
-    # screen (2026-09-30 UX/IA redesign) precisely because it is a decision
-    # a reader acts on today, not a model output. A shared board (see
-    # wt/instructions.py's own docstring): both roles see the identical
-    # list, never a per-user inbox. "Awaiting you" is caller-specific --
-    # only an update posted by the OTHER role can ever be acknowledged by
-    # this caller (wt/updates.acknowledge()'s own rule), so counting any
-    # other way would show a number this caller could never act on.
+    # ---- instructions: the Owner->Admin task board, not a technical
+    # forecast chart -- this replaced the old "Demand Forecast" preview on
+    # the Today screen (2026-09-30 UX/IA redesign) precisely because it is
+    # a decision a reader acts on today, not a model output. A shared board
+    # (see wt/instructions.py's own docstring): both roles see the
+    # identical list, never a per-user inbox.
     open_instructions = rows(c.execute(
         "SELECT id, title, status, priority, created_by, created_at FROM owner_instruction "
         "WHERE status NOT IN ('completed','cancelled') ORDER BY "
         "CASE priority WHEN 'urgent' THEN 0 WHEN 'important' THEN 1 ELSE 2 END, created_at DESC "
         "LIMIT 5"
     ))
-    unacked_for_caller = c.execute(
-        "SELECT COUNT(*) AS n FROM operational_update "
-        "WHERE acknowledged_at IS NULL AND created_by_role != ?", (p["role"],),
-    ).fetchone()["n"]
-    messages_preview = {
+    instructions_preview = {
         "openInstructions": len(open_instructions),
         "items": [
             {"id": i["id"], "title": i["title"], "status": i["status"], "priority": i["priority"]}
             for i in open_instructions
         ],
-        "unacknowledgedForCaller": unacked_for_caller,
     }
 
     return {
@@ -2806,7 +2858,7 @@ def dashboard_summary(
         "kpis": kpis,
         "alerts": attention,
         "forecastPreview": _forecast_preview(c),
-        "messagesPreview": messages_preview,
+        "instructionsPreview": instructions_preview,
         "buyToday": buy_today,
         "useFirst": use_first,
         "buckets": buckets,
@@ -2957,17 +3009,30 @@ def _demand_model(c: sqlite3.Connection) -> str:
     """'ewma', 'prophet', or 'hybrid' -- which demand model wt/depletion.py's
     forward chain uses for future-day demand (see build_demand()'s
     docstring). Backed by the app_setting 'depletion_demand_model' (0=ewma,
-    1=prophet, 2=hybrid; app_setting is float-only, see unli.get_setting),
-    defaulting to ewma so installing this code changes nothing until someone
-    deliberately opts in -- the same reasoning 'prophet' shipped under, now
-    extended to 'hybrid' rather than silently reinterpreting an existing
-    value. 'hybrid' is the strategy actually evaluated at 55.69% fleet-mean
-    WAPE (forecasting.evaluate_demand_model()); 'prophet' alone measures
-    57.81% -- worse, because it forces Prophet on every item rather than
-    validating per item. One setting, one authoritative answer at a time --
-    never two engines live simultaneously for the same request the way the
-    old forecasting.ingredient_depletion() purchase-quantity duplicate was."""
-    value = unli.get_setting(c, "depletion_demand_model", 0.0)
+    1=prophet, 2=hybrid; app_setting is float-only, see unli.get_setting).
+
+    'hybrid' is this module's internal setting name for the real production
+    architecture: forecasting._backtest_series()'s per-series rolling
+    backtest picks, for EACH menu item independently, whichever of the four
+    forecasting methods that actually exist (naive-previous-period,
+    trailing-moving-average, day-of-week-seasonal, Prophet) scored lowest
+    WAPE on that item's own history -- Prophet itself, when selected, with
+    whichever growth (flat/linear) its own leakage-free per-series tuning
+    picked (forecasting.select_prophet_growth()). This is per-series METHOD
+    SELECTION, not a fifth model competing with the four real ones; nothing
+    is blended or averaged across methods for a single item.
+    Defaults to 'hybrid' (2.0) because that is what forecasting.
+    evaluate_demand_model() measures as actually best -- 55.69% fleet-mean
+    WAPE, against 57.81% for forcing Prophet on every item regardless of fit
+    (demand_model='prophet') and both strictly better than the non-model
+    EWMA figure. An item with no fresh refresh_prophet_baselines() fit yet
+    (see that function) transparently falls back to the EWMA baseline for
+    that one item alone, same as always -- so this default is safe to ship
+    even before anyone has ever called the refresh endpoint. One setting,
+    one authoritative answer at a time -- never two engines live
+    simultaneously for the same request the way the old forecasting.
+    ingredient_depletion() purchase-quantity duplicate was."""
+    value = unli.get_setting(c, "depletion_demand_model", 2.0)
     if value >= 2.0:
         return "hybrid"
     return "prophet" if value >= 1.0 else "ewma"
@@ -3005,6 +3070,13 @@ def _depletion_fingerprint(c: sqlite3.Connection) -> tuple:
         c.execute("SELECT MAX(id) AS m FROM stock_ledger").fetchone()["m"] or 0,
         c.execute("SELECT MAX(id) AS m FROM recipe_line").fetchone()["m"] or 0,
         c.execute("SELECT MAX(updated_at) AS m FROM ingredient").fetchone()["m"] or "",
+        # ingredient_forecast() now also nets out incoming confirmed purchase
+        # orders (wt/depletion.py's _incoming_ordered()) -- a PO status flip
+        # (draft -> ordered, or a receipt) writes no stock_ledger/customer_
+        # order/recipe_line/ingredient row by itself, so it needs its own
+        # entry here or this cache would keep serving a pre-change
+        # suggestedOrderQty/incomingOrderedBase.
+        c.execute("SELECT MAX(updated_at) AS m FROM purchase_order").fetchone()["m"] or "",
         timeutil.to_manila(timeutil.utc_now()).hour,
         # 2026-09: which demand model is active, and which generation of
         # Prophet fits is cached -- either changing must invalidate exactly
@@ -3076,12 +3148,21 @@ def refresh_prophet_baselines_endpoint(
     for an explicit call (an admin action, or a scheduled task hitting this
     endpoint on a cadence such as nightly) and not fine to block a live page
     load on. Only takes effect for demand_model='prophet' or 'hybrid' -- see
-    the 'depletion_demand_model' app_setting (0=ewma, 1=prophet, 2=hybrid);
-    with it left at the default ('ewma'), calling this is harmless but has
-    no visible effect. See wt/depletion.refresh_prophet_baselines() for the
-    full reasoning, including why 'hybrid' -- not 'prophet' -- is the
-    strategy this thesis's evaluation numbers describe."""
-    return refresh_prophet_baselines(c, horizon_days, lookback_days)
+    the 'depletion_demand_model' app_setting (0=ewma, 1=prophet, 2=hybrid),
+    which now defaults to 'hybrid' (the production default -- see
+    _demand_model()'s own docstring for why); an owner who has explicitly
+    set it back to 'ewma' can still call this endpoint harmlessly, it just
+    has no visible effect until the setting changes again. See
+    wt/depletion.refresh_prophet_baselines() for the full reasoning,
+    including why 'hybrid' -- not 'prophet' -- is the strategy this
+    thesis's evaluation numbers describe.
+
+    2026-10: routed through run_prophet_refresh_job() rather than calling
+    refresh_prophet_baselines() directly, so a manual call here can never
+    race the background scheduler (start_prophet_refresh_scheduler()) and
+    always updates the same durable last-run status the console reads."""
+    return run_prophet_refresh_job(c, triggered_by="manual", horizon_days=horizon_days,
+                                   lookback_days=lookback_days)
 
 
 @app.get("/console/menu/margins", tags=["console"])
@@ -3246,7 +3327,7 @@ class SampleForReviewIn(BaseModel):
 @app.post("/console/anomalies/sample", tags=["console"])
 def sample_anomalies_for_review(
     body: SampleForReviewIn, c: sqlite3.Connection = Depends(conn),
-    _p: dict = Depends(needs("inventory.write")),
+    p: dict = Depends(needs("inventory.write")),
 ):
     """Select real (non-synthetic) stock-loss ledger rows into the blind
     review queue — see wt/anomaly.py's sample_for_review(). Writes only to
@@ -3255,7 +3336,7 @@ def sample_anomalies_for_review(
     ledger row already sampled (any status) is never selected twice."""
     return sample_for_review(
         c, n_flagged=body.n_flagged, n_near_threshold=body.n_near_threshold,
-        n_random=body.n_random, lookback_days=body.lookback_days,
+        n_random=body.n_random, lookback_days=body.lookback_days, user_id=p["sub"],
     )
 
 
@@ -3324,7 +3405,7 @@ class SampleConsumptionForReviewIn(BaseModel):
 @app.post("/console/anomalies/consumption/sample", tags=["console"])
 def sample_consumption_anomalies_for_review(
     body: SampleConsumptionForReviewIn, c: sqlite3.Connection = Depends(conn),
-    _p: dict = Depends(needs("inventory.write")),
+    p: dict = Depends(needs("inventory.write")),
 ):
     """Select genuine reconciled days into the consumption pass's blind
     review queue — see wt/anomaly.py's sample_consumption_for_review().
@@ -3333,7 +3414,7 @@ def sample_consumption_anomalies_for_review(
     deterministic rule's catches for an Isolation Forest prediction."""
     return sample_consumption_for_review(
         c, n_flagged=body.n_flagged, n_near_threshold=body.n_near_threshold,
-        n_random=body.n_random, lookback_days=body.lookback_days,
+        n_random=body.n_random, lookback_days=body.lookback_days, user_id=p["sub"],
     )
 
 
@@ -3380,6 +3461,105 @@ def scientific_consumption_validation_metrics_endpoint(
     below minimum reviewed evidence — see wt/anomaly.py's
     scientific_consumption_validation_metrics()."""
     return scientific_consumption_validation_metrics(c)
+
+
+# ===========================================================================
+# Review-sampling / scientific validation for the per-FLAVOUR pass — a
+# finer-grained dimension than the stream-level consumption pass above (one
+# reconciled service-date x flavour, not x stream). Mirrors the consumption
+# pass's endpoints exactly; see wt/anomaly.py's own Part 4 docstrings for why
+# model_prediction here is always the Isolation Forest's own verdict.
+# ===========================================================================
+@app.get("/console/anomalies/flavor/events", tags=["console"])
+def flavor_anomaly_events_endpoint(
+    lookback_days: int = Query(90, ge=1, le=365),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Restaurant-friendly flagged flavour-days grouped into events with a
+    root-cause attribution — see wt/anomaly.py's flavor_anomaly_events().
+    This is the view meant for operational staff: one alert per event, never
+    the raw per-flavour compositional flags (dozens of rows) that back it."""
+    return {"events": flavor_anomaly_events(c, lookback_days=lookback_days)}
+
+
+class SampleFlavorForReviewIn(BaseModel):
+    n_flagged: int | None = Field(default=None, ge=0)
+    n_near_threshold: int = Field(default=5, ge=0, le=50)
+    n_random: int = Field(default=5, ge=0, le=50)
+    lookback_days: int = Field(default=90, ge=1, le=365)
+
+
+@app.post("/console/anomalies/flavor/sample", tags=["console"])
+def sample_flavor_anomalies_for_review(
+    body: SampleFlavorForReviewIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")),
+):
+    """Select genuine (non-synthetic) reconciled flavour-days into the
+    flavour pass's blind review queue — see wt/anomaly.py's
+    sample_flavor_for_review(). Returns forest_trained=False with nothing
+    sampled below FLAVOR_MIN_RECONCILED_DAYS genuine reconciled days."""
+    return sample_flavor_for_review(
+        c, n_flagged=body.n_flagged, n_near_threshold=body.n_near_threshold,
+        n_random=body.n_random, lookback_days=body.lookback_days, user_id=p["sub"],
+    )
+
+
+@app.get("/console/anomalies/flavor/validation-queue", tags=["console"])
+def flavor_validation_queue_endpoint(
+    status: Literal["pending", "confirmed_anomaly", "false_positive",
+                     "expected_operational_variation", "insufficient_information"] = "pending",
+    blind: bool = Query(True, description="Must stay true for any labeling UI"),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.write")),
+):
+    """The human review queue for reconciled flavour-days. blind=True strips
+    every model-derived field so a reviewer judges each day on its
+    operational evidence alone — see wt/anomaly.py's flavor_validation_queue()."""
+    return {"status": status, "items": flavor_validation_queue(c, status=status, blind=blind)}
+
+
+class FlavorValidationLabelIn(BaseModel):
+    human_label: Literal["confirmed_anomaly", "false_positive",
+                          "expected_operational_variation", "insufficient_information"]
+    note: str | None = None
+
+
+@app.post("/console/anomalies/flavor/validation-queue/{sample_id}/label", tags=["console"])
+def label_flavor_validation_sample(
+    sample_id: int, body: FlavorValidationLabelIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")),
+):
+    """A human's one-time ground-truth verdict on a sampled flavour-day —
+    see wt/anomaly.py's submit_flavor_validation_label()."""
+    return submit_flavor_validation_label(c, sample_id, body.human_label, body.note,
+                                          user_id=p["sub"])
+
+
+@app.get("/console/anomalies/flavor/validation-metrics", tags=["console"])
+def scientific_flavor_validation_metrics_endpoint(
+    c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")), _pg: dict = Depends(needs_page("system")),
+):
+    """Precision/Recall/Specificity/F1 for the flavour pass, computed ONLY
+    from blind-reviewed unli_flavor_validation_sample rows, scoped to the
+    current model/eligibility version — see wt/anomaly.py's
+    scientific_flavor_validation_metrics(). This is the SIMULATION-free,
+    real-data-only figure; never to be confused with the fixed-seed
+    simulation Precision/Recall reported in tests.run_tests."""
+    return scientific_flavor_validation_metrics(c)
+
+
+@app.get("/console/anomalies/flavor/readiness", tags=["console"])
+def flavor_real_data_readiness_endpoint(
+    lookback_days: int = Query(90, ge=1, le=365),
+    c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")), _pg: dict = Depends(needs_page("system")),
+):
+    """Which of SIMULATION_ONLY / INSUFFICIENT_REAL_DATA /
+    READY_WITH_LIMITATIONS / READY_REAL_DATA the flavour pass is currently
+    in — see wt/anomaly.py's flavor_real_data_readiness(). Never reports
+    READY_REAL_DATA from simulated-workbook rows; genuine restaurant
+    observations and human review are the only evidence this counts."""
+    return flavor_real_data_readiness(c, lookback_days=lookback_days)
 
 
 @app.get("/console/anomalies/{ledger_id}/reviews", tags=["console"])
@@ -3518,6 +3698,132 @@ def review_draft_combo_endpoint(
     )
 
 
+class ComboComponentIn(BaseModel):
+    menu_item_id: int
+    quantity: float = Field(gt=0, le=20)
+
+
+class ComboPreviewIn(BaseModel):
+    components: list[ComboComponentIn] = Field(min_length=2)
+
+
+@app.post("/console/combos/preview", tags=["console"])
+def combo_preview_endpoint(
+    body: ComboPreviewIn, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")),
+):
+    """Read-only cost + suggested price range for an arbitrary (2+) set of
+    existing menu items — the "add/remove/edit items" step of building a
+    combo, before anything is published. See wt/combos.py's preview_combo."""
+    return combos_mod.preview_combo(c, [cmp.model_dump() for cmp in body.components])
+
+
+class ComboImageUploadIn(BaseModel):
+    content_base64: str
+
+
+@app.post("/console/combos/image-upload", tags=["console"])
+def combo_image_upload_endpoint(
+    body: ComboImageUploadIn, _p: dict = Depends(needs("combo.publish")),
+):
+    """Validates and saves an uploaded combo/menu-item image, returning the
+    image_path to send back on publish/PATCH. Never writes to menu_item
+    itself — a preview can be uploaded and discarded without publishing
+    anything (see wt/combos.py's save_menu_item_image)."""
+    image_path = combos_mod.save_menu_item_image(body.content_base64)
+    return {"image_path": image_path}
+
+
+@app.get("/console/combos", tags=["console"])
+def list_combos_endpoint(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    return {"combos": combos_mod.list_combos(c)}
+
+
+@app.get("/console/combos/{menu_item_pk}", tags=["console"])
+def get_combo_endpoint(
+    menu_item_pk: int, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("inventory.read")),
+):
+    return combos_mod.get_combo(c, menu_item_pk)
+
+
+class ComboPublishIn(BaseModel):
+    name: str = Field(max_length=120)
+    category: str = Field(max_length=80)
+    price: float = Field(ge=0)
+    components: list[ComboComponentIn] = Field(min_length=2)
+    image_path: str | None = None
+    draft_combo_id: int | None = None
+
+
+@app.post("/console/combos", tags=["console"], status_code=201)
+def publish_combo_endpoint(
+    body: ComboPublishIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("combo.publish")),
+):
+    """Publishes a combo to the live menu/POS: creates a real menu_item with
+    its own merged recipe (wt/combos.py's publish_combo). From this point on
+    the combo IS a menu item — GET /pos/menu, order creation, kitchen,
+    FEFO depletion, voids and sales reporting all handle it exactly like any
+    other sellable item, with zero combo-specific code anywhere in that
+    path. If draft_combo_id names a combo idea that is still 'draft', this
+    also records its approval (same audit trail as the ordinary approve
+    action) so the idea's review history shows what it became."""
+    if body.draft_combo_id is not None:
+        if not c.execute("SELECT 1 FROM draft_combo WHERE id=?", (body.draft_combo_id,)).fetchone():
+            raise HTTPException(404, f"draft combo {body.draft_combo_id} not found")
+    result = combos_mod.publish_combo(
+        c, name=body.name, category=body.category, price=body.price,
+        components=[cmp.model_dump() for cmp in body.components],
+        image_path=body.image_path, draft_combo_id=body.draft_combo_id, user_id=p["sub"],
+    )
+    if body.draft_combo_id is not None:
+        review_draft_combo(c, body.draft_combo_id, "approved",
+                            note=f"Published as {result['code']}.", user_id=p["sub"])
+    return result
+
+
+class ComboUpdateIn(BaseModel):
+    name: str | None = Field(default=None, max_length=120)
+    category: str | None = Field(default=None, max_length=80)
+    price: float | None = Field(default=None, ge=0)
+    components: list[ComboComponentIn] | None = Field(default=None, min_length=2)
+    image_path: str | None = None
+    remove_image: bool = False
+
+
+@app.patch("/console/combos/{menu_item_pk}", tags=["console"])
+def update_combo_endpoint(
+    menu_item_pk: int, body: ComboUpdateIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("combo.publish")),
+):
+    """Edits a published combo's name/category/price/image/items. Changing
+    `components` regenerates the combo's own recipe (never the component
+    items' recipes) so future orders deduct correctly; it never rewrites
+    what an already-completed order reserved or deducted."""
+    return combos_mod.update_combo(
+        c, menu_item_pk, name=body.name, category=body.category, price=body.price,
+        components=[cmp.model_dump() for cmp in body.components] if body.components is not None else None,
+        image_path=body.image_path, remove_image=body.remove_image, user_id=p["sub"],
+    )
+
+
+class ComboVisibilityIn(BaseModel):
+    pos_visible: bool
+
+
+@app.patch("/console/combos/{menu_item_pk}/visibility", tags=["console"])
+def set_combo_visibility_endpoint(
+    menu_item_pk: int, body: ComboVisibilityIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("combo.publish")),
+):
+    """Shows/hides a published combo on the POS without deleting it — same
+    pos_visible switch every other menu item already has."""
+    return combos_mod.set_combo_visibility(c, menu_item_pk, body.pos_visible, user_id=p["sub"])
+
+
 @app.get("/console/model-details", tags=["console"])
 def model_details_endpoint(
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
@@ -3542,6 +3848,12 @@ def model_details_endpoint(
         "anomaly_detection": consumption_model_details(c),
         "stock_loss_detection": anomaly_model_details(c),
         "product_combinations": association_model_details(c),
+        "flavor_anomaly_detection": flavor_consumption_model_details(c),
+        # 2026-10 fix: lets the console show whether the background
+        # scheduler (or a manual call) has actually fitted Prophet recently
+        # -- "hybrid" being the configured setting is not the same claim as
+        # a fresh fit actually backing it; see run_prophet_refresh_job().
+        "prophet_baseline_refresh": _get_prophet_refresh_status(c),
     }
 
 
@@ -3603,6 +3915,64 @@ def unli_history(
     """Reconciliation history and audit trail — the same rows the Isolation
     Forest trains on, read through the same view."""
     return unli.history(c, limit, item_key, days)
+
+
+class ReconcileRevisionIn(BaseModel):
+    opening_base: float = Field(ge=0, description="weighed out at start of service, base units")
+    closing_base: float = Field(ge=0, description="leftover weighed at close, base units")
+    added_base: float = Field(default=0.0, ge=0, description="top-ups issued during service")
+    note: str | None = None
+    client_request_id: str | None = Field(default=None, max_length=64)
+
+
+class ReconcileRevisionPreviewIn(BaseModel):
+    opening_base: float = Field(ge=0, description="weighed out at start of service, base units")
+    closing_base: float = Field(ge=0, description="leftover weighed at close, base units")
+    added_base: float = Field(default=0.0, ge=0, description="top-ups issued during service")
+
+
+@app.post("/unli/reconciliation/{pk}/revise/preview", tags=["unli"])
+def unli_preview_reconciliation_revision(
+    pk: int, body: ReconcileRevisionPreviewIn, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("unli.reconcile.write")),
+):
+    """Read-only dry run of the revision below — same capability gate,
+    since this is part of the same workflow, but writes nothing at all (no
+    ledger entry, no revision row, no stock change). Lets staff see the
+    freshly recomputed head count (so a late-committed order is visible
+    before anything is written) and the exact incremental correction that
+    WOULD post, before deciding to submit. See wt/unli.preview_revision()."""
+    return unli.preview_revision(c, pk, body.opening_base, body.closing_base, body.added_base)
+
+
+@app.post("/unli/reconciliation/{pk}/revise", tags=["unli"], status_code=201)
+def unli_revise_reconciliation(
+    pk: int, body: ReconcileRevisionIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("unli.reconcile.write")),
+):
+    """2026-10 fix: brings an already-reconciled service-date/stream up to
+    date when an order for that day committed after the original
+    reconciliation ran (the original row's own UNIQUE(service_date,
+    unli_item_id) refuses a second POST /unli/reconciliation outright — this
+    is the controlled, explicit alternative). Recomputes theoretical_base
+    fresh, so the late order is now included, and posts only the
+    incremental correction beyond what the original (and any earlier
+    revision) already applied — never the full gap again. The original row
+    and every earlier revision stay exactly as recorded. See
+    wt/unli.revise_reconciliation()."""
+    return unli.revise_reconciliation(
+        c, pk, body.opening_base, body.closing_base, body.added_base,
+        body.note, user_id=p["sub"], client_request_id=body.client_request_id,
+    )
+
+
+@app.get("/unli/reconciliation/{pk}/revisions", tags=["unli"])
+def unli_reconciliation_revisions(
+    pk: int, c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("unli.reconcile")),
+):
+    """Every revision recorded against one original reconciliation, oldest
+    first — the append-only trail of how a service-date's figures evolved."""
+    return {"revisions": unli.revision_history(c, pk)}
 
 
 class ReviewIn(BaseModel):
@@ -4008,7 +4378,7 @@ def set_pos_config(
 # Registered LAST and by exact path (not a StaticFiles mount at "/") so
 # nothing here can shadow an API route defined above.
 # ===========================================================================
-_STATIC_DIR = _Path(__file__).resolve().parent.parent / "static"
+_STATIC_DIR = _Path(__file__).resolve().parent.parent.parent / "frontend"
 
 # Brand assets (logo, tagline graphic) — a plain StaticFiles mount rather than
 # an explicit route since these are just files to hand back byte-for-byte.
@@ -4040,6 +4410,13 @@ async def _no_cache_console_assets(request, call_next):
 
 
 app.mount("/assets", StaticFiles(directory=_STATIC_DIR / "assets"), name="assets")
+
+# Uploaded menu-item/combo images (wt/combos.py's save_menu_item_image).
+# StaticFiles requires the directory to exist before mount, so it's created
+# here rather than committed empty to the repo.
+_UPLOADS_DIR = _STATIC_DIR / "uploads"
+_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=_UPLOADS_DIR), name="uploads")
 
 
 @app.get("/pos", include_in_schema=False)

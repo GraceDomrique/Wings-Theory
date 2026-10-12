@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import sqlite3
 
-from . import unli
+from . import audit, unli
 from .db import write_tx
 from .errors import NotFoundError, ValidationError
 from .resolver import expand_recipe
@@ -86,7 +86,18 @@ def set_combo_pricing_config(conn: sqlite3.Connection, updates: dict, user_id: s
             stored = NOT_CONFIGURED if value is None else float(_LABOR_METHOD_CODES[value])
         else:
             stored = NOT_CONFIGURED if value is None else float(value)
+        # unli.set_setting() opens and commits its own write_tx (it is the
+        # same helper every other app_setting write in this codebase uses),
+        # so the audit row is written in its own immediately-following
+        # transaction rather than nested inside it -- write_tx() rejects
+        # nesting outright (wt/db.py) to avoid a partial rollback leaving
+        # inconsistent state.
         unli.set_setting(conn, setting_key, stored, user_id=user_id)
+        with write_tx(conn):
+            audit.log(
+                conn, "combo_pricing_config", setting_key, "update", user_id,
+                field=field, new_value=value,
+            )
     return get_combo_pricing_config(conn)
 
 
@@ -333,6 +344,10 @@ def create_draft_combo(
             "INSERT INTO draft_combo_review (draft_combo_id, status, user_id) VALUES (?, 'draft', ?)",
             (draft_pk, user_id),
         )
+        audit.log(
+            conn, "draft_combo", draft_pk, "create", user_id,
+            note=f"items {item_a_id}+{item_b_id}" + (f" '{name}'" if name else ""),
+        )
     return _draft_row(conn.execute("SELECT * FROM draft_combo WHERE id=?", (draft_pk,)).fetchone())
 
 
@@ -381,5 +396,9 @@ def review_draft_combo(
             "INSERT INTO draft_combo_review (draft_combo_id, status, note, user_id, client_request_id) "
             "VALUES (?,?,?,?,?)",
             (draft_combo_id, status, note, user_id, client_request_id),
+        )
+        audit.log(
+            conn, "draft_combo", draft_combo_id, "review", user_id,
+            field="status", new_value=status, note=note,
         )
     return dict(conn.execute("SELECT * FROM draft_combo_review WHERE id=?", (cur.lastrowid,)).fetchone())

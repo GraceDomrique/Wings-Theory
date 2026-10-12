@@ -95,6 +95,21 @@ CAPABILITIES = {
     # itself, the kitchen's own zero-impact case, or the admin's full
     # access — never the manager's read-only role.
     "order.void":         ("cashier", "admin", "kitchen"),
+    # 2026-10-14 fix: recording the printed "Leftover Charge" penalty fee
+    # (migration 0037's customer_order.leftover_charge_total) used to reuse
+    # order.void, on the reasoning that both are "post-checkout order
+    # adjustments" -- but that coupling is wrong: order.void includes
+    # 'kitchen' for a completely different, narrow reason (releasing a
+    # still-punched, not-yet-started ticket from the KDS screen, with zero
+    # billing impact), and kitchen has no other billing-facing capability
+    # anywhere in this table. Reusing order.void would have quietly let
+    # kitchen staff record a billing charge nobody intended them to. A
+    # leftover charge is purely a till/billing action, assessed once a
+    # table's bill is already totaled (see wt/reservation.
+    # set_leftover_charge()) -- scoped to exactly the roles that handle
+    # checkout and billing, same set as order.create, plus admin for the
+    # same oversight reason every other write capability lists it.
+    "order.leftover_charge": ("cashier", "admin"),
     "order.status":       ("kitchen",),
     "order.read":         ("cashier", "manager", "admin", "owner"),
     "menu.read":          ("cashier", "kitchen", "manager", "admin", "owner"),
@@ -191,21 +206,26 @@ CAPABILITIES = {
     "purchase_order.cancel":    ("owner", "admin"),
     "purchase_order.read":      ("owner", "admin"),
 
-    # Operational updates (migration 0029): the free-text, bidirectional half
-    # of Owner/Admin communication that instructions' fixed state machine
-    # doesn't cover. Both roles can create and read; who may acknowledge a
-    # given update (only the role that did NOT post it) is a finer rule
-    # enforced inside wt/updates.acknowledge(), same shape as
-    # instruction.cancel above.
-    "update.create":      ("owner", "admin"),
-    "update.read":        ("owner", "admin"),
-    "update.acknowledge": ("owner", "admin"),
+    # Read-only visibility into admin_audit_log/login_event (2026-10
+    # accountability pass). Deliberately separate from user.manage, which
+    # stays admin-only for actually administering accounts — owner needs to
+    # SEE who touched what and when (that is the entire point of giving
+    # admin operational write access while owner retains oversight), not to
+    # manage users. Granting this never widens any write capability above.
+    "audit.read":         ("owner", "admin"),
 
     # Saving a "combo idea" (wt/combo_pricing.py) as a draft, and reviewing/
     # approving that draft — a pricing decision, same owner/admin pairing as
     # purchase_order.cancel above. Never publishes to the live menu/POS;
     # see wt/api.py's draft-combo endpoints.
     "combo.draft":        ("owner", "admin"),
+
+    # Publishing a combo to the live menu/POS creates a real menu_item +
+    # recipe — an operational write exactly like recipe.write/inventory.write,
+    # not a pricing decision like combo.draft above. Admin-only: owner stays
+    # read-only (approving the IDEA is combo.draft; making it sellable is
+    # this), consistent with every other write capability in this table.
+    "combo.publish":      ("admin",),
 }
 
 

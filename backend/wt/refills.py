@@ -954,7 +954,8 @@ def order_receipt(conn: sqlite3.Connection, order_pk: int) -> dict:
         SELECT id, order_no, status, table_label, head_count, created_by, created_at,
                committed_at, served_at, voided_at, void_reason, subtotal,
                discount_type, discount_amount, service_charge,
-               total, cash_received, change_due, source, source_order_id
+               total, cash_received, change_due, source, source_order_id,
+               leftover_charge_total
           FROM customer_order WHERE id=?
         """, (order_pk,)).fetchone()
     if not order:
@@ -970,6 +971,12 @@ def order_receipt(conn: sqlite3.Connection, order_pk: int) -> dict:
     charges = _rows(conn.execute(
         "SELECT * FROM order_charge WHERE order_id=? ORDER BY id", (order_pk,)))
     addon_total = round(sum(ch["amount"] for ch in charges), 2)
+    # 2026-10 fix: migration 0037's leftover_charge_total had no caller
+    # anywhere, including here -- the receipt previously never showed a
+    # leftover fee even once wt/reservation.set_leftover_charge() started
+    # writing one. Additive, same as addon_total, never folded into the
+    # frozen `total`/`order` dict itself.
+    leftover_charge_total = round(order["leftover_charge_total"] or 0.0, 2)
     original_total = order["total"]
 
     # A historical sale genuinely has no recorded cash tender (the source
@@ -994,10 +1001,11 @@ def order_receipt(conn: sqlite3.Connection, order_pk: int) -> dict:
         "session": session,
         "charges": charges,
         "addon_total": addon_total,
+        "leftover_charge_total": leftover_charge_total,
         "original_total": original_total,
         "payment_reconstructed": payment_reconstructed,
         "reconstructed_cash_received": reconstructed_cash,
         "reconstructed_change_due": reconstructed_change,
-        "current_total": round((original_total or 0) + addon_total, 2)
+        "current_total": round((original_total or 0) + addon_total + leftover_charge_total, 2)
                          if original_total is not None else None,
     }

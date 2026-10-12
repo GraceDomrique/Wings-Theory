@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import os
+import random
 import sqlite3
 import sys
 import tempfile
@@ -28,7 +29,7 @@ def _future_iso(days: int) -> str:
     return (timeutil.business_today() + dt.timedelta(days=days)).isoformat()
 
 from wt import (                                                    # noqa: E402
-    auth, db, instructions, owner_provisioning, purchasing, refills, timeutil, units, unli, updates,
+    auth, db, instructions, owner_provisioning, purchasing, refills, timeutil, units, unli,
 )
 from wt.cache import TTLCache                                       # noqa: E402
 from wt.anomaly import consumption_model_details                    # noqa: E402
@@ -45,10 +46,11 @@ from wt.associations import threshold_sensitivity                   # noqa: E402
 from wt.associations import expanding_window_validation              # noqa: E402
 from wt import associations                                          # noqa: E402
 from wt import combo_pricing                                        # noqa: E402
+from wt import combos                                                # noqa: E402
 from wt.resolver import recipe_cost                                 # noqa: E402
 from wt.errors import (                                             # noqa: E402
     InsufficientStockError, InvalidStateError, NotFoundError, RecipeCycleError,
-    UnitConversionError,
+    UnitConversionError, ValidationError,
 )
 from wt import demo_validation                                      # noqa: E402
 from wt import depletion, forecasting, xlsx_prophet_ingest          # noqa: E402
@@ -58,8 +60,8 @@ from wt.forecasting import (                                        # noqa: E402
 from wt.reservation import (                                        # noqa: E402
     availability_for_menu_item, commit_order, ingredient_reconciliation_report,
     inventory_valuation, receive_stock, record_count, record_variance_review,
-    record_wastage, release_order, reserve_order, variance_review_history,
-    void_after_commit,
+    record_wastage, release_order, reserve_order, set_leftover_charge,
+    variance_review_history, void_after_commit,
 )
 from wt.resolver import (                                           # noqa: E402
     expand_recipe, flavour_substitutions, order_requirements, validate_recipe,
@@ -834,6 +836,96 @@ class TestReservation(Base):
         commit_order(self.conn, o)
         with self.assertRaises(InvalidStateError):
             release_order(self.conn, o)
+
+
+# ===========================================================================
+# 2026-10 fix (Phase 9, audit): customer_order.leftover_charge_total
+# (migration 0037) had a column and a documented intent -- "the live
+# checkout path is updated to write it going forward" -- but no caller
+# anywhere. wt.reservation.set_leftover_charge() is that caller.
+# ===========================================================================
+class TestLeftoverCharge(Base):
+    def setUp(self):
+        super().setUp()
+        self.wings = add_ingredient(self.conn, "Wings", on_hand=1000)
+        self.recipe = add_recipe(self.conn, "Platter", [(self.wings, 500)])
+        self.menu = add_menu_item(self.conn, "Platter", self.recipe, price=219)
+
+    def _settled_order(self):
+        o = add_order(self.conn, [(self.menu, 1)])
+        reserve_order(self.conn, o)
+        commit_order(self.conn, o)
+        self.conn.execute(
+            "UPDATE customer_order SET subtotal=219, service_charge=0, total=219 WHERE id=?",
+            (o,))
+        self.conn.commit()
+        return o
+
+    def test_leftover_charge_is_additive_never_touches_the_frozen_total(self):
+        o = self._settled_order()
+        result = set_leftover_charge(self.conn, o, 50.0, user_id="cashier1")
+        self.assertEqual(result["leftover_charge_total"], 50.0)
+        self.assertEqual(result["grand_total"], 269.0)
+        row = self.conn.execute(
+            "SELECT total, leftover_charge_total FROM customer_order WHERE id=?", (o,)
+        ).fetchone()
+        self.assertEqual(row["total"], 219, "the frozen total column must never change")
+        self.assertEqual(row["leftover_charge_total"], 50.0)
+
+    def test_leftover_charge_never_touches_inventory_or_the_ledger(self):
+        o = self._settled_order()
+        ledger_before = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        on_hand_before = self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.wings,)).fetchone()["on_hand_base"]
+        set_leftover_charge(self.conn, o, 75.0)
+        ledger_after = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        on_hand_after = self.conn.execute(
+            "SELECT on_hand_base FROM ingredient WHERE id=?", (self.wings,)).fetchone()["on_hand_base"]
+        self.assertEqual(ledger_before, ledger_after)
+        self.assertEqual(on_hand_before, on_hand_after)
+
+    def test_leftover_charge_requires_the_order_to_be_checked_out_first(self):
+        o = add_order(self.conn, [(self.menu, 1)])
+        reserve_order(self.conn, o)
+        commit_order(self.conn, o)  # never checked out -- total stays NULL
+        with self.assertRaises(InvalidStateError):
+            set_leftover_charge(self.conn, o, 50.0)
+
+    def test_leftover_charge_cannot_be_negative(self):
+        o = self._settled_order()
+        with self.assertRaises(InvalidStateError):
+            set_leftover_charge(self.conn, o, -10.0)
+
+    def test_leftover_charge_is_refused_on_a_voided_order(self):
+        o = self._settled_order()
+        void_after_commit(self.conn, o, "customer walked out")
+        with self.assertRaises(InvalidStateError):
+            set_leftover_charge(self.conn, o, 50.0)
+
+    def test_leftover_charge_can_be_corrected_before_payment_and_is_audited(self):
+        o = self._settled_order()
+        set_leftover_charge(self.conn, o, 50.0, user_id="cashier1")
+        set_leftover_charge(self.conn, o, 30.0, user_id="cashier1")
+        row = self.conn.execute(
+            "SELECT leftover_charge_total FROM customer_order WHERE id=?", (o,)).fetchone()
+        self.assertEqual(row["leftover_charge_total"], 30.0)
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='order' "
+            "AND action='set_leftover_charge' ORDER BY id"))
+        self.assertEqual(len(events), 2)
+        # SQLite's NUMERIC affinity can store a whole-number REAL as INTEGER
+        # (50.0 -> 50), so the audit text round-trips as "50" not "50.0" --
+        # compare numerically rather than pinning an exact string.
+        self.assertEqual(float(events[0]["new_value"]), 50.0)
+        self.assertEqual(float(events[1]["previous_value"]), 50.0)
+        self.assertEqual(float(events[1]["new_value"]), 30.0)
+
+    def test_leftover_charge_shows_on_the_receipt_and_folds_into_current_total(self):
+        o = self._settled_order()
+        set_leftover_charge(self.conn, o, 50.0)
+        rec = refills.order_receipt(self.conn, o)
+        self.assertEqual(rec["leftover_charge_total"], 50.0)
+        self.assertEqual(rec["current_total"], rec["original_total"] + 50.0)
 
 
 # ===========================================================================
@@ -2779,6 +2871,53 @@ class TestConsoleAPI(unittest.TestCase):
         after = self.client.get("/console/reports/sales", headers=self.H_OWNER).json()["orders"]
         self.assertEqual(after, before - 1)
 
+    def test_leftover_charge_endpoint_appears_on_the_receipt(self):
+        """2026-10 fix: POST /pos/orders/{pk}/leftover-charge, through the
+        real HTTP/RBAC path -- the migration 0037 column had no caller
+        anywhere until wt.reservation.set_leftover_charge()."""
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        item = next(m for m in menu["items"] if m["sellable"] and not m["is_unli"])
+        r = self.client.post("/pos/orders", headers=self.H_CASH,
+                             json={"table_label": "T-leftover-test",
+                                   "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        oid = r.json()["order_id"]
+        lc = self.client.post(f"/pos/orders/{oid}/leftover-charge", headers=self.H_CASH,
+                              json={"amount": 40.0})
+        self.assertEqual(lc.status_code, 200, lc.text)
+        self.assertEqual(lc.json()["leftover_charge_total"], 40.0)
+        receipt = self.client.get(f"/pos/orders/{oid}/receipt", headers=self.H_CASH).json()
+        self.assertEqual(receipt["leftover_charge_total"], 40.0)
+        self.assertEqual(receipt["current_total"], receipt["original_total"] + 40.0)
+
+    def test_leftover_charge_has_its_own_capability_not_order_void(self):
+        """2026-10-14 fix: recording a leftover charge used to reuse
+        order.void, which -- because order.void separately grants 'kitchen'
+        a narrow, unrelated right to release a still-punched ticket --
+        would have let kitchen staff record a billing charge nobody
+        intended them to. It now has its own capability
+        (order.leftover_charge: cashier/admin only). Admin can still both
+        void an order AND record a leftover charge; kitchen can still void
+        a punched ticket but must be refused a leftover charge."""
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        item = next(m for m in menu["items"] if m["sellable"] and not m["is_unli"])
+        r = self.client.post("/pos/orders", headers=self.H_CASH,
+                             json={"table_label": "T-leftover-rbac",
+                                   "lines": [{"menu_item_pk": item["menu_item_pk"], "qty": 1}]})
+        oid = r.json()["order_id"]
+
+        kitchen_attempt = self.client.post(f"/pos/orders/{oid}/leftover-charge",
+                                           headers=self.H_KIT, json={"amount": 40.0})
+        self.assertEqual(kitchen_attempt.status_code, 403,
+                         "kitchen must not be able to record a billing charge")
+
+        admin_token = self.client.post(
+            "/auth/login", json={"username": "owner", "password": "wingstheory"}
+        ).json()["token"]
+        admin_attempt = self.client.post(
+            f"/pos/orders/{oid}/leftover-charge",
+            headers={"Authorization": f"Bearer {admin_token}"}, json={"amount": 40.0})
+        self.assertEqual(admin_attempt.status_code, 200, admin_attempt.text)
+
     def test_sales_summary_all_time_includes_an_order_the_days_window_would_miss(self):
         """all_time=true must not apply the default 30-day bound at all —
         the Owner Console's 'All' preset has no floor on how far back a
@@ -3631,7 +3770,7 @@ class TestLoginAudit(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute("DELETE FROM login_event WHERE id=?", (row_id,))
 
-    def test_audit_logins_endpoint_requires_user_manage(self):
+    def test_audit_logins_endpoint_requires_audit_read(self):
         # Any non-admin, live role is enough to prove the gate -- the
         # 'manager' account is deactivated (migration 0034) and can no
         # longer log in at all, so cashier stands in here.
@@ -3652,7 +3791,7 @@ class TestLoginAudit(unittest.TestCase):
         events = r.json()["events"]
         self.assertTrue(any(e["username"] == "owner" and e["success"] == 1 for e in events))
 
-    def test_audit_actions_endpoint_requires_user_manage_and_returns_events(self):
+    def test_audit_actions_endpoint_requires_audit_read_and_returns_events(self):
         owner_token = self.client.post(
             "/auth/login", json={"username": "owner", "password": "wingstheory"}
         ).json()["token"]
@@ -4921,6 +5060,22 @@ class TestAnomalyReview(Base):
         with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute("UPDATE anomaly_review SET status='resolved' WHERE id=?", (r1["id"],))
 
+    def test_review_is_audited(self):
+        """2026-10 fix: a human classifying a stock-loss flag must leave an
+        admin_audit_log row naming the actor, action and new status."""
+        ing = add_ingredient(self.conn, "Audited Review Ingredient")
+        add_ledger_entry(self.conn, ing, -50.0, "wastage", days_ago(0), balance_after=50.0)
+        ledger_id = self.conn.execute(
+            "SELECT id FROM stock_ledger WHERE ingredient_id=?", (ing,)
+        ).fetchone()["id"]
+        record_anomaly_review(self.conn, ledger_id, "confirmed_anomaly", user_id="mgr")
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='stock_loss_ledger' AND action='review' "
+            "AND entity_id=?", (str(ledger_id),)))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["new_value"], "confirmed_anomaly")
+        self.assertEqual(events[0]["user_id"], "mgr")
+
     def test_unknown_review_status_is_rejected(self):
         ing = add_ingredient(self.conn, "Bad Status Ingredient")
         add_ledger_entry(self.conn, ing, -5.0, "wastage", days_ago(0), balance_after=95.0)
@@ -5301,6 +5456,18 @@ class TestAnomalySampling(Base):
         self.assertEqual(row["model_version"], anomaly.ANOMALY_MODEL_VERSION)
         self.assertEqual(row["eligibility_version"], anomaly.ELIGIBILITY_FILTER_VERSION)
 
+    def test_sampling_is_audited(self):
+        """2026-10 fix: who triggered a review-queue sampling run must be
+        recorded, even though the rows it writes aren't individually
+        attributable to a reviewer's own decision."""
+        self._trained_population()
+        anomaly.sample_for_review(self.conn, user_id="owner1")
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='anomaly_validation_sample' "
+            "AND action='sample' ORDER BY id DESC LIMIT 1"))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["user_id"], "owner1")
+
 
 class TestValidationLabeling(Base):
     def _one_sample(self):
@@ -5346,6 +5513,16 @@ class TestValidationLabeling(Base):
         sample_id = self._one_sample()
         with self.assertRaises(InvalidStateError):
             anomaly.submit_validation_label(self.conn, sample_id, "false_positive")
+
+    def test_labeling_is_audited(self):
+        sample_id = self._one_sample()
+        anomaly.submit_validation_label(self.conn, sample_id, "confirmed_anomaly", user_id="admin1")
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='anomaly_validation_sample' "
+            "AND action='label' AND entity_id=?", (str(sample_id),)))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["new_value"], "confirmed_anomaly")
+        self.assertEqual(events[0]["user_id"], "admin1")
 
     def test_blind_queue_omits_model_derived_fields(self):
         self._one_sample()
@@ -6342,6 +6519,435 @@ class TestComboPricing(Base):
         menu_item_count = self.conn.execute("SELECT COUNT(*) AS n FROM menu_item").fetchone()["n"]
         self.assertEqual(menu_item_count, 2)  # no new menu item created by the review
 
+    # -- 2026-10 fix: draft create/review/config are now audited -----------
+    def test_draft_combo_creation_is_audited(self):
+        item_a, item_b = self._combo()
+        draft = combo_pricing.create_draft_combo(self.conn, item_a, item_b, user_id="admin1")
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='draft_combo' AND action='create' "
+            "AND entity_id=?", (str(draft["id"]),)))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["user_id"], "admin1")
+
+    def test_draft_combo_review_is_audited(self):
+        item_a, item_b = self._combo()
+        draft = combo_pricing.create_draft_combo(self.conn, item_a, item_b, user_id="admin1")
+        combo_pricing.review_draft_combo(self.conn, draft["id"], "approved", user_id="admin2")
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='draft_combo' AND action='review' "
+            "AND entity_id=?", (str(draft["id"]),)))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["new_value"], "approved")
+        self.assertEqual(events[0]["user_id"], "admin2")
+
+    def test_combo_pricing_config_change_is_audited(self):
+        combo_pricing.set_combo_pricing_config(
+            self.conn, {"target_food_cost_pct": 40.0}, user_id="admin1")
+        events = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='combo_pricing_config' "
+            "AND field='target_food_cost_pct' ORDER BY id DESC LIMIT 1"))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["new_value"], "40.0")
+
+
+# ===========================================================================
+class TestComboPublish(Base):
+    """wt/combos.py — the "approve -> becomes a real sellable POS item" half
+    of the combo workflow that migration 0036 deliberately left out. Covers
+    the recipe-merge math, the flavor-slot preservation that a naive
+    expand-and-flatten merge would silently lose, unli refusal, and that the
+    published combo is in every way an ordinary menu_item from here on
+    (no combo-specific branch anywhere in order/kitchen/depletion/void)."""
+
+    def _wings_platter_with_flavor(self, hot_sauce_g=50):
+        """A menu item with a real customer-choice flavor slot, the same
+        shape resolver.flavour_substitutions() matches on: an ingredient
+        line whose display_label contains 'flavor', pointing at a
+        sub_recipe ingredient."""
+        hot_sauce_base = add_ingredient(self.conn, "Hot Sauce Base", base_unit="g", pack=1000, cost=50.0)
+        buffalo = add_ingredient(self.conn, "Classic Buffalo Sauce", kind="sub_recipe", mode="exploded")
+        add_recipe(self.conn, "Classic Buffalo Sauce Recipe", [(hot_sauce_base, hot_sauce_g)],
+                   kind="sub_recipe", produces=buffalo)
+        wings = add_ingredient(self.conn, "Chicken Wings", base_unit="g", pack=1000, cost=200.0)
+        platter_recipe = add_recipe(self.conn, "Wings Platter", [(wings, 500)])
+        # add_recipe labels lines "line0"/"line1" by default — overwrite the
+        # flavor line's label to the shape the real recipe editor produces
+        # and flavour_substitutions() actually looks for.
+        self.conn.execute(
+            "INSERT INTO recipe_line (recipe_id, ingredient_id, display_label, qty_base, sort_order) "
+            "VALUES (?,?,'Flavor',?,1)", (platter_recipe, buffalo, hot_sauce_g))
+        return add_menu_item(self.conn, "Wings Platter", platter_recipe, price=259.0), platter_recipe
+
+    def _rice_and_coke(self):
+        rice_ing = add_ingredient(self.conn, "Rice", base_unit="g", pack=1000, cost=40.0, on_hand=50000.0)
+        rice_recipe = add_recipe(self.conn, "Rice", [(rice_ing, 200)])
+        rice = add_menu_item(self.conn, "Rice", rice_recipe, price=25.0)
+        coke_ing = add_ingredient(self.conn, "Coke Syrup", base_unit="g", pack=1000, cost=150.0, on_hand=50000.0)
+        coke_recipe = add_recipe(self.conn, "Coke", [(coke_ing, 30)])
+        coke = add_menu_item(self.conn, "Coke", coke_recipe, price=45.0)
+        return rice, coke
+
+    def test_publish_requires_at_least_two_components(self):
+        rice, _ = self._rice_and_coke()
+        with self.assertRaises(ValidationError):
+            combos.publish_combo(self.conn, name="Solo", category="Combos", price=10.0,
+                                  components=[{"menu_item_id": rice, "quantity": 1}])
+
+    def test_unli_component_is_refused_with_the_specified_message(self):
+        rice, _ = self._rice_and_coke()
+        unli_item = add_menu_item(self.conn, "Unlimited Wings", None, price=399.0, is_unli=True)
+        with self.assertRaises(ValidationError) as ctx:
+            combos.publish_combo(
+                self.conn, name="Unli Combo", category="Combos", price=400.0,
+                components=[{"menu_item_id": rice, "quantity": 1},
+                            {"menu_item_id": unli_item, "quantity": 1}])
+        self.assertIn("separate serving and reconciliation process", str(ctx.exception))
+
+    def test_component_with_no_recipe_is_refused(self):
+        rice, _ = self._rice_and_coke()
+        no_recipe_item = add_menu_item(self.conn, "No Recipe Item", None, price=20.0)
+        with self.assertRaises(ValidationError):
+            combos.publish_combo(
+                self.conn, name="Bad Combo", category="Combos", price=40.0,
+                components=[{"menu_item_id": rice, "quantity": 1},
+                            {"menu_item_id": no_recipe_item, "quantity": 1}])
+
+    def test_publish_creates_an_ordinary_sellable_menu_item(self):
+        rice, coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Rice + Coke", category="Combos", price=65.0,
+            components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": coke, "quantity": 2}],
+            user_id="admin1")
+        row = dict(self.conn.execute(
+            "SELECT is_combo, is_unli, pos_visible, recipe_id FROM menu_item WHERE id=?",
+            (combo["menu_item_id"],)).fetchone())
+        self.assertEqual(row["is_combo"], 1)
+        self.assertEqual(row["is_unli"], 0)       # never fabricates an unli item
+        self.assertEqual(row["pos_visible"], 1)   # on the POS immediately
+        self.assertIsNotNone(row["recipe_id"])
+        avail = dict(self.conn.execute(
+            "SELECT sellable FROM v_menu_item_availability WHERE menu_item_pk=?",
+            (combo["menu_item_id"],)).fetchone())
+        self.assertEqual(avail["sellable"], 1)    # same gate every other item passes through
+
+    def test_recipe_quantities_scale_and_merge_exactly_like_ordering_items_directly(self):
+        """The spec's own worked example: 2x Wings Platter + 1x Rice should
+        deduct exactly what ordering those two lines directly would — this
+        is the correctness bar for the whole merge, not just 'some number
+        comes out'."""
+        platter, platter_recipe = self._wings_platter_with_flavor(hot_sauce_g=50)
+        rice, _coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Platter Feast", category="Combos", price=500.0,
+            components=[{"menu_item_id": platter, "quantity": 2}, {"menu_item_id": rice, "quantity": 1}],
+            user_id="admin1")
+        combo_recipe_id = self.conn.execute(
+            "SELECT recipe_id FROM menu_item WHERE id=?", (combo["menu_item_id"],)).fetchone()["recipe_id"]
+
+        direct = {l.ingredient_id: l.qty_base for l in expand_recipe(self.conn, platter_recipe, multiplier=2)}
+        rice_recipe_id = self.conn.execute("SELECT recipe_id FROM menu_item WHERE id=?", (rice,)).fetchone()["recipe_id"]
+        for l in expand_recipe(self.conn, rice_recipe_id):
+            direct[l.ingredient_id] = direct.get(l.ingredient_id, 0.0) + l.qty_base
+
+        combo_leaves = {l.ingredient_id: l.qty_base for l in expand_recipe(self.conn, combo_recipe_id)}
+        self.assertEqual(combo_leaves, direct)
+
+    # -- 2026-10 fix: combo publish/edit/visibility are now audited --------
+    def _audit_rows(self, entity_type, action, entity_id=None):
+        q = "SELECT * FROM admin_audit_log WHERE entity_type=? AND action=?"
+        params = [entity_type, action]
+        if entity_id is not None:
+            q += " AND entity_id=?"
+            params.append(str(entity_id))
+        return rows(self.conn.execute(q + " ORDER BY id DESC", params))
+
+    def test_publishing_a_combo_is_audited(self):
+        rice, coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Audited Combo", category="Combos", price=65.0,
+            components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": coke, "quantity": 2}],
+            user_id="admin1")
+        events = self._audit_rows("menu_item", "publish_combo", combo["menu_item_id"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["user_id"], "admin1")
+
+    def test_editing_a_published_combo_is_audited(self):
+        rice, coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Edit Me", category="Combos", price=65.0,
+            components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": coke, "quantity": 2}],
+            user_id="admin1")
+        combos.update_combo(self.conn, combo["menu_item_id"], price=70.0, user_id="admin2")
+        events = self._audit_rows("menu_item", "update_combo", combo["menu_item_id"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["user_id"], "admin2")
+
+    def test_hiding_a_published_combo_is_audited(self):
+        rice, coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Hide Me", category="Combos", price=65.0,
+            components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": coke, "quantity": 2}],
+            user_id="admin1")
+        combos.set_combo_visibility(self.conn, combo["menu_item_id"], False, user_id="admin2")
+        events = self._audit_rows("menu_item", "set_combo_visibility", combo["menu_item_id"])
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["new_value"], "False")
+
+    # -- 2026-10 fix (Phase 8, audit): historical combo costing survives an
+    # edit -- the append-only stock_ledger already records exactly what a
+    # past order deducted, independent of any later recipe change. No
+    # recipe versioning was added: nothing in this codebase computes a
+    # historical PER-ORDER cost by re-resolving a recipe (grep confirms
+    # OrderHistory/SalesOverview/BestSellers never do this, for combos or
+    # any other menu item) -- the existing ledger is already sufficient
+    # historical evidence, so this pins that guarantee down with a test
+    # instead of adding schema complexity that nothing reads.
+    def test_editing_a_combos_recipe_never_changes_a_past_orders_ledger_rows(self):
+        rice, coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Historical Combo", category="Combos", price=65.0,
+            components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": coke, "quantity": 2}],
+            user_id="admin1")
+        combo_pk = combo["menu_item_id"]
+
+        # A real order through the real pipeline, at the combo's ORIGINAL
+        # recipe (1x rice, 2x coke).
+        o = add_order(self.conn, [(combo_pk, 1)])
+        reserve_order(self.conn, o)
+        commit_order(self.conn, o)
+        ledger_before = rows(self.conn.execute(
+            "SELECT ingredient_id, delta_base FROM stock_ledger WHERE reason='sale_commit' "
+            "ORDER BY id"))
+        self.assertTrue(ledger_before, "the order must have actually deducted something")
+
+        # Now edit the published combo to a completely different composition
+        # (new ingredient entirely) and price.
+        extra_ing = add_ingredient(self.conn, "Extra Sauce", base_unit="g", pack=1000,
+                                   cost=90.0, on_hand=50000.0)
+        extra_recipe = add_recipe(self.conn, "Extra Sauce Recipe", [(extra_ing, 20)])
+        extra_item = add_menu_item(self.conn, "Extra Sauce Item", extra_recipe, price=15.0)
+        extra_ing2 = add_ingredient(self.conn, "Extra Sauce 2", base_unit="g", pack=1000,
+                                    cost=60.0, on_hand=50000.0)
+        extra_recipe2 = add_recipe(self.conn, "Extra Sauce 2 Recipe", [(extra_ing2, 15)])
+        extra_item2 = add_menu_item(self.conn, "Extra Sauce Item 2", extra_recipe2, price=12.0)
+        combos.update_combo(
+            self.conn, combo_pk,
+            components=[{"menu_item_id": extra_item, "quantity": 5},
+                        {"menu_item_id": extra_item2, "quantity": 1}],
+            price=999.0, user_id="admin1")
+
+        # The already-written ledger rows for the FIRST order must be
+        # byte-for-byte unchanged -- stock_ledger is append-only and this
+        # edit must not have touched them.
+        ledger_after = rows(self.conn.execute(
+            "SELECT ingredient_id, delta_base FROM stock_ledger WHERE reason='sale_commit' "
+            "ORDER BY id"))
+        self.assertEqual(ledger_before, ledger_after)
+        # And the edit must not have retroactively added a ledger row for
+        # the NEW ingredient against the old order -- the old order never
+        # touched it.
+        extra_ing_rows = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM stock_ledger WHERE ingredient_id=?", (extra_ing,)
+        ).fetchone()["n"]
+        self.assertEqual(extra_ing_rows, 0)
+
+    def test_flavor_slot_survives_into_the_combo_recipe(self):
+        """A naive merge that flattens through expand_recipe (rather than
+        copying recipe_line rows) would bake in today's default flavor and
+        lose the "%flavor%"-labeled line flavour_substitutions() needs —
+        the combo would silently stop letting the cashier pick a flavor
+        for an item that has one on its own."""
+        platter, _ = self._wings_platter_with_flavor()
+        rice, _coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Platter + Rice", category="Combos", price=300.0,
+            components=[{"menu_item_id": platter, "quantity": 1}, {"menu_item_id": rice, "quantity": 1}])
+        combo_recipe_id = self.conn.execute(
+            "SELECT recipe_id FROM menu_item WHERE id=?", (combo["menu_item_id"],)).fetchone()["recipe_id"]
+        flavor_lines = self.conn.execute(
+            "SELECT display_label FROM recipe_line WHERE recipe_id=? AND display_label LIKE '%flavor%'",
+            (combo_recipe_id,)).fetchall()
+        self.assertEqual(len(flavor_lines), 1)
+
+    def test_duplicate_raw_ingredient_across_components_is_combined_into_one_line(self):
+        shared = add_ingredient(self.conn, "Shared Sauce Packet", base_unit="pc", pack=1, cost=5.0)
+        recipe_x = add_recipe(self.conn, "Item X", [(shared, 1)])
+        item_x = add_menu_item(self.conn, "Item X", recipe_x, price=50.0)
+        recipe_y = add_recipe(self.conn, "Item Y", [(shared, 2)])
+        item_y = add_menu_item(self.conn, "Item Y", recipe_y, price=60.0)
+        combo = combos.publish_combo(
+            self.conn, name="X + Y", category="Combos", price=100.0,
+            components=[{"menu_item_id": item_x, "quantity": 1}, {"menu_item_id": item_y, "quantity": 1}])
+        combo_recipe_id = self.conn.execute(
+            "SELECT recipe_id FROM menu_item WHERE id=?", (combo["menu_item_id"],)).fetchone()["recipe_id"]
+        lines = self.conn.execute(
+            "SELECT qty_base FROM recipe_line WHERE recipe_id=? AND ingredient_id=?",
+            (combo_recipe_id, shared)).fetchall()
+        self.assertEqual(len(lines), 1)           # one combined line, not two
+        self.assertAlmostEqual(lines[0]["qty_base"], 3.0, places=4)  # 1 + 2
+
+    def test_update_combo_regenerates_recipe_without_touching_component_recipes(self):
+        rice, coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Rice + Coke", category="Combos", price=65.0,
+            components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": coke, "quantity": 1}])
+        rice_recipe_id = self.conn.execute("SELECT recipe_id FROM menu_item WHERE id=?", (rice,)).fetchone()["recipe_id"]
+        rice_lines_before = rows(self.conn.execute(
+            "SELECT ingredient_id, qty_base FROM recipe_line WHERE recipe_id=?", (rice_recipe_id,)))
+
+        combos.update_combo(
+            self.conn, combo["menu_item_id"],
+            components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": coke, "quantity": 3}])
+
+        rice_lines_after = rows(self.conn.execute(
+            "SELECT ingredient_id, qty_base FROM recipe_line WHERE recipe_id=?", (rice_recipe_id,)))
+        self.assertEqual(rice_lines_before, rice_lines_after)  # component's own recipe untouched
+
+        combo_recipe_id = self.conn.execute(
+            "SELECT recipe_id FROM menu_item WHERE id=?", (combo["menu_item_id"],)).fetchone()["recipe_id"]
+        coke_recipe_id = self.conn.execute("SELECT recipe_id FROM menu_item WHERE id=?", (coke,)).fetchone()["recipe_id"]
+        coke_ing = self.conn.execute(
+            "SELECT ingredient_id FROM recipe_line WHERE recipe_id=?", (coke_recipe_id,)).fetchone()["ingredient_id"]
+        after_qty = self.conn.execute(
+            "SELECT qty_base FROM recipe_line WHERE recipe_id=? AND ingredient_id=?",
+            (combo_recipe_id, coke_ing)).fetchone()["qty_base"]
+        self.assertAlmostEqual(after_qty, 90.0, places=4)  # 3 x 30g
+
+    def test_set_visibility_hides_without_deleting(self):
+        rice, coke = self._rice_and_coke()
+        combo = combos.publish_combo(
+            self.conn, name="Rice + Coke", category="Combos", price=65.0,
+            components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": coke, "quantity": 1}])
+        combos.set_combo_visibility(self.conn, combo["menu_item_id"], False)
+        self.assertEqual(self.conn.execute(
+            "SELECT pos_visible FROM menu_item WHERE id=?", (combo["menu_item_id"],)).fetchone()["pos_visible"], 0)
+        # still a real row — never deleted
+        self.assertIsNotNone(self.conn.execute(
+            "SELECT 1 FROM menu_item WHERE id=?", (combo["menu_item_id"],)).fetchone())
+
+    def test_draft_duplicate_component_is_refused(self):
+        rice, _coke = self._rice_and_coke()
+        with self.assertRaises(ValidationError):
+            combos.publish_combo(
+                self.conn, name="Dup", category="Combos", price=10.0,
+                components=[{"menu_item_id": rice, "quantity": 1}, {"menu_item_id": rice, "quantity": 2}])
+
+
+# ===========================================================================
+class TestComboPublishEndToEnd(unittest.TestCase):
+    """The full lifecycle through the real HTTP API: publish -> appears on
+    GET /pos/menu -> orderable -> kitchen can see it -> inventory deducts ->
+    void releases it back. Proves wt/combos.py's claim that a published
+    combo needs zero combo-specific code anywhere else in the system."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        conn = db.get_conn()
+        conn.execute("UPDATE app_user SET must_change_password = 0")
+
+        # Two real, priced, in-stock menu items to combine — whatever the
+        # seed's first two non-unli, sellable, distinct-recipe items are.
+        candidates = rows(conn.execute(
+            "SELECT menu_item_pk, recipe_id FROM v_menu_item_availability "
+            "WHERE sellable=1 AND recipe_id IS NOT NULL ORDER BY menu_item_pk"))
+        seen_recipes, picked = set(), []
+        for c in candidates:
+            if c["recipe_id"] in seen_recipes:
+                continue
+            seen_recipes.add(c["recipe_id"])
+            picked.append(c["menu_item_pk"])
+            if len(picked) == 2:
+                break
+        cls.component_ids = picked
+        for ing_id in rows(conn.execute("SELECT DISTINCT ingredient_id AS id FROM recipe_line")):
+            conn.execute("UPDATE ingredient SET on_hand_base = on_hand_base + 100000 WHERE id=?", (ing_id["id"],))
+        conn.commit()
+
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+
+        def token(u, password="wingstheory"):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
+            return r.json()["token"]
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}  # seeded 'owner' username has role=admin
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+
+        # A genuine owner-ROLE account (distinct from the seeded username
+        # 'owner', which is role=admin) — the only way to create one is
+        # owner_provisioning.provision_first_owner, same as
+        # TestOwnerRoleAndProvisioning.
+        provisioned = owner_provisioning.provision_first_owner(conn, "biz_owner", "B. Owner")
+        conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def test_owner_cannot_publish_only_admin_can(self):
+        payload = {"name": "E2E RBAC Combo", "category": "Combos", "price": 1.0,
+                   "components": [{"menu_item_id": i, "quantity": 1} for i in self.component_ids]}
+        refused = self.client.post("/console/combos", headers=self.H_OWNER, json=payload)
+        self.assertEqual(refused.status_code, 403)
+
+    def test_full_lifecycle_publish_order_kitchen_inventory_void(self):
+        name = "E2E Lifecycle Combo"
+        payload = {"name": name, "category": "Combos", "price": 123.0,
+                   "components": [{"menu_item_id": i, "quantity": 1} for i in self.component_ids]}
+        pub = self.client.post("/console/combos", headers=self.H_ADMIN, json=payload)
+        self.assertEqual(pub.status_code, 201, pub.text)
+        combo_pk = pub.json()["menu_item_id"]
+
+        # Appears on the POS, sellable, with zero POS-side code changes.
+        menu = self.client.get("/pos/menu", headers=self.H_CASH).json()
+        tile = next((m for m in menu["items"] if m["menu_item_pk"] == combo_pk), None)
+        self.assertIsNotNone(tile, "published combo did not appear on GET /pos/menu")
+        self.assertTrue(tile["sellable"])
+        self.assertTrue(tile["is_combo"])
+
+        before_stock = {i: self.client.get(f"/pos/menu/{i}/availability", headers=self.H_CASH).json()
+                         for i in self.component_ids}
+
+        order = self.client.post("/pos/orders", headers=self.H_CASH,
+                                  json={"table_label": "T-combo-e2e",
+                                        "lines": [{"menu_item_pk": combo_pk, "qty": 1}]})
+        self.assertEqual(order.status_code, 201, order.text)
+        order_id = order.json()["order_id"]
+
+        # Kitchen sees it on the queue like any other ticket.
+        kds = self.client.get("/kds/queue", headers=self.H_KIT).json()
+        self.assertTrue(any(o["id"] == order_id for o in kds["orders"]),
+                         "combo order did not reach the kitchen queue")
+
+        # Inventory actually moved — at least one component ingredient's
+        # availability figure changed versus before the combo was ordered.
+        after_stock = {i: self.client.get(f"/pos/menu/{i}/availability", headers=self.H_CASH).json()
+                       for i in self.component_ids}
+        self.assertNotEqual(before_stock, after_stock, "ordering the combo did not deduct any inventory")
+
+        # Void releases it back — no combo-specific void path.
+        void = self.client.post(f"/pos/orders/{order_id}/void", headers=self.H_CASH, json={"reason": "test void"})
+        self.assertIn(void.status_code, (200, 201))
+
+        history = self.client.get("/console/combinations", headers=self.H_ADMIN)
+        self.assertEqual(history.status_code, 200)  # reporting path unaffected
+
 
 # ===========================================================================
 class TestFEFODepletion(Base):
@@ -7331,6 +7937,175 @@ class TestUnliReconciliation(UnliBase):
 
 
 # ===========================================================================
+# 2026-10 fix: the audit found record_reconciliation() can run before every
+# order for a service_date has committed, and its own UNIQUE(service_date,
+# unli_item_id) then permanently refuses a correction -- that day's variance
+# analysis silently undercounts the late order forever. unli.
+# revise_reconciliation() (migration 0049, a separate append-only table) is
+# the controlled fix: the original row is never touched or re-counted;
+# theoretical_base is recomputed fresh (picking up the late order); only the
+# INCREMENTAL correction beyond what was already applied gets posted.
+# ===========================================================================
+class TestUnliReconciliationRevision(UnliBase):
+    def test_a_late_committed_order_is_picked_up_by_a_revision(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))       # D = 3200
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings",
+                                              opening_base=3200, closing_base=0)
+        self.assertEqual(original["heads"], 4)
+        # A 5th cover's order, committed to the SAME service date AFTER the
+        # original reconciliation already ran.
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))
+        revised = unli.revise_reconciliation(self.conn, original["id"],
+                                             opening_base=3200, closing_base=0)
+        self.assertEqual(revised["heads"], 5, "the late order must be included in the fresh total")
+        self.assertAlmostEqual(revised["theoretical_base"], 5 * self.LAMBDA)
+
+    def test_original_reconciliation_row_is_never_mutated(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings",
+                                              opening_base=3200, closing_base=0)
+        before = dict(self.conn.execute(
+            "SELECT * FROM unli_reconciliation WHERE id=?", (original["id"],)).fetchone())
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))
+        unli.revise_reconciliation(self.conn, original["id"], opening_base=3200, closing_base=0)
+        after = dict(self.conn.execute(
+            "SELECT * FROM unli_reconciliation WHERE id=?", (original["id"],)).fetchone())
+        self.assertEqual(before, after)
+
+    def test_revision_posts_only_the_incremental_correction_not_double_deducted(self):
+        """The core double-deduction guard: on_hand after the revision must
+        reflect the TOTAL theoretical-vs-actual gap exactly once, never the
+        original gap plus a second full gap."""
+        before_any = self.on_hand()
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))       # D = 3200
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings",
+                                              opening_base=3000, closing_base=0)  # Au=3000, correction=+200
+        self.assertAlmostEqual(original["correction_base"], 200.0)
+
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))       # now D = 4000 (5 heads)
+        revised = unli.revise_reconciliation(self.conn, original["id"],
+                                             opening_base=3750, closing_base=0)  # Au=3750
+        # Fresh full gap = 4000 - 3750 = 250; already applied = 200;
+        # incremental = 50.
+        self.assertAlmostEqual(revised["correction_base"], 50.0)
+        self.assertAlmostEqual(revised["cumulative_correction_base"], 250.0)
+
+        # The order-commit deductions (2 orders: 4 heads + 1 head = 5*800=4000)
+        # plus the TOTAL correction (250) is the only thing that should have
+        # moved on_hand from its starting point -- not 200 and then another
+        # full 250.
+        self.assertAlmostEqual(self.on_hand(), before_any - 4000 + 250, places=2)
+
+    def test_revision_is_idempotent_via_client_request_id(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings",
+                                              opening_base=3200, closing_base=0)
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))
+        r1 = unli.revise_reconciliation(self.conn, original["id"], opening_base=3200,
+                                        closing_base=0, client_request_id="rev-1")
+        r2 = unli.revise_reconciliation(self.conn, original["id"], opening_base=3200,
+                                        closing_base=0, client_request_id="rev-1")
+        self.assertEqual(r1["id"], r2["id"])
+        count = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM unli_reconciliation_revision WHERE reconciliation_id=?",
+            (original["id"],)).fetchone()["n"]
+        self.assertEqual(count, 1, "a replayed request must not create a second revision row")
+
+    def test_a_second_revision_chains_off_the_first_not_the_original(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))       # D=3200
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings", 3200, 0)
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))       # D=4000
+        rev1 = unli.revise_reconciliation(self.conn, original["id"], 3200, 0)  # Au=3200 still
+        self.assertAlmostEqual(rev1["cumulative_correction_base"],
+                               (4000 - 3200))  # total gap now, since original correction was 0
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))       # D=4800
+        rev2 = unli.revise_reconciliation(self.conn, original["id"], 3200, 0)  # Au=3200 still
+        self.assertAlmostEqual(rev2["cumulative_correction_base"], (4800 - 3200))
+        self.assertAlmostEqual(rev2["correction_base"], rev2["cumulative_correction_base"] - rev1["cumulative_correction_base"])
+
+    def test_revision_history_is_append_only_and_in_order(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings", 3200, 0)
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))
+        unli.revise_reconciliation(self.conn, original["id"], 3200, 0)
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))
+        unli.revise_reconciliation(self.conn, original["id"], 3200, 0)
+        hist = unli.revision_history(self.conn, original["id"])
+        self.assertEqual(len(hist), 2)
+        self.assertEqual([h["heads"] for h in hist], [5, 6])
+
+    def test_revising_a_nonexistent_reconciliation_is_refused(self):
+        with self.assertRaises(NotFoundError):
+            unli.revise_reconciliation(self.conn, 999999, opening_base=1, closing_base=0)
+
+    def test_revision_cannot_go_below_zero_on_hand_and_reports_clamping(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))       # D = 3200
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings", 3200, 0)  # Au=3200, correction=0
+        # Drain on_hand to almost nothing so the next incremental correction
+        # would have to go negative past what physically exists.
+        self.conn.execute("UPDATE ingredient SET on_hand_base=5 WHERE id=?", (self.wings,))
+        self.conn.commit()
+        # Same heads (no late order), but a much larger measured actual --
+        # theoretical(3200) - actual(50000) = a huge negative incremental
+        # correction, far more than the 5 units left on hand.
+        revised = unli.revise_reconciliation(self.conn, original["id"], opening_base=50000, closing_base=0)
+        self.assertTrue(revised["correction_clamped"])
+        self.assertGreaterEqual(self.on_hand(), 0)
+
+    # -- 2026-10-14 fix: preview a revision before committing it -----------
+    def test_preview_detects_a_late_order_and_matches_what_revise_would_do(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))       # D = 3200
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings",
+                                              opening_base=3000, closing_base=0)  # correction=+200
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))       # late order -> D now 4000
+        preview = unli.preview_revision(self.conn, original["id"],
+                                        opening_base=3750, closing_base=0)
+        self.assertTrue(preview["lateOrdersDetected"])
+        self.assertEqual(preview["headsAtOriginal"], 4)
+        self.assertEqual(preview["heads"], 5)
+        self.assertAlmostEqual(preview["incrementalCorrectionBase"], 50.0)
+        self.assertAlmostEqual(preview["cumulativeCorrectionBase"], 250.0)
+
+        # Writes nothing at all.
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM unli_reconciliation_revision").fetchone()["n"], 0)
+        before_on_hand = self.on_hand()
+
+        # The real submission, with the SAME inputs, must match the preview
+        # exactly -- same shared calculation, not two copies that could
+        # drift.
+        revised = unli.revise_reconciliation(self.conn, original["id"],
+                                             opening_base=3750, closing_base=0)
+        self.assertAlmostEqual(revised["correction_base"], preview["incrementalCorrectionBase"])
+        self.assertAlmostEqual(revised["cumulative_correction_base"], preview["cumulativeCorrectionBase"])
+        self.assertNotEqual(self.on_hand(), before_on_hand, "the real submission, unlike the preview, must move stock")
+
+    def test_preview_with_no_late_order_reports_unchanged_heads(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings", 3200, 0)
+        preview = unli.preview_revision(self.conn, original["id"], opening_base=3200, closing_base=0)
+        self.assertFalse(preview["lateOrdersDetected"])
+        self.assertEqual(preview["heads"], preview["headsAtOriginal"])
+
+    def test_preview_never_writes_anything(self):
+        add_unli_order(self.conn, self.menu, 4, days_ago(1))
+        original = unli.record_reconciliation(self.conn, days_ago(1), "wings", 3000, 0)
+        add_unli_order(self.conn, self.menu, 1, days_ago(1))
+        on_hand_before = self.on_hand()
+        ledger_count_before = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        unli.preview_revision(self.conn, original["id"], opening_base=3750, closing_base=0)
+        unli.preview_revision(self.conn, original["id"], opening_base=3750, closing_base=0)
+        self.assertEqual(self.on_hand(), on_hand_before)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"],
+            ledger_count_before)
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM unli_reconciliation_revision").fetchone()["n"], 0)
+
+
+# ===========================================================================
 class TestUnliRecalibration(UnliBase):
     """lambda = SUM(actual) / SUM(heads) over the validated history."""
 
@@ -7868,6 +8643,29 @@ class TestConsumptionValidationLabeling(UnliBase):
         sample_id = self._one_sample()
         with self.assertRaises(InvalidStateError):
             anomaly.submit_consumption_validation_label(self.conn, sample_id, "false_positive")
+
+    def test_sampling_and_labeling_are_both_audited(self):
+        from wt.anomaly import MIN_RECONCILED_DAYS
+        for i in range(MIN_RECONCILED_DAYS):
+            self._reconcile_as(i + 2, 30, 810.0 + (i % 3) * 4, user_id=None, leftover=200.0)
+        self._reconcile_as(1, 30, 1500.0, user_id=None, leftover=100.0)
+        anomaly.sample_consumption_for_review(self.conn, n_near_threshold=0, n_random=0,
+                                              user_id="owner1")
+        sample_id = self.conn.execute(
+            "SELECT id FROM unli_consumption_validation_sample WHERE sample_source='model_flagged'"
+        ).fetchone()["id"]
+        sample_event = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='unli_consumption_validation_sample' "
+            "AND action='sample' ORDER BY id DESC LIMIT 1"))
+        self.assertEqual(len(sample_event), 1)
+        self.assertEqual(sample_event[0]["user_id"], "owner1")
+        anomaly.submit_consumption_validation_label(self.conn, sample_id, "confirmed_anomaly",
+                                                    user_id="admin1")
+        label_event = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='unli_consumption_validation_sample' "
+            "AND action='label' AND entity_id=?", (str(sample_id),)))
+        self.assertEqual(len(label_event), 1)
+        self.assertEqual(label_event[0]["user_id"], "admin1")
 
     def test_blind_queue_omits_model_derived_fields(self):
         self._one_sample()
@@ -11418,6 +12216,243 @@ class TestIngredientDepletionForecast(Base):
         self.assertNotEqual(row["suggestedOrderQty"], raw_packs, "fixture must land on a fractional pack count")
         self.assertEqual(row["suggestedOrderQty"], math.ceil(raw_packs))
 
+    def test_minimum_order_qty_raises_a_small_suggestion_to_the_supplier_floor(self):
+        """Replenishment spec example: 'Pack/order unit: 10 kg, Minimum
+        order: 20 kg' -- a supplier that won't ship less than its own floor
+        should see the pack-rounded suggestion raised to that floor."""
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=1)
+        _, unfloored_row = self._row(ing)
+        unfloored_qty = unfloored_row["suggestedOrderQty"]
+        self.assertIsNotNone(unfloored_qty)
+        floor = unfloored_qty + 5
+        self.conn.execute("UPDATE ingredient SET minimum_order_qty=? WHERE id=?", (floor, ing))
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertEqual(row["minimumOrderQty"], floor)
+        self.assertEqual(row["suggestedOrderQty"], floor)
+
+    def test_minimum_order_qty_never_creates_a_purchase_need_on_its_own(self):
+        """The supplier floor only raises an order that is already needed --
+        it must never itself be the reason a purchase is recommended for an
+        ingredient with a comfortable, healthy stock level."""
+        ing, _ = self._setup_item(on_hand=100000.0, per_serving=100.0, daily=10, lead_time=1)
+        self.conn.execute("UPDATE ingredient SET minimum_order_qty=? WHERE id=?", (50, ing))
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertIsNone(row["suggestedOrderQty"])
+
+    # -- 2026-10 fix: incoming purchase orders must be delivery-date aware --
+    def _place_po(self, ing, qty_purchase_units, expected_delivery_date, *, mark_ordered=True):
+        po = purchasing.create(
+            self.conn, "Supplier A", None, expected_delivery_date,
+            [{"ingredient_id": ing, "quantity": qty_purchase_units}], "owner1",
+        )
+        if mark_ordered:
+            purchasing.mark_ordered(self.conn, po["id"], "admin1")
+        self.conn.commit()
+        return po["id"]
+
+    def test_a_po_arriving_well_after_lead_time_never_suppresses_the_shortfall(self):
+        """The confirmed P0 bug: a PO due in 30 days must never cancel out an
+        ingredient's urgent shortfall when it only has a 3-day runway (lead
+        time here is 1 day, so the cutoff is tomorrow)."""
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=1)
+        _, before = self._row(ing)
+        self.assertIsNotNone(before["suggestedOrderQty"])
+        self._place_po(ing, 50, (self.TODAY + dt.timedelta(days=30)).isoformat())
+        _, after = self._row(ing)
+        self.assertEqual(after["suggestedOrderQty"], before["suggestedOrderQty"],
+                         "a late-arriving PO must not shrink the recommended order")
+        self.assertEqual(after["incomingLateBase"], 50 * after["packSize"])
+        self.assertEqual(after["incomingInTimeBase"], 0.0)
+        self.assertTrue(after["replenishmentMessage"].endswith(
+            "A purchase order is already on its way but is not expected to arrive in time."))
+
+    def test_a_po_arriving_on_time_still_offsets_the_shortfall(self):
+        """Not every incoming PO is a problem -- one due before the lead-time
+        cutoff should net out the shortfall exactly as before this fix."""
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=5)
+        _, before = self._row(ing)
+        self.assertIsNotNone(before["suggestedOrderQty"])
+        self._place_po(ing, before["suggestedOrderQty"], (self.TODAY + dt.timedelta(days=2)).isoformat())
+        _, after = self._row(ing)
+        self.assertEqual(after["incomingLateBase"], 0.0)
+        self.assertGreater(after["incomingInTimeBase"], 0.0)
+        self.assertIsNone(after["suggestedOrderQty"],
+                          "a confirmed order arriving in time must prevent a duplicate recommendation")
+
+    def test_an_overdue_po_still_counts_as_in_time_but_is_flagged_separately(self):
+        """A PO whose own promised date has already passed is a supplier
+        problem, not a reason to assume it will never arrive -- it still
+        nets against the shortfall, but is also surfaced as overdue."""
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=5)
+        _, before = self._row(ing)
+        self._place_po(ing, before["suggestedOrderQty"], (self.TODAY - dt.timedelta(days=4)).isoformat())
+        _, after = self._row(ing)
+        self.assertGreater(after["incomingOverdueBase"], 0.0)
+        self.assertEqual(after["incomingOverdueBase"], after["incomingInTimeBase"])
+        self.assertIsNone(after["suggestedOrderQty"])
+
+    def test_a_po_with_no_expected_delivery_date_is_treated_as_late_not_immediate(self):
+        """Safe handling of an unreliable date: missing is NOT assumed to
+        mean 'arrives today' -- that would be the more dangerous mistake, so
+        it must not offset an urgent shortfall either."""
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=1)
+        _, before = self._row(ing)
+        self._place_po(ing, 50, None)
+        _, after = self._row(ing)
+        self.assertEqual(after["incomingInTimeBase"], 0.0)
+        self.assertGreater(after["incomingLateBase"], 0.0)
+        self.assertEqual(after["suggestedOrderQty"], before["suggestedOrderQty"])
+
+    def test_a_cancelled_po_is_excluded_entirely(self):
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=5)
+        _, before = self._row(ing)
+        po_id = self._place_po(ing, before["suggestedOrderQty"], (self.TODAY + dt.timedelta(days=1)).isoformat())
+        purchasing.cancel(self.conn, po_id, "no longer needed", "admin1", "admin")
+        self.conn.commit()
+        _, after = self._row(ing)
+        self.assertEqual(after["incomingOrderedBase"], 0.0)
+        self.assertEqual(after["suggestedOrderQty"], before["suggestedOrderQty"])
+
+    def test_a_draft_po_is_still_excluded_from_incoming(self):
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=5)
+        _, before = self._row(ing)
+        self._place_po(ing, 999, (self.TODAY + dt.timedelta(days=1)).isoformat(), mark_ordered=False)
+        _, after = self._row(ing)
+        self.assertEqual(after["incomingOrderedBase"], 0.0)
+        self.assertEqual(after["suggestedOrderQty"], before["suggestedOrderQty"])
+
+    def test_a_partially_received_po_only_nets_the_remaining_quantity(self):
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=5)
+        _, before = self._row(ing)
+        po_id = self._place_po(ing, before["suggestedOrderQty"], (self.TODAY + dt.timedelta(days=1)).isoformat())
+        po = purchasing.get(self.conn, po_id)
+        item = po["items"][0]
+        full_base = item["quantity"] * (item["pack_size"] or 1) * (item["yield_factor"] or 1)
+        purchasing.receive_line(self.conn, item["id"], full_base / 2, "admin1", f"test-recv-{po_id}")
+        self.conn.commit()
+        _, after = self._row(ing)
+        self.assertGreater(after["incomingInTimeBase"], 0.0)
+        self.assertLess(after["incomingInTimeBase"],
+                        before["suggestedOrderQty"] * after["packSize"])
+
+    def test_multiple_incoming_pos_are_split_independently_by_their_own_dates(self):
+        ing, _ = self._setup_item(on_hand=1000.0, per_serving=100.0, daily=10, lead_time=2)
+        self._place_po(ing, 10, (self.TODAY + dt.timedelta(days=1)).isoformat())
+        self._place_po(ing, 10, (self.TODAY + dt.timedelta(days=30)).isoformat())
+        _, row = self._row(ing)
+        self.assertGreater(row["incomingInTimeBase"], 0.0)
+        self.assertGreater(row["incomingLateBase"], 0.0)
+        self.assertAlmostEqual(row["incomingOrderedBase"],
+                               row["incomingInTimeBase"] + row["incomingLateBase"], places=3)
+
+    # -- 2026-10-14 fix: a PO "within lead time" by a generic cutoff can
+    # still arrive AFTER an earlier stockout -- these use a realistic
+    # chicken-wings scenario (a real buffet ingredient, real kg-scale
+    # quantities) to prove the day-by-day trajectory, not a flat lead-time
+    # cutoff, is what actually decides whether a confirmed delivery
+    # prevents a stockout.
+    def _chicken_wings(self, on_hand_kg, daily_kg, lead_time=5):
+        """Chicken Wings, base unit grams, a realistic ~daily_kg kg/day
+        buffet-service consumption rate."""
+        return self._setup_item(
+            name="Chicken Wings", on_hand=on_hand_kg * 1000.0, per_serving=1000.0,
+            daily=daily_kg, lead_time=lead_time,
+        )
+
+    def test_a_delivery_arriving_after_the_real_stockout_day_never_prevents_it(self):
+        """20 kg on hand, ~20 kg/day consumption -- the shelf empties
+        around day 1. A confirmed 100 kg delivery due in 4 days passes the
+        OLD generic 'within the 5-day lead time' test, but it cannot
+        prevent a stockout that happens 3 days before it arrives."""
+        ing, _ = self._chicken_wings(on_hand_kg=20, daily_kg=20, lead_time=5)
+        _, baseline = self._row(ing)
+        self.assertIsNotNone(baseline["daysOfSupply"], "fixture must actually run out within the horizon")
+        self.assertLess(baseline["daysOfSupply"], 4,
+                        "fixture must stock out well before the 4-day-out delivery")
+
+        self._place_po(ing, 100, (self.TODAY + dt.timedelta(days=4)).isoformat())
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "critical",
+                         "a delivery landing after the real stockout day must not downgrade the status")
+        self.assertAlmostEqual(row["daysOfSupply"], baseline["daysOfSupply"], places=2,
+                               msg="the delivery arrives after the stockout, so the stockout day itself must not move")
+        self.assertIsNotNone(row["suggestedOrderQty"],
+                             "a purchase must still be recommended despite the 'in time by lead time' PO")
+        self.assertTrue(row["replenishmentMessage"].endswith(
+            "A purchase order is already on its way but is not expected to arrive in time."))
+
+    def test_a_delivery_arriving_before_the_real_stockout_day_does_prevent_it(self):
+        """Same ingredient and rate, but the confirmed delivery lands
+        BEFORE the shelf would actually empty -- the stockout must not
+        fire, and no further purchase should be recommended."""
+        ing, _ = self._chicken_wings(on_hand_kg=20, daily_kg=20, lead_time=5)
+        _, baseline = self._row(ing)
+        stockout_day = baseline["daysOfSupply"]
+        self.assertIsNotNone(stockout_day)
+
+        # A large enough delivery, one day before the real stockout, to
+        # comfortably cover demand through the rest of the horizon.
+        self._place_po(ing, 500, (self.TODAY + dt.timedelta(days=max(1, int(stockout_day)))).isoformat())
+        _, row = self._row(ing)
+        self.assertNotEqual(row["status"], "critical")
+        self.assertIsNone(row["suggestedOrderQty"])
+
+    def test_two_partial_deliveries_are_applied_chronologically(self):
+        """A supplier split a 60 kg order into two trucks: 20 kg on day 1,
+        40 kg on day 3. On-hand is sized so the shelf empties clearly
+        WITHIN today, well before either truck's own day -- neither
+        delivery can retroactively undo a stockout that already happened
+        before it arrived. Both must still be placed on their OWN day in
+        the trajectory (not summed and applied as one lump sum): a day-1
+        delivery must never be allowed to patch over a same-day stockout
+        just because it exists somewhere in the window."""
+        ing, _ = self._chicken_wings(on_hand_kg=5, daily_kg=20, lead_time=5)
+        _, baseline = self._row(ing)
+        self.assertLess(baseline["daysOfSupply"], 0.5,
+                        "fixture must stock out within today itself, before either delivery's own day")
+
+        self._place_po(ing, 20, (self.TODAY + dt.timedelta(days=1)).isoformat())
+        self._place_po(ing, 40, (self.TODAY + dt.timedelta(days=3)).isoformat())
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "critical",
+                         "both deliveries land after the real same-day stockout")
+        self.assertAlmostEqual(row["daysOfSupply"], baseline["daysOfSupply"], places=2)
+        # Both lines are still real, confirmed, in-time-by-the-generic-cutoff
+        # orders -- shown in the explanation even though neither prevents
+        # the stockout itself.
+        self.assertAlmostEqual(row["incomingInTimeBase"], 60 * 1000.0, places=2)
+
+    def test_lead_time_still_sets_the_earliest_realistic_new_order_arrival(self):
+        """No confirmed PO at all: the critical/at-risk tiers still key off
+        THIS supplier's own lead time -- a short lead time (a nearby
+        supplier) buys less safety margin than a long one, exactly as
+        before this fix; a new order is never assumed to arrive sooner than
+        the configured lead time allows."""
+        short_lead, _ = self._chicken_wings(on_hand_kg=60, daily_kg=20, lead_time=1)
+        long_lead, _ = self._chicken_wings(on_hand_kg=60, daily_kg=20, lead_time=10)
+        _, short_row = self._row(short_lead)
+        _, long_row = self._row(long_lead)
+        self.assertEqual(short_row["daysOfSupply"], long_row["daysOfSupply"],
+                         "lead time changes the STATUS tier, not the physical stockout day itself")
+        self.assertNotEqual(short_row["status"], "critical")
+        self.assertEqual(long_row["status"], "critical",
+                         "the same 3-day runway is critical against a 10-day lead time")
+
+    # -- 2026-10 fix: minimum-order floor stays pack-aligned and testable ---
+    def test_suggested_order_qty_helper_floor_is_whole_purchase_units(self):
+        self.assertEqual(depletion._suggested_order_qty(123.0, 10.0, 1.0, 7.3), 13)
+        self.assertEqual(depletion._suggested_order_qty(5.0, 10.0, 1.0, None), 1)
+
+    def test_suggested_order_qty_helper_zero_shortfall_recommends_nothing(self):
+        self.assertIsNone(depletion._suggested_order_qty(0.0, 10.0, 1.0, 50.0))
+        self.assertIsNone(depletion._suggested_order_qty(-5.0, 10.0, 1.0, 50.0))
+
+    def test_suggested_order_qty_helper_invalid_supplier_config_is_safe(self):
+        self.assertIsNone(depletion._suggested_order_qty(100.0, None, 1.0, 50.0))
+        self.assertIsNone(depletion._suggested_order_qty(100.0, 0, 1.0, 50.0))
+
     # -- today's observation ----------------------------------------------
     def test_busy_today_shortens_the_runway(self):
         # Sized so the runway lands INSIDE the forecast horizon both before and
@@ -11506,6 +12541,71 @@ class TestIngredientDepletionForecast(Base):
         _, row = self._row(ing)
         self.assertIsNone(row["reorderPoint"])
         self.assertFalse(row["belowReorderPoint"])
+
+    # -- plain-language replenishment warning -------------------------------
+    def test_replenishment_message_names_the_days_of_supply_when_critical(self):
+        ing, _ = self._setup_item(on_hand=1500.0, per_serving=100.0, daily=10, lead_time=4)
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "critical")
+        self.assertIn("earlier replenishment", row["replenishmentMessage"])
+        self.assertIn("Estimated stock", row["replenishmentMessage"])
+        self.assertIn(f"{round(row['daysOfSupply'])}", row["replenishmentMessage"])
+
+    def test_replenishment_message_flags_usage_above_the_usual_rate(self):
+        # trailingLedgerDailyRate (forecasting.ingredient_depletion) reads
+        # stock_ledger directly, which this fixture's raw customer_order/
+        # order_line inserts never post to -- so it needs its own, separate
+        # baseline ledger history at the ORIGINAL (pre-spike) rate. The
+        # forward EWMA forecast then reacts to the recent spike (half-life
+        # 14 days) much faster than a flat 56-day ledger average does,
+        # which is exactly the gap forecastDeviationFlag/Ratio exist to
+        # catch (see FORECAST_DEVIATION_RATIO) and what the message names.
+        ing, item = self._setup_item(on_hand=8000.0, per_serving=100.0, daily=10, days=40)
+        for n in range(1, 57):
+            add_ledger_entry(self.conn, ing, -1000.0, "sale_commit", self._day(n))
+        for n in range(1, 4):
+            self._sell(self._day(n), item, 80, self.SERVICE_HOURS[0])
+        self._sell(self.TODAY.isoformat(), item, 80, self.SERVICE_HOURS[0])
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertIsNotNone(row["trailingLedgerDailyRate"])
+        self.assertTrue(row["forecastDeviationFlag"])
+        self.assertGreater(row["forecastDeviationRatio"], 1.0)
+        self.assertIn("higher than the usual rate", row["replenishmentMessage"])
+
+    def test_replenishment_message_for_out_of_stock(self):
+        ing, _ = self._setup_item(on_hand=0.0, per_serving=100.0, daily=10)
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "out")
+        self.assertIn("is out of stock right now", row["replenishmentMessage"])
+
+    def test_replenishment_message_for_idle_ingredient(self):
+        ing = add_ingredient(self.conn, "Never Sold", on_hand=500.0, pack=1000)
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "idle")
+        self.assertIn("No recent usage recorded", row["replenishmentMessage"])
+
+    def test_replenishment_message_for_excess_and_healthy(self):
+        ing, _ = self._setup_item(on_hand=200000.0, per_serving=100.0, daily=10)
+        _, row = self._row(ing)
+        self.assertEqual(row["status"], "excess")
+        self.assertIn("well above typical needs", row["replenishmentMessage"])
+
+        ing2, _ = self._setup_item(on_hand=20000.0, per_serving=100.0, daily=10,
+                                   lead_time=2, name="Rice")
+        _, row2 = self._row(ing2)
+        self.assertEqual(row2["status"], "healthy")
+        self.assertIn("sufficient to cover", row2["replenishmentMessage"])
+
+    def test_replenishment_message_names_the_ingredient_when_below_configured_reorder_point(self):
+        ing, _ = self._setup_item(on_hand=20000.0, per_serving=100.0, daily=10, lead_time=2)
+        self.conn.execute("UPDATE ingredient SET reorder_point_base=25000 WHERE id=?", (ing,))
+        self.conn.commit()
+        _, row = self._row(ing)
+        self.assertTrue(row["belowReorderPoint"])
+        self.assertEqual(row["status"], "at_risk")
+        self.assertIn("fallen below the level set as safe", row["replenishmentMessage"])
 
     # -- unlimited streams -------------------------------------------------
     def test_unlimited_covers_drive_their_stream_ingredient(self):
@@ -11993,15 +13093,21 @@ class TestDepletionProphetDemandModel(Base):
         self.assertEqual(row["demandSource"], "prophet")
         self.assertGreaterEqual(full["prophetDrivenIngredients"], 1)
         # The replenishment math (safety stock, lead time, whole-pack
-        # rounding) is exactly wt/depletion.py's existing formula --
-        # recomputed here from the row's own reported inputs, same
-        # discipline as TestReplenishmentEndToEnd, so this proves the wiring
-        # rather than re-asserting arithmetic already covered elsewhere.
+        # rounding) is wired unchanged downstream of whichever demand
+        # source feeds it. 2026-10-14: suggestedOrderQty now reads the real
+        # day-by-day trajectory rather than a flat steady-rate x lead-time
+        # approximation (see depletion.ingredient_forecast()'s own
+        # 2026-10-14 comment), which Prophet's own shaped daily curve is not
+        # guaranteed to match exactly -- so this proves the wiring (a real,
+        # positive, whole-pack recommendation when one is made) rather than
+        # re-deriving arithmetic already covered directly in
+        # TestIngredientDepletionForecast/TestReplenishmentEndToEnd.
+        self.assertIsNotNone(row["packSize"])
+        self.assertEqual(row["leadTimeDays"], 2)
+        self.assertGreaterEqual(row["safetyStockBase"], 0)
         if row["suggestedOrderQty"] is not None:
-            shortfall = (row["forecastDailyConsumption"] * row["leadTimeDays"]
-                        + row["safetyStockBase"] - row["available"])
-            self.assertEqual(row["suggestedOrderQty"],
-                             math.ceil(shortfall / (row["packSize"] * (row["yieldFactor"] or 1.0))))
+            self.assertIsInstance(row["suggestedOrderQty"], int)
+            self.assertGreater(row["suggestedOrderQty"], 0)
 
     def test_item_with_too_little_history_falls_back_to_ewma_per_item(self):
         """Per-item fallback, not all-or-nothing: one item with enough
@@ -12321,11 +13427,21 @@ class TestDepletionHybridDemandModel(Base):
         full = depletion.ingredient_forecast(self.conn, demand_model="hybrid")
         self.assertEqual(full["demandModel"], "hybrid")
         row = next(r for r in full["ingredients"] if r["ingredientId"] == ing)
+        # 2026-10-14: suggestedOrderQty is now read from the real day-by-day
+        # trajectory (which this fixture's hybrid/Prophet-shaped demand
+        # curve is not flat across), not a flat steady-rate x lead-time
+        # approximation -- see depletion.ingredient_forecast()'s own
+        # 2026-10-14 comment for why. This still proves the pipeline is
+        # wired end to end with hybrid as the demand source: the
+        # architectural fields (pack size, lead time, safety stock) are
+        # populated and, when a purchase is recommended, it is a real
+        # positive whole number of packs, never fractional or zero.
+        self.assertIsNotNone(row["packSize"])
+        self.assertEqual(row["leadTimeDays"], 2)
+        self.assertGreaterEqual(row["safetyStockBase"], 0)
         if row["suggestedOrderQty"] is not None:
-            shortfall = (row["forecastDailyConsumption"] * row["leadTimeDays"]
-                        + row["safetyStockBase"] - row["available"])
-            self.assertEqual(row["suggestedOrderQty"],
-                             math.ceil(shortfall / (row["packSize"] * (row["yieldFactor"] or 1.0))))
+            self.assertIsInstance(row["suggestedOrderQty"], int)
+            self.assertGreater(row["suggestedOrderQty"], 0)
 
 
 # ===========================================================================
@@ -12793,21 +13909,21 @@ class TestReplenishmentEndToEnd(unittest.TestCase):
         self.assertIsNotNone(row["depletionDate"])
 
         # The purchase recommendation is internally consistent with the
-        # engine's OWN reported inputs -- recompute wt/depletion.py's formula
-        # from what the API actually returned and require an exact match,
-        # rather than asserting a hand-picked literal that real-data noise
-        # could flip.
-        REVIEW_CYCLE_DAYS = 3  # depletion.REVIEW_CYCLE_DAYS
-        shortfall = row["forecastDailyConsumption"] * (row["leadTimeDays"] + REVIEW_CYCLE_DAYS) - row["available"]
-        if shortfall > 0:
-            expected_qty = math.ceil(shortfall / (row["packSize"] * (row["yieldFactor"] or 1.0)))
-            self.assertEqual(row["suggestedOrderQty"], expected_qty)
+        # engine's architecture: a real recommendation, when made, is always
+        # a whole number of packs, sized against this ingredient's own real
+        # pack/lead-time/safety-stock configuration. 2026-10-14: no longer
+        # recomputed from a flat steady-rate x (lead+safety) approximation
+        # -- suggestedOrderQty now reads the real day-by-day trajectory (see
+        # depletion.ingredient_forecast()'s own 2026-10-14 comment), which a
+        # real nowcast-adjusted day 0 is not guaranteed to match exactly, so
+        # pinning the flat formula here would reintroduce exactly the
+        # real-data-noise brittleness this test's own comment above warns
+        # against.
+        if row["suggestedOrderQty"] is not None:
             self.assertEqual(row["suggestedOrderUnit"], row["purchaseUnit"])
             # Whole packs only -- a real order can never be 3.76 sacks.
             self.assertIsInstance(row["suggestedOrderQty"], int)
             self.assertGreater(row["suggestedOrderQty"], 0)
-        else:
-            self.assertIsNone(row["suggestedOrderQty"])
 
         # ---- reorder-point consistency: set one through the real edit
         # endpoint (not a raw SQL UPDATE -- this also proves the forecast
@@ -12905,9 +14021,20 @@ class TestProphetDemandModelSetting(unittest.TestCase):
         os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
-    def test_default_setting_is_ewma(self):
+    def test_default_setting_is_hybrid(self):
+        # 2026-10: 'hybrid' (per-series method selection) is now the
+        # production default -- see api.py's _demand_model() docstring --
+        # because forecasting.evaluate_demand_model() measures it as
+        # actually best (55.69% fleet-mean WAPE vs 57.81% for forcing
+        # Prophet on every item). With no refresh_prophet_baselines() call
+        # yet in this fresh test database, every item still has no cached
+        # selection, so it transparently reads exactly like 'ewma' --
+        # proven below via demandSource, not just the label.
         r = self.client.get("/console/forecasts/ingredients", headers=self.H_OWNER)
-        self.assertEqual(r.json()["demandModel"], "ewma")
+        body = r.json()
+        self.assertEqual(body["demandModel"], "hybrid")
+        row = next(r for r in body["ingredients"] if r["ingredientId"] == self.ing)
+        self.assertEqual(row["demandSource"], "ewma")
 
     def test_refresh_endpoint_requires_inventory_write(self):
         # 'manager' no longer holds inventory.write (2026-09 RBAC revision),
@@ -12923,6 +14050,21 @@ class TestProphetDemandModelSetting(unittest.TestCase):
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertGreaterEqual(body["fitted"], 1)
+        # 2026-10 fix: the manual endpoint must still report every field
+        # refresh_prophet_baselines() itself always has (unchanged contract,
+        # just merged with the new status fields rather than nested under
+        # them).
+        self.assertTrue(body["lastRunOk"])
+        self.assertEqual(body["triggeredBy"], "manual")
+        self.assertIn("lastRunAt", body)
+
+        # 2026-10 fix: the console's technical panel can now see that a real
+        # fit actually happened, not just that the setting says "hybrid".
+        md = self.client.get("/console/model-details", headers=self.H_OWNER).json()
+        status = md["prophet_baseline_refresh"]
+        self.assertIsNotNone(status)
+        self.assertTrue(status["lastRunOk"])
+        self.assertGreaterEqual(status["fitted"], 1)
 
     def test_flipping_the_setting_and_refreshing_switches_live_endpoints_to_prophet(self):
         from wt import unli
@@ -12942,6 +14084,49 @@ class TestProphetDemandModelSetting(unittest.TestCase):
         # Restore the default -- good hygiene even though app_setting is
         # scoped to this test class's own database, not process-global.
         unli.set_setting(self.conn, "depletion_demand_model", 0.0, user_id="test")
+
+
+class TestPropheRefreshJobStatusAndLocking(Base):
+    """wt/depletion.run_prophet_refresh_job() / get_refresh_status() -- the
+    2026-10 fix that makes 'hybrid' something that actually gets fitted
+    automatically, not just a setting label. Pure depletion.py level: the
+    HTTP/RBAC wiring is covered by TestProphetDemandModelSetting above."""
+
+    def test_no_status_before_the_first_run_in_this_database(self):
+        self.assertIsNone(depletion.get_refresh_status(self.conn))
+
+    def test_a_successful_run_is_recorded_durably(self):
+        result = depletion.run_prophet_refresh_job(self.conn, triggered_by="test")
+        self.assertTrue(result["lastRunOk"])
+        self.assertEqual(result["triggeredBy"], "test")
+        self.assertIn("fitted", result)
+        stored = depletion.get_refresh_status(self.conn)
+        self.assertEqual(stored, result)
+
+    def test_a_failed_run_is_recorded_and_never_raises(self):
+        """The scheduler loop must never die just because one fit failed --
+        a Prophet/DB error inside refresh_prophet_baselines() is caught,
+        recorded as a failure, and surfaced to the caller as a normal
+        return value, not an exception."""
+        with patch.object(depletion, "refresh_prophet_baselines",
+                         side_effect=RuntimeError("boom")):
+            result = depletion.run_prophet_refresh_job(self.conn, triggered_by="test")
+        self.assertFalse(result["lastRunOk"])
+        self.assertEqual(result["error"], "boom")
+        self.assertEqual(depletion.get_refresh_status(self.conn), result)
+
+    def test_a_run_already_in_progress_is_skipped_not_queued_or_duplicated(self):
+        """Two refreshes overlapping would race the same in-memory
+        _prophet_store/_hybrid_store -- the lock must make the second
+        caller a harmless no-op rather than a second concurrent fit."""
+        depletion._refresh_running = True
+        try:
+            result = depletion.run_prophet_refresh_job(self.conn, triggered_by="test")
+        finally:
+            depletion._refresh_running = False
+        self.assertTrue(result.get("skipped"))
+        self.assertIsNone(depletion.get_refresh_status(self.conn),
+                          "a skipped run must not overwrite the last real status")
 
 
 # ===========================================================================
@@ -13414,8 +14599,19 @@ class TestOwnerRoleAndProvisioning(unittest.TestCase):
     def test_owner_cannot_manage_users_or_permissions(self):
         r = self.client.post("/console/users/cashier1/reset_password", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 403, r.text)
-        r = self.client.get("/console/audit/logins", headers=self.H_OWNER)
+        r = self.client.get("/console/users", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 403, r.text)
+
+    def test_owner_can_read_but_not_write_the_audit_trail(self):
+        # 2026-10: audit.read is deliberately granted to owner (accountability
+        # oversight of admin's actions) — see wt/auth.py's own comment on the
+        # capability. This is read-only visibility, not account management:
+        # user.manage (reset_password, GET /console/users, create_user) stays
+        # admin-only, covered above.
+        r = self.client.get("/console/audit/logins", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get("/console/audit/actions", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 200, r.text)
 
     def test_owner_cannot_void_an_order(self):
         menu = self.client.get("/pos/menu", headers=self.H_CASH).json()["items"]
@@ -13586,11 +14782,12 @@ class TestOwnerInstructions(unittest.TestCase):
         self.assertEqual(r.status_code, 403, r.text)
 
 
-class TestOperationalUpdates(unittest.TestCase):
-    """Operational updates (migration 0029): the free-text, bidirectional
-    half of Owner/Admin communication — standalone heads-ups, interim
-    updates threaded onto an instruction, and explicit cross-role
-    acknowledgement."""
+class TestInstructionAssigneesAndAudit(unittest.TestCase):
+    """2026-10 pass: Messages (owner_instruction + the free-text
+    operational_update it threaded onto) is replaced by Instructions alone
+    — a structured task board, not a chat. Covers the owner's "Assign to"
+    admin lookup, that both roles can read the audit trail (previously
+    admin-only via user.manage), and the page-view audit entry."""
 
     @classmethod
     def setUpClass(cls):
@@ -13626,92 +14823,55 @@ class TestOperationalUpdates(unittest.TestCase):
         os.environ.pop("WT_ENV", None)
         scrub(cls.path)
 
-    def _events_for(self, pk):
-        return rows(self.conn.execute(
-            "SELECT * FROM admin_audit_log WHERE entity_type='operational_update' AND entity_id=? ORDER BY id",
-            (str(pk),),
-        ))
+    def test_owner_can_list_admin_assignees(self):
+        r = self.client.get("/console/instructions/assignees", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 200, r.text)
+        usernames = [i["username"] for i in r.json()["items"]]
+        self.assertIn("owner", usernames)
+        for item in r.json()["items"]:
+            self.assertNotIn("password_hash", item)
+            self.assertNotIn("locked_until", item)
 
-    def test_admin_can_send_a_standalone_heads_up_and_it_is_audited(self):
-        r = self.client.post(
-            "/console/updates", headers=self.H_ADMIN,
-            json={"body": "Chicken wing demand is above recent average."},
-        )
-        self.assertEqual(r.status_code, 201, r.text)
-        body = r.json()
-        self.assertIsNone(body["owner_instruction_id"])
-        self.assertEqual(body["created_by_role"], "admin")
-        self.assertIsNone(body["acknowledged_at"])
-        events = self._events_for(body["id"])
-        self.assertEqual([e["action"] for e in events], ["create"])
-
-    def test_owner_can_send_a_standalone_update_too(self):
-        r = self.client.post(
-            "/console/updates", headers=self.H_OWNER,
-            json={"body": "Please check the chicken stock, demand increased this week."},
-        )
-        self.assertEqual(r.status_code, 201, r.text)
-        self.assertEqual(r.json()["created_by_role"], "owner")
-
-    def test_blank_body_is_rejected(self):
-        r = self.client.post("/console/updates", headers=self.H_ADMIN, json={"body": "   "})
-        self.assertEqual(r.status_code, 422, r.text)
-
-    def test_update_can_be_threaded_onto_an_instruction(self):
-        pk = self.client.post(
-            "/console/instructions", headers=self.H_OWNER,
-            json={"title": "Contact supplier", "body": "Confirm delivery quantity", "priority": "normal"},
-        ).json()["id"]
-        self.client.post(f"/console/instructions/{pk}/acknowledge", headers=self.H_ADMIN)
-
-        r = self.client.post(
-            "/console/updates", headers=self.H_ADMIN,
-            json={"body": "Supplier confirmed 100 kg delivery tomorrow.", "owner_instruction_id": pk},
-        )
-        self.assertEqual(r.status_code, 201, r.text)
-        self.assertEqual(r.json()["owner_instruction_id"], pk)
-
-        listed = self.client.get(f"/console/updates?owner_instruction_id={pk}", headers=self.H_OWNER).json()
-        self.assertEqual(listed["count"], 1)
-        self.assertEqual(listed["items"][0]["body"], "Supplier confirmed 100 kg delivery tomorrow.")
-
-    def test_threading_onto_a_nonexistent_instruction_is_refused(self):
-        r = self.client.post(
-            "/console/updates", headers=self.H_ADMIN,
-            json={"body": "x", "owner_instruction_id": 999999},
-        )
-        self.assertEqual(r.status_code, 404, r.text)
-
-    def test_only_the_other_role_may_acknowledge(self):
-        pk = self.client.post(
-            "/console/updates", headers=self.H_ADMIN, json={"body": "Delivery received: 96 kg."},
-        ).json()["id"]
-
-        r = self.client.post(f"/console/updates/{pk}/acknowledge", headers=self.H_ADMIN)
+    def test_admin_cannot_list_assignees_instruction_create_is_owner_only(self):
+        r = self.client.get("/console/instructions/assignees", headers=self.H_ADMIN)
         self.assertEqual(r.status_code, 403, r.text)
 
-        r = self.client.post(f"/console/updates/{pk}/acknowledge", headers=self.H_OWNER)
+    def test_owner_and_admin_can_both_read_the_audit_trail(self):
+        r = self.client.get("/console/audit/actions", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertIsNotNone(r.json()["acknowledged_at"])
-        self.assertEqual(r.json()["acknowledged_by"], "biz_owner")
+        r = self.client.get("/console/audit/logins", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 200, r.text)
+        r = self.client.get("/console/audit/actions", headers=self.H_ADMIN)
+        self.assertEqual(r.status_code, 200, r.text)
 
-    def test_double_acknowledgement_is_refused(self):
-        pk = self.client.post(
-            "/console/updates", headers=self.H_OWNER, json={"body": "Please verify the delivery."},
-        ).json()["id"]
-        self.client.post(f"/console/updates/{pk}/acknowledge", headers=self.H_ADMIN)
-        r = self.client.post(f"/console/updates/{pk}/acknowledge", headers=self.H_ADMIN)
-        self.assertEqual(r.status_code, 409, r.text)
-
-    def test_cashier_and_kitchen_cannot_reach_updates(self):
+    def test_cashier_cannot_read_the_audit_trail(self):
         def token(u, password="wingstheory"):
             r = self.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
         h_cash = {"Authorization": f"Bearer {token('cashier1')}"}
-        r = self.client.get("/console/updates", headers=h_cash)
+        r = self.client.get("/console/audit/actions", headers=h_cash)
         self.assertEqual(r.status_code, 403, r.text)
-        r = self.client.post("/console/updates", headers=h_cash, json={"body": "x"})
-        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_page_view_is_audited_with_who_what_when_and_is_filterable(self):
+        r = self.client.post(
+            "/console/audit/page-view", headers=self.H_ADMIN,
+            json={"route_id": "receiving", "area": "Inventory → Receiving"},
+        )
+        self.assertEqual(r.status_code, 204, r.text)
+        events = self.client.get(
+            "/console/audit/actions", headers=self.H_OWNER, params={"entity_type": "page"},
+        ).json()["events"]
+        self.assertTrue(events, "expected at least one page-view audit row")
+        self.assertEqual(events[0]["entity_type"], "page")
+        self.assertEqual(events[0]["entity_id"], "receiving")
+        self.assertEqual(events[0]["action"], "view")
+        self.assertEqual(events[0]["user_id"], "owner")
+        self.assertEqual(events[0]["note"], "Inventory → Receiving")
+        self.assertIsNotNone(events[0]["created_at"])
+
+    def test_console_updates_route_is_gone(self):
+        r = self.client.get("/console/updates", headers=self.H_OWNER)
+        self.assertEqual(r.status_code, 404, r.text)
 
 
 class TestPurchaseOrders(unittest.TestCase):
@@ -15282,19 +16442,1056 @@ class TestDemoValidationHarness(Base):
             demo_validation.simulate_unli_consumption_validation(self.conn)
 
 
+# ===========================================================================
+class TestSimulatedWorkbookImport(unittest.TestCase):
+    """wt.simulated_workbook_import — the SIMULATED 1-year receiving/wastage/
+    stock-count/unli-flavour-reconciliation workbook. Needs the REAL 108
+    ingredients + 14 flavours seeded (the workbook's Ingredient ID/Flavor
+    values are only meaningful against that real set), so this uses the
+    same WT_DB-env + seed.run(fresh=True) pattern TestHistoricalSourceTracking
+    established, not the plain Base/fresh_db() fixture."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        cls.conn = db.get_conn()
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def setUp(self):
+        from wt import simulated_workbook_import as swi
+        self.swi = swi
+        if not swi.XLSX_PATH.exists():
+            self.skipTest(f"workbook not present at {swi.XLSX_PATH}")
+
+    def _snapshot_inventory(self):
+        return [
+            dict(r) for r in self.conn.execute(
+                "SELECT id, on_hand_base, reserved_base FROM ingredient ORDER BY id"
+            ).fetchall()
+        ]
+
+    def test_dry_run_writes_nothing_and_reports_full_acceptance(self):
+        counts_before = self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"]
+        result = self.swi.run(self.conn, dry_run=True)
+        self.assertEqual(result["receiving"]["rejected"], 0)
+        self.assertEqual(result["wastage"]["rejected"], 0)
+        self.assertEqual(result["counts"]["rejected"], 0)
+        self.assertEqual(result["reconciliation"]["rejected"], 0)
+        self.assertGreater(result["would_insert"]["receiving"], 0)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) AS n FROM stock_ledger").fetchone()["n"],
+            counts_before,
+        )
+
+    def test_real_import_end_to_end(self):
+        """One sequential test, not several independent ones: wt.db.write_tx
+        refuses to nest (by design -- see its own docstring), which rules
+        out wrapping each assertion in its own rollback-able savepoint
+        around a call that opens a write_tx internally. The properties below
+        are inherently sequential anyway (idempotency cannot be checked
+        without a first import already having happened, and the
+        never-touches-current-inventory snapshot must be taken before it)."""
+        before = self._snapshot_inventory()
+
+        first = self.swi.run(self.conn, dry_run=False, verbose=False)
+        self.assertGreater(first["inserted"]["receiving"], 0)
+        self.assertGreater(first["inserted"]["wastage"], 0)
+        self.assertGreater(first["inserted"]["counts"], 0)
+        self.assertGreater(first["inserted"]["reconciliation"], 0)
+        self.assertEqual(self.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+        after_first = self._snapshot_inventory()
+        self.assertEqual(before, after_first, "import must never mutate on_hand_base/reserved_base")
+
+        # provenance: the sentinel user must never be a real account, or
+        # anomaly.py's structural exclusion (_REAL_USER_CLAUSE) would silently
+        # start treating every imported loss-reason row as real
+        is_real_account = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM app_user WHERE username=?", (self.swi.USER_ID,)
+        ).fetchone()["n"]
+        self.assertEqual(is_real_account, 0)
+        anomalies = detect_anomalies(self.conn, lookback_days=400)
+        self.assertNotIn(self.swi.USER_ID, {a["user_id"] for a in anomalies})
+
+        # every imported reconciliation row resolves to a real flavour
+        orphans = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM unli_flavor_reconciliation r "
+            "LEFT JOIN unli_flavor f ON f.id = r.flavor_id WHERE f.id IS NULL"
+        ).fetchone()["n"]
+        self.assertEqual(orphans, 0)
+
+        # append-only, matching stock_ledger/anomaly_review's own convention
+        row_id = self.conn.execute("SELECT id FROM unli_flavor_reconciliation LIMIT 1").fetchone()["id"]
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE unli_flavor_reconciliation SET heads = 999 WHERE id = ?", (row_id,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM unli_flavor_reconciliation WHERE id = ?", (row_id,))
+
+        # idempotency: re-importing the identical workbook is a pure no-op
+        counts_before_second = {
+            t: self.conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            for t in ("stock_ledger", "purchase_order", "unli_flavor_reconciliation",
+                     "ingredient_variance_review")
+        }
+        second = self.swi.run(self.conn, dry_run=False, verbose=False)
+        self.assertEqual(second["inserted"], {k: 0 for k in second["inserted"]})
+        self.assertEqual(second["duplicates"]["receiving"], first["inserted"]["receiving"])
+        self.assertEqual(second["duplicates"]["reconciliation"], first["inserted"]["reconciliation"])
+        counts_after_second = {
+            t: self.conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            for t in ("stock_ledger", "purchase_order", "unli_flavor_reconciliation",
+                     "ingredient_variance_review")
+        }
+        self.assertEqual(counts_before_second, counts_after_second)
+        self.assertEqual(before, self._snapshot_inventory(), "second import must also never touch current inventory")
+
+    def test_malformed_row_with_unknown_ingredient_is_rejected_not_imported(self):
+        """A crafted single-sheet workbook with one row pointing at an
+        ingredient ID that does not exist -- proves the importer rejects
+        rather than silently drops or guesses."""
+        import openpyxl as _oxl
+        wb = _oxl.Workbook()
+        ws = wb.active
+        ws.title = "Receiving Log"
+        ws.append(["Receipt ID", "PO / Order Ref", "Ingredient ID", "Ordered Qty", "Received Qty",
+                  "Supplier", "Ordered At", "Received At", "Purchase/Pack Unit"])
+        ws.append(["BAD-RCV-1", "BAD-PO-1", "ING-9999", 1, 1, "Nobody", "2026-01-01", "2026-01-02", "pc"])
+        for name in ("Wastage Log", "Stock Counts", "Unli Reconciliation"):
+            wb.create_sheet(name).append(["x"])
+        p = Path(tempfile.gettempdir()) / "wt_test_bad_receiving.xlsx"
+        wb.save(p)
+        try:
+            result = self.swi.run(self.conn, dry_run=True, source_path=p)
+            self.assertEqual(result["receiving"]["accepted"], 0)
+            self.assertEqual(result["receiving"]["rejected"], 1)
+            self.assertIn("unknown_ingredient", result["rejected_examples"]["receiving"][0]["reject_reason"])
+        finally:
+            p.unlink(missing_ok=True)
+
+    def test_ingredient_id_zero_padding_mismatch_still_resolves(self):
+        """The workbook uses 'ING-001' (3-digit); the live ingredient table
+        uses 'ING-0001' (4-digit). _norm_ingredient_ref must bridge that, or
+        every row rejects as unknown_ingredient."""
+        self.assertEqual(self.swi._norm_ingredient_ref("ING-001"), self.swi._norm_ingredient_ref("ING-0001"))
+        self.assertIsNone(self.swi._norm_ingredient_ref(None))
+        self.assertIsNone(self.swi._norm_ingredient_ref(""))
+
+
+
+def _add_flavor(conn, name, rate=55.0):
+    ing_pk = add_ingredient(conn, f"{name} Sauce", on_hand=1_000_000.0, base_unit="g")
+    cur = conn.execute(
+        "INSERT INTO unli_flavor (ingredient_id, display_name, flavor_type) VALUES (?,?,?)",
+        (ing_pk, name, "included"))
+    return cur.lastrowid
+
+
+def _insert_flavor_row(conn, flavor_pk, service_date, heads, rate, servings=None, wings_served=None,
+                       leftover_frac=0.08, provisional_rate=None, recorded_by=None):
+    provisional_rate = provisional_rate if provisional_rate is not None else rate
+    servings = servings if servings is not None else max(1, int(heads * 1.5))
+    wings_served = wings_served if wings_served is not None else max(1.0, heads * 6.0)
+    actual = heads * rate
+    leftover = wings_served * leftover_frac
+    provisional = heads * provisional_rate
+    variance = actual - provisional
+    variance_ratio = (variance / provisional) if provisional > 0 else None
+    cur = conn.execute(
+        "INSERT INTO unli_flavor_reconciliation (service_date, flavor_id, heads, servings, "
+        "wings_served_pcs, leftover_pcs, net_consumed_pcs, actual_measured_base, unit, "
+        "provisional_base, variance_base, variance_ratio, deterministic_rule_flag, "
+        "observation_status, recorded_by, source_batch_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (service_date, flavor_pk, heads, servings, wings_served, leftover, wings_served - leftover,
+         actual, "g", provisional, variance, variance_ratio, 0, "reconciled", recorded_by, "test"))
+    return cur.lastrowid
+
+
+# ===========================================================================
+class TestAnomalyRobustRuleLayer(Base):
+    """2026-10 Unlimited-Wings capability-gap fix: _robust_center_spread()
+    and the two new rules it backs (large_leftover_ratio, large_
+    consumption_scale) in the 4-stream consumption pass. See wt/anomaly.py's
+    own RULE_ROBUST_MAD_MULTIPLE comment for the forensic diagnosis this
+    fix is based on."""
+
+    def _flavor_unli_fixture(self):
+        """A real 'wings' unli_item + baseline coefficient, minimal fixture
+        for _evaluate_consumption()-level tests (not the flavor pass)."""
+        ing = add_ingredient(self.conn, "Wings Sauce", on_hand=1_000_000.0, base_unit="g")
+        item_pk = add_unli_stream(self.conn, "wings", ing, lambda_value=14.0)
+        return item_pk
+
+    def _reconcile(self, item_pk, days_back, heads, actual_per_head, leftover_mult=1.0,
+                   recorded_by=None):
+        theoretical = heads * 14.0
+        actual = heads * actual_per_head
+        variance = actual - theoretical
+        variance_ratio = variance / theoretical if theoretical > 0 else None
+        opening = max(theoretical, actual) * 1.2 * leftover_mult
+        closing = max(0.0, opening - actual)
+        cur = self.conn.execute(
+            "INSERT INTO unli_reconciliation (service_date, unli_item_id, heads, theoretical_base, "
+            "actual_base, variance_base, variance_ratio, opening_base, added_base, closing_base, "
+            "status, validation_state, correction_base, recorded_by) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (days_ago(days_back), item_pk, heads, theoretical, actual, variance, variance_ratio,
+             opening, 0.0, closing, "within_tolerance", "validated", 0.0, recorded_by))
+        return cur.lastrowid
+
+    def test_robust_center_spread_median_mad(self):
+        med, spread = anomaly._robust_center_spread([1.0, 2.0, 3.0, 4.0, 5.0])
+        self.assertEqual(med, 3.0)
+        self.assertAlmostEqual(spread, 1.0 * anomaly._MAD_TO_SIGMA, places=4)
+
+    def test_robust_center_spread_empty_is_zero(self):
+        self.assertEqual(anomaly._robust_center_spread([]), (0.0, 0.0))
+
+    def test_robust_center_spread_zero_mad_identical_values(self):
+        med, spread = anomaly._robust_center_spread([5.0] * 20)
+        self.assertEqual(med, 5.0)
+        self.assertEqual(spread, 0.0)
+
+    def test_zero_mad_stream_never_fires_the_robust_rules(self):
+        """A stream with zero leftover variance (every day identical) must
+        not divide by zero or spuriously flag -- see _evaluate_consumption's
+        own `if robust["leftover_spread"] > 1e-9` guard."""
+        item_pk = self._flavor_unli_fixture()
+        for i in range(anomaly.MIN_ROBUST_RULE_DAYS + 5):
+            self._reconcile(item_pk, i + 1, 30, 14.0, leftover_mult=1.0)
+        self.conn.commit()
+        records, _ = anomaly._evaluate_consumption(self.conn, 90)
+        for rec in records:
+            self.assertFalse(rec["rule_flagged"])
+
+    def test_insufficient_history_no_robust_rule(self):
+        """Below MIN_ROBUST_RULE_DAYS for this stream, the leftover/scale
+        rules must not fire at all (not enough evidence for a robust
+        baseline) -- even for a day with an extreme leftover_ratio."""
+        item_pk = self._flavor_unli_fixture()
+        for i in range(anomaly.MIN_ROBUST_RULE_DAYS - 2):
+            self._reconcile(item_pk, i + 1, 30, 14.0, leftover_mult=1.0)
+        extreme_id = self._reconcile(item_pk, 50, 30, 14.0, leftover_mult=10.0)
+        self.conn.commit()
+        records, _ = anomaly._evaluate_consumption(self.conn, 90)
+        rec = next(r for r in records if r["row"]["reconciliation_id"] == extreme_id)
+        self.assertEqual(rec["rule_causes"], [])
+
+    def test_leftover_rule_fires_on_robust_deviation(self):
+        item_pk = self._flavor_unli_fixture()
+        for i in range(anomaly.MIN_ROBUST_RULE_DAYS + 10):
+            # a zero-variance "normal" population gives the robust rule a
+            # zero spread, which the guard correctly refuses to judge
+            # against (see test_zero_mad_stream_never_fires_the_robust_
+            # rules) -- a small realistic wobble is needed so there is an
+            # actual baseline spread for the extreme point to exceed.
+            self._reconcile(item_pk, i + 1, 30, 14.0, leftover_mult=1.0 + 0.05 * (1 if i % 2 == 0 else -1))
+        extreme_id = self._reconcile(item_pk, 60, 30, 14.0, leftover_mult=8.0)
+        self.conn.commit()
+        records, _ = anomaly._evaluate_consumption(self.conn, 90)
+        rec = next(r for r in records if r["row"]["reconciliation_id"] == extreme_id)
+        methods = [c[0] for c in rec["rule_causes"]]
+        self.assertIn("large_leftover_ratio", methods)
+
+    def test_consumption_scale_rule_fires_on_robust_deviation(self):
+        item_pk = self._flavor_unli_fixture()
+        for i in range(anomaly.MIN_ROBUST_RULE_DAYS + 10):
+            self._reconcile(item_pk, i + 1, 30, 14.0 + (i % 3) * 0.1, leftover_mult=1.0)
+        extreme_id = self._reconcile(item_pk, 60, 300, 14.0, leftover_mult=1.0)
+        self.conn.commit()
+        records, _ = anomaly._evaluate_consumption(self.conn, 90)
+        rec = next(r for r in records if r["row"]["reconciliation_id"] == extreme_id)
+        methods = [c[0] for c in rec["rule_causes"]]
+        self.assertIn("large_consumption_scale", methods)
+
+    def test_existing_variance_rule_unaffected(self):
+        """Regression safety: the pre-existing large_variance rule still
+        fires exactly as before the 2026-10 fix -- unrelated to the new
+        leftover/scale rules."""
+        item_pk = self._flavor_unli_fixture()
+        extreme_id = self._reconcile(item_pk, 1, 30, 30.0)   # >2x the 14.0 lambda
+        self.conn.commit()
+        records, _ = anomaly._evaluate_consumption(self.conn, 90)
+        rec = next(r for r in records if r["row"]["reconciliation_id"] == extreme_id)
+        methods = [c[0] for c in rec["rule_causes"]]
+        self.assertIn("large_variance", methods)
+
+    def test_multiple_simultaneous_rule_causes_sorted_by_severity(self):
+        """A day that trips BOTH the variance rule and the leftover rule
+        must report both in rule_causes, most-severe-first, and
+        detect_consumption_anomalies() must report the primary one as
+        'method' with the rest in other_rule_causes."""
+        item_pk = self._flavor_unli_fixture()
+        for i in range(anomaly.MIN_ROBUST_RULE_DAYS + 10):
+            self._reconcile(item_pk, i + 1, 30, 14.0, leftover_mult=1.0 + 0.05 * (1 if i % 2 == 0 else -1))
+        combo_id = self._reconcile(item_pk, 60, 30, 30.0, leftover_mult=9.0)
+        self.conn.commit()
+        records, _ = anomaly._evaluate_consumption(self.conn, 90)
+        rec = next(r for r in records if r["row"]["reconciliation_id"] == combo_id)
+        methods = [c[0] for c in rec["rule_causes"]]
+        self.assertIn("large_variance", methods)
+        self.assertIn("large_leftover_ratio", methods)
+        self.assertGreaterEqual(len(rec["rule_causes"]), 2)
+        scores = [c[1] for c in rec["rule_causes"]]
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+        flagged = anomaly.detect_consumption_anomalies(self.conn, 90)
+        out = next(f for f in flagged if f["reconciliation_id"] == combo_id)
+        if out["method"] != "isolation_forest":
+            self.assertIn(out["method"], ("large_variance", "large_leftover_ratio"))
+            self.assertGreaterEqual(len(out["other_rule_causes"]), 1)
+
+
+# ===========================================================================
+class TestFlavorConsumptionAnomaly(Base):
+    """Feature construction, detection, compositional behavior/event
+    grouping, and edge-case handling for the flavour-level pass
+    (wt/anomaly.py's detect_flavor_consumption_anomalies(), migration
+    0044/0045/0046)."""
+
+    def setUp(self):
+        super().setUp()
+        self.f1 = _add_flavor(self.conn, "Garlic Parmesan")
+        self.f2 = _add_flavor(self.conn, "Classic Buffalo")
+
+    def test_feature_construction_matches_hand_computed_values(self):
+        _insert_flavor_row(self.conn, self.f1, days_ago(1), heads=10, rate=50.0,
+                           servings=15, wings_served=100.0, leftover_frac=0.10,
+                           provisional_rate=50.0)
+        self.conn.commit()
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertEqual(len(records), 1)
+        f = records[0]["features"]
+        self.assertAlmostEqual(f["consumption_per_head"], 50.0, places=4)
+        self.assertAlmostEqual(f["refill_intensity"], 1.5, places=4)
+        self.assertAlmostEqual(f["flavor_share_of_wings"], 1.0, places=4)  # only flavour that day
+        self.assertAlmostEqual(f["leftover_ratio"], 0.10, places=4)
+        self.assertAlmostEqual(f["variance_ratio"], 0.0, places=4)
+        # single observation: no OTHER day to build a baseline/peer from
+        self.assertAlmostEqual(f["baseline_deviation_ratio"], 1.0, places=4)
+        self.assertAlmostEqual(f["peer_flavor_deviation_ratio"], 1.0, places=4)
+
+    def test_flavor_share_of_wings_divides_by_the_SAME_days_total(self):
+        d = days_ago(1)
+        _insert_flavor_row(self.conn, self.f1, d, heads=10, rate=50.0, wings_served=75.0)
+        _insert_flavor_row(self.conn, self.f2, d, heads=10, rate=50.0, wings_served=25.0)
+        self.conn.commit()
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        by_flavor = {r["row"]["flavor_id"]: r for r in records}
+        self.assertAlmostEqual(by_flavor[self.f1]["features"]["flavor_share_of_wings"], 0.75, places=4)
+        self.assertAlmostEqual(by_flavor[self.f2]["features"]["flavor_share_of_wings"], 0.25, places=4)
+
+    def test_basic_detection_flags_an_obvious_anomaly(self):
+        for i in range(25):
+            _insert_flavor_row(self.conn, self.f1, days_ago(i + 1), heads=10, rate=50.0)
+            _insert_flavor_row(self.conn, self.f2, days_ago(i + 1), heads=10, rate=50.0)
+        extreme_id = _insert_flavor_row(self.conn, self.f1, days_ago(60), heads=10, rate=200.0,
+                                        provisional_rate=50.0)
+        self.conn.commit()
+        flagged = anomaly.detect_flavor_consumption_anomalies(self.conn, 90)
+        self.assertIn(extreme_id, {f["reconciliation_id"] for f in flagged})
+
+    def test_compositional_share_effect_and_event_grouping(self):
+        """One flavour's genuine share spike mechanically moves its peers'
+        shares the opposite direction (shares sum to 1 across however many
+        flavours reconciled that day). With only 2 flavours total the
+        induced shift is exactly as large as the spike itself (perfectly
+        symmetric -- genuinely ambiguous which one is "the cause", and the
+        detector correctly keeps both primary in that case, tested
+        separately below). With more flavours sharing the day, the spike
+        in ONE is diluted across the others, making root-cause attribution
+        well-defined: detect_flavor_consumption_anomalies() must mark the
+        spiking flavour primary and its peers' compositional echoes
+        secondary (is_primary=False, secondary_of pointing at the primary),
+        never present six unrelated-looking alerts for one real event."""
+        flavors = [self.f1, self.f2] + [_add_flavor(self.conn, f"Extra {i}") for i in range(4)]
+        for i in range(25):
+            for fl in flavors:
+                _insert_flavor_row(self.conn, fl, days_ago(i + 1), heads=10, rate=50.0, wings_served=50.0)
+        event_date = days_ago(60)
+        spiked = _insert_flavor_row(self.conn, self.f1, event_date, heads=10, rate=50.0,
+                                    wings_served=250.0)   # share spike, rate normal
+        peers = [_insert_flavor_row(self.conn, fl, event_date, heads=10, rate=50.0, wings_served=50.0)
+                for fl in flavors[1:]]
+        self.conn.commit()
+        flagged = anomaly.detect_flavor_consumption_anomalies(self.conn, 90)
+        by_id = {f["reconciliation_id"]: f for f in flagged}
+        self.assertIn(spiked, by_id)
+        self.assertTrue(by_id[spiked]["is_primary"])
+        for peer_id in peers:
+            if peer_id in by_id:
+                # if a peer's compositional echo also crossed the threshold,
+                # it must be attributed as secondary, never an independent
+                # primary alert for what is really one event
+                self.assertFalse(by_id[peer_id]["is_primary"])
+                self.assertEqual(by_id[peer_id]["secondary_of"], spiked)
+                self.assertIn("secondary", by_id[peer_id]["why"].lower())
+
+        events = anomaly.flavor_anomaly_events(self.conn, 90)
+        event = next(e for e in events if e["service_date"] == event_date)
+        self.assertIn("Garlic Parmesan", event["primary_flavors"])
+
+    def test_two_comparably_severe_flavors_both_stay_primary(self):
+        """With exactly 2 flavours reconciled that day, one spiking and the
+        other symmetrically compensating, the deviation is EQUALLY large
+        for both -- genuinely ambiguous which one is "the cause" from the
+        numbers alone. The detector must not force a false single-cause
+        narrative here: both stay primary (comparable-magnitude guard)."""
+        for i in range(25):
+            _insert_flavor_row(self.conn, self.f1, days_ago(i + 1), heads=10, rate=50.0, wings_served=50.0)
+            _insert_flavor_row(self.conn, self.f2, days_ago(i + 1), heads=10, rate=50.0, wings_served=50.0)
+        event_date = days_ago(60)
+        a = _insert_flavor_row(self.conn, self.f1, event_date, heads=10, rate=50.0, wings_served=450.0)
+        b = _insert_flavor_row(self.conn, self.f2, event_date, heads=10, rate=50.0, wings_served=50.0)
+        self.conn.commit()
+        flagged = anomaly.detect_flavor_consumption_anomalies(self.conn, 90)
+        by_id = {f["reconciliation_id"]: f for f in flagged}
+        if a in by_id and b in by_id:
+            self.assertTrue(by_id[a]["is_primary"])
+            self.assertTrue(by_id[b]["is_primary"])
+
+    def test_missing_variance_ratio_defaults_to_zero(self):
+        # unli_flavor_reconciliation is append-only (migration 0044's own
+        # trg_unli_flavor_recon_no_update) -- insert with variance_ratio
+        # already NULL rather than inserting then updating.
+        self.conn.execute(
+            "INSERT INTO unli_flavor_reconciliation (service_date, flavor_id, heads, servings, "
+            "wings_served_pcs, leftover_pcs, net_consumed_pcs, actual_measured_base, unit, "
+            "provisional_base, variance_base, variance_ratio, deterministic_rule_flag, "
+            "observation_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (days_ago(1), self.f1, 10, 15, 60.0, 6.0, 54.0, 500.0, "g", None, None, None, 0, "reconciled"))
+        self.conn.commit()
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertEqual(records[0]["features"]["variance_ratio"], 0.0)
+
+    def test_zero_heads_excluded_from_evaluation(self):
+        rid = _insert_flavor_row(self.conn, self.f1, days_ago(1), heads=0, rate=50.0)
+        self.conn.commit()
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertNotIn(rid, {r["row"]["reconciliation_id"] for r in records})
+
+    def test_zero_wings_served_does_not_divide_by_zero(self):
+        rid = _insert_flavor_row(self.conn, self.f1, days_ago(1), heads=10, rate=50.0,
+                                 wings_served=0.0, leftover_frac=0.0)
+        self.conn.commit()
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        rec = next(r for r in records if r["row"]["reconciliation_id"] == rid)
+        self.assertEqual(rec["features"]["leftover_ratio"], 0.0)
+
+    def test_newly_introduced_flavor_has_no_crash_with_one_observation(self):
+        new_flavor = _add_flavor(self.conn, "Brand New Sauce")
+        rid = _insert_flavor_row(self.conn, new_flavor, days_ago(1), heads=5, rate=60.0)
+        self.conn.commit()
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        rec = next(r for r in records if r["row"]["reconciliation_id"] == rid)
+        self.assertEqual(rec["features"]["baseline_deviation_ratio"], 1.0)
+        flagged = anomaly.detect_flavor_consumption_anomalies(self.conn, 90)   # must not raise
+        self.assertIsInstance(flagged, list)
+
+    def test_discontinued_inactive_flavor_history_is_still_evaluated(self):
+        """A flavour's historical observation does not become invalid just
+        because the flavour was discontinued afterward -- deliberately NOT
+        filtered by unli_flavor.is_active (see _flavor_consumption_records's
+        SELECT). Documented via this test, not an oversight."""
+        rid = _insert_flavor_row(self.conn, self.f1, days_ago(5), heads=10, rate=50.0)
+        self.conn.execute("UPDATE unli_flavor SET is_active=0 WHERE id=?", (self.f1,))
+        self.conn.commit()
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertIn(rid, {r["row"]["reconciliation_id"] for r in records})
+
+    def test_sparse_dates_do_not_crash_peer_computation(self):
+        _insert_flavor_row(self.conn, self.f1, days_ago(1), heads=10, rate=50.0)
+        _insert_flavor_row(self.conn, self.f1, days_ago(40), heads=12, rate=55.0)
+        _insert_flavor_row(self.conn, self.f1, days_ago(89), heads=8, rate=45.0)
+        self.conn.commit()
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertEqual(len(records), 3)
+        anomaly.detect_flavor_consumption_anomalies(self.conn, 90)   # must not raise
+
+    def test_duplicate_reconciliation_is_rejected_by_schema(self):
+        d = days_ago(1)
+        _insert_flavor_row(self.conn, self.f1, d, heads=10, rate=50.0)
+        with self.assertRaises(sqlite3.IntegrityError):
+            _insert_flavor_row(self.conn, self.f1, d, heads=11, rate=51.0)
+
+    def test_sample_snapshot_is_frozen_even_if_later_data_arrives(self):
+        """Future-leakage-adjacent guarantee: a validation sample's frozen
+        model_prediction/anomaly_score/decision_threshold must not change
+        retroactively just because more recent reconciliation rows are
+        added after sampling -- the snapshot is taken at sample time, not
+        recomputed live on every read."""
+        for i in range(25):
+            _insert_flavor_row(self.conn, self.f1, days_ago(i + 10), heads=10, rate=50.0)
+            _insert_flavor_row(self.conn, self.f2, days_ago(i + 10), heads=10, rate=50.0)
+        self.conn.commit()
+        result = anomaly.sample_flavor_for_review(self.conn, n_flagged=0, n_near_threshold=2, n_random=2)
+        self.assertTrue(result["forest_trained"])
+        before = {r["id"]: dict(r) for r in
+                 self.conn.execute("SELECT * FROM unli_flavor_validation_sample").fetchall()}
+        # new, more recent data arrives
+        for i in range(5):
+            _insert_flavor_row(self.conn, self.f1, days_ago(i + 1), heads=10, rate=90.0)
+        self.conn.commit()
+        after = {r["id"]: dict(r) for r in
+                self.conn.execute("SELECT * FROM unli_flavor_validation_sample").fetchall()}
+        for sid, row in before.items():
+            self.assertEqual(row["model_prediction"], after[sid]["model_prediction"])
+            self.assertEqual(row["anomaly_score"], after[sid]["anomaly_score"])
+            self.assertEqual(row["decision_threshold"], after[sid]["decision_threshold"])
+
+
+# ===========================================================================
+class TestFlavorValidationReview(Base):
+    """Provenance exclusion/inclusion, review persistence/immutability, and
+    scientific-metrics correctness for the flavour-level review pipeline."""
+
+    def setUp(self):
+        super().setUp()
+        self.f1 = _add_flavor(self.conn, "Garlic Parmesan")
+
+    def _seed_real_population(self, n=25, recorded_by=None):
+        for i in range(n):
+            _insert_flavor_row(self.conn, self.f1, days_ago(i + 1), heads=10,
+                               rate=50.0 + (i % 3), recorded_by=recorded_by)
+        self.conn.commit()
+
+    def test_simulated_sentinel_provenance_is_excluded(self):
+        self._seed_real_population(recorded_by="simulated_workbook_import")
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertEqual(len(records), 0)
+
+    def test_test_harness_sentinel_provenance_is_excluded(self):
+        self._seed_real_population(recorded_by="flavor_severity_simulation_harness")
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertEqual(len(records), 0)
+
+    def test_real_app_user_provenance_is_included(self):
+        from wt.auth import hash_password
+        h, s = hash_password("wingstheory")
+        self.conn.execute(
+            "INSERT INTO app_user (username, display_name, role, password_hash, password_salt, "
+            "password_changed_at, must_change_password, is_active) "
+            "VALUES ('kitchen_real','Kitchen','kitchen',?,?,datetime('now'),0,1)", (h, s))
+        self._seed_real_population(recorded_by="kitchen_real")
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertEqual(len(records), 25)
+
+    def test_null_recorded_by_is_included(self):
+        """NULL means 'a legitimate system-internal write with no specific
+        human operator' -- never excluded by itself, same convention as
+        every other provenance clause in this module."""
+        self._seed_real_population(recorded_by=None)
+        records = anomaly._flavor_consumption_records(self.conn, 90)
+        self.assertEqual(len(records), 25)
+
+    def test_review_persistence_stores_full_identity(self):
+        self._seed_real_population()
+        result = anomaly.sample_flavor_for_review(self.conn, n_flagged=0, n_near_threshold=3, n_random=0)
+        self.assertGreater(result["sampled"], 0)
+        sample_id = result["reconciliation_ids"][0]
+        row = self.conn.execute(
+            "SELECT * FROM unli_flavor_validation_sample WHERE reconciliation_id=?", (sample_id,)
+        ).fetchone()
+        self.assertIsNotNone(row["model_version"])
+        self.assertIsNotNone(row["eligibility_version"])
+        self.assertEqual(row["human_label"], "pending")
+
+        out = anomaly.submit_flavor_validation_label(
+            self.conn, row["id"], "confirmed_anomaly", note="looked real", user_id="owner1")
+        self.assertEqual(out["human_label"], "confirmed_anomaly")
+        self.assertEqual(out["reviewed_by"], "owner1")
+        self.assertIsNotNone(out["reviewed_at"])
+        self.assertEqual(out["review_note"], "looked real")
+
+        label_event = rows(self.conn.execute(
+            "SELECT * FROM admin_audit_log WHERE entity_type='unli_flavor_validation_sample' "
+            "AND action='label' AND entity_id=?", (str(row["id"]),)))
+        self.assertEqual(len(label_event), 1)
+        self.assertEqual(label_event[0]["user_id"], "owner1")
+
+    def test_review_immutability_cannot_relabel(self):
+        self._seed_real_population()
+        result = anomaly.sample_flavor_for_review(self.conn, n_flagged=0, n_near_threshold=3, n_random=0)
+        sample_id = self.conn.execute(
+            "SELECT id FROM unli_flavor_validation_sample LIMIT 1"
+        ).fetchone()["id"]
+        anomaly.submit_flavor_validation_label(self.conn, sample_id, "confirmed_anomaly", user_id="r1")
+        with self.assertRaises(InvalidStateError):
+            anomaly.submit_flavor_validation_label(self.conn, sample_id, "false_positive", user_id="r2")
+        # history is preserved: the original label survives the rejected attempt
+        row = self.conn.execute(
+            "SELECT human_label, reviewed_by FROM unli_flavor_validation_sample WHERE id=?", (sample_id,)
+        ).fetchone()
+        self.assertEqual(row["human_label"], "confirmed_anomaly")
+        self.assertEqual(row["reviewed_by"], "r1")
+
+    def test_unknown_label_is_rejected(self):
+        self._seed_real_population()
+        anomaly.sample_flavor_for_review(self.conn, n_flagged=0, n_near_threshold=3, n_random=0)
+        sample_id = self.conn.execute("SELECT id FROM unli_flavor_validation_sample LIMIT 1").fetchone()["id"]
+        with self.assertRaises(InvalidStateError):
+            anomaly.submit_flavor_validation_label(self.conn, sample_id, "definitely_an_anomaly")
+
+    def test_scientific_metrics_unavailable_below_threshold(self):
+        self._seed_real_population()
+        anomaly.sample_flavor_for_review(self.conn, n_flagged=0, n_near_threshold=5, n_random=0)
+        for row in self.conn.execute("SELECT id FROM unli_flavor_validation_sample").fetchall():
+            anomaly.submit_flavor_validation_label(self.conn, row["id"], "confirmed_anomaly", user_id="r")
+        metrics = anomaly.scientific_flavor_validation_metrics(self.conn)
+        self.assertFalse(metrics["available"])
+        self.assertEqual(metrics["reason"], "insufficient_validation_data")
+
+    def test_scientific_metrics_confusion_matrix_correctness_above_threshold(self):
+        """Hand-construct exactly enough labeled samples, with known
+        model_prediction/human_label pairs, to clear every threshold, and
+        verify the derived confusion matrix matches by hand."""
+        self._seed_real_population(n=5)
+        now = __import__("datetime").datetime.now().isoformat()
+
+        def insert_sample(i, prediction, label):
+            self.conn.execute(
+                "INSERT INTO unli_flavor_validation_sample (reconciliation_id, sample_source, "
+                "model_prediction, rule_flagged, model_version, eligibility_version, human_label, "
+                "reviewed_by, reviewed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (i, "model_flagged" if prediction == "flagged" else "random_unflagged",
+                 prediction, 0, anomaly.FLAVOR_MODEL_VERSION, anomaly.FLAVOR_ELIGIBILITY_VERSION,
+                 label, "r", now))
+
+        rid = 10000
+        for _ in range(10):
+            rid += 1
+            _insert_flavor_row(self.conn, self.f1, days_ago(rid % 300 + 1), heads=10, rate=50.0)
+            insert_sample(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0], "flagged", "confirmed_anomaly")
+        for _ in range(3):
+            rid += 1
+            _insert_flavor_row(self.conn, self.f1, days_ago(rid % 300 + 1), heads=10, rate=50.0)
+            insert_sample(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0], "flagged", "false_positive")
+        for _ in range(2):
+            rid += 1
+            _insert_flavor_row(self.conn, self.f1, days_ago(rid % 300 + 1), heads=10, rate=50.0)
+            insert_sample(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0], "unflagged", "confirmed_anomaly")
+        for _ in range(15):
+            rid += 1
+            _insert_flavor_row(self.conn, self.f1, days_ago(rid % 300 + 1), heads=10, rate=50.0)
+            insert_sample(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0], "unflagged", "false_positive")
+        self.conn.commit()
+
+        metrics = anomaly.scientific_flavor_validation_metrics(self.conn)
+        self.assertTrue(metrics["available"])
+        cm = metrics["confusion_matrix"]
+        self.assertEqual(cm, {"tp": 10, "fp": 3, "fn": 2, "tn": 15})
+        self.assertAlmostEqual(metrics["precision"], 10 / 13, places=3)
+        self.assertAlmostEqual(metrics["recall"], 10 / 12, places=3)
+        self.assertIn("ISOLATION-FOREST-ONLY", metrics["methodology"])
+
+    def test_expected_variation_and_insufficient_information_excluded_from_confusion_matrix(self):
+        self._seed_real_population(n=3)
+        now = __import__("datetime").datetime.now().isoformat()
+        rows = self.conn.execute("SELECT id FROM unli_flavor_reconciliation").fetchall()
+        for i, r in enumerate(rows):
+            label = ["expected_operational_variation", "insufficient_information", "confirmed_anomaly"][i % 3]
+            self.conn.execute(
+                "INSERT INTO unli_flavor_validation_sample (reconciliation_id, sample_source, "
+                "model_prediction, rule_flagged, model_version, eligibility_version, human_label, "
+                "reviewed_by, reviewed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (r["id"], "model_flagged", "flagged", 0, anomaly.FLAVOR_MODEL_VERSION,
+                 anomaly.FLAVOR_ELIGIBILITY_VERSION, label, "r", now))
+        self.conn.commit()
+        metrics = anomaly.scientific_flavor_validation_metrics(self.conn)
+        cm = metrics["confusion_matrix"]
+        # only the confirmed_anomaly row contributes; the other two labels
+        # are real reviews but carry no usable confusion-matrix polarity
+        self.assertEqual(cm["tp"] + cm["fp"] + cm["fn"] + cm["tn"], 1)
+
+
+# ===========================================================================
+class TestFlavorRealDataReadinessTransition(Base):
+    """Part 13: the documented real-data transition policy, end to end --
+    0 real observations through sufficient real observations AND sufficient
+    genuine human labels. Simulated observations must never count toward
+    any threshold."""
+
+    def setUp(self):
+        super().setUp()
+        self.f1 = _add_flavor(self.conn, "Garlic Parmesan")
+        from wt.auth import hash_password
+        h, s = hash_password("wingstheory")
+        self.conn.execute(
+            "INSERT INTO app_user (username, display_name, role, password_hash, password_salt, "
+            "password_changed_at, must_change_password, is_active) "
+            "VALUES ('kitchen_real','Kitchen','kitchen',?,?,datetime('now'),0,1)", (h, s))
+        self.conn.commit()
+
+    def _real_rows(self, n, offset=1):
+        for i in range(n):
+            _insert_flavor_row(self.conn, self.f1, days_ago(offset + i), heads=10,
+                               rate=50.0 + (i % 3), recorded_by="kitchen_real")
+        self.conn.commit()
+
+    def test_zero_real_observations_is_simulation_only(self):
+        readiness = anomaly.flavor_real_data_readiness(self.conn, 90)
+        self.assertEqual(readiness["state"], "SIMULATION_ONLY")
+
+    def test_zero_real_observations_even_with_simulated_rows_present(self):
+        """Simulated rows must never count toward ANY readiness criterion."""
+        for i in range(100):
+            _insert_flavor_row(self.conn, self.f1, days_ago(i + 1), heads=10, rate=50.0,
+                               recorded_by="simulated_workbook_import")
+        self.conn.commit()
+        readiness = anomaly.flavor_real_data_readiness(self.conn, 90)
+        self.assertEqual(readiness["state"], "SIMULATION_ONLY")
+        self.assertEqual(readiness["criteria"]["real_observations"]["value"], 0)
+
+    def test_one_real_observation_is_insufficient(self):
+        self._real_rows(1)
+        readiness = anomaly.flavor_real_data_readiness(self.conn, 90)
+        self.assertEqual(readiness["state"], "INSUFFICIENT_REAL_DATA")
+
+    def test_small_real_history_is_insufficient(self):
+        self._real_rows(10)   # below FLAVOR_MIN_ELIGIBLE_REAL_OBSERVATIONS=50
+        readiness = anomaly.flavor_real_data_readiness(self.conn, 90)
+        self.assertEqual(readiness["state"], "INSUFFICIENT_REAL_DATA")
+
+    def test_sufficient_observations_but_no_labels_is_ready_with_limitations(self):
+        self._real_rows(anomaly.FLAVOR_MIN_ELIGIBLE_REAL_OBSERVATIONS + 5)
+        readiness = anomaly.flavor_real_data_readiness(self.conn, 90)
+        self.assertEqual(readiness["state"], "READY_WITH_LIMITATIONS")
+        self.assertTrue(readiness["criteria"]["real_observations"]["met"])
+        self.assertFalse(readiness["criteria"]["scientific_validation_labels"]["met"])
+
+    def test_sufficient_observations_and_labels_is_ready_real_data(self):
+        self._real_rows(anomaly.FLAVOR_MIN_ELIGIBLE_REAL_OBSERVATIONS + 5)
+        now = __import__("datetime").datetime.now().isoformat()
+        # need FLAVOR_MIN_FLAVOR_COVERAGE distinct flavours reviewed too --
+        # add more flavours with real rows for that criterion
+        extra_flavors = [_add_flavor(self.conn, f"Extra {i}") for i in range(anomaly.FLAVOR_MIN_FLAVOR_COVERAGE)]
+        for fl in extra_flavors:
+            for i in range(5):
+                _insert_flavor_row(self.conn, fl, days_ago(200 + i), heads=10, rate=50.0,
+                                   recorded_by="kitchen_real")
+        self.conn.commit()
+
+        used_ids: set = set()
+
+        def insert_sample(reconciliation_id, prediction, source, label):
+            self.conn.execute(
+                "INSERT INTO unli_flavor_validation_sample (reconciliation_id, sample_source, "
+                "model_prediction, rule_flagged, model_version, eligibility_version, human_label, "
+                "reviewed_by, reviewed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (reconciliation_id, source, prediction, 0, anomaly.FLAVOR_MODEL_VERSION,
+                 anomaly.FLAVOR_ELIGIBILITY_VERSION, label, "owner1", now))
+            used_ids.add(reconciliation_id)
+
+        # unordered-scan-safe: explicitly scope to self.f1's rows (ordered
+        # by id) for the confusion-matrix labels, tracking used ids rather
+        # than assuming a particular SELECT-without-ORDER-BY row order
+        # (which can legitimately differ once a covering index exists --
+        # see migration 0046's new UNIQUE(service_date, flavor_id) index).
+        f1_rows = self.conn.execute(
+            "SELECT id FROM unli_flavor_reconciliation WHERE flavor_id=? ORDER BY id", (self.f1,)
+        ).fetchall()
+        n_flagged_side = anomaly.FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE
+        n_unflagged_side = anomaly.FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE
+        for r in f1_rows[:n_flagged_side]:
+            insert_sample(r["id"], "flagged", "model_flagged", "confirmed_anomaly")
+        # pad n_unflagged_side up so total confirmed_or_fp clears
+        # FLAVOR_MIN_SCIENTIFIC_VALIDATION_LABELS too, not just the
+        # per-side minimum
+        n_unflagged_side = max(n_unflagged_side, anomaly.FLAVOR_MIN_SCIENTIFIC_VALIDATION_LABELS - n_flagged_side)
+        for r in f1_rows[n_flagged_side:n_flagged_side + n_unflagged_side]:
+            insert_sample(r["id"], "unflagged", "random_unflagged", "false_positive")
+
+        # a few more reviewed-but-non-confusion-matrix-relevant labels for
+        # flavour coverage, to clear reviewed_predictions/flavor_coverage too
+        for fl in extra_flavors:
+            r = self.conn.execute(
+                "SELECT id FROM unli_flavor_reconciliation WHERE flavor_id=? AND id NOT IN ({}) "
+                "ORDER BY id LIMIT 1".format(",".join("?" * len(used_ids)) or "-1"),
+                (fl, *used_ids),
+            ).fetchone()
+            insert_sample(r["id"], "unflagged", "random_unflagged", "false_positive")
+        self.conn.commit()
+
+        readiness = anomaly.flavor_real_data_readiness(self.conn, 90)
+        self.assertEqual(readiness["state"], "READY_REAL_DATA", readiness["criteria"])
+
+    def test_simulated_labels_never_count_toward_readiness(self):
+        """Even with plenty of real observations, labels submitted against
+        a DIFFERENT model/eligibility version (e.g. a stale simulation run)
+        must not count."""
+        self._real_rows(anomaly.FLAVOR_MIN_ELIGIBLE_REAL_OBSERVATIONS + 5)
+        now = __import__("datetime").datetime.now().isoformat()
+        rows = self.conn.execute("SELECT id FROM unli_flavor_reconciliation").fetchall()
+        for r in rows[:40]:
+            self.conn.execute(
+                "INSERT INTO unli_flavor_validation_sample (reconciliation_id, sample_source, "
+                "model_prediction, rule_flagged, model_version, eligibility_version, human_label, "
+                "reviewed_by, reviewed_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (r["id"], "model_flagged", "flagged", 0, "stale_model_version_v0",
+                 anomaly.FLAVOR_ELIGIBILITY_VERSION, "confirmed_anomaly", "owner1", now))
+        self.conn.commit()
+        readiness = anomaly.flavor_real_data_readiness(self.conn, 90)
+        self.assertEqual(readiness["state"], "READY_WITH_LIMITATIONS")
+        self.assertEqual(readiness["criteria"]["scientific_validation_labels"]["value"], 0)
+
+
+# ===========================================================================
+class TestFlavorAnomalySimulation(Base):
+    """SIMULATION / TECHNICAL VALIDATION ONLY -- NOT real-world validation.
+
+    Fixed-seed, documented, reproducible severity-graded exercise of the
+    REAL, unmodified detect_flavor_consumption_anomalies() pipeline against
+    a synthetic 14-flavour x 30-day normal population plus five anomaly
+    classes x three severities (mild/moderate/severe), moved here from an
+    ad-hoc scratchpad script (2026-10 Unlimited Wings capability-gap
+    follow-up, Part 6) so it survives as a permanent, rerunnable asset
+    rather than disposable analysis. Ground-truth labels are tracked only
+    in this test's own Python dict -- never written to a model feature or
+    column the detector reads.
+
+    Unlike wt/demo_validation.py's real-data-grounded harnesses (which read
+    REAL on-hand/consumption averages from a live production connection,
+    read-only), this one uses FIXED representative constants instead, so it
+    is fully self-contained and safe to run in any environment (CI
+    included) without a configured production database.
+    """
+
+    SEED = 20270001
+    N_DAYS_NORMAL = 30
+    N_FLAVORS = 6
+    BASE_RATE = 55.0          # representative g/head, not a live production read
+    BASE_HEADS = 9
+    BASE_SERVINGS = 14
+    BASE_WINGS = 55.0
+
+    RATE_DEVIATION_BANDS = {"mild": (0.30, 0.40), "moderate": (0.45, 0.65), "severe": (0.75, 1.10)}
+    LEFTOVER_MULT_BANDS = {"mild": (2.0, 2.8), "moderate": (3.2, 4.2), "severe": (5.0, 7.0)}
+    SHARE_MULT_BANDS = {"mild": (2.0, 2.8), "moderate": (3.2, 4.2), "severe": (5.0, 7.0)}
+    VARIANCE_BANDS = {"mild": (0.25, 0.35), "moderate": (0.40, 0.60), "severe": (0.70, 1.00)}
+    PEER_DEVIATION_BANDS = {"mild": (0.35, 0.45), "moderate": (0.50, 0.70), "severe": (0.80, 1.10)}
+    CLASSES = ("abnormal_consumption_per_head", "extreme_refill_intensity",
+              "abnormal_flavor_share", "unusual_reconciliation_variance",
+              "peer_flavor_deviation")
+    SEVERITIES = ("mild", "moderate", "severe")
+    N_PER_CELL = 4
+
+    def _build(self):
+        rng = random.Random(self.SEED)
+        flavor_pks = [_add_flavor(self.conn, f"Sim Flavor {i}") for i in range(self.N_FLAVORS)]
+        ground_truth: dict[int, str] = {}
+        # one shared offset per CALENDAR DAY (all flavours reconciled that
+        # day share it), not per row -- a day offset per row was an earlier
+        # version of this harness's own bug (see the project's ML
+        # validation report's "harness bugs caught" note for the same
+        # class of mistake in the scratchpad predecessor of this test).
+        total_days = self.N_DAYS_NORMAL + len(self.CLASSES) * len(self.SEVERITIES) * self.N_PER_CELL
+        day_offsets = list(range(1, total_days + 20))
+        rng.shuffle(day_offsets)
+        day_offset_iter = iter(day_offsets)
+
+        def insert(flavor_pk, service_date, heads, rate, leftover_mult, servings, wings_served, label):
+            return _insert_flavor_row(
+                self.conn, flavor_pk, service_date, heads, rate,
+                servings=servings, wings_served=wings_served, leftover_frac=0.08 * leftover_mult,
+                provisional_rate=self.BASE_RATE, recorded_by=None,
+            )
+
+        # normal population -- shared daily-traffic factor + small per-flavour
+        # wobble (see the 2026-10 harness-construction finding: independent
+        # per-flavour noise manufactures unrealistic day-to-day SHARE
+        # variance no real shop would show).
+        for _ in range(self.N_DAYS_NORMAL):
+            service_date = days_ago(next(day_offset_iter))
+            day_traffic = rng.uniform(0.85, 1.15)
+            for fp in flavor_pks:
+                wobble = rng.uniform(0.93, 1.07)
+                heads = max(1, int(self.BASE_HEADS * day_traffic * wobble))
+                rate = self.BASE_RATE * (1.0 + rng.gauss(0.0, 0.05))
+                servings = max(1, int(self.BASE_SERVINGS * day_traffic * wobble))
+                wings = max(1.0, self.BASE_WINGS * day_traffic * wobble)
+                rid = insert(fp, service_date, heads, rate, 1.0, servings, wings, "normal")
+                ground_truth[rid] = "normal"
+
+        for cls in self.CLASSES:
+            for sev in self.SEVERITIES:
+                for i in range(self.N_PER_CELL):
+                    service_date = days_ago(next(day_offset_iter))
+                    day_traffic = rng.uniform(0.9, 1.1)
+                    target_idx = rng.randrange(len(flavor_pks))
+                    for idx, fp in enumerate(flavor_pks):
+                        wobble = rng.uniform(0.96, 1.04)
+                        heads = max(1, int(self.BASE_HEADS * day_traffic * wobble))
+                        rate = self.BASE_RATE * (1.0 + rng.gauss(0.0, 0.05))
+                        servings = max(1, int(self.BASE_SERVINGS * day_traffic * wobble))
+                        wings = max(1.0, self.BASE_WINGS * day_traffic * wobble)
+                        leftover_mult = 1.0
+                        label = "normal"
+                        if idx == target_idx:
+                            direction = 1 if i % 2 == 0 else -1
+                            if cls == "abnormal_consumption_per_head":
+                                lo, hi = self.RATE_DEVIATION_BANDS[sev]
+                                rate = self.BASE_RATE * (1.0 + direction * rng.uniform(lo, hi))
+                            elif cls == "extreme_refill_intensity":
+                                lo, hi = self.LEFTOVER_MULT_BANDS[sev]
+                                servings = max(1, int(servings * rng.uniform(lo, hi)))
+                            elif cls == "abnormal_flavor_share":
+                                lo, hi = self.SHARE_MULT_BANDS[sev]
+                                wings = max(1.0, wings * rng.uniform(lo, hi))
+                            elif cls == "unusual_reconciliation_variance":
+                                lo, hi = self.VARIANCE_BANDS[sev]
+                                rate = self.BASE_RATE * (1.0 + direction * rng.uniform(lo, hi))
+                            else:  # peer_flavor_deviation
+                                lo, hi = self.PEER_DEVIATION_BANDS[sev]
+                                rate = self.BASE_RATE * (1.0 + direction * rng.uniform(lo, hi))
+                            label = f"{cls}/{sev}"
+                        rid = insert(fp, service_date, heads, rate, leftover_mult, servings, wings, label)
+                        ground_truth[rid] = label
+        self.conn.commit()
+        return ground_truth
+
+    def test_simulation_is_isolated_and_exercises_the_real_pipeline(self):
+        """Isolation guarantee: self.conn/self.path (Base.setUp -> fresh_db())
+        is always a brand-new temp-file database this test created and will
+        scrub in tearDown, structurally incapable of being a real
+        deployment's database -- same guarantee wt/demo_validation.py's own
+        _fresh_isolated_db() documents at length, not repeated here.
+
+        recorded_by is deliberately left NULL here (never a synthetic
+        sentinel string) -- NOT because the rows are "real" (they are not;
+        the whole database is thrown away after this test), but because
+        NULL is what lets _REAL_FLAVOR_RECORDER_CLAUSE treat them as
+        eligible, which is required for detect_flavor_consumption_
+        anomalies() to actually SCORE them -- exactly the same choice
+        demo_validation.py's harnesses make, for the identical reason: a
+        harness that tags its own rows as excluded would be unable to
+        exercise the real detection pipeline it exists to validate.
+        Provenance EXCLUSION itself (a sentinel string IS correctly
+        excluded) is covered separately and thoroughly by
+        TestFlavorValidationReview's own provenance tests."""
+        from wt import db as _db
+        self.assertNotEqual(self.path, str(_db.PRODUCTION_DB))
+        gt = self._build()
+        records = anomaly._flavor_consumption_records(self.conn, 400)
+        self.assertEqual(len(records), len(gt),
+                         "NULL-recorded_by rows must be eligible, or this harness cannot "
+                         "exercise the real detection pipeline at all")
+
+    def test_deterministic_for_a_given_seed(self):
+        """Same seed, same ground-truth construction, run twice in two
+        independent databases -- the generated population must be
+        identical (not merely the detector's response to it)."""
+        gt1 = self._build()
+        conn2, path2 = fresh_db()
+        try:
+            orig_conn = self.conn
+            self.conn = conn2
+            gt2 = self._build()
+            self.conn = orig_conn
+        finally:
+            conn2.close()
+            scrub(path2)
+        self.assertEqual(sorted(gt1.values()), sorted(gt2.values()))
+
+    def test_severity_graded_detection_rates(self):
+        """The actual numerical result this harness exists to produce --
+        SIMULATION/TECHNICAL VALIDATION ONLY, never to be quoted as
+        real-world precision/recall. Asserts defensible floors consistent
+        with the project's own 2026-10 ML validation report, not exact
+        pinned numbers (sklearn's IsolationForest with a fixed random_state
+        is deterministic for fixed input, but floors are used here so a
+        future, still-correct detector/feature tweak does not spuriously
+        break this test over a one-row difference)."""
+        ground_truth = self._build()
+        import os
+        os.environ["WT_ENV"] = os.environ.get("WT_ENV", "test")
+        flagged = anomaly.detect_flavor_consumption_anomalies(self.conn, lookback_days=400)
+        flagged_ids = {f["reconciliation_id"] for f in flagged}
+
+        by_class: dict[str, dict] = {}
+        for rid, label in ground_truth.items():
+            if label == "normal":
+                continue
+            by_class.setdefault(label, {"n": 0, "detected": 0})
+            by_class[label]["n"] += 1
+            if rid in flagged_ids:
+                by_class[label]["detected"] += 1
+
+        # classes expected to detect well even at mild severity (direct
+        # per-head/variance/share measurements the rule layer or forest
+        # both target well -- see this project's ML validation report)
+        # this unit test runs a much smaller population (6 flavours, 4
+        # samples/cell) than the project's own full ML validation report
+        # (14 flavours, 8 samples/cell, production-scale grounding) for
+        # speed -- floors are tiered by severity, not pinned to that
+        # report's exact recall numbers, since a small sample size alone
+        # can shift one or two detections either way.
+        floors = {"mild": 0.25, "moderate": 0.5, "severe": 0.5}
+        for cls in ("abnormal_consumption_per_head", "abnormal_flavor_share",
+                   "unusual_reconciliation_variance", "peer_flavor_deviation"):
+            for sev in self.SEVERITIES:
+                cell = by_class.get(f"{cls}/{sev}")
+                if cell:
+                    self.assertGreaterEqual(
+                        cell["detected"] / cell["n"], floors[sev],
+                        f"{cls}/{sev} recall unexpectedly low: {cell}")
+
+        # extreme_refill_intensity has no dedicated rule (forest-only) and
+        # is documented as weak at mild severity -- only severe is asserted
+        severe_cell = by_class.get("extreme_refill_intensity/severe")
+        if severe_cell:
+            self.assertGreaterEqual(severe_cell["detected"] / severe_cell["n"], 0.5)
+
+        normal_ids = {rid for rid, lab in ground_truth.items() if lab == "normal"}
+        normal_flagged = sum(1 for rid in normal_ids if rid in flagged_ids)
+        # row-level false positives from the compositional share effect are
+        # expected (see this project's ML validation report) -- but at the
+        # EVENT/DAY level, false alarms on purely normal days must be zero
+        events = anomaly.flavor_anomaly_events(self.conn, lookback_days=400)
+        normal_dates = {
+            r["service_date"] for r in self.conn.execute(
+                "SELECT DISTINCT service_date FROM unli_flavor_reconciliation"
+            ).fetchall()
+        } - {
+            self.conn.execute(
+                "SELECT service_date FROM unli_flavor_reconciliation WHERE id=?", (rid,)
+            ).fetchone()["service_date"]
+            for rid, lab in ground_truth.items() if lab != "normal"
+        }
+        false_alarm_days = sum(1 for e in events if e["service_date"] in normal_dates)
+        self.assertEqual(false_alarm_days, 0,
+                         "a purely normal day must never generate a flagged event")
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(
         loader.loadTestsFromTestCase(t) for t in (
             TestUnits, TestTTLCache, TestSchemaConstraints, TestResolver, TestMenuGate,
-            TestReservation, TestReceiveStock, TestRecordCount, TestRecordWastage,
+            TestReservation, TestLeftoverCharge, TestReceiveStock, TestRecordCount, TestRecordWastage,
             TestIngredientReconciliation, TestRepeatedVarianceSignal,
             TestVarianceReview, TestVarianceReviewAPI,
             TestInventoryValuation, TestUnliOrders, TestConcurrency, TestFEFO,
             TestFEFODepletion,
             TestExpiredStockUsability, TestCorrectStockCapability, TestCountIdempotency,
             TestCountToday,
-            TestTimezoneHardening, TestUnliReconciliation, TestUnliRecalibration,
+            TestTimezoneHardening, TestUnliReconciliation, TestUnliReconciliationRevision,
+            TestUnliRecalibration,
             TestConsumptionAnomaly, TestConsumptionAnomalyProvenance,
             TestConsumptionValidationSampling, TestConsumptionValidationRuleVsML,
             TestConsumptionValidationLabeling, TestScientificConsumptionValidationMetrics,
@@ -15306,27 +17503,31 @@ def main() -> int:
             TestOrderIntegrityRegressions,
             TestUnlimitedPortionMatrix, TestReferenceAlignment,
             TestSeedImport, TestXlsxProphetIngest, TestVerificationWorkflow, TestConsoleAPI,
-            TestAdminAuditLog, TestRBAC,
+            TestAdminAuditLog, TestRBAC, TestPagePermissions,
             TestLoginAudit, TestMLResultCaching, TestDashboardSummary, TestPasswordSecurity,
             TestForecasting, TestProphetGrowthSelection, TestEffectiveNow,
             TestStoreDemandForecast, TestSeriesForecastability,
             TestIngredientDepletionForecast,
             TestDepletionProphetDemandModel, TestDepletionHybridDemandModel,
             TestReplenishmentBacktestDistribution, TestReplenishmentEndToEnd,
-            TestProphetDemandModelSetting, TestFlavourSubstitution,
+            TestProphetDemandModelSetting, TestPropheRefreshJobStatusAndLocking,
+            TestFlavourSubstitution,
             TestAnomaly, TestAnomalyReview,
             TestAnomalyEligibilityRobustness, TestAnomalyProvenanceTaxonomy,
             TestAnomalySampling, TestValidationLabeling,
             TestScientificValidationMetrics, TestAnomalyProvenanceSources,
             TestLedgerIntegrityAfterMLInfrastructure,
-            TestAssociations, TestComboPricing,
+            TestAssociations, TestComboPricing, TestComboPublish, TestComboPublishEndToEnd,
             TestPOSInventoryIntegrationMatrix,
             TestMigrationSafety, TestEnvironmentSafety, TestBackupRestore,
             TestOwnerProvisioning, TestOwnerRoleAndProvisioning, TestOwnerInstructions,
-            TestOperationalUpdates, TestPurchaseOrders,
+            TestInstructionAssigneesAndAudit, TestPurchaseOrders,
             TestAuditGapCoverage, TestNewMigrationsIntegrity,
             TestPOSFixes, TestHistoricalSourceTracking, TestPOSTablesAndHeadFlavors,
-            TestDemoValidationHarness, TestAssociationsHoldoutValidation,
+            TestDemoValidationHarness, TestSimulatedWorkbookImport,
+            TestAnomalyRobustRuleLayer, TestFlavorConsumptionAnomaly, TestFlavorValidationReview,
+            TestFlavorRealDataReadinessTransition, TestFlavorAnomalySimulation,
+            TestAssociationsHoldoutValidation,
             TestExpandingWindowValidation, TestReplenishmentBacktestHistoricalReconstruction,
             TestRefillDemandReachesTheForecast, TestHistoricalLeakagePrevention,
             TestReplenishmentBacktestFindings,

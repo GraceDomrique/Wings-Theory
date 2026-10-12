@@ -24,6 +24,21 @@
 -- app_user, for the same reason owner_instruction's own created_by is a
 -- plain username string: the record should read the same way years later
 -- even if the account is later deactivated.
+--
+-- 2026-10 DEPRECATED, ORPHANED: wt/updates.py (this table's only reader and
+-- writer) and its 3 API routes were deleted when the free-text "Messages"
+-- channel was replaced by Instructions (owner_instruction) as the sole
+-- Owner<->Admin channel -- see that work's own commit for the reasoning.
+-- Nothing in this codebase reads or writes this table any more (confirmed:
+-- grep -rn operational_update backend/wt backend/migrations finds zero
+-- hits outside this file). Left in place deliberately, not dropped: any
+-- rows a real deployment already wrote before the removal are historical
+-- records, and dropping a table on a live database is a materially
+-- different risk than leaving an unused one — see the 2026-10
+-- post-implementation audit, which flagged this as safe-to-leave rather
+-- than safe-to-drop. If this is ever revisited, drop it only via its own
+-- reviewed migration with a real dependency check against production data,
+-- never as a side effect of an unrelated change.
 -- -----------------------------------------------------------------------------
 CREATE TABLE operational_update (
   id                    INTEGER PRIMARY KEY AUTOINCREMENT,

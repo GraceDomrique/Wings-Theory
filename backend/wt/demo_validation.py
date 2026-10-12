@@ -58,10 +58,14 @@ import datetime as _dt
 import os
 import random
 import sqlite3
+import statistics
 import tempfile
 from pathlib import Path
 
-from . import anomaly, db, timeutil
+import openpyxl
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+from . import anomaly, db, simulated_workbook_import as swi, timeutil
 
 MODE = "DEMO_SIMULATION"
 
@@ -528,6 +532,527 @@ def simulate_unli_consumption_validation(
             "sample_consumption_for_review_result": sample_result,
             "labels_submitted": labeled,
             "scientific_consumption_validation_metrics": metrics,
+        }
+    finally:
+        conn.close()
+        _scrub(path)
+
+
+# ===========================================================================
+# Pass A / Pass C, scored against the SECOND workbook's own injected ground
+# truth (data/Wings_Theory_1_Year_Historical_Collection_simulatedd.xlsx,
+# "Injected Synthetic Truth" column on Stock Counts/Unli Reconciliation) --
+# NOT this module's own RNG-generated fixtures above. Same isolation
+# contract as the rest of this file: a brand-new throwaway database, never
+# the production one; the ONLY thing read from `real_conn` is the real
+# ingredient/unli_flavor reference catalog (names, units, FK shape), never
+# any row this harness itself writes. Ground truth lives only in this
+# function's own Python dict, built straight from the workbook, exactly
+# like the RNG harnesses above never persist their ground truth to a schema
+# column. Every synthetic row here is written with user_id/recorded_by=NULL
+# (not wt.simulated_workbook_import.USER_ID) specifically so the REAL
+# detect_anomalies()/detect_flavor_consumption_anomalies() -- run completely
+# unmodified -- see it as eligible inside THIS throwaway database; this is
+# the opposite tagging choice from the production importer, which stamps
+# USER_ID precisely so the SAME rows are structurally excluded once they
+# land in the real database. Per the workbook's own "ML Evaluation
+# Requirements" sheet, these IsolationForest results answer "does the
+# synthetic pipeline correctly flag an injected anomaly," never "is this
+# production-accurate" (production_validated is always False here).
+# ===========================================================================
+
+def _copy_ingredients_for_workbook(real_conn: sqlite3.Connection, iso_conn: sqlite3.Connection,
+                                   norm_ids: set[str]) -> dict[str, dict]:
+    rows = real_conn.execute(
+        "SELECT id, ingredient_id, name, category, base_unit, purchase_unit, "
+        "pack_size, pack_size_status, unit_cost, unit_cost_status, yield_factor FROM ingredient"
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        norm = swi._norm_ingredient_ref(r["ingredient_id"])
+        if norm not in norm_ids:
+            continue
+        cur = iso_conn.execute(
+            "INSERT INTO ingredient (ingredient_id, name, category, base_unit, "
+            "purchase_unit, pack_size, pack_size_status, on_hand_base, unit_cost, "
+            "unit_cost_status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (r["ingredient_id"], r["name"], r["category"], r["base_unit"], r["purchase_unit"],
+             r["pack_size"] or 1.0, r["pack_size_status"], 0.0,
+             r["unit_cost"] or 1.0, r["unit_cost_status"]),
+        )
+        out[norm] = {"id": cur.lastrowid, "ingredient_id": r["ingredient_id"], "base_unit": r["base_unit"],
+                    "pack_size": r["pack_size"], "yield_factor": r["yield_factor"]}
+    iso_conn.commit()
+    return out
+
+
+def _copy_flavors_for_workbook(real_conn: sqlite3.Connection, iso_conn: sqlite3.Connection,
+                               flavor_names: set[str]) -> dict[str, dict]:
+    rows = real_conn.execute(
+        "SELECT f.display_name, f.flavor_type, i.name, i.category, i.base_unit, "
+        "i.purchase_unit, i.pack_size, i.pack_size_status, i.unit_cost, i.unit_cost_status "
+        "FROM unli_flavor f JOIN ingredient i ON i.id = f.ingredient_id"
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        if r["display_name"] not in flavor_names:
+            continue
+        cur = iso_conn.execute(
+            "INSERT INTO ingredient (ingredient_id, name, category, base_unit, "
+            "purchase_unit, pack_size, pack_size_status, on_hand_base, unit_cost, "
+            "unit_cost_status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (f"WB-FLAVOR-{r['display_name']}", r["name"], r["category"], r["base_unit"],
+             r["purchase_unit"], r["pack_size"] or 1.0, r["pack_size_status"], 0.0,
+             r["unit_cost"] or 1.0, r["unit_cost_status"]),
+        )
+        ing_pk = cur.lastrowid
+        cur2 = iso_conn.execute(
+            "INSERT INTO unli_flavor (ingredient_id, display_name, flavor_type) VALUES (?,?,?)",
+            (ing_pk, r["display_name"], r["flavor_type"] or "included"),
+        )
+        out[r["display_name"]] = {"id": cur2.lastrowid, "display_name": r["display_name"],
+                                  "base_unit": r["base_unit"]}
+    iso_conn.commit()
+    return out
+
+
+def _confusion_matrix(id_to_ref: dict[int, str], ground_truth: dict[str, str],
+                      flagged_ids: set[int], anomaly_label: str) -> dict:
+    tp = fp = fn = tn = 0
+    for rid, ref in id_to_ref.items():
+        is_anomaly = ground_truth.get(ref) == anomaly_label
+        is_flagged = rid in flagged_ids
+        if is_anomaly and is_flagged:
+            tp += 1
+        elif not is_anomaly and is_flagged:
+            fp += 1
+        elif is_anomaly and not is_flagged:
+            fn += 1
+        else:
+            tn += 1
+    precision = (tp / (tp + fp)) if (tp + fp) > 0 else None
+    recall = (tp / (tp + fn)) if (tp + fn) > 0 else None
+    f1 = (2 * precision * recall / (precision + recall)) if precision and recall and (precision + recall) > 0 else None
+    return {
+        "confusion_matrix": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        "precision": round(precision, 3) if precision is not None else None,
+        "recall": round(recall, 3) if recall is not None else None,
+        "f1": round(f1, 3) if f1 is not None else None,
+    }
+
+
+def _chronological_calibrate_and_score(
+    items: list[tuple[str, str, float, str]], train_fraction: float = 0.6,
+) -> dict:
+    """Shared threshold-calibration step for the two workbook-ground-truth
+    IsolationForest harnesses below. `items` is (ref, date_str, score,
+    truth_label) tuples for every record the model scored (score = the
+    model's own continuous IsolationForest decision score, public
+    convention higher-is-more-anomalous, exactly what anomaly.py's
+    `_evaluate_*` functions already compute). Sorted chronologically and
+    split into an EARLIER train fold (threshold search only -- never sees
+    which split element it is scored against) and a LATER held-out test
+    fold, so the reported test-fold metrics never came from a threshold
+    chosen with knowledge of those same labels. The threshold itself is
+    whichever score cutoff maximizes F1 on the train fold alone; ties
+    broken toward the higher (stricter) cutoff.
+    """
+    items = sorted(items, key=lambda t: t[1])
+    n = len(items)
+    cut = max(1, int(n * train_fraction))
+    train, test = items[:cut], items[cut:]
+
+    def _f1_at(fold, threshold):
+        tp = sum(1 for _, _, s, y in fold if s >= threshold and y == "ANOMALY")
+        fp = sum(1 for _, _, s, y in fold if s >= threshold and y == "NORMAL")
+        fn = sum(1 for _, _, s, y in fold if s < threshold and y == "ANOMALY")
+        precision = tp / (tp + fp) if (tp + fp) else 0.0
+        recall = tp / (tp + fn) if (tp + fn) else 0.0
+        return (2 * precision * recall / (precision + recall)) if (precision + recall) else 0.0
+
+    candidate_thresholds = sorted({round(s, 4) for _, _, s, _ in train}, reverse=True)
+    best_threshold, best_f1 = (candidate_thresholds[0] if candidate_thresholds else 0.0), -1.0
+    for thr in candidate_thresholds:
+        f1 = _f1_at(train, thr)
+        if f1 > best_f1:
+            best_f1, best_threshold = f1, thr
+
+    tp = fp = fn = tn = 0
+    for _, _, s, y in test:
+        pred_pos = s >= best_threshold
+        is_pos = y == "ANOMALY"
+        if pred_pos and is_pos:
+            tp += 1
+        elif pred_pos and not is_pos:
+            fp += 1
+        elif not pred_pos and is_pos:
+            fn += 1
+        else:
+            tn += 1
+    precision = (tp / (tp + fp)) if (tp + fp) > 0 else None
+    recall = (tp / (tp + fn)) if (tp + fn) > 0 else None
+    f1 = (2 * precision * recall / (precision + recall)) if precision and recall and (precision + recall) > 0 else None
+    fpr = (fp / (fp + tn)) if (fp + tn) > 0 else None
+
+    test_scores = [s for _, _, s, _ in test]
+    test_labels = [1 if y == "ANOMALY" else 0 for _, _, _, y in test]
+    roc_auc = pr_auc = None
+    if test_labels and 0 < sum(test_labels) < len(test_labels):
+        roc_auc = round(float(roc_auc_score(test_labels, test_scores)), 4)
+        pr_auc = round(float(average_precision_score(test_labels, test_scores)), 4)
+
+    return {
+        "calibration_method": (
+            "Chronological 60/40 split; decision threshold = the IsolationForest score "
+            "cutoff maximizing F1 on the train fold only, applied unchanged to the test fold. "
+            "ROC-AUC/PR-AUC computed on the test fold's continuous scores (threshold-free)."
+        ),
+        "train_fold": {"n": len(train), "n_anomalous": sum(1 for *_, y in train if y == "ANOMALY"),
+                       "date_range": [train[0][1], train[-1][1]] if train else None},
+        "test_fold": {"n": len(test), "n_anomalous": sum(1 for *_, y in test if y == "ANOMALY"),
+                     "date_range": [test[0][1], test[-1][1]] if test else None},
+        "chosen_threshold": round(best_threshold, 4),
+        "train_f1_at_threshold": round(best_f1, 4),
+        "confusion_matrix": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        "precision": round(precision, 3) if precision is not None else None,
+        "recall": round(recall, 3) if recall is not None else None,
+        "f1": round(f1, 3) if f1 is not None else None,
+        "false_positive_rate": round(fpr, 4) if fpr is not None else None,
+        "roc_auc": roc_auc,
+        "pr_auc": pr_auc,
+        "alert_rate": round((tp + fp) / len(test), 4) if test else None,
+    }
+
+
+def simulate_stock_loss_from_workbook(
+    real_conn: sqlite3.Connection, source_path: Path | None = None, lookback_days: int = 420,
+) -> dict:
+    """Pass A (stock-loss IsolationForest) scored against simulatedd.xlsx's
+    own injected ground truth (Stock Counts' "Injected Synthetic Truth" ==
+    INJECTED_STOCK_LOSS / SYNTHETIC_NORMAL). See this section's own
+    docstring above for the isolation contract."""
+    source_path = source_path or swi.XLSX_PATH
+    wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+    wastage_raw = swi._load_sheet(wb, swi._WASTAGE_SHEET)
+    counts_raw = swi._load_sheet(wb, swi._COUNTS_SHEET)
+    receiving_raw = swi._load_sheet(wb, swi._RECEIVING_SHEET)
+    wb.close()
+
+    norm_ids = {swi._norm_ingredient_ref(r.get("Ingredient ID")) for r in wastage_raw + counts_raw}
+    norm_ids.discard(None)
+
+    conn, path = _fresh_isolated_db()
+    try:
+        ingredients = _copy_ingredients_for_workbook(real_conn, conn, norm_ids)
+        if not ingredients:
+            return {"mode": MODE, "available": False,
+                   "reason": "no real ingredient rows matched the workbook's Ingredient IDs"}
+
+        wastage_ok, _ = swi._validate_rows(
+            wastage_raw, id_col="Waste ID", ingredient_col="Ingredient ID",
+            qty_cols=["Quantity (base units)"], ingredients=ingredients,
+        )
+        counts_ok, _ = swi._validate_rows(
+            counts_raw, id_col="Count ID", ingredient_col="Ingredient ID",
+            qty_cols=["System Expected Qty (base units)", "Physical Count Qty (base units)"],
+            ingredients=ingredients,
+        )
+        receiving_ok, _ = swi._validate_rows(
+            receiving_raw, id_col="Receipt ID", ingredient_col="Ingredient ID",
+            qty_cols=["Ordered Qty", "Received Qty"], ingredients=ingredients,
+        )
+        ground_truth = {r["Waste ID"]: r.get("Injected Synthetic Truth") for r in wastage_ok}
+        ground_truth.update({r["Count ID"]: r.get("Injected Synthetic Truth") for r in counts_ok})
+
+        # receiving_rows folded into the balance bookkeeping only (no ledger
+        # row) -- see _replay_ledger's 2026-10-08 docstring update: without
+        # this, a count's delta/fraction wrongly includes interim restocking
+        # as if it were loss, which was the dominant source of false
+        # positives in the rule-based layer below.
+        ledger_rows = swi._replay_ledger(conn, wastage_ok, counts_ok, ingredients, receiving_rows=receiving_ok)
+        id_to_ref: dict[int, str] = {}
+        for lr in ledger_rows:
+            lid = swi.insert_ledger_row(conn, lr, None)
+            id_to_ref[lid] = lr["ref_id"]
+        conn.commit()
+
+        # "default" numbers: the REAL, unmodified detect_anomalies() (rule
+        # layer + IsolationForest cap, production's own thresholds) --
+        # answers "how does the model behave out of the box on the
+        # receiving-balance-corrected data," before any calibration below.
+        flagged = anomaly.detect_anomalies(conn, lookback_days=lookback_days)
+        flagged_ids = {f["ledger_id"] for f in flagged}
+        default_scored = _confusion_matrix(id_to_ref, ground_truth, flagged_ids, "INJECTED_STOCK_LOSS")
+        n_anomalous = sum(1 for v in ground_truth.values() if v == "INJECTED_STOCK_LOSS")
+
+        # "calibrated" numbers: the model's own continuous IsolationForest
+        # score (_evaluate_stock_loss's `score` field -- same fit, same
+        # features, nothing recomputed), with a decision threshold chosen
+        # on an earlier chronological fold and tested on a later one.
+        records, _ = anomaly._evaluate_stock_loss(conn, lookback_days=lookback_days)
+        items = []
+        for rec in records:
+            ref = id_to_ref.get(rec["row"]["id"])
+            if ref is None or rec["score"] is None:
+                continue
+            truth = "ANOMALY" if ground_truth.get(ref) == "INJECTED_STOCK_LOSS" else "NORMAL"
+            items.append((ref, rec["row"]["created_at"], rec["score"], truth))
+        calibrated = (_chronological_calibrate_and_score(items) if items else
+                     {"available": False, "reason": "IsolationForest did not train (pool below MIN_POOLED_SAMPLES)"})
+
+        return {
+            "mode": MODE,
+            "available": True,
+            "production_validated": False,
+            "methodology": (
+                "Wastage Log + Stock Counts + Receiving Log rows from simulatedd.xlsx replayed "
+                "into an isolated, throwaway database (never production) against REAL "
+                "ingredient reference rows copied read-only from the live database. Ground "
+                "truth is the workbook's own 'Injected Synthetic Truth' column, read directly."
+            ),
+            "source_workbook": str(source_path),
+            "sample_count": len(id_to_ref),
+            "ground_truth_counts": {"INJECTED_STOCK_LOSS": n_anomalous,
+                                    "SYNTHETIC_NORMAL": len(ground_truth) - n_anomalous},
+            "default_thresholds": {
+                "description": "detect_anomalies() as shipped: rule layer (fraction>=0.25) OR "
+                               "IsolationForest capped to the worst 10% of the pool.",
+                "detect_anomalies_flagged_count": len(flagged),
+                "alert_rate": round(len(flagged_ids) / len(id_to_ref), 4) if id_to_ref else None,
+                **default_scored,
+            },
+            "calibrated": calibrated,
+        }
+    finally:
+        conn.close()
+        _scrub(path)
+
+
+def simulate_flavor_consumption_from_workbook(
+    real_conn: sqlite3.Connection, source_path: Path | None = None, lookback_days: int = 420,
+) -> dict:
+    """Pass C (flavour-level consumption IsolationForest) scored against
+    simulatedd.xlsx's own injected ground truth (Unli Reconciliation's
+    "Injected Synthetic Truth" == INJECTED_CONSUMPTION_ANOMALY /
+    SYNTHETIC_NORMAL). See this section's own docstring above for the
+    isolation contract. The workbook has no equivalent sheet for the
+    generic (non-flavour) unli consumption stream Pass B scores -- callers
+    needing that number must report it unavailable rather than substitute
+    this one, per the workbook's own 'ML Evaluation Requirements' sheet."""
+    source_path = source_path or swi.XLSX_PATH
+    wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+    recon_raw = swi._load_sheet(wb, swi._RECONCILIATION_SHEET)
+    wb.close()
+
+    def _strip(raw):
+        return raw[len(swi._FLAVOR_PREFIX):] if raw and raw.startswith(swi._FLAVOR_PREFIX) else raw
+
+    flavor_names = {_strip(r.get("Flavor")) for r in recon_raw}
+    flavor_names.discard(None)
+
+    conn, path = _fresh_isolated_db()
+    try:
+        flavors = _copy_flavors_for_workbook(real_conn, conn, flavor_names)
+        if not flavors:
+            return {"mode": MODE, "available": False,
+                   "reason": "no real unli_flavor rows matched the workbook's Flavor names"}
+
+        recon_ok = []
+        for row in recon_raw:
+            name = _strip(row.get("Flavor"))
+            if row.get("Reconciliation ID") and name in flavors:
+                recon_ok.append({**row, "_flavor_name": name})
+        ground_truth = {r["Reconciliation ID"]: r.get("Injected Synthetic Truth") for r in recon_ok}
+
+        batch_id = f"workbook-eval-{_dt.datetime.now().strftime('%Y%m%d%H%M%S')}"
+        id_to_ref: dict[int, str] = {}
+        for row in recon_ok:
+            ref = row["Reconciliation ID"]
+            flavor = flavors[row["_flavor_name"]]
+            lid = swi.insert_reconciliation_row(conn, row, flavor, ref, batch_id, None)
+            id_to_ref[lid] = ref
+        conn.commit()
+
+        flagged = anomaly.detect_flavor_consumption_anomalies(conn, lookback_days=lookback_days)
+        flagged_ids = {f["reconciliation_id"] for f in flagged}
+        default_scored = _confusion_matrix(id_to_ref, ground_truth, flagged_ids, "INJECTED_CONSUMPTION_ANOMALY")
+        n_anomalous = sum(1 for v in ground_truth.values() if v == "INJECTED_CONSUMPTION_ANOMALY")
+
+        records, _ = anomaly._evaluate_flavor_consumption(conn, lookback_days=lookback_days)
+        items = []
+        for rec in records:
+            ref = id_to_ref.get(rec["row"]["reconciliation_id"])
+            if ref is None or rec["score"] is None:
+                continue
+            truth = "ANOMALY" if ground_truth.get(ref) == "INJECTED_CONSUMPTION_ANOMALY" else "NORMAL"
+            items.append((ref, rec["row"]["service_date"], rec["score"], truth))
+        calibrated = (_chronological_calibrate_and_score(items) if items else
+                     {"available": False, "reason": "IsolationForest did not train (pool below FLAVOR_MIN_RECONCILED_DAYS)"})
+
+        return {
+            "mode": MODE,
+            "available": True,
+            "production_validated": False,
+            "methodology": (
+                "Unli Reconciliation rows from simulatedd.xlsx replayed into an isolated, "
+                "throwaway database (never production) against REAL unli_flavor/ingredient "
+                "reference rows copied read-only from the live database. Ground truth is the "
+                "workbook's own 'Injected Synthetic Truth' column, read directly."
+            ),
+            "source_workbook": str(source_path),
+            "sample_count": len(id_to_ref),
+            "ground_truth_counts": {"INJECTED_CONSUMPTION_ANOMALY": n_anomalous,
+                                    "SYNTHETIC_NORMAL": len(ground_truth) - n_anomalous},
+            "default_thresholds": {
+                "description": "detect_flavor_consumption_anomalies() as shipped: rule layer "
+                               "(variance/leftover/share) OR IsolationForest capped to the "
+                               "worst 25% of the pool.",
+                "detect_flavor_consumption_anomalies_flagged_count": len(flagged),
+                "alert_rate": round(len(flagged_ids) / len(id_to_ref), 4) if id_to_ref else None,
+                **default_scored,
+            },
+            "calibrated": calibrated,
+        }
+    finally:
+        conn.close()
+        _scrub(path)
+
+
+def simulate_unli_consumption_from_workbook(
+    real_conn: sqlite3.Connection, source_path: Path | None = None, lookback_days: int = 420,
+) -> dict:
+    """Pass B (generic, non-flavour-level unli consumption IsolationForest)
+    executed against simulatedd.xlsx. The workbook has no day-level 'whole
+    unli stream' sheet of its own (only per-flavour Unli Reconciliation) --
+    this legitimately rolls that same per-flavour data UP to one row per
+    service_date (heads = the day's max per-flavour head count, a defensible
+    proxy for 'diners exposed to the unli offer that day' since every diner
+    sees every flavour; servings/wings/leftover/consumption = summed across
+    flavours, valid because all 14 flavour ingredients share the same base
+    unit, 'g', confirmed against the real catalog before summing) rather
+    than inventing day-level figures from nothing. A day's ground truth is
+    ANOMALY if ANY flavour reconciled that day carries
+    INJECTED_CONSUMPTION_ANOMALY -- a real anomaly in one flavour's sauce
+    usage is a real anomaly in the day's aggregate consumption too."""
+    source_path = source_path or swi.XLSX_PATH
+    wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+    recon_raw = swi._load_sheet(wb, swi._RECONCILIATION_SHEET)
+    wb.close()
+
+    def _strip(raw):
+        return raw[len(swi._FLAVOR_PREFIX):] if raw and raw.startswith(swi._FLAVOR_PREFIX) else raw
+
+    by_date: dict[str, list[dict]] = {}
+    for row in recon_raw:
+        name = _strip(row.get("Flavor"))
+        sd = row.get("Service Date")
+        if not name or not sd:
+            continue
+        by_date.setdefault(swi._iso(sd), []).append(row)
+
+    conn, path = _fresh_isolated_db()
+    try:
+        ing_cur = conn.execute(
+            "INSERT INTO ingredient (ingredient_id, name, category, base_unit, "
+            "purchase_unit, pack_size, pack_size_status, on_hand_base, unit_cost, "
+            "unit_cost_status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            ("WB-UNLI-AGG-001", "Workbook-aggregate wings sauce (all flavours)", "wet_food", "g",
+             "g", 1.0, "verified", 0.0, 1.0, "verified"),
+        )
+        ingredient_pk = ing_cur.lastrowid
+        item_cur = conn.execute(
+            "INSERT INTO unli_item (item_key, label, ingredient_id) VALUES (?,?,?)",
+            ("wings", "Unlimited Wings (workbook aggregate)", ingredient_pk),
+        )
+        unli_item_pk = item_cur.lastrowid
+
+        day_rows = []
+        for sd, rows in sorted(by_date.items()):
+            heads = max(int(r.get("Heads Exposed / Relevant Heads") or 0) for r in rows)
+            servings = sum(int(r.get("Servings / Refills") or 0) for r in rows)
+            wings_served = sum(float(r.get("Wings Served (pcs)") or 0) for r in rows)
+            leftover = sum(float(r.get("Leftovers (pcs)") or 0) for r in rows)
+            actual = sum(float(r.get("Actual Measured Ingredient Consumption") or 0) for r in rows)
+            provisional = sum(float(r["Provisional Consumption"]) for r in rows
+                             if r.get("Provisional Consumption") is not None)
+            is_anomaly = any(r.get("Injected Synthetic Truth") == "INJECTED_CONSUMPTION_ANOMALY" for r in rows)
+            day_rows.append({
+                "service_date": sd, "heads": heads, "servings": servings,
+                "wings_served": wings_served, "leftover": leftover,
+                "actual": actual, "provisional": provisional, "is_anomaly": is_anomaly,
+            })
+
+        normal_rates = [d["actual"] / d["heads"] for d in day_rows if d["heads"] > 0 and not d["is_anomaly"]]
+        baseline_lambda = statistics.median(normal_rates) if normal_rates else 0.0
+        coef_cur = conn.execute(
+            "INSERT INTO unli_coefficient (unli_item_id, lambda_value, role, status) VALUES (?,?,?,?)",
+            (unli_item_pk, baseline_lambda, "baseline", "verified"),
+        )
+        coefficient_pk = coef_cur.lastrowid
+        conn.commit()
+
+        ground_truth: dict[str, str] = {}
+        for d in day_rows:
+            if d["heads"] <= 0:
+                continue
+            variance = d["actual"] - d["provisional"]
+            variance_ratio = (variance / d["provisional"]) if d["provisional"] else None
+            opening = max(d["provisional"], d["actual"]) * 1.2
+            closing = max(0.0, opening - d["actual"])
+            conn.execute(
+                "INSERT INTO unli_reconciliation (service_date, unli_item_id, heads, "
+                "theoretical_base, actual_base, variance_base, variance_ratio, coefficient_id, "
+                "opening_base, added_base, closing_base, status, validation_state, "
+                "correction_base, recorded_by, note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (d["service_date"], unli_item_pk, d["heads"], d["provisional"], d["actual"],
+                 variance, variance_ratio, coefficient_pk, opening, 0.0, closing,
+                 "within_tolerance", "validated", 0.0, None,
+                 "[workbook-aggregate] " + d["service_date"]),
+            )
+            ground_truth[d["service_date"]] = "ANOMALY" if d["is_anomaly"] else "NORMAL"
+        conn.commit()
+
+        id_to_date = {
+            r["id"]: r["service_date"] for r in
+            conn.execute("SELECT id, service_date FROM unli_reconciliation").fetchall()
+        }
+
+        flagged = anomaly.detect_consumption_anomalies(conn, lookback_days=lookback_days)
+        flagged_ids = {f["reconciliation_id"] for f in flagged}
+        default_scored = _confusion_matrix(id_to_date, ground_truth, flagged_ids, "ANOMALY")
+        n_anomalous = sum(1 for v in ground_truth.values() if v == "ANOMALY")
+
+        records, _ = anomaly._evaluate_consumption(conn, lookback_days=lookback_days)
+        items = []
+        for rec in records:
+            sd = id_to_date.get(rec["row"]["reconciliation_id"])
+            if sd is None or rec["score"] is None:
+                continue
+            items.append((sd, sd, rec["score"], ground_truth.get(sd, "NORMAL")))
+        calibrated = (_chronological_calibrate_and_score(items) if items else
+                     {"available": False, "reason": "IsolationForest did not train (pool below MIN_POOLED_SAMPLES)"})
+
+        return {
+            "mode": MODE,
+            "available": True,
+            "production_validated": False,
+            "methodology": (
+                "Unli Reconciliation rows from simulatedd.xlsx aggregated per service_date "
+                "(summed across all 14 flavours, a single shared base unit) into one "
+                "day-level stream and replayed into an isolated, throwaway database. Ground "
+                "truth: a day is anomalous if any flavour that day carried "
+                "INJECTED_CONSUMPTION_ANOMALY."
+            ),
+            "source_workbook": str(source_path),
+            "sample_count": len(ground_truth),
+            "ground_truth_counts": {"ANOMALY": n_anomalous, "NORMAL": len(ground_truth) - n_anomalous},
+            "default_thresholds": {
+                "description": "detect_consumption_anomalies() as shipped.",
+                "detect_consumption_anomalies_flagged_count": len(flagged),
+                "alert_rate": round(len(flagged_ids) / len(ground_truth), 4) if ground_truth else None,
+                **default_scored,
+            },
+            "calibrated": calibrated,
         }
     finally:
         conn.close()

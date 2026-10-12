@@ -47,11 +47,12 @@ from __future__ import annotations
 
 import random
 import sqlite3
+import statistics
 
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
-from . import timeutil
+from . import audit, timeutil
 from .db import write_tx
 from .errors import InvalidStateError, NotFoundError
 
@@ -112,6 +113,64 @@ RULE_VARIANCE_MULTIPLE = 2.0     # |variance| >= this many x the configured tole
 # kept. Found by a test that seeded sixteen ordinary days and got sixteen
 # flags back.
 MAX_FLAG_FRACTION = 0.25
+
+# --- 2026-10 capability-gap fix: leftover-only / scale-only days -----------
+#
+# Forensic diagnosis (numbers from a fixed-seed severity-graded simulation,
+# see the project's ML validation report): leftover_ratio for an injected
+# "excessive leftover" day sits 4-25 STANDARD DEVIATIONS from the normal
+# population's own leftover_ratio distribution — an enormous, unambiguous
+# signal — yet the IsolationForest flagged only 1-2 of 24 such days (and
+# the large_variance rule, which only ever looks at variance_ratio, flagged
+# zero of them by construction). The cause is not a weak signal; it is
+# where that signal lives. IsolationForest isolates a point by repeatedly
+# splitting on a RANDOMLY CHOSEN feature among all seven; a point extreme in
+# exactly one dimension while ordinary in the other six needs many more
+# splits, on average, to isolate than a point extreme across several
+# CORRELATED dimensions at once (variance_ratio/baseline_deviation_ratio/
+# peer_rate_ratio move together by construction — three of the seven
+# features are really one signal). With contamination='auto' picking its
+# cutoff from the pooled score distribution, single-axis outliers routinely
+# lose the competition for a flagged slot to multi-axis ones, no matter how
+# extreme that one axis is. This is a well-documented, textbook property of
+# tree-ensemble isolation methods, not a bug in this implementation and not
+# something feature reweighting fixes honestly (reweighting toward whichever
+# axis the CURRENT test population happens to stress is exactly the
+# "manipulate the validation data until F1 improves" this fix must not do).
+#
+# leftover_ratio and consumption_scale_ratio are also not naturally
+# IsolationForest's kind of problem in the first place: each has a direct,
+# single-number business interpretation an owner can be told in one
+# sentence ("more came back than usual" / "today's volume was unusual for
+# this many covers"), and each already behaves as a tight, well-calibrated
+# distribution when the shop is operating normally (see the diagnostic:
+# leftover_ratio's normal-population stdev is a small fraction of its
+# normal-population mean). That is exactly the shape a robust statistical
+# threshold handles better than an ensemble method tuned for
+# higher-dimensional, less-interpretable structure — restaurant-operational
+# reasoning, not just a metrics argument (see Part 2 of that report).
+#
+# So: two new deterministic rules, matching RULE_VARIANCE_MULTIPLE's own
+# shape exactly (a configurable multiple of a robust spread, never a raw
+# global constant), computed PER STREAM against THIS WINDOW's own
+# population — self-calibrating per shop, same philosophy peer_rate_ratio/
+# heads/consumption_scale_ratio already use. Median + scaled-MAD (1.4826x,
+# the standard normal-equivalent scaling) rather than mean/stdev: a median/
+# MAD-based center and spread is not dragged around by the handful of
+# anomalies it is trying to detect the way a mean/stdev would be.
+RULE_ROBUST_MAD_MULTIPLE = 3.0   # a standard "3 robust-sigma" outlier threshold
+_MAD_TO_SIGMA = 1.4826
+
+# Minimum reconciled days for THIS stream before a robust per-stream
+# median/MAD is trusted at all. Deliberately lower than MIN_RECONCILED_DAYS
+# (12): a median/MAD needs far fewer points to be a stable, meaningful
+# center/spread than a 7-dimensional IsolationForest fit does, and this
+# rule's cost of being wrong (fires on an under-evidenced stream) is bounded
+# by the same MAD_MULTIPLE discipline, whereas the forest's cost would be
+# fitting noise. Not 12 to avoid artificially matching an unrelated
+# constant; not lower than 6 because 2-3 points cannot give a non-degenerate
+# median split either side.
+MIN_ROBUST_RULE_DAYS = 6
 
 # 2026-09-30 finding, stock-loss pass, RE-AUDITED 2026-10 for exact
 # provenance (see that audit's own report for the full per-mechanism trace):
@@ -527,6 +586,18 @@ def _consumption_records(conn: sqlite3.Connection, lookback_days: int) -> list[d
     return records
 
 
+def _robust_center_spread(values: list[float]) -> tuple[float, float]:
+    """Median and scaled-MAD (see RULE_ROBUST_MAD_MULTIPLE's own comment for
+    why median/MAD rather than mean/stdev). Returns (0.0, 0.0) for an empty
+    input; callers must treat a zero spread as "not enough evidence to
+    judge", never as "everything is infinitely far away"."""
+    if not values:
+        return 0.0, 0.0
+    med = statistics.median(values)
+    mad = statistics.median(abs(v - med) for v in values)
+    return med, mad * _MAD_TO_SIGMA
+
+
 def _evaluate_consumption(conn: sqlite3.Connection, lookback_days: int = 90) -> tuple[list[dict], float | None]:
     """The shared evaluation core behind detect_consumption_anomalies() AND
     sample_consumption_for_review() — see _evaluate_stock_loss()'s identical
@@ -551,10 +622,32 @@ def _evaluate_consumption(conn: sqlite3.Connection, lookback_days: int = 90) -> 
       score               public sign (higher = more anomalous), the
                           forest's own decision_function output. None when
                           the forest did not train.
-      rule_flagged        bool, independent of the forest entirely — whether
-                          the large_variance rule's own fixed threshold
-                          fires for this record, computed exactly the same
-                          way regardless of whether the forest ran.
+      rule_flagged        bool, independent of the forest entirely — True if
+                          ANY of the three deterministic rules below fires
+                          for this record, computed exactly the same way
+                          regardless of whether the forest ran. Kept as a
+                          single bool (not a list) because it is persisted
+                          to unli_consumption_validation_sample as one
+                          column (migration 0043) and existing callers/tests
+                          read it as "did a rule catch this" generically —
+                          see rule_causes below for which one(s).
+      rule_causes         list of (method, severity_ratio, score, why) for
+                          every rule that fired, most-severe first; empty
+                          when rule_flagged is False. severity_ratio is
+                          "how many multiples of this rule's own threshold"
+                          — comparable across the three different rules,
+                          used by detect_consumption_anomalies() to pick the
+                          clearest single explanation when more than one
+                          fires (see Part 9/explainability).
+
+    Three rules, same "needs no training data, fires from day one" shape as
+    the stock-loss pass's large_fraction rule:
+      large_variance              |variance_ratio| >= tol * RULE_VARIANCE_MULTIPLE
+                                   (owner-configured tolerance; unchanged)
+      large_leftover_ratio        robust per-stream deviation of leftover_ratio
+                                   >= RULE_ROBUST_MAD_MULTIPLE (2026-10 addition,
+                                   see that constant's own comment for why)
+      large_consumption_scale     same, over consumption_scale_ratio
 
     decision_threshold is the forest's own live cutoff (None when it did not
     train) — sample_consumption_for_review() only samples 'near_threshold'
@@ -570,11 +663,65 @@ def _evaluate_consumption(conn: sqlite3.Connection, lookback_days: int = 90) -> 
     ).fetchone()
     tol = float(tol["value"]) if tol else 0.10
 
+    # Per-stream robust center/spread for the two new rules — computed once
+    # per stream against THIS WINDOW's own population (self-calibrating,
+    # same philosophy as peer_rate_ratio/heads/consumption_scale_ratio
+    # already use), not a single pooled-across-streams number: wings/rice/
+    # fries/drinks have very different normal leftover/scale behavior.
+    by_stream_robust: dict[int, dict] = {}
+    recs_by_stream: dict[int, list] = {}
+    for rec in records:
+        recs_by_stream.setdefault(rec["row"]["unli_item_id"], []).append(rec)
+    for stream_id, recs in recs_by_stream.items():
+        if len(recs) < MIN_ROBUST_RULE_DAYS:
+            by_stream_robust[stream_id] = None
+            continue
+        leftover_med, leftover_spread = _robust_center_spread(
+            [r["features"]["leftover_ratio"] for r in recs])
+        scale_med, scale_spread = _robust_center_spread(
+            [r["features"]["consumption_scale_ratio"] for r in recs])
+        by_stream_robust[stream_id] = {
+            "leftover_med": leftover_med, "leftover_spread": leftover_spread,
+            "scale_med": scale_med, "scale_spread": scale_spread,
+        }
+
     for rec in records:
         rec["iforest_prediction"] = None
         rec["score"] = None
         f = rec["features"]
-        rec["rule_flagged"] = abs(f["variance_ratio"]) >= tol * RULE_VARIANCE_MULTIPLE
+        robust = by_stream_robust.get(rec["row"]["unli_item_id"])
+
+        variance_ratio_x = abs(f["variance_ratio"]) / (tol * RULE_VARIANCE_MULTIPLE) if tol else 0.0
+        variance_flagged = abs(f["variance_ratio"]) >= tol * RULE_VARIANCE_MULTIPLE
+
+        leftover_dev = leftover_flagged = False
+        scale_dev = scale_flagged = False
+        leftover_x = scale_x = 0.0
+        if robust:
+            if robust["leftover_spread"] > 1e-9:
+                leftover_dev = abs(f["leftover_ratio"] - robust["leftover_med"]) / robust["leftover_spread"]
+                leftover_x = leftover_dev / RULE_ROBUST_MAD_MULTIPLE
+                leftover_flagged = leftover_dev >= RULE_ROBUST_MAD_MULTIPLE
+            if robust["scale_spread"] > 1e-9:
+                scale_dev = abs(f["consumption_scale_ratio"] - robust["scale_med"]) / robust["scale_spread"]
+                scale_x = scale_dev / RULE_ROBUST_MAD_MULTIPLE
+                scale_flagged = scale_dev >= RULE_ROBUST_MAD_MULTIPLE
+
+        causes = []
+        if variance_flagged:
+            causes.append(("large_variance", variance_ratio_x, round(abs(f["variance_ratio"]), 3)))
+        if leftover_flagged:
+            causes.append(("large_leftover_ratio", leftover_x, round(leftover_dev, 3)))
+        if scale_flagged:
+            causes.append(("large_consumption_scale", scale_x, round(scale_dev, 3)))
+        causes.sort(key=lambda c: -c[1])
+
+        rec["rule_flagged"] = bool(causes)
+        rec["rule_causes"] = causes
+        # back-compat scalar, same convention as before (whatever the
+        # variance rule alone would have reported) -- no existing caller
+        # reads this when rule_causes is available, kept only so nothing
+        # that still looks at rec["rule_score"] directly breaks.
         rec["rule_score"] = round(abs(f["variance_ratio"]), 3)
 
     decision_threshold = None
@@ -642,6 +789,30 @@ def detect_consumption_anomalies(conn: sqlite3.Connection, lookback_days: int = 
     ).fetchone()
     tol = float(tol_row["value"]) if tol_row else 0.10
 
+    # Plain-language cause text per rule method — Part 9: an alert must say
+    # WHY in words a kitchen/floor reader understands, never raw
+    # IsolationForest/statistical jargon. Isolation-forest flags keep their
+    # existing feature-pattern phrasing (already shipped, not changed here).
+    def _rule_why(method: str, score: float, r, f) -> str:
+        if method == "large_variance":
+            vr = score
+            return (
+                f"measured consumption is {vr * 100:.0f}% away from the provisional "
+                f"figure — more than {RULE_VARIANCE_MULTIPLE:g}x the {tol * 100:.0f}% "
+                f"tolerance configured for this shop"
+            )
+        if method == "large_leftover_ratio":
+            pct = f["leftover_ratio"] * 100
+            return (
+                f"leftover was {pct:.0f}% of what was put out — well outside this "
+                f"stream's normal leftover range, regardless of how much was consumed"
+            )
+        # large_consumption_scale
+        return (
+            f"total {r['label']} consumption on {r['heads']} covers was unusual for a "
+            f"day like this, even though the per-head rate itself looked ordinary"
+        )
+
     flagged: dict[int, dict] = {}
     for rec in records:
         r, f = rec["row"], rec["features"]
@@ -661,17 +832,16 @@ def detect_consumption_anomalies(conn: sqlite3.Connection, lookback_days: int = 
             })
             flagged[out["reconciliation_id"]] = out
         elif rec["rule_flagged"]:
-            vr = abs(f["variance_ratio"])
+            # rule_causes is sorted most-severe-first (§_evaluate_consumption) —
+            # the console shows ONE clear cause, not a committee of three.
+            method, severity_ratio, score = rec["rule_causes"][0]
             out = describe(rec)
             out.update({
-                "method": "large_variance",
-                "score": rec["rule_score"],
-                "why": (
-                    f"measured consumption is {vr * 100:.0f}% away from the provisional "
-                    f"figure — more than {RULE_VARIANCE_MULTIPLE:g}x the {tol * 100:.0f}% "
-                    f"tolerance configured for this shop"
-                ),
-                "severity": "high" if vr >= tol * 4 else "medium",
+                "method": method,
+                "score": score,
+                "why": _rule_why(method, score, r, f),
+                "severity": "high" if severity_ratio >= 2.0 else "medium",
+                "other_rule_causes": [c[0] for c in rec["rule_causes"][1:]],
             })
             flagged[out["reconciliation_id"]] = out
 
@@ -712,6 +882,8 @@ def consumption_model_details(conn: sqlite3.Connection, lookback_days: int = 90)
         "features": list(FEATURE_NAMES),
         "min_reconciled_days": MIN_RECONCILED_DAYS,
         "rule_variance_multiple": RULE_VARIANCE_MULTIPLE,
+        "rule_robust_mad_multiple": RULE_ROBUST_MAD_MULTIPLE,
+        "min_robust_rule_days": MIN_ROBUST_RULE_DAYS,
         "max_flag_fraction": MAX_FLAG_FRACTION,
         "lookback_days": lookback_days,
         "records_evaluated": len(records),
@@ -773,6 +945,10 @@ def record_anomaly_review(
             (ledger_id, status, note, user_id, client_request_id),
         )
         row = conn.execute("SELECT * FROM anomaly_review WHERE id=?", (cur.lastrowid,)).fetchone()
+        audit.log(
+            conn, "stock_loss_ledger", ledger_id, "review", user_id,
+            field="status", new_value=status, note=note,
+        )
     return _review_row(row)
 
 
@@ -999,6 +1175,7 @@ def sample_for_review(
     n_random: int = DEFAULT_RANDOM_SAMPLE,
     lookback_days: int = 90,
     rng: random.Random | None = None,
+    user_id: str | None = None,
 ) -> dict:
     """Select real, non-synthetic stock-loss ledger rows for blind human
     review, writing one anomaly_validation_sample row per newly-selected
@@ -1080,6 +1257,11 @@ def sample_for_review(
                 )
                 if cur.rowcount:
                     inserted.append(r["id"])
+        if inserted:
+            audit.log(
+                conn, "anomaly_validation_sample", "batch", "sample", user_id,
+                note=f"{len(inserted)} stock-loss row(s) added to the review queue",
+            )
 
     return {
         "sampled": len(inserted),
@@ -1134,6 +1316,10 @@ def submit_validation_label(
         updated = conn.execute(
             "SELECT * FROM anomaly_validation_sample WHERE id=?", (sample_id,)
         ).fetchone()
+        audit.log(
+            conn, "anomaly_validation_sample", sample_id, "label", user_id,
+            field="human_label", new_value=human_label, note=note,
+        )
     return _validation_sample_row(updated)
 
 
@@ -1358,13 +1544,16 @@ def _consumption_validation_row(row: sqlite3.Row) -> dict:
 
 
 def _stratified_random_sample_by(candidates: list[dict], n: int, rng: random.Random,
-                                 key) -> list[dict]:
+                                 key, max_share: float = MAX_STREAM_SHARE_OF_RANDOM_SAMPLE) -> list[dict]:
     """Generalized form of _stratified_random_sample() — same algorithm, over
     whatever correlation key the caller's observation unit actually has
-    (ingredient for stock-loss, unli_item_id/stream for consumption)."""
+    (ingredient for stock-loss, unli_item_id/stream for consumption,
+    flavor_id for the flavour-level pass — see max_share, parameterized so
+    each caller's own cap constant actually takes effect rather than
+    silently reusing the stream-level one)."""
     if not candidates or n <= 0:
         return []
-    per_key_cap = max(1, int(round(n * MAX_STREAM_SHARE_OF_RANDOM_SAMPLE)))
+    per_key_cap = max(1, int(round(n * max_share)))
     shuffled = candidates[:]
     rng.shuffle(shuffled)
     out: list[dict] = []
@@ -1391,6 +1580,7 @@ def sample_consumption_for_review(
     n_random: int = CONSUMPTION_DEFAULT_RANDOM_SAMPLE,
     lookback_days: int = 90,
     rng: random.Random | None = None,
+    user_id: str | None = None,
 ) -> dict:
     """Select genuine, non-synthetic reconciled days for blind human review.
 
@@ -1479,6 +1669,11 @@ def sample_consumption_for_review(
                 )
                 if cur.rowcount:
                     inserted.append(r["reconciliation_id"])
+        if inserted:
+            audit.log(
+                conn, "unli_consumption_validation_sample", "batch", "sample", user_id,
+                note=f"{len(inserted)} reconciled day(s) added to the review queue",
+            )
 
     return {
         "sampled": len(inserted),
@@ -1532,6 +1727,10 @@ def submit_consumption_validation_label(
         updated = conn.execute(
             "SELECT * FROM unli_consumption_validation_sample WHERE id=?", (sample_id,)
         ).fetchone()
+        audit.log(
+            conn, "unli_consumption_validation_sample", sample_id, "label", user_id,
+            field="human_label", new_value=human_label, note=note,
+        )
     return _consumption_validation_row(updated)
 
 
@@ -1674,4 +1873,952 @@ def scientific_consumption_validation_metrics(
         "false_positive_rate": round(fpr, 3) if fpr is not None else None,
         "negative_predictive_value": round(npv, 3) if npv is not None else None,
         "accuracy": round(accuracy, 3) if accuracy is not None else None,
+    }
+
+
+
+
+# ===========================================================================
+# Flavor-level consumption anomalies -- a SEPARATE detector, migration 0044's
+# unli_flavor_reconciliation (14 flavors), not a replacement for the
+# 4-stream pass above.
+#
+# Why this is a distinct model rather than folded into the stream-level one
+# ---------------------------------------------------------------------------
+# The 4-stream pass pools ALL flavours of wings into one "wings" signal --
+# it answers "was overall wings consumption unusual today", and by
+# construction it CANNOT answer "was Garlic Parmesan specifically unusual
+# today, even though the other 13 flavours were ordinary" -- a single
+# flavour's abnormal day is diluted into, and can be invisible inside, the
+# pooled stream-level average. That is a genuinely different operational
+# question (restaurant-operational reasoning, not just "more data exists"):
+#   - is THIS flavour's per-head consumption unusual relative to its OWN
+#     history (a recipe/prep drift specific to one sauce)?
+#   - is THIS flavour taking an unusually large SHARE of total wings volume
+#     relative to its normal share (over-serving one flavour, under-serving
+#     others)?
+#   - is THIS flavour unusual relative to its PEERS on the same day (every
+#     flavour served that day, cross-sectionally)?
+# None of those are answerable from the 4-stream model's own feature set,
+# which has no flavour dimension at all. The two detectors are kept
+# structurally separate -- different function, different feature set,
+# different table -- exactly as the stream-level pass was never touched or
+# repurposed to build this.
+#
+# This detector applies the SAME lesson the stream-level fix above just
+# demonstrated numerically: a single-axis anomaly (one feature extreme,
+# the rest ordinary) is NOT reliably caught by a pooled multi-feature
+# IsolationForest alone, because isolation path length is computed jointly
+# across all dimensions, chosen at random. Rather than repeat that mistake
+# and need a second capability-gap pass later, the rule+forest hybrid
+# ships here from day one.
+# ===========================================================================
+
+FLAVOR_MIN_RECONCILED_DAYS = 20      # pooled across all 14 flavours before the forest trains
+FLAVOR_MAX_FLAG_FRACTION = 0.25      # same cap philosophy as MAX_FLAG_FRACTION
+FLAVOR_RULE_VARIANCE_MULTIPLE = RULE_VARIANCE_MULTIPLE   # same configured shop tolerance, same concept
+FLAVOR_RULE_ROBUST_MAD_MULTIPLE = RULE_ROBUST_MAD_MULTIPLE
+FLAVOR_MIN_ROBUST_RULE_DAYS = 10     # per-flavour days needed before ITS OWN robust baseline is trusted
+
+FLAVOR_MODEL_VERSION = "unli_flavor_consumption_isoforest_v1"
+FLAVOR_ELIGIBILITY_VERSION = "recorded_by_app_user_membership_v1"
+
+# --- review-sampling pool sizes, same shape as the stream-level pass's own
+# CONSUMPTION_DEFAULT_*/MAX_STREAM_SHARE_OF_RANDOM_SAMPLE constants --------
+FLAVOR_DEFAULT_FLAGGED_SAMPLE_CAP = 15
+FLAVOR_DEFAULT_NEAR_THRESHOLD_SAMPLE = 5
+FLAVOR_DEFAULT_RANDOM_SAMPLE = 5
+MAX_FLAVOR_SHARE_OF_RANDOM_SAMPLE = 0.5   # no single flavour supplies more than half the random pool
+
+# --- Part 4: real-data readiness thresholds (flavor_real_data_readiness())
+# Same reasoning as CONSUMPTION_MIN_SCIENTIFIC_VALIDATION_LABELS/_PER_
+# PREDICTION_SIDE (small enough to be reachable, large enough that 1-2
+# lucky/unlucky reviews cannot swing a reported metric), scaled up for this
+# pass's larger dimensionality: 14 distinct per-flavour distributions, not
+# one stream, so "is this normal" is a harder question with more ways to be
+# unrepresentative. Fixed in code, never a caller-supplied parameter --
+# nothing can lower these just to reach a more flattering readiness state
+# sooner.
+FLAVOR_MIN_ELIGIBLE_REAL_OBSERVATIONS = 50   # real (non-synthetic) reconciled flavor-days, any flavor
+FLAVOR_MIN_SERVICE_DATE_COVERAGE_DAYS = 14   # distinct real service_dates represented
+FLAVOR_MIN_REVIEWED_PREDICTIONS = 20         # human-reviewed sample rows, any label, this model/eligibility version
+FLAVOR_MIN_SCIENTIFIC_VALIDATION_LABELS = 30 # confirmed_anomaly + false_positive combined
+FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE = 8    # each of flagged-side / unflagged-side
+FLAVOR_MIN_FLAVOR_COVERAGE = 8               # distinct flavours represented among reviewed labels (of 14)
+
+FLAVOR_FEATURE_NAMES = (
+    "consumption_per_head",
+    "refill_intensity",
+    "flavor_share_of_wings",
+    "baseline_deviation_ratio",
+    "peer_flavor_deviation_ratio",
+    "leftover_ratio",
+    "variance_ratio",
+)
+
+# Same structural provenance test as _REAL_RECORDER_CLAUSE, over
+# unli_flavor_reconciliation.recorded_by (migration 0044) -- a row is
+# eligible if recorded_by is NULL (legitimate system-internal write with no
+# specific human operator) or a genuine app_user account. The simulated-
+# workbook importer stamps every row with user_id='simulated_workbook_
+# import' (wt/simulated_workbook_import.py), which is never an app_user row
+# (verified live in the integration report this builds on) -- so every one
+# of the 5,071 imported rows is automatically excluded from this detector's
+# training/flagging population by the SAME mechanism the rest of this
+# module already relies on. No new provenance column, no new exclusion
+# code: a future REAL flavour reconciliation recorded through the normal
+# operational path with a real username becomes eligible the moment it is
+# written, with no migration and no code change (Part 6's requirement).
+_REAL_FLAVOR_RECORDER_CLAUSE = (
+    "(fr.recorded_by IS NULL OR fr.recorded_by IN (SELECT username FROM app_user))"
+)
+
+
+def _flavor_consumption_records(conn: sqlite3.Connection, lookback_days: int) -> list[dict]:
+    """One feature vector per (service_date, flavor) reconciled observation.
+    All seven features are derived only from columns unli_flavor_
+    reconciliation actually has (migration 0044) -- no invented
+    measurement. See the module docstring above for each feature's exact
+    formula and the operational question it answers.
+
+      1 consumption_per_head        actual_measured_base / heads. Direct
+                                    measurement, comparable across days for
+                                    the SAME flavour.
+      2 refill_intensity            servings / heads. How many refill rounds
+                                    per customer this flavour saw.
+      3 flavor_share_of_wings       this flavour's wings_served_pcs / the
+                                    SUM of wings_served_pcs across every
+                                    flavour reconciled on the same
+                                    service_date. Over/under-serving one
+                                    flavour relative to the others that day.
+      4 baseline_deviation_ratio    consumption_per_head / this flavour's
+                                    OWN robust (median) rate across the
+                                    lookback window -- a slow per-flavour
+                                    drift stays visible.
+      5 peer_flavor_deviation_ratio consumption_per_head / the MEAN
+                                    consumption_per_head across ALL flavours
+                                    reconciled on the SAME service_date --
+                                    cross-sectional: unusual relative to its
+                                    peers that specific day, not its own
+                                    history.
+      6 leftover_ratio              leftover_pcs / wings_served_pcs. How
+                                    much of what was served for this flavour
+                                    came back.
+      7 variance_ratio              the importer/source's own stored
+                                    variance_ratio (measured vs provisional),
+                                    read directly -- not recomputed.
+    """
+    rows = conn.execute(
+        f"""
+        SELECT fr.id AS reconciliation_id, fr.service_date, fr.flavor_id,
+               f.display_name AS flavor_name, fr.heads, fr.servings,
+               fr.wings_served_pcs, fr.leftover_pcs, fr.net_consumed_pcs,
+               fr.actual_measured_base, fr.unit, fr.provisional_base,
+               fr.variance_base, fr.variance_ratio, fr.recorded_by
+          FROM unli_flavor_reconciliation fr
+          JOIN unli_flavor f ON f.id = fr.flavor_id
+         WHERE fr.service_date >= ?
+           AND fr.heads > 0
+           AND fr.observation_status <> 'rejected'
+           AND {_REAL_FLAVOR_RECORDER_CLAUSE}
+         ORDER BY fr.flavor_id, fr.service_date
+        """,
+        (timeutil.business_date_n_days_ago(lookback_days),),
+    ).fetchall()
+    if not rows:
+        return []
+
+    by_flavor: dict[int, list] = {}
+    by_date: dict[str, list] = {}
+    for r in rows:
+        by_flavor.setdefault(r["flavor_id"], []).append(r)
+        by_date.setdefault(r["service_date"], []).append(r)
+
+    flavor_baseline: dict[int, float] = {}
+    for flavor_id, recs in by_flavor.items():
+        rates = [(rec["actual_measured_base"] / rec["heads"]) for rec in recs if rec["heads"]]
+        flavor_baseline[flavor_id] = statistics.median(rates) if rates else 0.0
+
+    records = []
+    for r in rows:
+        rate = (r["actual_measured_base"] / r["heads"]) if r["heads"] else 0.0
+        day_peers = by_date[r["service_date"]]
+        day_rates = [(x["actual_measured_base"] / x["heads"]) for x in day_peers if x["heads"]]
+        day_rate_mean = sum(day_rates) / len(day_rates) if day_rates else 0.0
+        day_wings_total = sum(x["wings_served_pcs"] for x in day_peers)
+        baseline = flavor_baseline.get(r["flavor_id"], 0.0)
+
+        records.append({
+            "row": r,
+            "features": {
+                "consumption_per_head": rate,
+                "refill_intensity": (r["servings"] / r["heads"]) if r["heads"] else 0.0,
+                "flavor_share_of_wings": (r["wings_served_pcs"] / day_wings_total)
+                                        if day_wings_total > 0 else 0.0,
+                "baseline_deviation_ratio": (rate / baseline) if baseline > 0 else 1.0,
+                "peer_flavor_deviation_ratio": (rate / day_rate_mean) if day_rate_mean > 0 else 1.0,
+                "leftover_ratio": (r["leftover_pcs"] / r["wings_served_pcs"])
+                                  if r["wings_served_pcs"] else 0.0,
+                "variance_ratio": r["variance_ratio"] if r["variance_ratio"] is not None else 0.0,
+            },
+        })
+    return records
+
+
+def _evaluate_flavor_consumption(
+    conn: sqlite3.Connection, lookback_days: int = 90,
+) -> tuple[list[dict], float | None]:
+    """Same rule+forest shape as _evaluate_consumption(), applied to the
+    flavour-level dataset. See that function's own docstring for the
+    iforest_prediction/score/rule_flagged/rule_causes contract -- identical
+    here."""
+    records = _flavor_consumption_records(conn, lookback_days)
+    if not records:
+        return [], None
+
+    tol_row = conn.execute(
+        "SELECT value FROM app_setting WHERE key='unli_variance_tolerance'"
+    ).fetchone()
+    tol = float(tol_row["value"]) if tol_row else 0.10
+
+    recs_by_flavor: dict[int, list] = {}
+    for rec in records:
+        recs_by_flavor.setdefault(rec["row"]["flavor_id"], []).append(rec)
+
+    by_flavor_robust: dict[int, dict | None] = {}
+    for flavor_id, recs in recs_by_flavor.items():
+        if len(recs) < FLAVOR_MIN_ROBUST_RULE_DAYS:
+            by_flavor_robust[flavor_id] = None
+            continue
+        leftover_med, leftover_spread = _robust_center_spread(
+            [r["features"]["leftover_ratio"] for r in recs])
+        share_med, share_spread = _robust_center_spread(
+            [r["features"]["flavor_share_of_wings"] for r in recs])
+        by_flavor_robust[flavor_id] = {
+            "leftover_med": leftover_med, "leftover_spread": leftover_spread,
+            "share_med": share_med, "share_spread": share_spread,
+        }
+
+    for rec in records:
+        f = rec["features"]
+        robust = by_flavor_robust.get(rec["row"]["flavor_id"])
+
+        variance_flagged = abs(f["variance_ratio"]) >= tol * FLAVOR_RULE_VARIANCE_MULTIPLE
+        variance_x = abs(f["variance_ratio"]) / (tol * FLAVOR_RULE_VARIANCE_MULTIPLE) if tol else 0.0
+
+        leftover_dev = leftover_flagged = False
+        share_dev = share_flagged = False
+        leftover_x = share_x = 0.0
+        if robust:
+            if robust["leftover_spread"] > 1e-9:
+                leftover_dev = abs(f["leftover_ratio"] - robust["leftover_med"]) / robust["leftover_spread"]
+                leftover_x = leftover_dev / FLAVOR_RULE_ROBUST_MAD_MULTIPLE
+                leftover_flagged = leftover_dev >= FLAVOR_RULE_ROBUST_MAD_MULTIPLE
+            if robust["share_spread"] > 1e-9:
+                share_dev = abs(f["flavor_share_of_wings"] - robust["share_med"]) / robust["share_spread"]
+                share_x = share_dev / FLAVOR_RULE_ROBUST_MAD_MULTIPLE
+                share_flagged = share_dev >= FLAVOR_RULE_ROBUST_MAD_MULTIPLE
+
+        causes = []
+        if variance_flagged:
+            causes.append(("large_variance", variance_x, round(abs(f["variance_ratio"]), 3)))
+        if leftover_flagged:
+            causes.append(("large_leftover_ratio", leftover_x, round(leftover_dev, 3)))
+        if share_flagged:
+            causes.append(("abnormal_flavor_share", share_x, round(share_dev, 3)))
+        causes.sort(key=lambda c: -c[1])
+
+        rec["iforest_prediction"] = None
+        rec["score"] = None
+        rec["rule_flagged"] = bool(causes)
+        rec["rule_causes"] = causes
+
+    decision_threshold = None
+    if len(records) >= FLAVOR_MIN_RECONCILED_DAYS:
+        X = np.array([[rec["features"][name] for name in FLAVOR_FEATURE_NAMES] for rec in records])
+        model = IsolationForest(n_estimators=N_ESTIMATORS, contamination="auto",
+                                random_state=RANDOM_STATE)
+        preds = model.fit_predict(X)
+        raw_scores = model.decision_function(X)
+        for rec, raw in zip(records, raw_scores):
+            rec["iforest_prediction"] = "unflagged"
+            rec["_raw_score"] = float(raw)
+            rec["score"] = round(-rec["_raw_score"], 3)
+        candidates = sorted(
+            (rec for rec, pred in zip(records, preds) if pred == -1),
+            key=lambda rec: rec["_raw_score"],
+        )
+        cap = max(1, int(len(records) * FLAVOR_MAX_FLAG_FRACTION))
+        for rec in candidates[:cap]:
+            rec["iforest_prediction"] = "flagged"
+        if cap and candidates:
+            decision_threshold = candidates[min(cap, len(candidates)) - 1]["score"]
+
+    return records, decision_threshold
+
+
+def detect_flavor_consumption_anomalies(conn: sqlite3.Connection, lookback_days: int = 90) -> list[dict]:
+    """Flavour-level counterpart to detect_consumption_anomalies() -- see
+    the module docstring above for why this is a separate detector rather
+    than a change to the 4-stream one. Same descriptive-only contract:
+    flags, explains, nothing downstream acts on one.
+    """
+    records, _ = _evaluate_flavor_consumption(conn, lookback_days)
+
+    tol_row = conn.execute(
+        "SELECT value FROM app_setting WHERE key='unli_variance_tolerance'"
+    ).fetchone()
+    tol = float(tol_row["value"]) if tol_row else 0.10
+
+    def describe(rec) -> dict:
+        r, f = rec["row"], rec["features"]
+        return {
+            "reconciliation_id": r["reconciliation_id"],
+            "service_date": r["service_date"],
+            "flavor_id": r["flavor_id"], "flavor_name": r["flavor_name"],
+            "heads": r["heads"], "servings": r["servings"],
+            "actual_measured_base": round(r["actual_measured_base"], 2),
+            "unit": r["unit"],
+            "consumption_per_head": round(f["consumption_per_head"], 2),
+            "variance_pct": round((r["variance_ratio"] or 0.0) * 100, 1),
+            "features": {k: round(v, 4) for k, v in f.items()},
+        }
+
+    def why(method: str, score: float, r, f) -> str:
+        if method == "large_variance":
+            return (
+                f"{r['flavor_name']} consumption measured {score * 100:.0f}% away from the "
+                f"provisional figure -- more than {FLAVOR_RULE_VARIANCE_MULTIPLE:g}x the "
+                f"{tol * 100:.0f}% tolerance configured for this shop"
+            )
+        if method == "large_leftover_ratio":
+            return (
+                f"{r['flavor_name']} leftover was {f['leftover_ratio'] * 100:.0f}% of what was "
+                f"served -- well outside this flavour's normal leftover range"
+            )
+        if method == "abnormal_flavor_share":
+            return (
+                f"{r['flavor_name']} took {f['flavor_share_of_wings'] * 100:.0f}% of total wings "
+                f"served that day -- well outside its normal share relative to the other flavours"
+            )
+        return (
+            f"{r['flavor_name']} consumption per customer was unusually high or low compared "
+            f"with its recent pattern and its peer flavours that day"
+        )
+
+    flagged: dict[int, dict] = {}
+    for rec in records:
+        r, f = rec["row"], rec["features"]
+        if rec["iforest_prediction"] == "flagged":
+            out = describe(rec)
+            out.update({
+                "method": "isolation_forest",
+                "score": rec["score"],
+                "why": why("isolation_forest", 0.0, r, f),
+                "severity": "high" if rec["_raw_score"] < -0.15 else "medium",
+                "other_rule_causes": [],
+            })
+            flagged[out["reconciliation_id"]] = out
+        elif rec["rule_flagged"]:
+            method, severity_ratio, score = rec["rule_causes"][0]
+            out = describe(rec)
+            out.update({
+                "method": method,
+                "score": score,
+                "why": why(method, score, r, f),
+                "severity": "high" if severity_ratio >= 2.0 else "medium",
+                "other_rule_causes": [c[0] for c in rec["rule_causes"][1:]],
+            })
+            flagged[out["reconciliation_id"]] = out
+
+    out = list(flagged.values())
+    _attribute_flavor_events(out)
+    out.sort(key=lambda x: x["service_date"], reverse=True)
+    return out
+
+
+def _attribute_flavor_events(flagged: list[dict]) -> None:
+    """2026-10 compositional-flavor-share finding: flavor_share_of_wings is
+    zero-sum across all 14 flavours (they must sum to 1), so one genuinely
+    abnormal flavour MECHANICALLY shifts its peers' shares the same day --
+    confirmed numerically (day-level precision 1.0 vs row-level precision
+    0.59 on the identical fixed-seed validation population; every row-level
+    "false positive" landed on a day that had a genuine injected anomaly,
+    none on a purely normal day). That is a real, correctly-detected
+    deviation, NOT a detector flaw -- so this does not relabel anything or
+    drop any row. It groups same-day flags into one event and marks which
+    one is the clearest single explanation (Part 1, option C: primary
+    root-cause flavour + secondary compositional effects), purely as
+    PRESENTATION. Row-level detail (every field already on each dict) is
+    left completely intact; scientific_flavor_validation_metrics() and
+    sample_flavor_for_review() never read is_primary/secondary_of and
+    continue to score every row independently.
+
+    Mutates each dict in place, adding event_id/is_primary/secondary_of.
+    A row is a demotion CANDIDATE if its own per-head measurements look
+    ordinary -- baseline_deviation_ratio and peer_flavor_deviation_ratio
+    both close to 1.0, and it was not caught by the variance or leftover
+    rule specifically -- regardless of whether the SHARE deviation itself
+    was caught by the abnormal_flavor_share rule or by the forest (the
+    forest also has flavor_share_of_wings as one of its 7 input
+    dimensions, so it can catch the same compositional echo the rule does;
+    checking the method name alone, as an earlier version of this function
+    did, missed that case). A row flagged for its own direct per-head
+    measurement, even on the same date, is an independent finding and is
+    never demoted. When the top two candidates are comparably severe
+    (within 80% of each other), both are kept as primary rather than
+    forcing a single-cause narrative onto what may genuinely be two
+    unrelated unusual flavours the same day.
+    """
+    by_date: dict[str, list[dict]] = {}
+    for item in flagged:
+        by_date.setdefault(item["service_date"], []).append(item)
+
+    def severity_proxy(item: dict) -> float:
+        # isolation_forest's "score" and a rule's "score" are both already
+        # "higher = more anomalous" on their own scale -- not cross-
+        # comparable in absolute terms, but comparable enough to rank
+        # same-method candidates, which is all primacy ordering needs.
+        return abs(item["score"]) if item["score"] is not None else 0.0
+
+    def is_share_driven(item: dict) -> bool:
+        if item["method"] in ("large_variance", "large_leftover_ratio"):
+            return False
+        f = item["features"]
+        return (abs(f["baseline_deviation_ratio"] - 1.0) < 0.15
+                and abs(f["peer_flavor_deviation_ratio"] - 1.0) < 0.15)
+
+    def primacy_key(item: dict) -> tuple:
+        return (1 if is_share_driven(item) else 0, -severity_proxy(item))
+
+    for service_date, items in by_date.items():
+        items.sort(key=primacy_key)
+        primary = items[0]
+        primary_mag = severity_proxy(primary)
+        primary["event_id"] = service_date
+        primary["is_primary"] = True
+        primary["secondary_of"] = None
+        for other in items[1:]:
+            other["event_id"] = service_date
+            other_mag = severity_proxy(other)
+            comparable = primary_mag > 0 and (other_mag / primary_mag) >= 0.8
+            if is_share_driven(other) and not comparable:
+                other["is_primary"] = False
+                other["secondary_of"] = primary["reconciliation_id"]
+                other["why"] += (
+                    f" -- likely a secondary (compositional) effect of {primary['flavor_name']}'s "
+                    f"unusual day, not an independent issue"
+                )
+            else:
+                other["is_primary"] = True
+                other["secondary_of"] = None
+
+
+def flavor_anomaly_events(conn: sqlite3.Connection, lookback_days: int = 90) -> list[dict]:
+    """The grouped, event-level view of detect_flavor_consumption_anomalies()
+    -- one entry per service_date that had at least one flagged flavour,
+    naming the primary (root-cause) flavour(s) and which others are
+    annotated as likely compositional/secondary effects. This is a
+    PRESENTATION grouping only (see _attribute_flavor_events's own
+    docstring) -- never used for scientific metrics, which stay strictly
+    row-level. Exists so a restaurant user sees one alert per real event
+    instead of up to 14 on a single compositional day.
+    """
+    flagged = detect_flavor_consumption_anomalies(conn, lookback_days)
+    by_date: dict[str, list[dict]] = {}
+    for item in flagged:
+        by_date.setdefault(item["service_date"], []).append(item)
+
+    events = []
+    for service_date, items in by_date.items():
+        primaries = [i for i in items if i["is_primary"]]
+        secondaries = [i for i in items if not i["is_primary"]]
+        if len(primaries) == 1:
+            lead = primaries[0]
+            why = f"{lead['flavor_name']} appears to be the primary unusual flavour"
+            if secondaries:
+                why += (
+                    f"; changes in {len(secondaries)} other flavour "
+                    f"share{'s' if len(secondaries) != 1 else ''} are likely secondary effects"
+                )
+        else:
+            names = ", ".join(p["flavor_name"] for p in primaries)
+            why = (
+                f"Multiple flavours ({names}) were unusual on this date -- not confidently "
+                f"attributable to a single root cause"
+            )
+        events.append({
+            "service_date": service_date,
+            "primary_flavors": [p["flavor_name"] for p in primaries],
+            "secondary_flavors": [s["flavor_name"] for s in secondaries],
+            "total_flagged": len(items),
+            "why": why,
+            "rows": items,
+        })
+    events.sort(key=lambda e: e["service_date"], reverse=True)
+    return events
+
+
+def flavor_consumption_model_details(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:
+    """Technical-panel parameters/live counts for the flavour-level pass --
+    mirrors consumption_model_details()'s honesty about synthetic exclusion
+    and below-threshold non-training."""
+    records = _flavor_consumption_records(conn, lookback_days)
+    anomalies = detect_flavor_consumption_anomalies(conn, lookback_days)
+    by_method: dict[str, int] = {}
+    for a in anomalies:
+        by_method[a["method"]] = by_method.get(a["method"], 0) + 1
+
+    since = timeutil.business_date_n_days_ago(lookback_days)
+    total_all = conn.execute(
+        "SELECT COUNT(*) AS n FROM unli_flavor_reconciliation fr "
+        "WHERE fr.service_date >= ? AND fr.heads > 0 AND fr.observation_status <> 'rejected'",
+        (since,),
+    ).fetchone()["n"]
+    synthetic = total_all - len(records)
+
+    return {
+        "model": "IsolationForest (scikit-learn) + robust-threshold rule layer",
+        "data_source": "unli_flavor_reconciliation (per-flavour reconciled service days)",
+        "n_estimators": N_ESTIMATORS,
+        "random_state": RANDOM_STATE,
+        "n_features": len(FLAVOR_FEATURE_NAMES),
+        "features": list(FLAVOR_FEATURE_NAMES),
+        "min_reconciled_days": FLAVOR_MIN_RECONCILED_DAYS,
+        "rule_variance_multiple": FLAVOR_RULE_VARIANCE_MULTIPLE,
+        "rule_robust_mad_multiple": FLAVOR_RULE_ROBUST_MAD_MULTIPLE,
+        "min_robust_rule_days": FLAVOR_MIN_ROBUST_RULE_DAYS,
+        "max_flag_fraction": FLAVOR_MAX_FLAG_FRACTION,
+        "lookback_days": lookback_days,
+        "records_evaluated": len(records),
+        "synthetic_excluded": synthetic,
+        "synthetic_excluded_note": (
+            None if synthetic == 0 else
+            f"{synthetic} flavour-reconciliation record(s) in this window were recorded by a "
+            "non-account source (e.g. the simulated-workbook importer) -- excluded from "
+            "training and flagging. See _REAL_FLAVOR_RECORDER_CLAUSE."
+        ),
+        "trained_this_call": len(records) >= FLAVOR_MIN_RECONCILED_DAYS,
+        "flagged": len(anomalies),
+        "flagged_by_method": by_method,
+        "readiness": flavor_real_data_readiness(conn, lookback_days),
+    }
+
+
+def _flavor_validation_row(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"], "reconciliation_id": row["reconciliation_id"],
+        "sample_source": row["sample_source"], "model_prediction": row["model_prediction"],
+        "rule_flagged": bool(row["rule_flagged"]), "rule_causes": row["rule_causes"],
+        "anomaly_score": row["anomaly_score"], "decision_threshold": row["decision_threshold"],
+        "is_primary": None if row["is_primary"] is None else bool(row["is_primary"]),
+        "secondary_of_reconciliation_id": row["secondary_of_reconciliation_id"],
+        "model_version": row["model_version"], "eligibility_version": row["eligibility_version"],
+        "evaluated_at": row["evaluated_at"], "human_label": row["human_label"],
+        "reviewed_by": row["reviewed_by"], "reviewed_at": row["reviewed_at"],
+        "review_note": row["review_note"], "created_at": row["created_at"],
+    }
+
+
+def sample_flavor_for_review(
+    conn: sqlite3.Connection,
+    n_flagged: int | None = None,
+    n_near_threshold: int = FLAVOR_DEFAULT_NEAR_THRESHOLD_SAMPLE,
+    n_random: int = FLAVOR_DEFAULT_RANDOM_SAMPLE,
+    lookback_days: int = 90,
+    rng: random.Random | None = None,
+    user_id: str | None = None,
+) -> dict:
+    """Flavour-level counterpart to sample_consumption_for_review() -- same
+    three-pool shape (model_flagged / near_threshold / random_unflagged),
+    same rule-vs-ML separation (only ever samples a genuine IsolationForest
+    'flagged' verdict as model_flagged, never a rule-only catch -- see that
+    function's own docstring for the full rationale, identical here),
+    same refusal-not-substitution below FLAVOR_MIN_RECONCILED_DAYS.
+    Stratifies the random pool by flavor_id (MAX_FLAVOR_SHARE_OF_RANDOM_
+    SAMPLE) rather than unli_item_id -- the correlation unit this pass's
+    observations actually have.
+    """
+    records, decision_threshold = _evaluate_flavor_consumption(conn, lookback_days)
+    if decision_threshold is None:
+        return {
+            "sampled": 0, "reconciliation_ids": [],
+            "pools": {"model_flagged": 0, "near_threshold": 0, "random_unflagged": 0},
+            "candidates_considered": len(records),
+            "forest_trained": False,
+            "reason": (
+                "insufficient_genuine_reconciled_days" if records else
+                "no_genuine_reconciled_days"
+            ),
+            "model_version": FLAVOR_MODEL_VERSION,
+            "eligibility_version": FLAVOR_ELIGIBILITY_VERSION,
+        }
+
+    already_sampled = {
+        r["reconciliation_id"] for r in
+        conn.execute("SELECT reconciliation_id FROM unli_flavor_validation_sample").fetchall()
+    }
+
+    flagged = [rec for rec in records
+              if rec["iforest_prediction"] == "flagged"
+              and rec["row"]["reconciliation_id"] not in already_sampled]
+    unflagged = [rec for rec in records
+                if rec["iforest_prediction"] == "unflagged"
+                and rec["row"]["reconciliation_id"] not in already_sampled]
+
+    flagged_cap = n_flagged if n_flagged is not None else min(len(flagged), FLAVOR_DEFAULT_FLAGGED_SAMPLE_CAP)
+    flagged_pool = flagged[:flagged_cap]
+
+    scored_unflagged = sorted(unflagged, key=lambda rec: -rec["score"])
+    near_threshold_pool = scored_unflagged[:n_near_threshold]
+
+    near_threshold_ids = {rec["row"]["reconciliation_id"] for rec in near_threshold_pool}
+    random_candidates = [rec for rec in unflagged
+                         if rec["row"]["reconciliation_id"] not in near_threshold_ids]
+    random_pool = _stratified_random_sample_by(
+        random_candidates, n_random, rng or random.Random(),
+        key=lambda rec: rec["row"]["flavor_id"], max_share=MAX_FLAVOR_SHARE_OF_RANDOM_SAMPLE)
+
+    inserted: list[int] = []
+    with write_tx(conn):
+        for sample_source, pool in (
+            ("model_flagged", flagged_pool),
+            ("near_threshold", near_threshold_pool),
+            ("random_unflagged", random_pool),
+        ):
+            for rec in pool:
+                r = rec["row"]
+                causes_text = ",".join(c[0] for c in rec["rule_causes"]) if rec["rule_causes"] else None
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO unli_flavor_validation_sample "
+                    "(reconciliation_id, sample_source, model_prediction, rule_flagged, "
+                    " rule_causes, anomaly_score, decision_threshold, model_version, "
+                    " eligibility_version) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (r["reconciliation_id"], sample_source, rec["iforest_prediction"],
+                     1 if rec["rule_flagged"] else 0, causes_text, rec["score"], decision_threshold,
+                     FLAVOR_MODEL_VERSION, FLAVOR_ELIGIBILITY_VERSION),
+                )
+                if cur.rowcount:
+                    inserted.append(r["reconciliation_id"])
+        if inserted:
+            audit.log(
+                conn, "unli_flavor_validation_sample", "batch", "sample", user_id,
+                note=f"{len(inserted)} reconciled flavour-day(s) added to the review queue",
+            )
+
+    return {
+        "sampled": len(inserted),
+        "reconciliation_ids": inserted,
+        "pools": {
+            "model_flagged": len(flagged_pool),
+            "near_threshold": len(near_threshold_pool),
+            "random_unflagged": len(random_pool),
+        },
+        "candidates_considered": len(records),
+        "forest_trained": True,
+        "model_version": FLAVOR_MODEL_VERSION,
+        "eligibility_version": FLAVOR_ELIGIBILITY_VERSION,
+    }
+
+
+def submit_flavor_validation_label(
+    conn: sqlite3.Connection, sample_id: int, human_label: str,
+    note: str | None = None, user_id: str | None = None,
+) -> dict:
+    """A human's one-time ground-truth verdict on one sampled flavour-day.
+
+    Four possible labels (migration 0045) -- richer than the stream-level
+    pass's two, because a flavour-level reviewer genuinely has a fourth
+    honest answer the stream-level question doesn't: 'insufficient_
+    information' (nothing recorded lets them judge this one either way).
+    Only confirmed_anomaly/false_positive enter the scientific confusion
+    matrix (scientific_flavor_validation_metrics()); expected_operational_
+    variation and insufficient_information are retained for audit but
+    excluded, the same way 'pending' is. Set exactly once -- a reviewer who
+    changes their mind is a product decision for later, not silently
+    allowed here, matching every other one-time-label convention in this
+    module.
+    """
+    valid = ("confirmed_anomaly", "false_positive", "expected_operational_variation",
+            "insufficient_information")
+    if human_label not in valid:
+        raise InvalidStateError(
+            f"human_label must be one of {valid}, got {human_label!r} -- pending is a state "
+            "this record starts in, never one a reviewer submits"
+        )
+    with write_tx(conn):
+        row = conn.execute(
+            "SELECT * FROM unli_flavor_validation_sample WHERE id=?", (sample_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError(f"flavor validation sample {sample_id} not found")
+        if row["human_label"] != "pending":
+            raise InvalidStateError(
+                f"sample {sample_id} was already labeled '{row['human_label']}' on "
+                f"{row['reviewed_at']} -- labeling is one-time per sample"
+            )
+        conn.execute(
+            "UPDATE unli_flavor_validation_sample SET human_label=?, reviewed_by=?, "
+            "reviewed_at=datetime('now'), review_note=? WHERE id=?",
+            (human_label, user_id, note, sample_id),
+        )
+        updated = conn.execute(
+            "SELECT * FROM unli_flavor_validation_sample WHERE id=?", (sample_id,)
+        ).fetchone()
+        audit.log(
+            conn, "unli_flavor_validation_sample", sample_id, "label", user_id,
+            field="human_label", new_value=human_label, note=note,
+        )
+    return _flavor_validation_row(updated)
+
+
+def flavor_validation_queue(conn: sqlite3.Connection, status: str = "pending",
+                            blind: bool = True) -> list[dict]:
+    """The human-facing review queue for the flavour-level pass. blind=True
+    (the only mode the labeling screen may use) omits sample_source/
+    model_prediction/rule_flagged/rule_causes/anomaly_score/decision_
+    threshold/model_version/eligibility_version/evaluated_at/is_primary/
+    secondary_of entirely -- a reviewer judging whether a day's numbers
+    were genuinely unusual must not see the model's own opinion (or this
+    pass's compositional-event attribution) first, same blinding rationale
+    as every other review queue in this module."""
+    rows = conn.execute(
+        """
+        SELECT s.*, fr.service_date, f.display_name AS flavor_name, fr.heads, fr.servings,
+               fr.actual_measured_base, fr.unit, fr.provisional_base, fr.variance_base,
+               fr.variance_ratio
+          FROM unli_flavor_validation_sample s
+          JOIN unli_flavor_reconciliation fr ON fr.id = s.reconciliation_id
+          JOIN unli_flavor f ON f.id = fr.flavor_id
+         WHERE s.human_label = ?
+         ORDER BY s.evaluated_at
+        """,
+        (status,),
+    ).fetchall()
+    out = []
+    for r in rows:
+        item = {
+            "sample_id": r["id"], "reconciliation_id": r["reconciliation_id"],
+            "service_date": r["service_date"], "flavor_name": r["flavor_name"],
+            "heads": r["heads"], "servings": r["servings"],
+            "actual_measured_base": round(r["actual_measured_base"], 2),
+            "unit": r["unit"],
+            "variance_pct": round((r["variance_ratio"] or 0.0) * 100, 1),
+            "human_label": r["human_label"],
+        }
+        if not blind:
+            item.update({
+                "sample_source": r["sample_source"], "model_prediction": r["model_prediction"],
+                "rule_flagged": bool(r["rule_flagged"]), "rule_causes": r["rule_causes"],
+                "anomaly_score": r["anomaly_score"], "decision_threshold": r["decision_threshold"],
+                "is_primary": None if r["is_primary"] is None else bool(r["is_primary"]),
+                "secondary_of_reconciliation_id": r["secondary_of_reconciliation_id"],
+                "model_version": r["model_version"], "eligibility_version": r["eligibility_version"],
+                "evaluated_at": r["evaluated_at"],
+            })
+        out.append(item)
+    return out
+
+
+def scientific_flavor_validation_metrics(
+    conn: sqlite3.Connection, model_version: str | None = None, eligibility_version: str | None = None,
+) -> dict:
+    """TP/FP/FN/TN and derived metrics for the flavour-level pass, computed
+    ONLY from unli_flavor_validation_sample rows a human has labeled
+    confirmed_anomaly or false_positive (expected_operational_variation and
+    insufficient_information are real reviews but carry no usable ground-
+    truth polarity for a confusion matrix -- see migration 0045's own
+    comment), scoped to one (model_version, eligibility_version) pair.
+
+        TP = model_prediction='flagged'   AND human_label='confirmed_anomaly'
+        FP = model_prediction='flagged'   AND human_label='false_positive'
+        FN = model_prediction='unflagged' AND human_label='confirmed_anomaly'
+        TN = model_prediction='unflagged' AND human_label='false_positive'
+
+    model_prediction is always the IsolationForest's own verdict alone
+    (sample_flavor_for_review() never samples a rule-only catch as
+    model_flagged) -- this is the ISOLATION-FOREST-ONLY confusion matrix.
+    It is NOT the combined rule+forest operational detector's performance
+    (that figure is the row-level precision/recall reported directly
+    against detect_flavor_consumption_anomalies()'s own output in the
+    validation harness -- see tests.run_tests's TestFlavorAnomalySimulation
+    for the SIMULATION/TECHNICAL figure, never to be confused with this
+    REAL-DATA-ONLY function). rule_causes is preserved on every sample row
+    for audit, never read here, for the identical reason rule_flagged isn't
+    read by the stream-level scientific_consumption_validation_metrics().
+    """
+    model_version = model_version or FLAVOR_MODEL_VERSION
+    eligibility_version = eligibility_version or FLAVOR_ELIGIBILITY_VERSION
+
+    rows = conn.execute(
+        "SELECT * FROM unli_flavor_validation_sample "
+        "WHERE model_version=? AND eligibility_version=? "
+        "AND human_label IN ('confirmed_anomaly','false_positive')",
+        (model_version, eligibility_version),
+    ).fetchall()
+
+    tp = fp = fn = tn = 0
+    by_source: dict[str, int] = {"model_flagged": 0, "near_threshold": 0, "random_unflagged": 0}
+    for r in rows:
+        by_source[r["sample_source"]] = by_source.get(r["sample_source"], 0) + 1
+        is_flagged = r["model_prediction"] == "flagged"
+        if r["human_label"] == "confirmed_anomaly":
+            tp += is_flagged
+            fn += (not is_flagged)
+        elif r["human_label"] == "false_positive":
+            fp += is_flagged
+            tn += (not is_flagged)
+
+    total = tp + fp + fn + tn
+    flagged_side, unflagged_side = tp + fp, fn + tn
+    base = {
+        "model_version": model_version, "eligibility_version": eligibility_version,
+        "confusion_matrix": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        "labels_by_sample_source": by_source,
+    }
+    if (total < FLAVOR_MIN_SCIENTIFIC_VALIDATION_LABELS
+            or flagged_side < FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE
+            or unflagged_side < FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE):
+        return {
+            **base,
+            "available": False,
+            "reason": "insufficient_validation_data",
+            "detail": (
+                f"{total} labeled sample(s) under this model/eligibility version "
+                f"({flagged_side} on the flagged side, {unflagged_side} on the unflagged side). "
+                f"Needs >= {FLAVOR_MIN_SCIENTIFIC_VALIDATION_LABELS} total and >= "
+                f"{FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE} on each side of the model's own "
+                "prediction before Precision/Recall/Specificity can be reported rather than "
+                "guessed at."
+            ),
+        }
+
+    precision = (tp / (tp + fp)) if (tp + fp) > 0 else None
+    recall = (tp / (tp + fn)) if (tp + fn) > 0 else None
+    specificity = (tn / (tn + fp)) if (tn + fp) > 0 else None
+    f1 = (2 * precision * recall / (precision + recall)
+          if precision and recall and (precision + recall) > 0 else None)
+    fpr = (fp / (fp + tn)) if (fp + tn) > 0 else None
+    fnr = (fn / (fn + tp)) if (fn + tp) > 0 else None
+    npv = (tn / (tn + fn)) if (tn + fn) > 0 else None
+    accuracy = ((tp + tn) / total) if total > 0 else None
+
+    return {
+        **base,
+        "available": True,
+        "methodology": (
+            "ISOLATION-FOREST-ONLY sample-based validation metrics, not a population census "
+            "and not the combined rule+forest operational detector's performance: the flagged "
+            "population is reviewed up to its cap, but near-threshold and random-unflagged "
+            "days were SAMPLED rather than exhaustively reviewed. These figures describe the "
+            "reviewed cohort under this model/eligibility version and must not be quoted as "
+            "population-wide accuracy, and must never be reported as 'the detector's' "
+            "precision/recall without noting the rule layer is excluded."
+        ),
+        "confirmed_labels": total,
+        "precision": round(precision, 3) if precision is not None else None,
+        "recall": round(recall, 3) if recall is not None else None,
+        "specificity": round(specificity, 3) if specificity is not None else None,
+        "f1": round(f1, 3) if f1 is not None else None,
+        "false_positive_rate": round(fpr, 3) if fpr is not None else None,
+        "false_negative_rate": round(fnr, 3) if fnr is not None else None,
+        "negative_predictive_value": round(npv, 3) if npv is not None else None,
+        "accuracy": round(accuracy, 3) if accuracy is not None else None,
+    }
+
+
+def flavor_real_data_readiness(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:
+    """Part 4's readiness policy -- the ONLY function that may report
+    READY_REAL_DATA for the flavour-level pass, and only when every
+    criterion below is met by GENUINE (non-synthetic) evidence. Thresholds
+    are fixed module constants, never a caller-supplied parameter, so
+    nothing can lower them just to reach a more flattering state sooner.
+
+    States, in order of increasing evidence:
+      SIMULATION_ONLY        zero genuine observations exist at all
+      INSUFFICIENT_REAL_DATA genuine observations exist but below the
+                             volume/date-coverage floor to train or
+                             evaluate meaningfully
+      READY_WITH_LIMITATIONS the forest can train on real data, but
+                             human-reviewed ground truth is not yet
+                             sufficient for a scientific claim
+      READY_REAL_DATA        sufficient real observations, date coverage,
+                             AND genuinely human-reviewed labels on both
+                             sides of the model's own prediction
+    Simulated-workbook rows (recorded_by='simulated_workbook_import', never
+    an app_user) never count toward any criterion below -- every count here
+    is already filtered through _REAL_FLAVOR_RECORDER_CLAUSE
+    (_flavor_consumption_records) or model_version/eligibility_version
+    scoping (the validation-sample table), the same structural exclusion
+    the rest of this module relies on throughout.
+    """
+    records = _flavor_consumption_records(conn, lookback_days)
+    real_observations = len(records)
+    distinct_dates = len({r["row"]["service_date"] for r in records})
+
+    labeled = conn.execute(
+        "SELECT * FROM unli_flavor_validation_sample WHERE model_version=? AND eligibility_version=?",
+        (FLAVOR_MODEL_VERSION, FLAVOR_ELIGIBILITY_VERSION),
+    ).fetchall()
+    reviewed = [r for r in labeled if r["human_label"] != "pending"]
+    confirmed_or_fp = [r for r in reviewed if r["human_label"] in ("confirmed_anomaly", "false_positive")]
+    flagged_side = sum(1 for r in confirmed_or_fp if r["model_prediction"] == "flagged")
+    unflagged_side = sum(1 for r in confirmed_or_fp if r["model_prediction"] == "unflagged")
+
+    reviewed_flavor_ids: set[int] = set()
+    for r in reviewed:
+        fr = conn.execute(
+            "SELECT flavor_id FROM unli_flavor_reconciliation WHERE id=?", (r["reconciliation_id"],)
+        ).fetchone()
+        if fr:
+            reviewed_flavor_ids.add(fr["flavor_id"])
+
+    criteria = {
+        "real_observations": {
+            "value": real_observations, "required": FLAVOR_MIN_ELIGIBLE_REAL_OBSERVATIONS,
+            "met": real_observations >= FLAVOR_MIN_ELIGIBLE_REAL_OBSERVATIONS},
+        "service_date_coverage_days": {
+            "value": distinct_dates, "required": FLAVOR_MIN_SERVICE_DATE_COVERAGE_DAYS,
+            "met": distinct_dates >= FLAVOR_MIN_SERVICE_DATE_COVERAGE_DAYS},
+        "reviewed_predictions": {
+            "value": len(reviewed), "required": FLAVOR_MIN_REVIEWED_PREDICTIONS,
+            "met": len(reviewed) >= FLAVOR_MIN_REVIEWED_PREDICTIONS},
+        "scientific_validation_labels": {
+            "value": len(confirmed_or_fp), "required": FLAVOR_MIN_SCIENTIFIC_VALIDATION_LABELS,
+            "met": len(confirmed_or_fp) >= FLAVOR_MIN_SCIENTIFIC_VALIDATION_LABELS},
+        "labels_on_flagged_side": {
+            "value": flagged_side, "required": FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE,
+            "met": flagged_side >= FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE},
+        "labels_on_unflagged_side": {
+            "value": unflagged_side, "required": FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE,
+            "met": unflagged_side >= FLAVOR_MIN_LABELS_PER_PREDICTION_SIDE},
+        "flavor_coverage": {
+            "value": len(reviewed_flavor_ids), "required": FLAVOR_MIN_FLAVOR_COVERAGE,
+            "met": len(reviewed_flavor_ids) >= FLAVOR_MIN_FLAVOR_COVERAGE},
+    }
+    all_met = all(c["met"] for c in criteria.values())
+
+    if real_observations == 0:
+        state, reason = "SIMULATION_ONLY", (
+            "zero genuine (non-synthetic) flavour reconciliation observations exist yet"
+        )
+    elif not criteria["real_observations"]["met"] or not criteria["service_date_coverage_days"]["met"]:
+        state, reason = "INSUFFICIENT_REAL_DATA", (
+            "real observation volume and/or date coverage is below the minimum needed to "
+            "train or evaluate meaningfully"
+        )
+    elif not all_met:
+        state, reason = "READY_WITH_LIMITATIONS", (
+            "the forest can train on real data, but human-reviewed ground truth is not yet "
+            "sufficient for a scientific Precision/Recall claim"
+        )
+    else:
+        state, reason = "READY_REAL_DATA", (
+            "sufficient real observations, date coverage, and genuinely human-reviewed labels "
+            "on both sides of the model's own prediction"
+        )
+
+    return {
+        "state": state, "reason": reason, "criteria": criteria,
+        "model_version": FLAVOR_MODEL_VERSION, "eligibility_version": FLAVOR_ELIGIBILITY_VERSION,
     }

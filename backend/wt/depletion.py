@@ -117,6 +117,7 @@ Prophet (or EWMA) forecasts demand; this module still decides what to buy.
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import math
 import sqlite3
 import statistics
@@ -124,6 +125,28 @@ import threading
 import time
 
 from . import forecasting, reservation, timeutil
+from .db import write_tx
+
+# 2026-10-08: same structural real-vs-synthetic test as wt/anomaly.py's
+# _REAL_USER_CLAUSE (see that module's SYNTHETIC_SEED_USER_IDS comment for
+# the full reasoning) -- found missing here while diagnosing why
+# replenishment_backtest()'s "real outcome" ground truth shifted after an
+# otherwise-unrelated simulated-workbook-import fix. Every balance-
+# reconstruction query below (_stock_history/_balances_at_cutoff/
+# _min_balances_in_window) sums stock_ledger.delta_base with NO reason or
+# provenance filter, by design -- a real wastage/spoilage/count_adjustment
+# row must count toward a real historical balance exactly like a real sale
+# does. But that same unfiltered sum also picks up every wastage/count
+# row the simulated-workbook importer writes (reason IN wastage/spoilage/
+# count_adjustment, same 108 real ingredients, overlapping real calendar
+# dates) -- those rows are tagged user_id='simulated_workbook_import',
+# never a real app_user, so this clause excludes them the same way
+# anomaly.py already does for its own candidate population. Applied to
+# every stock_ledger SUM in this module that reconstructs a historical
+# balance (current-state reads already go through ingredient.on_hand_base,
+# which an import never touches -- see simulated_workbook_import.py's own
+# docstring -- so those paths need no change).
+_REAL_LEDGER_USER_CLAUSE = "(user_id IS NULL OR user_id IN (SELECT username FROM app_user))"
 
 # --- demand model constants -------------------------------------------------
 LOOKBACK_DAYS = 56          # ~8 weeks: enough weekday repeats, recent enough to be this menu
@@ -720,6 +743,128 @@ def refresh_prophet_baselines(conn: sqlite3.Connection, horizon_days: int = HORI
     }
 
 
+# ===========================================================================
+# 2026-10 fix: an automatic refresh, so "hybrid" is what actually runs
+# ===========================================================================
+# refresh_prophet_baselines() above was only ever invoked by a human calling
+# POST /console/forecasts/refresh-prophet-baselines (or a test). Nothing in
+# this codebase's own startup/scheduling ever called it, so the
+# depletion_demand_model setting could read "hybrid" while every item's
+# actual _prophet_daily_for_item()/_hybrid_daily_for_item() still returned
+# None (never refreshed) and silently fell back to EWMA for that item --
+# confirmed by this project's own test_default_setting_is_hybrid. The fix
+# below is deliberately the smallest thing that closes that gap: a single
+# background thread, started once at process startup, that calls the SAME
+# refresh_prophet_baselines() on a fixed interval well inside
+# PROPHET_STALE_AFTER_SECONDS -- never retrained per-request, never
+# retrained per POS transaction, and never blocking app startup (the thread
+# is spawned and the startup handler returns immediately).
+REFRESH_INTERVAL_SECONDS = 12 * 3600  # 4x inside the 48h staleness window
+_refresh_run_lock = threading.Lock()
+_refresh_running = False
+
+
+def get_refresh_status(conn: sqlite3.Connection) -> dict | None:
+    """Last-known outcome of refresh_prophet_baselines(), however it was
+    triggered (the background scheduler or the manual admin endpoint) --
+    both go through run_prophet_refresh_job() below, which is the only
+    writer of this row. Returns None before the very first run in this
+    database's lifetime (e.g. immediately after a fresh migration, before
+    the background thread's first pass completes)."""
+    row = conn.execute(
+        "SELECT value FROM app_setting WHERE key='prophet_refresh_status'"
+    ).fetchone()
+    if not row or not row["value"]:
+        return None
+    try:
+        return json.loads(row["value"])
+    except (TypeError, ValueError):
+        return None
+
+
+def _save_refresh_status(conn: sqlite3.Connection, status: dict) -> None:
+    with write_tx(conn):
+        conn.execute(
+            "INSERT INTO app_setting (key, value, updated_by, updated_at) "
+            "VALUES ('prophet_refresh_status', ?, 'system', datetime('now')) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+            "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
+            (json.dumps(status),),
+        )
+
+
+def run_prophet_refresh_job(conn: sqlite3.Connection, *, triggered_by: str,
+                            horizon_days: int = HORIZON_DAYS,
+                            lookback_days: int = LOOKBACK_DAYS) -> dict:
+    """The one path both the background scheduler and the manual admin
+    endpoint call to actually run refresh_prophet_baselines() -- guards
+    against two refreshes overlapping (Prophet fitting a realistic menu
+    takes on the order of a minute; a second trigger arriving mid-run would
+    otherwise race the same in-memory _prophet_store/_hybrid_store), records
+    a durable last-run status so the console can show real freshness
+    instead of silence, and never lets a Prophet failure propagate out to
+    crash a background thread or an API request -- a failed run is recorded
+    as a failure and the existing per-item EWMA fallback keeps serving
+    forecasts exactly as it already does for any never-refreshed item."""
+    global _refresh_running
+    with _refresh_run_lock:
+        if _refresh_running:
+            return {"skipped": True, "reason": "a refresh is already running"}
+        _refresh_running = True
+    started_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    try:
+        summary = refresh_prophet_baselines(conn, horizon_days, lookback_days)
+        # Merged, not nested: every existing caller of this endpoint reads
+        # fields like body["fitted"] straight off the top level (this used
+        # to BE refresh_prophet_baselines()'s own return value) -- the new
+        # status fields are additive, not a reshape.
+        status = {**summary, "lastRunAt": started_at, "lastRunOk": True,
+                 "triggeredBy": triggered_by}
+        _save_refresh_status(conn, status)
+        return status
+    except Exception as exc:  # noqa: BLE001 -- must never crash the caller
+        status = {
+            "lastRunAt": started_at, "lastRunOk": False,
+            "triggeredBy": triggered_by, "error": str(exc),
+        }
+        _save_refresh_status(conn, status)
+        return status
+    finally:
+        with _refresh_run_lock:
+            _refresh_running = False
+
+
+def start_prophet_refresh_scheduler(get_conn) -> None:
+    """Spawns the one background thread that keeps hybrid forecasting
+    actually fed with fresh Prophet fits, on a fixed interval, without
+    blocking whatever calls this (app startup). `get_conn` is a zero-arg
+    callable returning this process's own connection (same pattern as
+    api.py's own `conn()` dependency) -- called fresh each iteration rather
+    than captured once, since a long-lived background thread should not
+    hold a single sqlite3.Connection open across hours of POS traffic.
+
+    Runs an initial refresh almost immediately (a fresh deployment should
+    not have to wait REFRESH_INTERVAL_SECONDS for its first real Prophet
+    fit) and then on the fixed interval forever, for the lifetime of the
+    process. A daemon thread: it never needs its own graceful-shutdown path
+    because it does nothing but call an idempotent, already-transactional
+    job function."""
+    import logging
+    logger = logging.getLogger("wt.depletion.prophet_scheduler")
+
+    def _loop() -> None:
+        time.sleep(5)  # let the app finish starting before the first fit
+        while True:
+            try:
+                run_prophet_refresh_job(get_conn(), triggered_by="scheduler")
+            except Exception:  # noqa: BLE001 -- the loop must never die
+                logger.exception("scheduled Prophet refresh failed")
+            time.sleep(REFRESH_INTERVAL_SECONDS)
+
+    t = threading.Thread(target=_loop, name="prophet-refresh-scheduler", daemon=True)
+    t.start()
+
+
 def _prophet_daily_for_item(conn: sqlite3.Connection, item_pk: int,
                             lookback_days: int, horizon_days: int) -> dict | None:
     """Whatever refresh_prophet_baselines() last cached for this item, or
@@ -882,7 +1027,7 @@ def _stock_history(conn: sqlite3.Connection, ingredient_id: int, on_hand: float,
     bd = timeutil.sql_business_date("created_at")
     rows = conn.execute(
         f"SELECT {bd} AS d, SUM(delta_base) AS delta FROM stock_ledger "
-        f"WHERE ingredient_id = ? AND created_at >= ? GROUP BY d",
+        f"WHERE ingredient_id = ? AND created_at >= ? AND {_REAL_LEDGER_USER_CLAUSE} GROUP BY d",
         (ingredient_id, timeutil.utc_bound_n_manila_days_ago(days, now)),
     ).fetchall()
     by_day = {r["d"]: float(r["delta"] or 0.0) for r in rows}
@@ -912,7 +1057,8 @@ def _ingredient_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         """
         SELECT i.id, i.ingredient_id, i.name, i.category, i.base_unit, i.purchase_unit,
                i.pack_size, i.yield_factor, i.lead_time_days, i.reorder_point_base,
-               i.inventory_type, i.on_hand_base, i.reserved_base,
+               i.minimum_order_qty,
+               i.inventory_type, i.on_hand_base, i.reserved_base, i.supplier,
                (i.on_hand_base - i.reserved_base - COALESCE(x.expired_base, 0)) AS available_base,
                COALESCE(x.expired_base, 0) AS expired_base,
                i.unit_cost, i.unit_cost_status, i.pack_size_status,
@@ -937,6 +1083,126 @@ def _operational_rate(conn: sqlite3.Connection, lookback_days: int) -> dict[int,
         (timeutil.utc_bound_n_manila_days_ago(lookback_days),),
     ).fetchall()
     return {r["ingredient_id"]: max(0.0, float(r["used"] or 0)) / lookback_days for r in rows}
+
+
+def _incoming_ordered(conn: sqlite3.Connection) -> dict[int, list[tuple[float, str | None]]]:
+    """Per-ingredient list of (outstanding base-unit qty, expected_delivery_date
+    ISO string or None) for every confirmed ('ordered' or 'partially_received')
+    purchase-order LINE -- one entry per PO, so multiple incoming orders for
+    the same ingredient are each kept separate rather than collapsed into one
+    number. A 'draft' PO is not yet a commitment to a supplier
+    (wt/purchasing.py's own lifecycle: draft -> ordered -> ...), so it is
+    deliberately excluded here: counting it as incoming would let an owner's
+    own unsent draft mask a real shortfall on this same screen. A 'cancelled'
+    or fully 'received' PO is excluded by the same status filter. Partial
+    deliveries are already correctly reduced by `received_qty_base`.
+
+    2026-10 fix: this used to return one aggregated total that the caller
+    subtracted from the shortfall regardless of WHEN the order was due --
+    an order arriving in 30 days could fully mask an urgent 3-day shortfall.
+    Returning each line's own expected_delivery_date lets the caller (which
+    already knows the ingredient's own lead_time_days) decide, per order,
+    whether it actually arrives in time to count against that urgency --
+    see _split_incoming_base() below. purchase_order_item.quantity is stored
+    in the ingredient's purchase_unit (see purchasing.create()); converted to
+    base the same way order_qty is converted back to purchase_unit above, via
+    pack_size * yield_factor."""
+    rows = conn.execute(
+        "SELECT poi.ingredient_id, "
+        "       (poi.quantity * COALESCE(i.pack_size, 1) * COALESCE(i.yield_factor, 1) "
+        "           - poi.received_qty_base) AS line_base, "
+        "       po.expected_delivery_date "
+        "  FROM purchase_order_item poi "
+        "  JOIN purchase_order po ON po.id = poi.purchase_order_id "
+        "  JOIN ingredient i ON i.id = poi.ingredient_id "
+        " WHERE po.status IN ('ordered','partially_received')",
+    ).fetchall()
+    out: dict[int, list[tuple[float, str | None]]] = {}
+    for r in rows:
+        qty = max(0.0, float(r["line_base"] or 0))
+        if qty <= 0:
+            continue
+        out.setdefault(r["ingredient_id"], []).append((qty, r["expected_delivery_date"]))
+    return out
+
+
+def _split_incoming_base(lines: list[tuple[float, str | None]], today: _dt.date,
+                         lead_days: float) -> tuple[float, float, float]:
+    """Splits one ingredient's incoming PO lines into
+    (in_time_base, late_base, overdue_base) using THIS ingredient's own
+    lead_time_days as the cutoff date (today + lead_days): a line only
+    offsets an urgent shortfall if it is due on or before that cutoff, so a
+    delivery arriving after stock would already run out -- or one with no
+    reliable date at all -- never quietly cancels out the warning. A line
+    with no expected_delivery_date is treated as 'late' rather than assumed
+    to arrive immediately, per the same reasoning. A line already overdue
+    against its own promised date is reported separately (`overdue_base`,
+    a subset of in_time_base) so a caller can flag the supplier risk without
+    changing the netting itself -- it is still due "by the cutoff" (the
+    cutoff is in the future; an overdue date is in the past), so it still
+    counts toward in_time_base."""
+    cutoff = today + _dt.timedelta(days=max(0.0, lead_days))
+    in_time = 0.0
+    late = 0.0
+    overdue = 0.0
+    for qty, due in lines:
+        due_date = None
+        if due:
+            try:
+                due_date = _dt.date.fromisoformat(str(due)[:10])
+            except ValueError:
+                due_date = None
+        if due_date is not None and due_date <= cutoff:
+            in_time += qty
+            if due_date < today:
+                overdue += qty
+        else:
+            late += qty
+    return in_time, late, overdue
+
+
+def _incoming_by_day(lines: list[tuple[float, str | None]], today: _dt.date,
+                     n: int) -> list[float]:
+    """2026-10-14 fix: the day-indexed counterpart to _split_incoming_base()
+    above. That function answers 'does this ingredient's TOTAL incoming
+    quantity arrive by a generic lead-time cutoff' -- useful for the
+    purchase-recommendation explanation, but not precise enough to answer
+    the real question a stockout warning needs answered: will stock run out
+    on a SPECIFIC day before a SPECIFIC delivery lands on ITS day. A PO due
+    in 4 days passes the old 'in time' test against a 5-day lead time, but
+    that says nothing about whether consumption empties the shelf on day 2
+    -- two days before that same PO arrives. This function instead places
+    each line's quantity on the exact day index it is due, so the caller
+    can add it to the day-by-day balance walk at the right point and let a
+    real zero-crossing on an earlier day stand, regardless of what arrives
+    later.
+
+    Returned as a list of length `n` (index 0 = the rest of today, index i
+    = i full days from today, matching ingredient_forecast()'s own `cons`/
+    `raw`/`traj` arrays exactly) so a caller can do `bal += incoming[k]` in
+    the same loop that does `bal -= cons[k]`. A line already overdue (due
+    date in the past) is placed at index 0 -- it could arrive at any
+    moment, and treating it as already-available-today is the same
+    assumption _split_incoming_base() makes when it counts an overdue line
+    toward in_time_base. A line with no reliable date, or due beyond this
+    call's own horizon, contributes nothing to the walk (excluded, not
+    assumed immediate) -- it still shows up in the aggregate late/
+    unscheduled totals _split_incoming_base() reports for transparency, it
+    just cannot be placed on a specific day that does not exist in this
+    projection."""
+    by_day = [0.0] * n
+    for qty, due in lines:
+        if not due:
+            continue
+        try:
+            due_date = _dt.date.fromisoformat(str(due)[:10])
+        except ValueError:
+            continue
+        offset = (due_date - today).days
+        k = max(0, offset)
+        if k < n:
+            by_day[k] += qty
+    return by_day
 
 
 def _refill_lambda(conn: sqlite3.Connection, lookback_days: int,
@@ -1007,6 +1273,95 @@ def _refill_lambda(conn: sqlite3.Connection, lookback_days: int,
         (lower, *upper_params),
     ).fetchall()
     return {r["ing_id"]: (r["q"] or 0.0) / heads for r in rows if (r["q"] or 0.0) > 0}
+
+
+def _suggested_order_qty(shortfall_base: float, pack_size: float | None,
+                         yield_factor: float | None,
+                         minimum_order_qty: float | None) -> int | None:
+    """Purchase-unit quantity to recommend ordering, or None if nothing is
+    needed. `shortfall_base` is already net of available stock, safety
+    stock, and any confirmed order arriving IN TIME (see
+    _split_incoming_base()) -- this function only turns a positive base-unit
+    gap into a whole number of purchase units. Returns None for an invalid
+    supplier configuration (no pack_size) or when there is no shortfall, so
+    a caller never recommends an order that doesn't make sense.
+
+    minimum_order_qty is stored in the same purchase-unit count as the
+    result (migration 0047) -- it is ceil'd the same way the pack-size
+    quantity is, so the floor it applies is always a whole number of
+    purchase units too, never a fractional pack. It can only ever RAISE an
+    already-needed order (the shortfall>0 guard decides whether an order
+    happens at all), never create one on its own."""
+    if shortfall_base <= 0 or not pack_size:
+        return None
+    packs_needed = math.ceil(shortfall_base / (pack_size * (yield_factor or 1.0)))
+    if minimum_order_qty:
+        packs_needed = max(packs_needed, math.ceil(minimum_order_qty))
+    return packs_needed
+
+
+def _replenishment_message(name: str, status: str, days_of_supply: float | None,
+                           deviation_ratio: float | None, deviation_flag: bool,
+                           below_rop: bool, arrives_too_late: bool = False) -> str:
+    """Plain-language depletion/days-of-supply warning for the floor, built
+    only from figures ingredient_forecast() has already computed above --
+    this never runs a second estimate of its own. Always calls the figure
+    "estimated": real on-hand can differ from the ledger's number because of
+    spills, over-portioning, spoilage and the like, and the wording should
+    say so rather than imply a physical count.
+
+    `deviation_flag`/`deviation_ratio` compare the forward forecast's steady
+    rate against the same ingredient's own trailing-ledger average (see
+    FORECAST_DEVIATION_RATIO above) -- when the forward rate is the higher
+    of the two, that is today's usage running above the ingredient's usual
+    rate, which is the specific thing worth naming in the warning rather
+    than leaving "may run out" unexplained.
+    """
+    days_text = None
+    if days_of_supply is not None:
+        d = max(0, round(days_of_supply))
+        days_text = f"approximately {d} more day{'' if d == 1 else 's'}"
+
+    usage_up = bool(deviation_flag and deviation_ratio is not None and deviation_ratio > 1.0)
+
+    if status == "out":
+        return f"{name} is out of stock right now."
+
+    if status in ("critical", "at_risk"):
+        lead_in = (f"{name} may require earlier replenishment than scheduled."
+                  if status == "critical" else
+                  f"{name} may fall below a safe level before the next delivery.")
+        usage_clause = " Current usage is higher than the usual rate." if usage_up else ""
+        # below_rop can only ever raise a status to "at_risk" (see the caller),
+        # never reach here on its own without the forecast tier agreeing --
+        # named explicitly rather than left implicit in the generic wording.
+        rop_clause = (f" Stock has also fallen below the level set as safe for this ingredient."
+                     if below_rop else "")
+        supply_clause = (f" Estimated stock may only be sufficient for {days_text}."
+                         if days_text else
+                         " Estimated stock may not be sufficient to reach the next delivery.")
+        # A confirmed order already exists but, per its own expected delivery
+        # date, will not arrive in time to prevent this -- named explicitly
+        # so this doesn't read as "nothing has been done about it" when a PO
+        # is in fact already placed, just not placed in time.
+        late_clause = (" A purchase order is already on its way but is not expected to "
+                       "arrive in time."
+                       if arrives_too_late else "")
+        return lead_in + usage_clause + rop_clause + supply_clause + late_clause
+
+    if below_rop:
+        return (f"{name}'s estimated stock has fallen below the level set as safe for it. "
+               "Consider replenishing earlier than scheduled.")
+
+    if status == "idle":
+        return (f"No recent usage recorded for {name} — estimated depletion cannot be "
+               "projected from current data.")
+
+    if status == "excess":
+        return f"{name}'s estimated stock is well above typical needs — no action needed."
+
+    return (f"{name}'s estimated stock is sufficient to cover the period through the "
+           "next scheduled delivery.")
 
 
 def _cross_zero(trajectory: list[float], start: float) -> float | None:
@@ -1107,6 +1462,7 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
     # ingredient in one pass.
     trailing_rate = {r["ingredient_id"]: r["avg_daily_consumption"]
                      for r in forecasting.ingredient_depletion(conn, lookback_days=lookback_days, now=now)}
+    incoming_ordered = _incoming_ordered(conn) if historical_available is None else {}
 
     n = horizon_days + 1        # index 0 = rest of today, then horizon_days full days
 
@@ -1207,6 +1563,35 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
             available = historical_available[ing_id]
         cons = consumption[ing_id]
         sig = [math.sqrt(v) for v in variance[ing_id]]
+        lead = ing["lead_time_days"] or 0
+        rop = ing["reorder_point_base"]
+
+        # 2026-10-14 fix: _incoming_ordered() only ever reads the CURRENT
+        # purchase_order table, so it cannot be backdated -- excluded
+        # during replenishment_backtest() (historical_available is set),
+        # same reasoning as ingredient_forecast()'s own docstring for why
+        # that parameter reconstructs on-hand only, not every live table.
+        incoming_lines = incoming_ordered.get(ing_id, []) if historical_available is None else []
+        incoming_total_base = sum(q for q, _ in incoming_lines)
+        # Aggregate in-time/late/overdue totals, kept for the purchase-
+        # recommendation explanation and the "arrives too late" message --
+        # see _split_incoming_base()'s own docstring for why this generic
+        # lead-time cutoff is NOT precise enough to drive the trajectory or
+        # the shortfall below on its own.
+        incoming_in_time_base, incoming_late_base, incoming_overdue_base = (
+            _split_incoming_base(incoming_lines, today, lead)
+        )
+        # The precise, day-indexed version: places each line on the exact
+        # day it is actually due so the balance walk below can show a real
+        # stockout on an earlier day standing even when a later delivery
+        # would eventually have covered the aggregate shortfall -- see
+        # _incoming_by_day()'s own docstring for the gap this closes (a PO
+        # 'within lead time' by the generic cutoff can still arrive after
+        # consumption would already have emptied the shelf).
+        incoming_by_day = (
+            _incoming_by_day(incoming_lines, today, n) if historical_available is None
+            else [0.0] * n
+        )
 
         # Two runs of the same arithmetic. `raw` is allowed to go negative --
         # that is where the zero crossing and the size of any shortfall come
@@ -1215,11 +1600,22 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
         # remaining demand goes unserved, it does not keep draining a
         # non-existent balance. Plotting the raw line instead would put 90% of
         # the chart below the axis and hide the part anyone cares about.
+        #
+        # A confirmed delivery is added on its OWN day (`bal += incoming_
+        # by_day[k]`), in the same walk, chronologically alongside every
+        # other day's consumption -- never as a single lump-sum adjustment
+        # at the end. This is what makes an earlier stockout (a day whose
+        # running balance crosses zero before a later delivery's own day)
+        # show up as a real zero-crossing in `raw` regardless of how much
+        # is confirmed to arrive afterward, and what makes multiple
+        # deliveries compose correctly: each lands exactly once, on its own
+        # day, in calendar order.
         raw, traj, band_lo, band_hi = [], [], [], []
         bal = available
         cum_sig2 = 0.0
         for k in range(n):
             bal -= cons[k]
+            bal += incoming_by_day[k]
             raw.append(bal)
             traj.append(max(0.0, bal))
             cum_sig2 += sig[k] ** 2
@@ -1245,8 +1641,6 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
         )
 
         depletion_idx = _cross_zero(raw, available) if steady > 0 or cons[0] > 0 else None
-        lead = ing["lead_time_days"] or 0
-        rop = ing["reorder_point_base"]
         raw_at_lead = _interp_at(raw, available, lead)
 
         if available <= 0:
@@ -1284,13 +1678,38 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
         # it by name in the purchase-recommendation explanation instead of
         # it being invisible inside the shortfall total.
         safety_stock_base = steady * REVIEW_CYCLE_DAYS
-        order_qty = None
-        if steady > 0 and ing["pack_size"]:
-            shortfall = steady * lead + safety_stock_base - available
-            if shortfall > 0:
-                order_qty = math.ceil(shortfall / (ing["pack_size"] * (ing["yield_factor"] or 1.0)))
+        # 2026-10-14 fix: the purchase recommendation now reads the SAME
+        # delivery-aware, real-daily-consumption trajectory the status tier
+        # above was just computed from, rather than a separate flat
+        # `steady x lead` approximation that could disagree with it (e.g.
+        # ignore a nowcast-adjusted day 0, or net out a PO that arrives
+        # after an earlier day's stockout already stands). Evaluated at the
+        # same lead+safety-cycle horizon REVIEW_CYCLE_DAYS already uses
+        # elsewhere, so "how much do we need to order" and "is this
+        # critical/at_risk" are answers to the same underlying question,
+        # never two independently-drifting calculations.
+        eval_day = lead + REVIEW_CYCLE_DAYS
+        projected_at_eval = _interp_at(raw, available, eval_day)
+        shortfall = -projected_at_eval if projected_at_eval < 0 else 0.0
+        order_qty = _suggested_order_qty(
+            shortfall, ing["pack_size"], ing["yield_factor"], ing["minimum_order_qty"],
+        )
 
         top = sorted(contributors[ing_id].items(), key=lambda kv: -kv[1])[:5]
+
+        # 2026-10-14 fix: "arrives too late" now means exactly what the
+        # trajectory just proved -- status is still critical/at_risk despite
+        # SOME confirmed quantity being on order. incoming_late_base alone
+        # (the generic lead-time-cutoff split) used to under-fire this: a PO
+        # due in 4 days against a 5-day lead time counted as "in time" by
+        # that cutoff even when the real day-by-day trajectory shows stock
+        # emptying on day 1, three days before that same delivery lands.
+        arrives_too_late = (
+            status in ("critical", "at_risk") and incoming_total_base > 0
+        )
+        replenishment_message = _replenishment_message(
+            ing["name"], status, depletion_idx, deviation_ratio,
+            forecast_deviation_flag, below_rop, arrives_too_late=arrives_too_late)
 
         out.append({
             "ingredientId": ing_id,
@@ -1302,6 +1721,26 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
             "purchaseUnit": ing["purchase_unit"],
             "packSize": ing["pack_size"],
             "yieldFactor": ing["yield_factor"],
+            "minimumOrderQty": ing["minimum_order_qty"],
+            "supplier": ing["supplier"],
+            # Already placed with a supplier and not yet (fully) received --
+            # see _incoming_ordered()'s own docstring for what counts. This
+            # total, and the in-time/late/overdue split below, are reported
+            # for the purchase-recommendation explanation; the actual
+            # shortfall/order-qty math above reads the day-indexed
+            # incoming_by_day placed directly into the trajectory (`raw`),
+            # not these aggregates -- see _incoming_by_day()'s docstring for
+            # why a generic lead-time cutoff isn't precise enough on its own.
+            "incomingOrderedBase": round(incoming_total_base, 3),
+            # The date-aware split (2026-10 fix): how much of the total
+            # above actually offsets this ingredient's urgency (due by
+            # today + lead_time_days) versus arrives too late/with no
+            # reliable date to count on, surfaced separately so a caller
+            # never has to guess which POs the recommendation already
+            # accounted for.
+            "incomingInTimeBase": round(incoming_in_time_base, 3),
+            "incomingLateBase": round(incoming_late_base, 3),
+            "incomingOverdueBase": round(incoming_overdue_base, 3),
             "onHand": round(float(ing["on_hand_base"] or 0), 3),
             "reserved": round(float(ing["reserved_base"] or 0), 3),
             "available": round(available, 3),
@@ -1350,6 +1789,11 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
             "suggestedOrderQty": order_qty,
             "suggestedOrderUnit": ing["purchase_unit"] if order_qty is not None else None,
             "status": status,
+            # Plain-language depletion warning for the floor/owner UI -- see
+            # _replenishment_message()'s own docstring. Derived entirely
+            # from the fields above it in this same dict; never a second
+            # calculation.
+            "replenishmentMessage": replenishment_message,
             "trajectory": [round(v, 3) for v in traj],
             "band": ({"low": [round(v, 3) for v in band_lo],
                       "high": [round(v, 3) for v in band_hi]} if has_band else None),
@@ -1601,7 +2045,7 @@ def _balances_at_cutoff(conn: sqlite3.Connection, cutoff_iso: str) -> dict[int, 
               for r in conn.execute("SELECT id, on_hand_base FROM ingredient")}
     after = {r["ingredient_id"]: float(r["d"] or 0.0) for r in conn.execute(
         "SELECT ingredient_id, SUM(delta_base) AS d FROM stock_ledger "
-        "WHERE created_at >= ? GROUP BY ingredient_id", (cutoff_iso,),
+        f"WHERE created_at >= ? AND {_REAL_LEDGER_USER_CLAUSE} GROUP BY ingredient_id", (cutoff_iso,),
     ).fetchall()}
     return {iid: current[iid] - after.get(iid, 0.0) for iid in current}
 
@@ -1644,7 +2088,8 @@ def _min_balances_in_window(conn: sqlite3.Connection, start_iso: str, end_iso: s
     run = dict(start_balance)
     for r in conn.execute(
         "SELECT ingredient_id, delta_base FROM stock_ledger "
-        "WHERE created_at >= ? AND created_at < ? ORDER BY created_at, id",
+        f"WHERE created_at >= ? AND created_at < ? AND {_REAL_LEDGER_USER_CLAUSE} "
+        "ORDER BY created_at, id",
         (start_iso, end_iso),
     ):
         i = r["ingredient_id"]

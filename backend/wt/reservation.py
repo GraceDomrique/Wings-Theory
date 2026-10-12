@@ -621,6 +621,67 @@ def void_after_commit(
         }
 
 
+def set_leftover_charge(
+    conn: sqlite3.Connection, order_pk: int, amount: float, user_id: str | None = None,
+) -> dict:
+    """2026-10 fix: the live-checkout half of migration 0037's stated plan
+    ("the live checkout path is updated to write it going forward") had
+    never actually been built — customer_order.leftover_charge_total
+    existed in the schema with no caller anywhere. This is that caller.
+
+    A real printed-on-the-menu penalty fee ("Leftover Charge - Wings/Rice/
+    Fries") for unfinished Unlimited Wings food, assessed once a table's
+    bill has already been totaled (migration 0037's own comment: "assessed
+    once, at checkout, against the whole table's unfinished food" — a
+    human judgment call about how much food is left, not a figure this
+    system could compute on its own). Deliberately NOT folded into
+    subtotal/service_charge/total: those five columns are frozen the moment
+    an order is checked out (trg_order_financials_immutable, migration
+    0011/0019) and migration 0037 explicitly chose to leave
+    leftover_charge_total outside that trigger's guard — "provenance/detail
+    on an already-settled order, not a figure that trigger's immutability
+    guarantee is about". This never touches stock_ledger, inventory, or any
+    already-frozen money column; it is a pure billing addendum, exactly as
+    that migration specified.
+
+    Settable only once a table's bill has a total (i.e. checkout already
+    ran) — a leftover charge on an order that was never checked out has
+    nothing to be "in addition to" yet. Overwriting an existing value is
+    allowed (a cashier correcting their own visual estimate before the
+    customer pays) and is itself audited, so the correction is traceable;
+    this is not append-only the way stock_ledger is, because it is a
+    billing detail a human can legitimately amend before payment, not a
+    permanent fact about physical stock leaving the building.
+    """
+    if amount < 0:
+        raise InvalidStateError("leftover charge cannot be negative")
+    with write_tx(conn):
+        order = _order(conn, order_pk)
+        if order["status"] == "void":
+            raise InvalidStateError("cannot charge a voided order for leftover food")
+        if order["total"] is None:
+            raise InvalidStateError(
+                "order has not been checked out yet — there is no settled bill to add a "
+                "leftover charge to"
+            )
+        previous = order["leftover_charge_total"]
+        conn.execute(
+            "UPDATE customer_order SET leftover_charge_total=? WHERE id=?",
+            (round(amount, 2), order_pk),
+        )
+        audit.log(
+            conn, "order", order["order_no"], "set_leftover_charge", user_id,
+            field="leftover_charge_total",
+            previous_value=previous, new_value=round(amount, 2),
+        )
+    return {
+        "order_id": order_pk,
+        "order_no": order["order_no"],
+        "leftover_charge_total": round(amount, 2),
+        "grand_total": round((order["total"] or 0.0) + amount, 2),
+    }
+
+
 def receive_stock(
     conn: sqlite3.Connection,
     ingredient_pk: int,

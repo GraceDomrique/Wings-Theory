@@ -423,6 +423,276 @@ def review(conn: sqlite3.Connection, recon_pk: int, approve: bool,
     return {"id": recon_pk, "validation_state": state, "reviewed_by": user_id}
 
 
+def revision_history(conn: sqlite3.Connection, recon_pk: int) -> list[dict]:
+    """Every revision ever recorded against one original reconciliation,
+    oldest first — the append-only record a caller walks to see exactly how
+    a service-date's reconciled figures evolved as late orders committed."""
+    return [
+        dict(r) for r in conn.execute(
+            "SELECT * FROM unli_reconciliation_revision WHERE reconciliation_id=? ORDER BY id",
+            (recon_pk,),
+        ).fetchall()
+    ]
+
+
+def _cumulative_correction(conn: sqlite3.Connection, recon_pk: int, original_correction: float) -> float:
+    row = conn.execute(
+        "SELECT cumulative_correction_base FROM unli_reconciliation_revision "
+        "WHERE reconciliation_id=? ORDER BY id DESC LIMIT 1",
+        (recon_pk,),
+    ).fetchone()
+    return row["cumulative_correction_base"] if row else original_correction
+
+
+def _revision_calc(conn: sqlite3.Connection, recon_pk: int,
+                   opening_base: float, closing_base: float, added_base: float) -> dict:
+    """The arithmetic revise_reconciliation() and preview_revision() both
+    need, factored out so the preview a caller reviews is GUARANTEED to be
+    the exact same computation the real submission later applies -- never
+    two independently-maintained copies that could drift apart. Read-only:
+    touches no table, opens no transaction. Raises NotFoundError/
+    InvalidStateError exactly as revise_reconciliation() itself documents.
+    """
+    original = conn.execute(
+        "SELECT * FROM unli_reconciliation WHERE id=?", (recon_pk,)
+    ).fetchone()
+    if not original:
+        raise NotFoundError(f"reconciliation {recon_pk} not found")
+
+    s = conn.execute(
+        "SELECT ui.id, ui.item_key, ui.label, ui.ingredient_id, i.base_unit "
+        "FROM unli_item ui JOIN ingredient i ON i.id = ui.ingredient_id WHERE ui.id=?",
+        (original["unli_item_id"],),
+    ).fetchone()
+
+    issued = opening_base + added_base
+    if closing_base > issued + EPS:
+        raise InvalidStateError(
+            f"leftover ({closing_base:g} {s['base_unit']}) is more than what was put "
+            f"out ({issued:g} {s['base_unit']}) — check the two readings"
+        )
+    actual = issued - closing_base
+
+    # Fresh, not the original's own stale figure -- this is what picks
+    # up a late-committed order automatically, and what lets a caller
+    # detect one at all (heads > original["heads"]).
+    prov = provisional_for_date(conn, s["id"], original["service_date"])
+    heads = prov["heads"]
+    theoretical = prov["theoretical_base"]
+    if heads <= 0:
+        raise InvalidStateError(
+            f"no completed unlimited orders on {original['service_date']} — there is no "
+            f"provisional deduction to reconcile against"
+        )
+
+    variance = actual - theoretical
+    variance_ratio = (variance / theoretical) if theoretical > 0 else None
+    tol = tolerance(conn)
+    if variance_ratio is None or abs(variance_ratio) <= tol:
+        status = "within_tolerance"
+        validation_state = "validated"
+    else:
+        status = "over_tolerance" if variance_ratio > 0 else "under_tolerance"
+        validation_state = "pending_review"
+
+    full_correction = theoretical - actual
+    already_applied = _cumulative_correction(conn, recon_pk, original["correction_base"])
+    incremental = full_correction - already_applied
+
+    on_hand = conn.execute(
+        "SELECT on_hand_base FROM ingredient WHERE id=?", (s["ingredient_id"],)
+    ).fetchone()["on_hand_base"]
+    applied = max(incremental, -on_hand) if incremental < 0 else incremental
+    clamped = abs(applied - incremental) > EPS
+
+    return {
+        "original": original, "stream": s, "actual": actual, "heads": heads,
+        "theoretical": theoretical, "variance": variance, "variance_ratio": variance_ratio,
+        "tolerance_ratio": tol, "status": status, "validation_state": validation_state,
+        "already_applied": already_applied, "applied": applied, "clamped": clamped,
+    }
+
+
+def preview_revision(
+    conn: sqlite3.Connection, recon_pk: int,
+    opening_base: float, closing_base: float, added_base: float = 0.0,
+) -> dict:
+    """Read-only dry run of revise_reconciliation() -- lets a caller see the
+    freshly recomputed head count (so a late-committed order is visible
+    BEFORE anything is written), the measured variance, and the exact
+    incremental correction that would post, without touching stock, the
+    ledger, or the revision table at all. 'lateOrdersDetected' is simply
+    whether the fresh head count differs from what the original
+    reconciliation recorded -- the plain, honest signal that at least one
+    order has committed (or been voided) against this service date since
+    it was last reconciled."""
+    for label, value in (("opening", opening_base), ("closing", closing_base),
+                         ("added", added_base)):
+        if value < 0:
+            raise InvalidStateError(f"{label} weight cannot be negative")
+    calc = _revision_calc(conn, recon_pk, opening_base, closing_base, added_base)
+    original, s = calc["original"], calc["stream"]
+    cumulative = calc["already_applied"] + calc["applied"]
+    return {
+        "reconciliationId": recon_pk,
+        "serviceDate": original["service_date"],
+        "label": s["label"],
+        "baseUnit": s["base_unit"],
+        "headsAtOriginal": original["heads"],
+        "heads": calc["heads"],
+        "lateOrdersDetected": calc["heads"] != original["heads"],
+        "theoreticalBase": round(calc["theoretical"], 3),
+        "actualBase": round(calc["actual"], 3),
+        "varianceBase": round(calc["variance"], 3),
+        "varianceRatio": round(calc["variance_ratio"], 4) if calc["variance_ratio"] is not None else None,
+        "variancePct": round(calc["variance_ratio"] * 100, 2) if calc["variance_ratio"] is not None else None,
+        "toleranceRatio": calc["tolerance_ratio"],
+        "status": calc["status"],
+        "validationState": calc["validation_state"],
+        "alreadyAppliedBase": round(calc["already_applied"], 3),
+        "incrementalCorrectionBase": round(calc["applied"], 3),
+        "cumulativeCorrectionBase": round(cumulative, 3),
+        "correctionClamped": calc["clamped"],
+    }
+
+
+def revise_reconciliation(
+    conn: sqlite3.Connection, recon_pk: int,
+    opening_base: float, closing_base: float, added_base: float = 0.0,
+    note: str | None = None, user_id: str | None = None,
+    client_request_id: str | None = None,
+) -> dict:
+    """Bring an already-reconciled service-date/stream up to date — the
+    2026-10 fix for the case record_reconciliation() itself explicitly
+    refuses: a reconciliation run before every one of that day's orders had
+    committed. The ORIGINAL unli_reconciliation row is never mutated (its
+    own UNIQUE(service_date, unli_item_id) and every existing reader of it
+    keep meaning exactly what they always meant) — this inserts a new,
+    separate unli_reconciliation_revision row instead, see migration 0049.
+
+    theoretical_base is always recomputed fresh via provisional_for_date(),
+    so a late-committed order (or a correction/void that landed since the
+    original run) is picked up automatically. The correction POSTED here is
+    only the INCREMENTAL difference between the freshly computed
+    theoretical-vs-actual gap and whatever has already been applied across
+    the original row and any earlier revisions — never the full gap again,
+    which is exactly the double-deduction this module's own module
+    docstring warns against. Idempotent via client_request_id, same pattern
+    as every other mutating write in this codebase (e.g.
+    purchasing.receive_line). See preview_revision() for the read-only dry
+    run a caller should show before calling this."""
+    if client_request_id:
+        existing = conn.execute(
+            "SELECT * FROM unli_reconciliation_revision WHERE client_request_id=?",
+            (client_request_id,),
+        ).fetchone()
+        if existing:
+            return _revision_row(conn, dict(existing))
+
+    for label, value in (("opening", opening_base), ("closing", closing_base),
+                         ("added", added_base)):
+        if value < 0:
+            raise InvalidStateError(f"{label} weight cannot be negative")
+
+    with write_tx(conn):
+        calc = _revision_calc(conn, recon_pk, opening_base, closing_base, added_base)
+        original, s = calc["original"], calc["stream"]
+        heads, theoretical, actual = calc["heads"], calc["theoretical"], calc["actual"]
+        variance, variance_ratio = calc["variance"], calc["variance_ratio"]
+        tol, status, validation_state = calc["tolerance_ratio"], calc["status"], calc["validation_state"]
+        already_applied, applied, clamped = calc["already_applied"], calc["applied"], calc["clamped"]
+
+        ledger_id = None
+        if abs(applied) > EPS:
+            conn.execute(
+                "UPDATE ingredient SET on_hand_base = MAX(0, on_hand_base + :d), "
+                "updated_at = datetime('now') WHERE id = :id",
+                {"d": applied, "id": s["ingredient_id"]},
+            )
+            if applied < 0:
+                deplete_fefo(conn, s["ingredient_id"], -applied)
+            else:
+                restore_fefo(conn, s["ingredient_id"], applied)
+
+        cumulative = already_applied + applied
+        cur = conn.execute(
+            """
+            INSERT INTO unli_reconciliation_revision
+              (reconciliation_id, heads, theoretical_base, actual_base, variance_base,
+               variance_ratio, opening_base, added_base, closing_base, tolerance_ratio,
+               status, validation_state, correction_base, cumulative_correction_base,
+               client_request_id, recorded_by, note)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (recon_pk, heads, theoretical, actual, variance, variance_ratio,
+             opening_base, added_base, closing_base, tol, status, validation_state,
+             applied, cumulative, client_request_id, user_id, note),
+        )
+        revision_id = cur.lastrowid
+
+        if abs(applied) > EPS:
+            # reason stays 'unli_reconcile' -- stock_ledger.reason's CHECK
+            # constraint (migration 0005) is a fixed, deliberately short
+            # enum that would need a full table rebuild to extend (the one
+            # place append-only really matters, per that migration's own
+            # comment), which is more schema risk than this fix needs.
+            # ref_type/ref_id already point at this specific revision row,
+            # so provenance is fully traceable without a new reason value.
+            _ledger(
+                conn, s["ingredient_id"], applied, "unli_reconcile",
+                "unli_reconciliation_revision", str(revision_id), user_id,
+                note=f"{s['label']} {original['service_date']} (revision): measured "
+                     f"{actual:.1f} vs freshly computed provisional {theoretical:.1f} "
+                     f"{s['base_unit']}, {applied:+.1f} incremental correction",
+            )
+            ledger_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            conn.execute("UPDATE unli_reconciliation_revision SET ledger_id=? WHERE id=?",
+                         (ledger_id, revision_id))
+
+        row = conn.execute(
+            "SELECT * FROM unli_reconciliation_revision WHERE id=?", (revision_id,)
+        ).fetchone()
+
+    return _revision_row(conn, dict(row), label=s["label"], base_unit=s["base_unit"],
+                         service_date=original["service_date"], clamped=clamped)
+
+
+def _revision_row(conn: sqlite3.Connection, r: dict, *, label: str | None = None,
+                  base_unit: str | None = None, service_date: str | None = None,
+                  clamped: bool = False) -> dict:
+    if label is None or base_unit is None or service_date is None:
+        original = conn.execute(
+            "SELECT service_date, unli_item_id FROM unli_reconciliation WHERE id=?",
+            (r["reconciliation_id"],),
+        ).fetchone()
+        s = conn.execute(
+            "SELECT label, base_unit FROM unli_item ui JOIN ingredient i ON i.id = ui.ingredient_id "
+            "WHERE ui.id=?", (original["unli_item_id"],),
+        ).fetchone()
+        label, base_unit, service_date = s["label"], s["base_unit"], original["service_date"]
+    return {
+        "id": r["id"],
+        "reconciliation_id": r["reconciliation_id"],
+        "service_date": service_date,
+        "label": label,
+        "base_unit": base_unit,
+        "heads": r["heads"],
+        "theoretical_base": round(r["theoretical_base"], 3),
+        "actual_base": round(r["actual_base"], 3),
+        "variance_base": round(r["variance_base"], 3),
+        "variance_ratio": round(r["variance_ratio"], 4) if r["variance_ratio"] is not None else None,
+        "variance_pct": round(r["variance_ratio"] * 100, 2) if r["variance_ratio"] is not None else None,
+        "status": r["status"],
+        "validation_state": r["validation_state"],
+        "correction_base": round(r["correction_base"], 3),
+        "cumulative_correction_base": round(r["cumulative_correction_base"], 3),
+        "correction_clamped": clamped,
+        "inventory_corrected": abs(r["correction_base"]) > EPS,
+        "ledger_id": r["ledger_id"],
+        "created_at": r["created_at"],
+    }
+
+
 def history(conn: sqlite3.Connection, limit: int = 100, item_key: str | None = None,
             days: int | None = None) -> dict:
     sql = "SELECT * FROM v_unli_daily_consumption WHERE 1=1"
