@@ -69,6 +69,17 @@ from . import anomaly, db, simulated_workbook_import as swi, timeutil
 
 MODE = "DEMO_SIMULATION"
 
+# The stock-loss positive label's exact string differs by workbook revision
+# (simulatedd.xlsx used "INJECTED_STOCK_LOSS"; Wings_Theory_Regenerated_
+# Consistent_Inventory.xlsx's Stock Counts sheet uses "SYNTHETIC_LOSS" --
+# confirmed against that workbook's own "Validation Summary" sheet, which
+# reports "Injected stock loss events: 587" matching the SYNTHETIC_LOSS
+# count exactly, not INJECTED_STOCK_LOSS, which that workbook never emits).
+# Checking against this set rather than one hardcoded string is what makes
+# simulate_stock_loss_from_workbook() correct against either workbook
+# without per-revision code changes.
+_STOCK_LOSS_POSITIVE_LABELS = frozenset({"INJECTED_STOCK_LOSS", "SYNTHETIC_LOSS"})
+
 
 # ===========================================================================
 # Isolation: a fresh, throwaway database per call
@@ -540,7 +551,7 @@ def simulate_unli_consumption_validation(
 
 # ===========================================================================
 # Pass A / Pass C, scored against the SECOND workbook's own injected ground
-# truth (data/Wings_Theory_1_Year_Historical_Collection_simulatedd.xlsx,
+# truth (the historical/inventory workbooks,
 # "Injected Synthetic Truth" column on Stock Counts/Unli Reconciliation) --
 # NOT this module's own RNG-generated fixtures above. Same isolation
 # contract as the rest of this file: a brand-new throwaway database, never
@@ -617,10 +628,11 @@ def _copy_flavors_for_workbook(real_conn: sqlite3.Connection, iso_conn: sqlite3.
 
 
 def _confusion_matrix(id_to_ref: dict[int, str], ground_truth: dict[str, str],
-                      flagged_ids: set[int], anomaly_label: str) -> dict:
+                      flagged_ids: set[int], anomaly_label: str | frozenset) -> dict:
+    positive_labels = anomaly_label if isinstance(anomaly_label, (set, frozenset)) else {anomaly_label}
     tp = fp = fn = tn = 0
     for rid, ref in id_to_ref.items():
-        is_anomaly = ground_truth.get(ref) == anomaly_label
+        is_anomaly = ground_truth.get(ref) in positive_labels
         is_flagged = rid in flagged_ids
         if is_anomaly and is_flagged:
             tp += 1
@@ -727,11 +739,12 @@ def _chronological_calibrate_and_score(
 def simulate_stock_loss_from_workbook(
     real_conn: sqlite3.Connection, source_path: Path | None = None, lookback_days: int = 420,
 ) -> dict:
-    """Pass A (stock-loss IsolationForest) scored against simulatedd.xlsx's
-    own injected ground truth (Stock Counts' "Injected Synthetic Truth" ==
-    INJECTED_STOCK_LOSS / SYNTHETIC_NORMAL). See this section's own
+    """Pass A (stock-loss IsolationForest) scored against the inventory
+    workbook's own injected ground truth (Stock Counts' "Injected Synthetic
+    Truth" column; the positive label's exact string varies by workbook
+    revision -- see _STOCK_LOSS_POSITIVE_LABELS). See this section's own
     docstring above for the isolation contract."""
-    source_path = source_path or swi.XLSX_PATH
+    source_path = source_path or swi.INVENTORY_XLSX_PATH
     wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
     wastage_raw = swi._load_sheet(wb, swi._WASTAGE_SHEET)
     counts_raw = swi._load_sheet(wb, swi._COUNTS_SHEET)
@@ -782,8 +795,8 @@ def simulate_stock_loss_from_workbook(
         # receiving-balance-corrected data," before any calibration below.
         flagged = anomaly.detect_anomalies(conn, lookback_days=lookback_days)
         flagged_ids = {f["ledger_id"] for f in flagged}
-        default_scored = _confusion_matrix(id_to_ref, ground_truth, flagged_ids, "INJECTED_STOCK_LOSS")
-        n_anomalous = sum(1 for v in ground_truth.values() if v == "INJECTED_STOCK_LOSS")
+        default_scored = _confusion_matrix(id_to_ref, ground_truth, flagged_ids, _STOCK_LOSS_POSITIVE_LABELS)
+        n_anomalous = sum(1 for v in ground_truth.values() if v in _STOCK_LOSS_POSITIVE_LABELS)
 
         # "calibrated" numbers: the model's own continuous IsolationForest
         # score (_evaluate_stock_loss's `score` field -- same fit, same
@@ -795,7 +808,7 @@ def simulate_stock_loss_from_workbook(
             ref = id_to_ref.get(rec["row"]["id"])
             if ref is None or rec["score"] is None:
                 continue
-            truth = "ANOMALY" if ground_truth.get(ref) == "INJECTED_STOCK_LOSS" else "NORMAL"
+            truth = "ANOMALY" if ground_truth.get(ref) in _STOCK_LOSS_POSITIVE_LABELS else "NORMAL"
             items.append((ref, rec["row"]["created_at"], rec["score"], truth))
         calibrated = (_chronological_calibrate_and_score(items) if items else
                      {"available": False, "reason": "IsolationForest did not train (pool below MIN_POOLED_SAMPLES)"})
@@ -805,14 +818,14 @@ def simulate_stock_loss_from_workbook(
             "available": True,
             "production_validated": False,
             "methodology": (
-                "Wastage Log + Stock Counts + Receiving Log rows from simulatedd.xlsx replayed "
-                "into an isolated, throwaway database (never production) against REAL "
+                "Wastage Log + Stock Counts + Receiving Log rows from the inventory workbook "
+                "replayed into an isolated, throwaway database (never production) against REAL "
                 "ingredient reference rows copied read-only from the live database. Ground "
                 "truth is the workbook's own 'Injected Synthetic Truth' column, read directly."
             ),
             "source_workbook": str(source_path),
             "sample_count": len(id_to_ref),
-            "ground_truth_counts": {"INJECTED_STOCK_LOSS": n_anomalous,
+            "ground_truth_counts": {"STOCK_LOSS": n_anomalous,
                                     "SYNTHETIC_NORMAL": len(ground_truth) - n_anomalous},
             "default_thresholds": {
                 "description": "detect_anomalies() as shipped: rule layer (fraction>=0.25) OR "
@@ -832,14 +845,14 @@ def simulate_flavor_consumption_from_workbook(
     real_conn: sqlite3.Connection, source_path: Path | None = None, lookback_days: int = 420,
 ) -> dict:
     """Pass C (flavour-level consumption IsolationForest) scored against
-    simulatedd.xlsx's own injected ground truth (Unli Reconciliation's
-    "Injected Synthetic Truth" == INJECTED_CONSUMPTION_ANOMALY /
-    SYNTHETIC_NORMAL). See this section's own docstring above for the
-    isolation contract. The workbook has no equivalent sheet for the
+    the historical workbook's own injected ground truth (Unli
+    Reconciliation's "Injected Synthetic Truth" == INJECTED_CONSUMPTION_
+    ANOMALY / SYNTHETIC_NORMAL). See this section's own docstring above for
+    the isolation contract. The workbook has no equivalent sheet for the
     generic (non-flavour) unli consumption stream Pass B scores -- callers
     needing that number must report it unavailable rather than substitute
     this one, per the workbook's own 'ML Evaluation Requirements' sheet."""
-    source_path = source_path or swi.XLSX_PATH
+    source_path = source_path or swi.HISTORICAL_XLSX_PATH
     wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
     recon_raw = swi._load_sheet(wb, swi._RECONCILIATION_SHEET)
     wb.close()
@@ -894,7 +907,7 @@ def simulate_flavor_consumption_from_workbook(
             "available": True,
             "production_validated": False,
             "methodology": (
-                "Unli Reconciliation rows from simulatedd.xlsx replayed into an isolated, "
+                "Unli Reconciliation rows from the historical workbook replayed into an isolated, "
                 "throwaway database (never production) against REAL unli_flavor/ingredient "
                 "reference rows copied read-only from the live database. Ground truth is the "
                 "workbook's own 'Injected Synthetic Truth' column, read directly."
@@ -922,7 +935,7 @@ def simulate_unli_consumption_from_workbook(
     real_conn: sqlite3.Connection, source_path: Path | None = None, lookback_days: int = 420,
 ) -> dict:
     """Pass B (generic, non-flavour-level unli consumption IsolationForest)
-    executed against simulatedd.xlsx. The workbook has no day-level 'whole
+    executed against the historical workbook. It has no day-level 'whole
     unli stream' sheet of its own (only per-flavour Unli Reconciliation) --
     this legitimately rolls that same per-flavour data UP to one row per
     service_date (heads = the day's max per-flavour head count, a defensible
@@ -934,7 +947,7 @@ def simulate_unli_consumption_from_workbook(
     ANOMALY if ANY flavour reconciled that day carries
     INJECTED_CONSUMPTION_ANOMALY -- a real anomaly in one flavour's sauce
     usage is a real anomaly in the day's aggregate consumption too."""
-    source_path = source_path or swi.XLSX_PATH
+    source_path = source_path or swi.HISTORICAL_XLSX_PATH
     wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
     recon_raw = swi._load_sheet(wb, swi._RECONCILIATION_SHEET)
     wb.close()
@@ -1037,7 +1050,7 @@ def simulate_unli_consumption_from_workbook(
             "available": True,
             "production_validated": False,
             "methodology": (
-                "Unli Reconciliation rows from simulatedd.xlsx aggregated per service_date "
+                "Unli Reconciliation rows from the historical workbook aggregated per service_date "
                 "(summed across all 14 flavours, a single shared base unit) into one "
                 "day-level stream and replayed into an isolated, throwaway database. Ground "
                 "truth: a day is anomalous if any flavour that day carried "

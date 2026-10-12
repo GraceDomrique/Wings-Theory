@@ -1,17 +1,30 @@
-"""Import data/Wings_Theory_1_Year_Historical_Collection_simulatedd.xlsx —
-one year of SIMULATED/MODELLED receiving, wastage, stock-count and
-unlimited-wings-flavour-reconciliation history.
+"""Import data/Wings_Theory_Regenerated_Consistent_Inventory.xlsx (receiving,
+wastage, stock counts -- "inventory" source) and
+data/Wings_Theory_1_Year_Historical.xlsx (unlimited-wings flavour
+reconciliation -- "historical" source): one year of SIMULATED/MODELLED
+operational history, explicitly never real (see both workbooks' own "Read
+Me"/"START HERE" sheets).
 
-2026-10-08: superseded the original SIMULATED.xlsx workbook with a second
-revision ("simulatedd.xlsx") that adds explicit per-row ground truth
-(Injected Synthetic Truth / Scenario ID columns) for isolated ML evaluation
-and reshapes the Wastage Log / Stock Counts sheets (new column names, no
-more free-text "Reason / Review Classification" column on Stock Counts).
-See run()'s own module-level ONE-TIME CLEANUP note below: this requires
-purging the previous workbook's already-imported rows before re-running,
-since both workbooks mint their own independent Receipt/Waste/Count/
-Reconciliation IDs and the old ones would otherwise sit alongside the new
-ones forever as duplicate synthetic history.
+2026-10-12: superseded the single-workbook design
+(Wings_Theory_1_Year_Historical_Collection_simulatedd.xlsx) with this
+two-workbook split, matching how the replacement data actually arrived:
+one "primary" workbook for inventory movements, one
+"supplementary" workbook for everything unli-flavour-related. Both new
+workbooks keep the same column shapes the importer already validated against
+(Injected Synthetic Truth / Scenario ID inline on Wastage Log/Stock Counts/
+Unli Reconciliation) -- no column-mapping changes were needed, only the
+file split.
+
+Because every previous workbook revision mints its own independent
+Receipt/Waste/Count/Reconciliation IDs, re-running this importer against a
+new source workbook would otherwise leave the previous revision's rows
+sitting alongside the new ones forever as duplicate synthetic history. See
+run()'s own `replace_existing` parameter (default True) for how this is
+handled: every row this module ever wrote is unambiguously identifiable by
+its sentinel user_id/recorded_by/created_by (USER_ID below, never a real
+app_user), so "replace the obsolete synthetic data" means "delete every row
+carrying that sentinel, then re-import from the current source workbooks" --
+never touches a row any other actor wrote, real or synthetic.
 
 What this is and is not
 ------------------------
@@ -51,23 +64,25 @@ enforce that:
      the integration this module is part of proves current inventory is
      bit-for-bit unchanged by an import.
 
+From INVENTORY_XLSX_PATH (Wings_Theory_Regenerated_Consistent_Inventory.xlsx):
 Receiving Log -> purchase_order/purchase_order_item/purchase_order_receipt
 (for supplier lead-time analytics only, see wt/depletion.py's future
-consumer of actual_lead_time) and Wastage Log/Stock Counts -> stock_ledger
-(+ ingredient_variance_review for a count row with a substantive review
-classification). Unli Reconciliation -> unli_flavor_reconciliation
-(migration 0044). Unli Sessions/Unli Refills, Supplier Master and Cooking
-Oil Tests are deliberately NOT imported: Sessions/Refills are the
-simulation's own internal working detail that FEEDS the already-aggregated
-Unli Reconciliation sheet (importing both would double-count the same
-synthetic consumption at two granularities, and the session-level table,
-unli_session, has UNIQUE(order_id) already satisfied by REAL unli_session
-rows xlsx_history_import.py created for these exact WTRORD orders — a
-second session per order is not representable without either violating that
-constraint or overwriting real data, both forbidden); Supplier Master and
-Cooking Oil Tests are 100% blank/reference-only in this workbook (confirmed
-by the 2026-10-05 forensic audit this module's design is based on) — there
-is nothing in them to import yet.
+consumer of actual_lead_time) and Wastage Log/Stock Counts -> stock_ledger.
+From HISTORICAL_XLSX_PATH (Wings_Theory_1_Year_Historical.xlsx): Unli
+Reconciliation -> unli_flavor_reconciliation (migration 0044) only. Unli
+Sessions/Unli Refills, Ingredient Reference, Supplier Master and Cooking Oil
+Tests on that same workbook are deliberately NOT imported: Sessions/Refills
+are the simulation's own internal working detail that FEEDS the
+already-aggregated Unli Reconciliation sheet (importing both would
+double-count the same synthetic consumption at two granularities, and the
+session-level table, unli_session, has UNIQUE(order_id) already satisfied
+by REAL unli_session rows xlsx_history_import.py created for these exact
+WTRORD orders — a second session per order is not representable without
+either violating that constraint or overwriting real data, both
+forbidden); Ingredient Reference/Supplier Master are reference-only
+duplicates of the real ingredient catalog (the importer resolves against
+the REAL catalog via _ingredient_map(), never this workbook's own copy of
+it); Cooking Oil Tests has no consumer in this schema yet.
 """
 from __future__ import annotations
 
@@ -82,7 +97,13 @@ from .units import UnitConversionError, purchase_to_base
 
 USER_ID = "simulated_workbook_import"
 _DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
-XLSX_PATH = _DATA_DIR / "Wings_Theory_1_Year_Historical_Collection_simulatedd.xlsx"
+# "Primary" source: Receiving Log/Wastage Log/Stock Counts (inventory
+# movements). "Supplementary" source: Unli Reconciliation only -- see this
+# module's own docstring on why Unli Sessions/Refills are never imported
+# from here even though the workbook carries them.
+INVENTORY_XLSX_PATH = _DATA_DIR / "Wings_Theory_Regenerated_Consistent_Inventory.xlsx"
+HISTORICAL_XLSX_PATH = _DATA_DIR / "Wings_Theory_1_Year_Historical.xlsx"
+XLSX_PATH = INVENTORY_XLSX_PATH  # back-compat alias for existing callers/tests
 
 _RECEIVING_SHEET = "Receiving Log"
 _WASTAGE_SHEET = "Wastage Log"
@@ -414,14 +435,20 @@ def insert_reconciliation_row(conn, row: dict, flavor: dict, ref: str, batch_id:
     return cur.lastrowid
 
 
-def load_and_validate(wb, ingredients: dict[str, dict], flavors: dict[str, dict]) -> dict:
+def load_and_validate(inv_wb, hist_wb, ingredients: dict[str, dict], flavors: dict[str, dict]) -> dict:
     """Shared sheet-load + validation step, factored out so the isolated
     workbook-ground-truth harness in wt/demo_validation.py validates/rejects
-    rows through the exact same rules as production run() below."""
-    receiving_raw = _load_sheet(wb, _RECEIVING_SHEET)
-    wastage_raw = _load_sheet(wb, _WASTAGE_SHEET)
-    counts_raw = _load_sheet(wb, _COUNTS_SHEET)
-    recon_raw = _load_sheet(wb, _RECONCILIATION_SHEET)
+    rows through the exact same rules as production run() below.
+
+    inv_wb (the "inventory" workbook) supplies Receiving/Wastage/Stock
+    Counts; hist_wb (the "historical" workbook) supplies Unli Reconciliation
+    only. Callers that only need one side (e.g. demo_validation's
+    per-pass harnesses) may pass the same workbook object for both -- every
+    sheet lookup below is independent."""
+    receiving_raw = _load_sheet(inv_wb, _RECEIVING_SHEET)
+    wastage_raw = _load_sheet(inv_wb, _WASTAGE_SHEET)
+    counts_raw = _load_sheet(inv_wb, _COUNTS_SHEET)
+    recon_raw = _load_sheet(hist_wb, _RECONCILIATION_SHEET)
 
     receiving_ok, receiving_rejected = _validate_rows(
         receiving_raw, id_col="Receipt ID", ingredient_col="Ingredient ID",
@@ -458,16 +485,96 @@ def load_and_validate(wb, ingredients: dict[str, dict], flavors: dict[str, dict]
     }
 
 
+def _delete_bypassing_append_only_guard(conn, table: str, where_sql: str, params: tuple) -> int:
+    """DELETE from a table whose BEFORE DELETE trigger(s) enforce
+    append-only (stock_ledger, unli_flavor_reconciliation,
+    ingredient_variance_review all do, for real rows). Reads the exact
+    trigger definitions from sqlite_master (never hand-duplicated, so they
+    cannot drift from whatever migration actually created them), drops
+    them, runs the DELETE, and recreates them from the captured SQL before
+    returning -- the append-only guarantee is back in force before any
+    other statement runs, including on an exception (see `finally`).
+    `where_sql`/`params` must scope the DELETE to rows this module itself
+    wrote (the synthetic USER_ID sentinel) -- this function enforces
+    nothing about that; callers are responsible for a safe WHERE clause."""
+    trigger_defs = [
+        r[0] for r in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='trigger' AND tbl_name=? AND sql IS NOT NULL",
+            (table,),
+        ).fetchall()
+    ]
+    trigger_names = [
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name=?", (table,),
+        ).fetchall()
+    ]
+    for name in trigger_names:
+        conn.execute(f"DROP TRIGGER IF EXISTS {name}")
+    try:
+        cur = conn.execute(f"DELETE FROM {table} WHERE {where_sql}", params)
+        return cur.rowcount
+    finally:
+        for sql in trigger_defs:
+            conn.execute(sql)
+
+
+def _purge_previous_import(conn) -> dict:
+    """Delete every row this module has ever written (identified solely by
+    its sentinel USER_ID -- never by which workbook revision wrote it), so a
+    re-run against a NEW source workbook cannot leave a prior revision's
+    rows sitting alongside the new ones. Must run inside the same write_tx
+    as the re-import that follows, so a failure never leaves the database
+    between purge and re-import.
+
+    stock_ledger / unli_flavor_reconciliation / ingredient_variance_review
+    are all append-only by design (BEFORE UPDATE/DELETE triggers, enforced
+    for every real row ever recorded in them) -- see
+    _delete_bypassing_append_only_guard() for how this lifts that guard
+    ONLY for the duration of this purge and ONLY for rows carrying the
+    synthetic sentinel (user_id/recorded_by=USER_ID, structurally never a
+    real account). A real row in any of these tables is never reachable by
+    these DELETEs, and the append-only guarantee is restored before this
+    function returns."""
+    counts = {}
+
+    cur = conn.execute(
+        "DELETE FROM purchase_order_receipt WHERE purchase_order_item_id IN ("
+        " SELECT id FROM purchase_order_item WHERE purchase_order_id IN ("
+        "  SELECT id FROM purchase_order WHERE created_by = ?))", (USER_ID,))
+    counts["purchase_order_receipt"] = cur.rowcount
+    cur = conn.execute(
+        "DELETE FROM purchase_order_item WHERE purchase_order_id IN ("
+        " SELECT id FROM purchase_order WHERE created_by = ?)", (USER_ID,))
+    counts["purchase_order_item"] = cur.rowcount
+    cur = conn.execute("DELETE FROM purchase_order WHERE created_by = ?", (USER_ID,))
+    counts["purchase_order"] = cur.rowcount
+
+    counts["stock_ledger"] = _delete_bypassing_append_only_guard(
+        conn, "stock_ledger", "ref_type IN ('sim_wastage','sim_count') AND user_id = ?", (USER_ID,))
+    counts["ingredient_variance_review"] = _delete_bypassing_append_only_guard(
+        conn, "ingredient_variance_review", "user_id = ?", (USER_ID,))
+    counts["unli_flavor_reconciliation"] = _delete_bypassing_append_only_guard(
+        conn, "unli_flavor_reconciliation", "recorded_by = ?", (USER_ID,))
+
+    return counts
+
+
 def run(conn=None, dry_run: bool = False, verbose: bool = True,
-       source_path: Path = XLSX_PATH) -> dict:
+       inventory_path: Path = INVENTORY_XLSX_PATH,
+       historical_path: Path = HISTORICAL_XLSX_PATH,
+       replace_existing: bool = True) -> dict:
     conn = conn or db.get_conn()
-    wb = openpyxl.load_workbook(source_path, read_only=True, data_only=True)
+    inv_wb = openpyxl.load_workbook(inventory_path, read_only=True, data_only=True)
+    hist_wb = inv_wb if historical_path == inventory_path else \
+        openpyxl.load_workbook(historical_path, read_only=True, data_only=True)
 
     ingredients = _ingredient_map(conn)
     flavors = _flavor_map(conn)
 
-    loaded = load_and_validate(wb, ingredients, flavors)
-    wb.close()
+    loaded = load_and_validate(inv_wb, hist_wb, ingredients, flavors)
+    inv_wb.close()
+    if hist_wb is not inv_wb:
+        hist_wb.close()
     receiving_raw, receiving_ok, receiving_rejected = loaded["receiving"]
     wastage_raw, wastage_ok, wastage_rejected = loaded["wastage"]
     counts_raw, counts_ok, counts_rejected = loaded["counts"]
@@ -508,6 +615,8 @@ def run(conn=None, dry_run: bool = False, verbose: bool = True,
     batch_id = f"simrun-{_dt.datetime.now().strftime('%Y%m%d%H%M%S')}"
 
     with write_tx(conn):
+        purged = _purge_previous_import(conn) if replace_existing else {}
+
         # --- Receiving Log -> purchase_order/_item/_receipt, analytics only.
         # Never calls purchasing.receive_line()/reservation._receive_stock_
         # locked() -- see module docstring. One PO + one item + one receipt
@@ -581,6 +690,7 @@ def run(conn=None, dry_run: bool = False, verbose: bool = True,
 
     stats["inserted"] = inserted
     stats["duplicates"] = duplicates
+    stats["purged_previous_import"] = purged
     stats["batch_id"] = batch_id
     if verbose:
         print(f"simulated workbook import ({batch_id}): {inserted}")
@@ -591,10 +701,16 @@ if __name__ == "__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--inventory-path", type=Path, default=INVENTORY_XLSX_PATH)
+    p.add_argument("--historical-path", type=Path, default=HISTORICAL_XLSX_PATH)
+    p.add_argument("--no-replace", action="store_true",
+                   help="Skip purging a previous import's rows before re-importing "
+                        "(default is to replace them).")
     args = p.parse_args()
     c = db.get_conn()
     if not args.dry_run:
         db.backup_now("pre_simulated_workbook_import", conn=c)
-    result = run(c, dry_run=args.dry_run)
+    result = run(c, dry_run=args.dry_run, inventory_path=args.inventory_path,
+                 historical_path=args.historical_path, replace_existing=not args.no_replace)
     import json
     print(json.dumps(result, ensure_ascii=True, default=str, indent=2))

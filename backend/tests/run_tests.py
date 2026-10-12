@@ -16476,8 +16476,10 @@ class TestSimulatedWorkbookImport(unittest.TestCase):
     def setUp(self):
         from wt import simulated_workbook_import as swi
         self.swi = swi
-        if not swi.XLSX_PATH.exists():
-            self.skipTest(f"workbook not present at {swi.XLSX_PATH}")
+        if not swi.INVENTORY_XLSX_PATH.exists():
+            self.skipTest(f"workbook not present at {swi.INVENTORY_XLSX_PATH}")
+        if not swi.HISTORICAL_XLSX_PATH.exists():
+            self.skipTest(f"workbook not present at {swi.HISTORICAL_XLSX_PATH}")
 
     def _snapshot_inventory(self):
         return [
@@ -16543,13 +16545,16 @@ class TestSimulatedWorkbookImport(unittest.TestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.conn.execute("DELETE FROM unli_flavor_reconciliation WHERE id = ?", (row_id,))
 
-        # idempotency: re-importing the identical workbook is a pure no-op
+        # idempotency (replace_existing=False): re-importing the identical
+        # workbook with no replace is a pure dedup no-op -- every row is
+        # already present under the exact same workbook row ID, so nothing
+        # new is inserted and nothing is purged.
         counts_before_second = {
             t: self.conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
             for t in ("stock_ledger", "purchase_order", "unli_flavor_reconciliation",
                      "ingredient_variance_review")
         }
-        second = self.swi.run(self.conn, dry_run=False, verbose=False)
+        second = self.swi.run(self.conn, dry_run=False, verbose=False, replace_existing=False)
         self.assertEqual(second["inserted"], {k: 0 for k in second["inserted"]})
         self.assertEqual(second["duplicates"]["receiving"], first["inserted"]["receiving"])
         self.assertEqual(second["duplicates"]["reconciliation"], first["inserted"]["reconciliation"])
@@ -16560,6 +16565,52 @@ class TestSimulatedWorkbookImport(unittest.TestCase):
         }
         self.assertEqual(counts_before_second, counts_after_second)
         self.assertEqual(before, self._snapshot_inventory(), "second import must also never touch current inventory")
+
+        # replace (replace_existing=True, the default): re-importing the
+        # SAME workbook again purges every USER_ID-tagged row first, then
+        # re-inserts all of it from scratch -- end state is identical to
+        # counts_after_second even though every row's own id has changed,
+        # which is exactly the behaviour a re-run against a REVISED
+        # workbook relies on (see module docstring on why replace, not
+        # dedup, is the default).
+        third = self.swi.run(self.conn, dry_run=False, verbose=False)
+        self.assertEqual(third["duplicates"], {k: 0 for k in third["duplicates"]})
+        self.assertEqual(third["inserted"], first["inserted"])
+        # purge counts are the SYNTHETIC-only rows this module itself wrote
+        # (not the whole table, which also holds real xlsx_history_import
+        # rows) -- that subset is unchanged by the replace_existing=False
+        # no-op above, so it must equal exactly what the first import
+        # inserted.
+        purged = third["purged_previous_import"]
+        self.assertEqual(purged["stock_ledger"], first["inserted"]["wastage"] + first["inserted"]["counts"])
+        self.assertEqual(purged["purchase_order"], first["inserted"]["receiving"])
+        self.assertEqual(purged["purchase_order_item"], first["inserted"]["receiving"])
+        # <=, not ==: a short/failed delivery (Received Qty 0) gets a
+        # purchase_order/_item row but no receipt row -- see run()'s own
+        # comment on this.
+        self.assertLessEqual(purged["purchase_order_receipt"], first["inserted"]["receiving"])
+        self.assertGreater(purged["purchase_order_receipt"], 0)
+        self.assertEqual(purged["unli_flavor_reconciliation"], first["inserted"]["reconciliation"])
+        self.assertEqual(self.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        counts_after_third = {
+            t: self.conn.execute(f"SELECT COUNT(*) AS n FROM {t}").fetchone()["n"]
+            for t in ("stock_ledger", "purchase_order", "unli_flavor_reconciliation",
+                     "ingredient_variance_review")
+        }
+        self.assertEqual(counts_after_second, counts_after_third,
+                         "replace must leave the SAME row counts when re-run against an unchanged workbook")
+        self.assertEqual(before, self._snapshot_inventory(), "replace must also never touch current inventory")
+
+        # the append-only guard must be back in force after replace's
+        # internal drop/recreate -- not just "no error happened to occur"
+        row_id = self.conn.execute("SELECT id FROM unli_flavor_reconciliation LIMIT 1").fetchone()["id"]
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE unli_flavor_reconciliation SET heads = 999 WHERE id = ?", (row_id,))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM unli_flavor_reconciliation WHERE id = ?", (row_id,))
+        ledger_row_id = self.conn.execute("SELECT id FROM stock_ledger WHERE ref_type='sim_wastage' LIMIT 1").fetchone()["id"]
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM stock_ledger WHERE id = ?", (ledger_row_id,))
 
     def test_malformed_row_with_unknown_ingredient_is_rejected_not_imported(self):
         """A crafted single-sheet workbook with one row pointing at an
@@ -16577,7 +16628,7 @@ class TestSimulatedWorkbookImport(unittest.TestCase):
         p = Path(tempfile.gettempdir()) / "wt_test_bad_receiving.xlsx"
         wb.save(p)
         try:
-            result = self.swi.run(self.conn, dry_run=True, source_path=p)
+            result = self.swi.run(self.conn, dry_run=True, inventory_path=p, historical_path=p)
             self.assertEqual(result["receiving"]["accepted"], 0)
             self.assertEqual(result["receiving"]["rejected"], 1)
             self.assertIn("unknown_ingredient", result["rejected_examples"]["receiving"][0]["reject_reason"])
@@ -16591,6 +16642,25 @@ class TestSimulatedWorkbookImport(unittest.TestCase):
         self.assertEqual(self.swi._norm_ingredient_ref("ING-001"), self.swi._norm_ingredient_ref("ING-0001"))
         self.assertIsNone(self.swi._norm_ingredient_ref(None))
         self.assertIsNone(self.swi._norm_ingredient_ref(""))
+
+    def test_stock_loss_workbook_eval_recognizes_this_workbooks_own_positive_label(self):
+        """Regression guard for a real defect found 2026-10-12: Wings_Theory_
+        Regenerated_Consistent_Inventory.xlsx's Stock Counts sheet labels an
+        injected loss 'SYNTHETIC_LOSS', not the older simulatedd.xlsx
+        convention 'INJECTED_STOCK_LOSS' that demo_validation.py's
+        simulate_stock_loss_from_workbook() had hardcoded. Scoring against
+        the wrong label silently produced ground_truth_counts of 0
+        positives (precision 0.0, recall None) on every call -- a model
+        that looked broken because the harness was reading the wrong
+        column value, not because the model had nothing to find. See
+        demo_validation._STOCK_LOSS_POSITIVE_LABELS."""
+        result = demo_validation.simulate_stock_loss_from_workbook(self.conn)
+        self.assertTrue(result["available"])
+        self.assertGreater(result["ground_truth_counts"]["STOCK_LOSS"], 0,
+                           "the workbook's own Validation Summary sheet reports "
+                           "'Injected stock loss events' > 0 -- zero here means the "
+                           "positive-label check regressed again")
+        self.assertIsNotNone(result["default_thresholds"]["recall"])
 
 
 

@@ -1,0 +1,2981 @@
+{
+  "A1_demand_forecast_items": {
+    "available": true,
+    "method_version": "2026-09-rolling-backtest-v1",
+    "methodology": "Chronological expanding-window rolling backtest, never a random split. Up to 16 items with the most real sales history, up to 4 most-recent folds each, 7-day forecast horizon per fold, minimum 21-day initial training window. Every fold scored for naive-previous-period, trailing-moving-average, day-of-week-seasonal, and Prophet.",
+    "effective_now": "2026-09-21",
+    "horizon_days": 7,
+    "min_train_days": 21,
+    "max_folds_per_item": 4,
+    "items_considered": 32,
+    "items_evaluated": 16,
+    "items_insufficient_history": 0,
+    "items_excluded_for_capacity": [
+      {
+        "item_id": 4,
+        "item_name": "Spicy Korean Wing Bowl",
+        "reason": "not among the 16 items with the most real sales history (has 312 sale-days)"
+      },
+      {
+        "item_id": 27,
+        "item_name": "Sulit Deal-3 pcs Wings + Rice",
+        "reason": "not among the 16 items with the most real sales history (has 302 sale-days)"
+      },
+      {
+        "item_id": 25,
+        "item_name": "6 pcs Wings (1 Flavor) with Fries & Ranch Dip",
+        "reason": "not among the 16 items with the most real sales history (has 300 sale-days)"
+      },
+      {
+        "item_id": 9,
+        "item_name": "Beef Tapa",
+        "reason": "not among the 16 items with the most real sales history (has 295 sale-days)"
+      },
+      {
+        "item_id": 14,
+        "item_name": "Cheesy Bacon Fries",
+        "reason": "not among the 16 items with the most real sales history (has 292 sale-days)"
+      },
+      {
+        "item_id": 30,
+        "item_name": "Blueberry Yogurt (Tall)",
+        "reason": "not among the 16 items with the most real sales history (has 288 sale-days)"
+      },
+      {
+        "item_id": 17,
+        "item_name": "1 Pitcher Iced Tea",
+        "reason": "not among the 16 items with the most real sales history (has 284 sale-days)"
+      },
+      {
+        "item_id": 13,
+        "item_name": "Bacon and 2 Egg",
+        "reason": "not among the 16 items with the most real sales history (has 281 sale-days)"
+      },
+      {
+        "item_id": 26,
+        "item_name": "Wings Platter 6 pcs w/ Fries",
+        "reason": "not among the 16 items with the most real sales history (has 263 sale-days)"
+      },
+      {
+        "item_id": 3,
+        "item_name": "Creamy Sausage Pasta",
+        "reason": "not among the 16 items with the most real sales history (has 262 sale-days)"
+      },
+      {
+        "item_id": 12,
+        "item_name": "Spam and Egg",
+        "reason": "not among the 16 items with the most real sales history (has 257 sale-days)"
+      },
+      {
+        "item_id": 23,
+        "item_name": "Coke Zero",
+        "reason": "not among the 16 items with the most real sales history (has 250 sale-days)"
+      },
+      {
+        "item_id": 29,
+        "item_name": "Banana Milk Shake (Tall)",
+        "reason": "not among the 16 items with the most real sales history (has 244 sale-days)"
+      },
+      {
+        "item_id": 2,
+        "item_name": "Spicy Tuna Linguine Pesto",
+        "reason": "not among the 16 items with the most real sales history (has 223 sale-days)"
+      },
+      {
+        "item_id": 1,
+        "item_name": "White Truffle Pasta",
+        "reason": "not among the 16 items with the most real sales history (has 184 sale-days)"
+      },
+      {
+        "item_id": 31,
+        "item_name": "Wings Platter 36 pcs (6 Flavors)",
+        "reason": "not among the 16 items with the most real sales history (has 81 sale-days)"
+      }
+    ],
+    "evaluated_date_range": {
+      "from": "2025-09-22",
+      "to": "2026-09-21"
+    },
+    "items": [
+      {
+        "item_id": 32,
+        "item_name": "Unlimited Wings \u2014 14 Flavors",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 9.7857,
+            "rmse": 11.1036,
+            "wape": 23.8775,
+            "smape": 21.5925,
+            "mape": 26.5,
+            "mase": 1.169
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 6.5408,
+            "rmse": 8.1258,
+            "wape": 15.47,
+            "smape": 15.6475,
+            "mape": 16.975,
+            "mase": 0.78
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 6.2317,
+            "rmse": 7.7339,
+            "wape": 14.6875,
+            "smape": 15.545,
+            "mape": 14.7,
+            "mase": 0.7425
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 4.9625,
+            "rmse": 6.1764,
+            "wape": 11.88,
+            "smape": 11.8825,
+            "mape": 12.65,
+            "mase": 0.5917
+          }
+        },
+        "selected_method": "prophet",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "linear",
+        "growth_selection": {
+          "selected_growth": "linear",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 14.24,
+            "linear": 12.64
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 8,
+        "item_name": "Taiwanese Pork Chop",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 2.2143,
+            "rmse": 2.4662,
+            "wape": 61.245,
+            "smape": 80.51,
+            "mape": 67.8,
+            "mase": 1.164
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.3852,
+            "rmse": 1.5299,
+            "wape": 38.7775,
+            "smape": 42.7475,
+            "mape": 53.75,
+            "mase": 0.7288
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.3344,
+            "rmse": 1.5881,
+            "wape": 37.5075,
+            "smape": 41.07,
+            "mape": 50.525,
+            "mase": 0.7017
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.3347,
+            "rmse": 1.5887,
+            "wape": 37.51,
+            "smape": 41.0775,
+            "mape": 50.525,
+            "mase": 0.7017
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 36.65,
+            "linear": 43.0
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 22,
+        "item_name": "Royal",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 2.1071,
+            "rmse": 2.6667,
+            "wape": 52.13,
+            "smape": 55.4175,
+            "mape": 49.875,
+            "mase": 0.8792
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.5766,
+            "rmse": 2.0713,
+            "wape": 38.8375,
+            "smape": 42.255,
+            "mape": 37.625,
+            "mase": 0.658
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.3954,
+            "rmse": 1.9543,
+            "wape": 34.3825,
+            "smape": 38.405,
+            "mape": 33.875,
+            "mase": 0.5825
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.3947,
+            "rmse": 1.9545,
+            "wape": 34.3625,
+            "smape": 38.3825,
+            "mape": 33.825,
+            "mase": 0.5822
+          }
+        },
+        "selected_method": "prophet",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 47.11,
+            "linear": 51.92
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 20,
+        "item_name": "Sprite",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 2.3929,
+            "rmse": 2.7432,
+            "wape": 83.69,
+            "smape": 97.3225,
+            "mape": 94.6,
+            "mase": 0.9962
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.8571,
+            "rmse": 2.2455,
+            "wape": 68.79,
+            "smape": 71.1875,
+            "mape": 66.475,
+            "mase": 0.7735
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.7197,
+            "rmse": 2.1429,
+            "wape": 63.1225,
+            "smape": 69.05,
+            "mape": 66.675,
+            "mase": 0.7163
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.7822,
+            "rmse": 2.1756,
+            "wape": 66.12,
+            "smape": 69.9525,
+            "mape": 73.025,
+            "mase": 0.7418
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "linear",
+        "growth_selection": {
+          "selected_growth": "linear",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 56.44,
+            "linear": 56.16
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 21,
+        "item_name": "Coke",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 2.9643,
+            "rmse": 3.2538,
+            "wape": 117.8575,
+            "smape": 87.23,
+            "mape": 136.825,
+            "mase": 1.4392
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.7423,
+            "rmse": 2.0408,
+            "wape": 77.5825,
+            "smape": 58.3025,
+            "mape": 83.175,
+            "mase": 0.8462
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.4225,
+            "rmse": 1.7466,
+            "wape": 55.9575,
+            "smape": 52.3275,
+            "mape": 59.95,
+            "mase": 0.691
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.4229,
+            "rmse": 1.7466,
+            "wape": 55.9675,
+            "smape": 52.34,
+            "mape": 59.95,
+            "mase": 0.6913
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 63.71,
+            "linear": 69.32
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 24,
+        "item_name": "12 pcs (2 Flavors) Ala Carte Wing Rack",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 1.25,
+            "rmse": 1.6681,
+            "wape": 52.17,
+            "smape": 53.72,
+            "mape": 47.8,
+            "mase": 0.745
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.1582,
+            "rmse": 1.4048,
+            "wape": 50.23,
+            "smape": 51.5325,
+            "mape": 50.425,
+            "mase": 0.6905
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.0428,
+            "rmse": 1.4022,
+            "wape": 44.42,
+            "smape": 46.5275,
+            "mape": 41.7,
+            "mase": 0.6218
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.1197,
+            "rmse": 1.4162,
+            "wape": 48.2175,
+            "smape": 48.885,
+            "mape": 48.825,
+            "mase": 0.6677
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "linear",
+        "growth_selection": {
+          "selected_growth": "linear",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 35.13,
+            "linear": 32.18
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 6,
+        "item_name": "Creamy Chicken & Mushroom Alfredo",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 1.2857,
+            "rmse": 1.579,
+            "wape": 38.295,
+            "smape": 41.7775,
+            "mape": 50.2,
+            "mase": 0.6475
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.5535,
+            "rmse": 1.9087,
+            "wape": 48.9975,
+            "smape": 48.79,
+            "mape": 68.625,
+            "mase": 0.7815
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.4543,
+            "rmse": 1.7839,
+            "wape": 41.465,
+            "smape": 47.065,
+            "mape": 47.5,
+            "mase": 0.7325
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.4536,
+            "rmse": 1.7835,
+            "wape": 41.445,
+            "smape": 47.04,
+            "mape": 47.5,
+            "mase": 0.732
+          }
+        },
+        "selected_method": "naive_previous_period",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "exact_tie_prefers_flat",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 44.03,
+            "linear": 44.03
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 19,
+        "item_name": "Ranch Dip",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 1.5714,
+            "rmse": 1.9067,
+            "wape": 51.3475,
+            "smape": 81.805,
+            "mape": 46.675,
+            "mase": 0.7537
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.2015,
+            "rmse": 1.519,
+            "wape": 43.05,
+            "smape": 47.15,
+            "mape": 37.25,
+            "mase": 0.5787
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.0565,
+            "rmse": 1.3299,
+            "wape": 37.8925,
+            "smape": 45.195,
+            "mape": 32.525,
+            "mase": 0.5085
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.0571,
+            "rmse": 1.3307,
+            "wape": 37.915,
+            "smape": 45.21,
+            "mape": 32.525,
+            "mase": 0.5088
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 69.74,
+            "linear": 70.26
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 5,
+        "item_name": "Chicken Salpicao",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 1.9286,
+            "rmse": 2.1256,
+            "wape": 68.8225,
+            "smape": 82.005,
+            "mape": 77.775,
+            "mase": 1.0195
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.2934,
+            "rmse": 1.6072,
+            "wape": 46.2475,
+            "smape": 53.4475,
+            "mape": 44.5,
+            "mase": 0.6838
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.2544,
+            "rmse": 1.4803,
+            "wape": 44.56,
+            "smape": 53.635,
+            "mape": 46.0,
+            "mase": 0.6627
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.2543,
+            "rmse": 1.4807,
+            "wape": 44.56,
+            "smape": 53.6275,
+            "mape": 46.025,
+            "mase": 0.6627
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 45.87,
+            "linear": 50.1
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 15,
+        "item_name": "Onion Rings",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 2.5714,
+            "rmse": 3.0136,
+            "wape": 89.695,
+            "smape": 95.7425,
+            "mape": 87.45,
+            "mase": 1.315
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.773,
+            "rmse": 2.1179,
+            "wape": 65.2775,
+            "smape": 74.1775,
+            "mape": 53.725,
+            "mase": 0.9067
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.725,
+            "rmse": 2.0366,
+            "wape": 64.69,
+            "smape": 70.3975,
+            "mape": 58.275,
+            "mase": 0.8825
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.7257,
+            "rmse": 2.0371,
+            "wape": 64.72,
+            "smape": 70.425,
+            "mape": 58.275,
+            "mase": 0.883
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 64.88,
+            "linear": 69.09
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 18,
+        "item_name": "1 Cup Rice",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 2.75,
+            "rmse": 3.0894,
+            "wape": 105.0025,
+            "smape": 94.22,
+            "mape": 112.7,
+            "mase": 1.4555
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.4643,
+            "rmse": 1.7382,
+            "wape": 63.09,
+            "smape": 62.905,
+            "mape": 67.35,
+            "mase": 0.7752
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.3618,
+            "rmse": 1.651,
+            "wape": 57.3825,
+            "smape": 61.1575,
+            "mape": 57.675,
+            "mase": 0.7208
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.3957,
+            "rmse": 1.6384,
+            "wape": 59.8025,
+            "smape": 61.1475,
+            "mape": 65.075,
+            "mase": 0.739
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "linear",
+        "growth_selection": {
+          "selected_growth": "linear",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 50.15,
+            "linear": 48.91
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 16,
+        "item_name": "Fish & Chips with Tartar Sauce",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 1.3214,
+            "rmse": 1.6223,
+            "wape": 55.845,
+            "smape": 61.9675,
+            "mape": 72.375,
+            "mase": 0.6705
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.0944,
+            "rmse": 1.3443,
+            "wape": 46.9875,
+            "smape": 51.655,
+            "mape": 49.15,
+            "mase": 0.555
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 0.8348,
+            "rmse": 1.0257,
+            "wape": 35.77,
+            "smape": 42.955,
+            "mape": 34.825,
+            "mase": 0.4235
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 0.8346,
+            "rmse": 1.0258,
+            "wape": 35.765,
+            "smape": 42.9425,
+            "mape": 34.8,
+            "mase": 0.4235
+          }
+        },
+        "selected_method": "prophet",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 62.78,
+            "linear": 65.47
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 7,
+        "item_name": "Pork Tonkatsu",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 1.5715,
+            "rmse": 1.7668,
+            "wape": 87.655,
+            "smape": 82.545,
+            "mape": 71.925,
+            "mase": 0.921
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.4566,
+            "rmse": 1.7428,
+            "wape": 85.9475,
+            "smape": 78.495,
+            "mape": 52.5,
+            "mase": 0.8535
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.3232,
+            "rmse": 1.5594,
+            "wape": 75.195,
+            "smape": 77.9775,
+            "mape": 46.1,
+            "mase": 0.7757
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.3793,
+            "rmse": 1.6029,
+            "wape": 80.7925,
+            "smape": 77.2975,
+            "mape": 51.975,
+            "mase": 0.8088
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "linear",
+        "growth_selection": {
+          "selected_growth": "linear",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 49.53,
+            "linear": 49.23
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 11,
+        "item_name": "Pork Tocino",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 3.0714,
+            "rmse": 3.5633,
+            "wape": 181.6675,
+            "smape": 132.485,
+            "mape": 146.925,
+            "mase": 1.7692
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.3852,
+            "rmse": 1.8344,
+            "wape": 76.7925,
+            "smape": 80.31,
+            "mape": 55.65,
+            "mase": 0.7953
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.3073,
+            "rmse": 1.751,
+            "wape": 74.955,
+            "smape": 76.62,
+            "mape": 51.725,
+            "mase": 0.7498
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.3075,
+            "rmse": 1.7516,
+            "wape": 74.9675,
+            "smape": 76.6275,
+            "mape": 51.75,
+            "mase": 0.7495
+          }
+        },
+        "selected_method": "day_of_week_seasonal",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 55.31,
+            "linear": 63.0
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 10,
+        "item_name": "Hungarian Sausage",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 1.6786,
+            "rmse": 2.065,
+            "wape": 58.68,
+            "smape": 60.6725,
+            "mape": 91.725,
+            "mase": 1.0325
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.2168,
+            "rmse": 1.4362,
+            "wape": 42.43,
+            "smape": 45.61,
+            "mape": 56.0,
+            "mase": 0.749
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.2998,
+            "rmse": 1.5889,
+            "wape": 44.8525,
+            "smape": 48.8925,
+            "mape": 48.425,
+            "mase": 0.7997
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.2996,
+            "rmse": 1.5886,
+            "wape": 44.84,
+            "smape": 48.885,
+            "mape": 48.45,
+            "mase": 0.7998
+          }
+        },
+        "selected_method": "trailing_moving_average",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 69.87,
+            "linear": 81.9
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      {
+        "item_id": 28,
+        "item_name": "Mango Shake (Tall)",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 1.5,
+            "rmse": 1.7397,
+            "wape": 74.8075,
+            "smape": 101.6675,
+            "mape": 57.35,
+            "mase": 0.7452
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 1.4184,
+            "rmse": 1.6434,
+            "wape": 71.0275,
+            "smape": 83.5325,
+            "mape": 50.325,
+            "mase": 0.7042
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 1.5142,
+            "rmse": 1.6853,
+            "wape": 75.7475,
+            "smape": 85.695,
+            "mape": 55.3,
+            "mase": 0.7518
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 1.514,
+            "rmse": 1.6855,
+            "wape": 75.735,
+            "smape": 85.6725,
+            "mape": 55.275,
+            "mase": 0.7518
+          }
+        },
+        "selected_method": "trailing_moving_average",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "flat",
+        "growth_selection": {
+          "selected_growth": "flat",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 58.91,
+            "linear": 61.56
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      }
+    ],
+    "fleet_summary": {
+      "naive_previous_period": {
+        "items_scored": 16,
+        "mean_wape": 75.17,
+        "mean_mae": 2.4978
+      },
+      "trailing_moving_average": {
+        "items_scored": 16,
+        "mean_wape": 54.97,
+        "mean_mae": 1.7573
+      },
+      "day_of_week_seasonal": {
+        "items_scored": 16,
+        "mean_wape": 50.16,
+        "mean_mae": 1.6424
+      },
+      "prophet": {
+        "items_scored": 16,
+        "mean_wape": 50.91,
+        "mean_mae": 1.5774
+      }
+    },
+    "selection_counts": {
+      "prophet": 3,
+      "day_of_week_seasonal": 10,
+      "naive_previous_period": 1,
+      "trailing_moving_average": 2
+    },
+    "growth_selection_counts": {
+      "flat": 11,
+      "linear": 5,
+      "fallback": 0
+    },
+    "prophet_vs_baseline": {
+      "best_baseline_mean_wape": 50.16,
+      "prophet_mean_wape": 50.91,
+      "absolute_improvement_wape_pts": -0.75,
+      "percentage_improvement": -1.5,
+      "prophet_actually_better": false,
+      "note": "Positive improvement means Prophet's fleet-mean WAPE across the rolling backtest folds is lower than the best baseline's. A negative value is reported as-is -- it means the baseline measurably won on this data."
+    }
+  },
+  "A2_demand_forecast_store": {
+    "available": true,
+    "method_version": "2026-09-rolling-backtest-v1",
+    "methodology": "Chronological expanding-window rolling backtest -- identical methodology to the menu-item backtest above, applied to the store's own aggregate daily series instead. Up to 4 most-recent folds, 7-day forecast horizon per fold, minimum 21-day initial training window. Every fold scored for naive-previous-period, trailing-moving-average, day-of-week-seasonal, and Prophet.",
+    "effective_now": "2026-09-21",
+    "horizon_days": 7,
+    "min_train_days": 21,
+    "max_folds": 4,
+    "metrics_evaluated": 3,
+    "metrics_insufficient_history": 0,
+    "metrics": {
+      "orders": {
+        "metric": "orders",
+        "label": "Daily order count",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 15.7858,
+            "rmse": 17.8224,
+            "wape": 24.2725,
+            "smape": 22.63,
+            "mape": 25.925,
+            "mase": 1.358
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 10.7117,
+            "rmse": 12.4153,
+            "wape": 16.23,
+            "smape": 16.24,
+            "mape": 16.875,
+            "mase": 0.9208
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 7.5351,
+            "rmse": 9.2705,
+            "wape": 11.345,
+            "smape": 11.5025,
+            "mape": 10.85,
+            "mase": 0.6477
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 6.5554,
+            "rmse": 7.556,
+            "wape": 10.0425,
+            "smape": 10.0975,
+            "mape": 10.6,
+            "mase": 0.564
+          }
+        },
+        "selected_method": "prophet",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "linear",
+        "growth_selection": {
+          "selected_growth": "linear",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 11.36,
+            "linear": 10.59
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      "items": {
+        "metric": "items",
+        "label": "Daily items sold",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 21.6786,
+            "rmse": 26.4974,
+            "wape": 20.035,
+            "smape": 19.615,
+            "mape": 22.3,
+            "mase": 1.0375
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 18.0204,
+            "rmse": 20.8013,
+            "wape": 16.5775,
+            "smape": 16.63,
+            "mape": 17.05,
+            "mase": 0.8623
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 11.8489,
+            "rmse": 15.2493,
+            "wape": 10.875,
+            "smape": 10.985,
+            "mape": 10.275,
+            "mase": 0.5665
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 11.2268,
+            "rmse": 12.6934,
+            "wape": 10.3925,
+            "smape": 10.5875,
+            "mape": 10.925,
+            "mase": 0.5373
+          }
+        },
+        "selected_method": "prophet",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "linear",
+        "growth_selection": {
+          "selected_growth": "linear",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 11.99,
+            "linear": 11.92
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      },
+      "sales": {
+        "metric": "sales",
+        "label": "Daily gross sales (PHP)",
+        "insufficient_history": false,
+        "days_available": 365,
+        "folds": [
+          {
+            "train_days": 336,
+            "test_start": "2026-08-24",
+            "test_end": "2026-08-30"
+          },
+          {
+            "train_days": 343,
+            "test_start": "2026-08-31",
+            "test_end": "2026-09-06"
+          },
+          {
+            "train_days": 350,
+            "test_start": "2026-09-07",
+            "test_end": "2026-09-13"
+          },
+          {
+            "train_days": 357,
+            "test_start": "2026-09-14",
+            "test_end": "2026-09-20"
+          }
+        ],
+        "methods": {
+          "naive_previous_period": {
+            "folds_scored": 4,
+            "mae": 4983.5,
+            "rmse": 5734.4973,
+            "wape": 19.315,
+            "smape": 18.805,
+            "mape": 21.225,
+            "mase": 1.0295
+          },
+          "trailing_moving_average": {
+            "folds_scored": 4,
+            "mae": 4278.2398,
+            "rmse": 4803.6026,
+            "wape": 16.4325,
+            "smape": 16.5075,
+            "mape": 17.125,
+            "mase": 0.8835
+          },
+          "day_of_week_seasonal": {
+            "folds_scored": 4,
+            "mae": 3169.1068,
+            "rmse": 4033.8468,
+            "wape": 12.155,
+            "smape": 12.4675,
+            "mape": 11.575,
+            "mase": 0.6542
+          },
+          "prophet": {
+            "folds_scored": 4,
+            "mae": 2729.0521,
+            "rmse": 3128.5911,
+            "wape": 10.5325,
+            "smape": 10.6775,
+            "mape": 10.95,
+            "mase": 0.5637
+          }
+        },
+        "selected_method": "prophet",
+        "selection_reason": "lowest mean WAPE across 4 rolling backtest fold(s)",
+        "prophet_growth": "linear",
+        "growth_selection": {
+          "selected_growth": "linear",
+          "reason": "lower_tuning_wape",
+          "is_fallback": false,
+          "folds_attempted": 3,
+          "folds_scored": {
+            "flat": 3,
+            "linear": 3
+          },
+          "mean_wape": {
+            "flat": 11.81,
+            "linear": 11.0
+          },
+          "horizon": 7,
+          "min_train": 21,
+          "max_folds": 3,
+          "tuning_end_date": "2026-08-23"
+        }
+      }
+    },
+    "selection_counts": {
+      "prophet": 3
+    },
+    "growth_selection_counts": {
+      "flat": 0,
+      "linear": 3,
+      "fallback": 0
+    }
+  },
+  "A3_replenishment_backtest": {
+    "available": true,
+    "methodology": "6 evaluation point(s), every 10 days across the last 60 days, each recomputed with ingredient_forecast()'s own `now` parameter using only data that existed at that point, checked against real ledger balances 7 days later.",
+    "evaluation_points": 6,
+    "check_days_ahead": 7,
+    "total_ingredient_evaluations": 648,
+    "confusion": {
+      "caught": 0,
+      "false_alarm": 168,
+      "missed": 0,
+      "quiet": 480
+    },
+    "false_alarm_breakdown": {
+      "resolved_by_restock": 106,
+      "genuine": 62,
+      "note": "'resolved_by_restock': a real purchase_receipt ledger row landed for that exact ingredient within the check window -- the flag's own lead-time logic is what that window is keyed to, so this is at least as consistent with the warning having been acted on as with it being wrong. 'genuine': no such receiving event occurred, yet the ingredient never actually hit zero -- the model overestimated risk with no restocking to explain why."
+    },
+    "observable_windows": {
+      "confusion": {
+        "caught": 0,
+        "false_alarm": 117,
+        "missed": 0,
+        "quiet": 315
+      },
+      "precision": 0.0,
+      "recall": null,
+      "f1": null,
+      "false_alarm_breakdown": {
+        "resolved_by_restock": 106,
+        "genuine": 11
+      },
+      "precision_adjusted": 0.0,
+      "excluded_points": [
+        {
+          "evaluationDate": "2026-09-22",
+          "ordersInCheckWindow": 3,
+          "expectedOrdersInCheckWindow": 450.1,
+          "coverage": 0.0067
+        },
+        {
+          "evaluationDate": "2026-10-02",
+          "ordersInCheckWindow": 0,
+          "expectedOrdersInCheckWindow": 377.8,
+          "coverage": 0.0
+        }
+      ],
+      "note": "Same as `confusion`, but skips evaluation points whose 7-day check window recorded under 25% of a normal week's orders (a data-collection gap or closure). With no trading, no stock outcome can have been driven by demand, so a flag there is neither confirmed nor refuted. `confusion` above still includes them."
+    },
+    "within_window_label": {
+      "confusion": {
+        "caught": 0,
+        "false_alarm": 168,
+        "missed": 0,
+        "quiet": 480
+      },
+      "precision": 0.0,
+      "recall": null,
+      "f1": null,
+      "note": "Stockout = balance <= 0 at any point inside the check window (what the docstring has always claimed), instead of only at its end. Same flags, same forecasts."
+    },
+    "any_warning": {
+      "confusion": {
+        "caught": 0,
+        "false_alarm": 206,
+        "missed": 0,
+        "quiet": 442
+      },
+      "precision": 0.0,
+      "recall": null,
+      "f1": null,
+      "note": "Positive = critical, out OR at_risk, against the same end-of-window label. at_risk means 'depletes after the lead time but within lead + review cycle' -- ordering today still prevents it, so it is not part of the primary flag."
+    },
+    "missed_stockouts": [],
+    "genuine_false_alarms": [
+      {
+        "evaluationDate": "2026-08-13",
+        "ingredient": "Ice",
+        "status": "critical",
+        "availableAtEval": 4476.41,
+        "forecastDailyConsumption": 1376.5409,
+        "projectedDepletionDays": 2.75,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-08-13",
+        "ingredient": "Orange Juice",
+        "status": "critical",
+        "availableAtEval": 11200.0,
+        "forecastDailyConsumption": 2833.8943,
+        "projectedDepletionDays": 3.2,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-08-23",
+        "ingredient": "Sprite (Can)",
+        "status": "critical",
+        "availableAtEval": 2.0,
+        "forecastDailyConsumption": 2.6749,
+        "projectedDepletionDays": 0.45,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-08-23",
+        "ingredient": "Cheese Powder",
+        "status": "critical",
+        "availableAtEval": 1440.0,
+        "forecastDailyConsumption": 1398.456,
+        "projectedDepletionDays": 0.65,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-08-23",
+        "ingredient": "Coke Zero (Can)",
+        "status": "critical",
+        "availableAtEval": 6.0,
+        "forecastDailyConsumption": 1.6099,
+        "projectedDepletionDays": 3.52,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-09-02",
+        "ingredient": "Sprite (Can)",
+        "status": "critical",
+        "availableAtEval": 2.0,
+        "forecastDailyConsumption": 4.8406,
+        "projectedDepletionDays": 0.0,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-09-02",
+        "ingredient": "Corn Syrup",
+        "status": "critical",
+        "availableAtEval": 3900.0,
+        "forecastDailyConsumption": 1222.3166,
+        "projectedDepletionDays": 2.8,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-09-12",
+        "ingredient": "Cheese Powder",
+        "status": "critical",
+        "availableAtEval": 1440.0,
+        "forecastDailyConsumption": 1717.6906,
+        "projectedDepletionDays": 0.35,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-09-12",
+        "ingredient": "Coke (Can)",
+        "status": "critical",
+        "availableAtEval": 7.742,
+        "forecastDailyConsumption": 2.8359,
+        "projectedDepletionDays": 2.21,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-09-12",
+        "ingredient": "Corn Syrup",
+        "status": "critical",
+        "availableAtEval": 3900.0,
+        "forecastDailyConsumption": 1361.0117,
+        "projectedDepletionDays": 2.38,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-09-12",
+        "ingredient": "Orange Juice",
+        "status": "critical",
+        "availableAtEval": 11200.0,
+        "forecastDailyConsumption": 2915.6156,
+        "projectedDepletionDays": 3.5,
+        "windowObservable": true
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Black Tea Bag",
+        "status": "critical",
+        "availableAtEval": 122.0,
+        "forecastDailyConsumption": 805.6321,
+        "projectedDepletionDays": 0.0,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Frozen French Fries",
+        "status": "critical",
+        "availableAtEval": 3060.0,
+        "forecastDailyConsumption": 10431.6033,
+        "projectedDepletionDays": 0.16,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Chicken Wings",
+        "status": "critical",
+        "availableAtEval": 215.36,
+        "forecastDailyConsumption": 683.7568,
+        "projectedDepletionDays": 0.18,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Korean BBQ Sauce",
+        "status": "critical",
+        "availableAtEval": 3249.297,
+        "forecastDailyConsumption": 9063.5618,
+        "projectedDepletionDays": 0.23,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Parmesan Cheese",
+        "status": "critical",
+        "availableAtEval": 1816.618,
+        "forecastDailyConsumption": 4066.3588,
+        "projectedDepletionDays": 0.34,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Mirin",
+        "status": "critical",
+        "availableAtEval": 3195.94,
+        "forecastDailyConsumption": 6085.5343,
+        "projectedDepletionDays": 0.43,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Cooked White Rice",
+        "status": "critical",
+        "availableAtEval": 11860.0,
+        "forecastDailyConsumption": 20379.7116,
+        "projectedDepletionDays": 0.49,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Butter",
+        "status": "critical",
+        "availableAtEval": 10579.05,
+        "forecastDailyConsumption": 16112.5347,
+        "projectedDepletionDays": 0.58,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Honey",
+        "status": "critical",
+        "availableAtEval": 8670.0,
+        "forecastDailyConsumption": 11722.3512,
+        "projectedDepletionDays": 0.68,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Soy Sauce",
+        "status": "critical",
+        "availableAtEval": 9790.0,
+        "forecastDailyConsumption": 12294.857,
+        "projectedDepletionDays": 0.75,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Garlic (Minced, g)",
+        "status": "critical",
+        "availableAtEval": 4435.12,
+        "forecastDailyConsumption": 5493.5879,
+        "projectedDepletionDays": 0.76,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Habanero Sauce",
+        "status": "critical",
+        "availableAtEval": 2028.59,
+        "forecastDailyConsumption": 2143.6043,
+        "projectedDepletionDays": 0.92,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Sprite (Can)",
+        "status": "critical",
+        "availableAtEval": 2.0,
+        "forecastDailyConsumption": 2.2338,
+        "projectedDepletionDays": 0.96,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Sesame Seeds",
+        "status": "critical",
+        "availableAtEval": 1679.0,
+        "forecastDailyConsumption": 1359.3185,
+        "projectedDepletionDays": 1.23,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Cheese Powder",
+        "status": "critical",
+        "availableAtEval": 1440.0,
+        "forecastDailyConsumption": 1160.1359,
+        "projectedDepletionDays": 1.24,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Water",
+        "status": "critical",
+        "availableAtEval": 8335.0,
+        "forecastDailyConsumption": 6625.8909,
+        "projectedDepletionDays": 1.29,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Ginger",
+        "status": "critical",
+        "availableAtEval": 1860.0,
+        "forecastDailyConsumption": 1268.2515,
+        "projectedDepletionDays": 1.47,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Brown Sugar",
+        "status": "critical",
+        "availableAtEval": 7403.0,
+        "forecastDailyConsumption": 4473.7845,
+        "projectedDepletionDays": 1.66,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Egg",
+        "status": "critical",
+        "availableAtEval": 40.0,
+        "forecastDailyConsumption": 20.8334,
+        "projectedDepletionDays": 1.97,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Hot Sauce",
+        "status": "critical",
+        "availableAtEval": 19742.625,
+        "forecastDailyConsumption": 9714.9363,
+        "projectedDepletionDays": 2.04,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Cooking Oil",
+        "status": "critical",
+        "availableAtEval": 4796.34,
+        "forecastDailyConsumption": 2412.2602,
+        "projectedDepletionDays": 2.1,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Calamansi Juice",
+        "status": "critical",
+        "availableAtEval": 2124.0,
+        "forecastDailyConsumption": 883.3889,
+        "projectedDepletionDays": 2.41,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Sesame Oil",
+        "status": "critical",
+        "availableAtEval": 2956.0,
+        "forecastDailyConsumption": 975.3402,
+        "projectedDepletionDays": 3.02,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Coke (Can)",
+        "status": "critical",
+        "availableAtEval": 7.742,
+        "forecastDailyConsumption": 2.3314,
+        "projectedDepletionDays": 3.34,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "ingredient": "Corn Syrup",
+        "status": "critical",
+        "availableAtEval": 3900.0,
+        "forecastDailyConsumption": 1074.6795,
+        "projectedDepletionDays": 3.55,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Black Tea Bag",
+        "status": "critical",
+        "availableAtEval": 82.0,
+        "forecastDailyConsumption": 700.8375,
+        "projectedDepletionDays": 0.0,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Frozen French Fries",
+        "status": "critical",
+        "availableAtEval": 2640.0,
+        "forecastDailyConsumption": 9077.9477,
+        "projectedDepletionDays": 0.1,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Chicken Wings",
+        "status": "critical",
+        "availableAtEval": 181.2,
+        "forecastDailyConsumption": 594.8872,
+        "projectedDepletionDays": 0.11,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Korean BBQ Sauce",
+        "status": "critical",
+        "availableAtEval": 3249.297,
+        "forecastDailyConsumption": 7744.9358,
+        "projectedDepletionDays": 0.21,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Parmesan Cheese",
+        "status": "critical",
+        "availableAtEval": 1601.618,
+        "forecastDailyConsumption": 3549.1858,
+        "projectedDepletionDays": 0.24,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Cooked White Rice",
+        "status": "critical",
+        "availableAtEval": 10050.0,
+        "forecastDailyConsumption": 17766.1684,
+        "projectedDepletionDays": 0.34,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Mirin",
+        "status": "critical",
+        "availableAtEval": 3195.94,
+        "forecastDailyConsumption": 5208.5825,
+        "projectedDepletionDays": 0.38,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Cheese Powder",
+        "status": "critical",
+        "availableAtEval": 720.0,
+        "forecastDailyConsumption": 1021.788,
+        "projectedDepletionDays": 0.46,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Butter",
+        "status": "critical",
+        "availableAtEval": 10241.05,
+        "forecastDailyConsumption": 14203.8124,
+        "projectedDepletionDays": 0.47,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Honey",
+        "status": "critical",
+        "availableAtEval": 8330.0,
+        "forecastDailyConsumption": 10363.4217,
+        "projectedDepletionDays": 0.54,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Habanero Sauce",
+        "status": "critical",
+        "availableAtEval": 1628.59,
+        "forecastDailyConsumption": 1920.3817,
+        "projectedDepletionDays": 0.58,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Sprite (Can)",
+        "status": "critical",
+        "availableAtEval": 2.0,
+        "forecastDailyConsumption": 1.9428,
+        "projectedDepletionDays": 0.62,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Soy Sauce",
+        "status": "critical",
+        "availableAtEval": 9752.0,
+        "forecastDailyConsumption": 10551.0992,
+        "projectedDepletionDays": 0.64,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Garlic (Minced, g)",
+        "status": "critical",
+        "availableAtEval": 4435.12,
+        "forecastDailyConsumption": 4743.4174,
+        "projectedDepletionDays": 0.65,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Water",
+        "status": "critical",
+        "availableAtEval": 6305.0,
+        "forecastDailyConsumption": 5935.1794,
+        "projectedDepletionDays": 0.72,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Sesame Seeds",
+        "status": "critical",
+        "availableAtEval": 1677.0,
+        "forecastDailyConsumption": 1165.3942,
+        "projectedDepletionDays": 1.09,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Ginger",
+        "status": "critical",
+        "availableAtEval": 1854.0,
+        "forecastDailyConsumption": 1093.29,
+        "projectedDepletionDays": 1.32,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Egg",
+        "status": "critical",
+        "availableAtEval": 34.0,
+        "forecastDailyConsumption": 18.3295,
+        "projectedDepletionDays": 1.42,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Brown Sugar",
+        "status": "critical",
+        "availableAtEval": 7401.0,
+        "forecastDailyConsumption": 3851.5123,
+        "projectedDepletionDays": 1.52,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Cooking Oil",
+        "status": "critical",
+        "availableAtEval": 4241.34,
+        "forecastDailyConsumption": 2123.4209,
+        "projectedDepletionDays": 1.63,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Hot Sauce",
+        "status": "critical",
+        "availableAtEval": 19742.625,
+        "forecastDailyConsumption": 8753.0637,
+        "projectedDepletionDays": 1.82,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Calamansi Juice",
+        "status": "critical",
+        "availableAtEval": 2124.0,
+        "forecastDailyConsumption": 788.6516,
+        "projectedDepletionDays": 2.24,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Sesame Oil",
+        "status": "critical",
+        "availableAtEval": 2950.0,
+        "forecastDailyConsumption": 836.6352,
+        "projectedDepletionDays": 3.13,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Coke (Can)",
+        "status": "critical",
+        "availableAtEval": 7.742,
+        "forecastDailyConsumption": 2.0162,
+        "projectedDepletionDays": 3.15,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Corn Syrup",
+        "status": "critical",
+        "availableAtEval": 3900.0,
+        "forecastDailyConsumption": 937.5449,
+        "projectedDepletionDays": 3.85,
+        "windowObservable": false
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "ingredient": "Ice",
+        "status": "critical",
+        "availableAtEval": 3876.41,
+        "forecastDailyConsumption": 922.376,
+        "projectedDepletionDays": 3.87,
+        "windowObservable": false
+      }
+    ],
+    "service_level": 1.0,
+    "critical_flag_precision": 0.0,
+    "critical_flag_recall": null,
+    "critical_flag_f1": null,
+    "critical_flag_precision_adjusted": 0.0,
+    "critical_flag_f1_adjusted": null,
+    "adjusted_precision_note": "Excludes false_alarm_breakdown.resolved_by_restock from the false-alarm count -- see that field's note. critical_flag_precision above is kept unchanged alongside this for comparison.",
+    "avg_days_of_supply_when_healthy_or_excess": 36806.71,
+    "days_of_supply_distribution_when_healthy_or_excess": {
+      "n": 436,
+      "mean": 36806.71,
+      "median": 2882.03,
+      "min": 5.48,
+      "max": 842357.5,
+      "p25": 738.08,
+      "p75": 9683.93,
+      "p90": 61112.48
+    },
+    "points": [
+      {
+        "evaluationDate": "2026-08-13",
+        "checkedThrough": "2026-08-20",
+        "ingredientsEvaluated": 108,
+        "ordersInCheckWindow": 504,
+        "windowCoverage": 1.125,
+        "windowObservable": true,
+        "caught": 0,
+        "false_alarm": 29,
+        "missed": 0,
+        "quiet": 79
+      },
+      {
+        "evaluationDate": "2026-08-23",
+        "checkedThrough": "2026-08-30",
+        "ingredientsEvaluated": 108,
+        "ordersInCheckWindow": 468,
+        "windowCoverage": 1.0255,
+        "windowObservable": true,
+        "caught": 0,
+        "false_alarm": 28,
+        "missed": 0,
+        "quiet": 80
+      },
+      {
+        "evaluationDate": "2026-09-02",
+        "checkedThrough": "2026-09-09",
+        "ingredientsEvaluated": 108,
+        "ordersInCheckWindow": 454,
+        "windowCoverage": 0.9967,
+        "windowObservable": true,
+        "caught": 0,
+        "false_alarm": 29,
+        "missed": 0,
+        "quiet": 79
+      },
+      {
+        "evaluationDate": "2026-09-12",
+        "checkedThrough": "2026-09-19",
+        "ingredientsEvaluated": 108,
+        "ordersInCheckWindow": 449,
+        "windowCoverage": 0.9803,
+        "windowObservable": true,
+        "caught": 0,
+        "false_alarm": 31,
+        "missed": 0,
+        "quiet": 77
+      },
+      {
+        "evaluationDate": "2026-09-22",
+        "checkedThrough": "2026-09-29",
+        "ingredientsEvaluated": 108,
+        "ordersInCheckWindow": 3,
+        "windowCoverage": 0.0067,
+        "windowObservable": false,
+        "caught": 0,
+        "false_alarm": 25,
+        "missed": 0,
+        "quiet": 83
+      },
+      {
+        "evaluationDate": "2026-10-02",
+        "checkedThrough": "2026-10-09",
+        "ingredientsEvaluated": 108,
+        "ordersInCheckWindow": 0,
+        "windowCoverage": 0.0,
+        "windowObservable": false,
+        "caught": 0,
+        "false_alarm": 26,
+        "missed": 0,
+        "quiet": 82
+      }
+    ]
+  },
+  "A4_anomaly_stock_loss_validation_metrics": {
+    "available": false,
+    "reason": "Validation metrics unavailable \u2014 insufficient confirmed labels on real (non-synthetic-seed) ledger rows (0/20 required: confirmed_anomaly or false_positive reviews). Existing reviews of synthetic-seed rows (see SYNTHETIC_SEED_USER_IDS) do not count toward this, since those rows are no longer in the model's candidate population.",
+    "confirmed_labels": 0,
+    "min_required": 20,
+    "confusion_matrix": {
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "tn": 0
+    }
+  },
+  "A5_anomaly_stock_loss_scientific": {
+    "model_version": "stock_loss_isoforest_v1",
+    "eligibility_version": "app_user_membership_v1",
+    "confusion_matrix": {
+      "tp": 0,
+      "fp": 0,
+      "fn": 0,
+      "tn": 0
+    },
+    "labels_by_sample_source": {
+      "model_flagged": 0,
+      "near_threshold": 0,
+      "random_unflagged": 0
+    },
+    "available": false,
+    "reason": "insufficient_validation_data",
+    "detail": "0 labeled sample(s) under this model/eligibility version (0 on the flagged side, 0 on the unflagged side). Needs >= 20 total and >= 5 on each side of the model's own prediction before Precision/Recall/Specificity can be reported rather than guessed at."
+  },
+  "A6_consumption_model_details": {
+    "model": "IsolationForest (scikit-learn)",
+    "data_source": "v_unli_daily_consumption (reconciled service days)",
+    "n_estimators": 200,
+    "random_state": 42,
+    "n_features": 7,
+    "features": [
+      "actual_per_head",
+      "variance_ratio",
+      "baseline_deviation_ratio",
+      "peer_rate_ratio",
+      "leftover_ratio",
+      "heads",
+      "consumption_scale_ratio"
+    ],
+    "min_reconciled_days": 12,
+    "rule_variance_multiple": 2.0,
+    "rule_robust_mad_multiple": 3.0,
+    "min_robust_rule_days": 6,
+    "max_flag_fraction": 0.25,
+    "lookback_days": 90,
+    "records_evaluated": 0,
+    "synthetic_excluded": 0,
+    "synthetic_excluded_note": null,
+    "trained_this_call": false,
+    "flagged": 0,
+    "flagged_by_method": {}
+  },
+  "B1_stock_loss_vs_injected_truth": {
+    "mode": "DEMO_SIMULATION",
+    "available": true,
+    "production_validated": false,
+    "methodology": "Wastage Log + Stock Counts + Receiving Log rows from simulatedd.xlsx replayed into an isolated, throwaway database (never production) against REAL ingredient reference rows copied read-only from the live database. Ground truth is the workbook's own 'Injected Synthetic Truth' column, read directly.",
+    "source_workbook": "C:\\Users\\PLPASIG\\Desktop\\wings-theory\\data\\Wings_Theory_1_Year_Historical_Collection_simulatedd.xlsx",
+    "sample_count": 1944,
+    "ground_truth_counts": {
+      "INJECTED_STOCK_LOSS": 65,
+      "SYNTHETIC_NORMAL": 1879
+    },
+    "default_thresholds": {
+      "description": "detect_anomalies() as shipped: rule layer (fraction>=0.25) OR IsolationForest capped to the worst 10% of the pool.",
+      "detect_anomalies_flagged_count": 1014,
+      "alert_rate": 0.5216,
+      "confusion_matrix": {
+        "tp": 57,
+        "fp": 957,
+        "fn": 8,
+        "tn": 922
+      },
+      "precision": 0.056,
+      "recall": 0.877,
+      "f1": 0.106
+    },
+    "calibrated": {
+      "calibration_method": "Chronological 60/40 split; decision threshold = the IsolationForest score cutoff maximizing F1 on the train fold only, applied unchanged to the test fold. ROC-AUC/PR-AUC computed on the test fold's continuous scores (threshold-free).",
+      "train_fold": {
+        "n": 1166,
+        "n_anomalous": 38,
+        "date_range": [
+          "2025-10-01",
+          "2026-03-30"
+        ]
+      },
+      "test_fold": {
+        "n": 778,
+        "n_anomalous": 27,
+        "date_range": [
+          "2026-03-30",
+          "2026-08-27"
+        ]
+      },
+      "chosen_threshold": 0.424,
+      "train_f1_at_threshold": 0.1011,
+      "confusion_matrix": {
+        "tp": 21,
+        "fp": 206,
+        "fn": 6,
+        "tn": 545
+      },
+      "precision": 0.093,
+      "recall": 0.778,
+      "f1": 0.165,
+      "false_positive_rate": 0.2743,
+      "roc_auc": 0.8167,
+      "pr_auc": 0.1052,
+      "alert_rate": 0.2918
+    }
+  },
+  "B2_unli_consumption_vs_injected_truth": {
+    "mode": "DEMO_SIMULATION",
+    "available": true,
+    "production_validated": false,
+    "methodology": "Unli Reconciliation rows from simulatedd.xlsx aggregated per service_date (summed across all 14 flavours, a single shared base unit) into one day-level stream and replayed into an isolated, throwaway database. Ground truth: a day is anomalous if any flavour that day carried INJECTED_CONSUMPTION_ANOMALY.",
+    "source_workbook": "C:\\Users\\PLPASIG\\Desktop\\wings-theory\\data\\Wings_Theory_1_Year_Historical_Collection_simulatedd.xlsx",
+    "sample_count": 365,
+    "ground_truth_counts": {
+      "ANOMALY": 52,
+      "NORMAL": 313
+    },
+    "default_thresholds": {
+      "description": "detect_consumption_anomalies() as shipped.",
+      "detect_consumption_anomalies_flagged_count": 72,
+      "alert_rate": 0.1973,
+      "confusion_matrix": {
+        "tp": 44,
+        "fp": 28,
+        "fn": 8,
+        "tn": 285
+      },
+      "precision": 0.611,
+      "recall": 0.846,
+      "f1": 0.71
+    },
+    "calibrated": {
+      "calibration_method": "Chronological 60/40 split; decision threshold = the IsolationForest score cutoff maximizing F1 on the train fold only, applied unchanged to the test fold. ROC-AUC/PR-AUC computed on the test fold's continuous scores (threshold-free).",
+      "train_fold": {
+        "n": 219,
+        "n_anomalous": 28,
+        "date_range": [
+          "2025-09-21",
+          "2026-04-27"
+        ]
+      },
+      "test_fold": {
+        "n": 146,
+        "n_anomalous": 24,
+        "date_range": [
+          "2026-04-28",
+          "2026-09-20"
+        ]
+      },
+      "chosen_threshold": -0.012,
+      "train_f1_at_threshold": 0.6377,
+      "confusion_matrix": {
+        "tp": 18,
+        "fp": 14,
+        "fn": 6,
+        "tn": 108
+      },
+      "precision": 0.562,
+      "recall": 0.75,
+      "f1": 0.643,
+      "false_positive_rate": 0.1148,
+      "roc_auc": 0.9098,
+      "pr_auc": 0.6871,
+      "alert_rate": 0.2192
+    }
+  },
+  "B3_flavor_consumption_vs_injected_truth": {
+    "mode": "DEMO_SIMULATION",
+    "available": true,
+    "production_validated": false,
+    "methodology": "Unli Reconciliation rows from simulatedd.xlsx replayed into an isolated, throwaway database (never production) against REAL unli_flavor/ingredient reference rows copied read-only from the live database. Ground truth is the workbook's own 'Injected Synthetic Truth' column, read directly.",
+    "source_workbook": "C:\\Users\\PLPASIG\\Desktop\\wings-theory\\data\\Wings_Theory_1_Year_Historical_Collection_simulatedd.xlsx",
+    "sample_count": 1460,
+    "ground_truth_counts": {
+      "INJECTED_CONSUMPTION_ANOMALY": 55,
+      "SYNTHETIC_NORMAL": 1405
+    },
+    "default_thresholds": {
+      "description": "detect_flavor_consumption_anomalies() as shipped: rule layer (variance/leftover/share) OR IsolationForest capped to the worst 25% of the pool.",
+      "detect_flavor_consumption_anomalies_flagged_count": 256,
+      "alert_rate": 0.1753,
+      "confusion_matrix": {
+        "tp": 50,
+        "fp": 206,
+        "fn": 5,
+        "tn": 1199
+      },
+      "precision": 0.195,
+      "recall": 0.909,
+      "f1": 0.322
+    },
+    "calibrated": {
+      "calibration_method": "Chronological 60/40 split; decision threshold = the IsolationForest score cutoff maximizing F1 on the train fold only, applied unchanged to the test fold. ROC-AUC/PR-AUC computed on the test fold's continuous scores (threshold-free).",
+      "train_fold": {
+        "n": 876,
+        "n_anomalous": 28,
+        "date_range": [
+          "2025-09-21",
+          "2026-04-27"
+        ]
+      },
+      "test_fold": {
+        "n": 584,
+        "n_anomalous": 27,
+        "date_range": [
+          "2026-04-28",
+          "2026-09-20"
+        ]
+      },
+      "chosen_threshold": 0.079,
+      "train_f1_at_threshold": 0.5714,
+      "confusion_matrix": {
+        "tp": 14,
+        "fp": 6,
+        "fn": 13,
+        "tn": 551
+      },
+      "precision": 0.7,
+      "recall": 0.519,
+      "f1": 0.596,
+      "false_positive_rate": 0.0108,
+      "roc_auc": 0.9823,
+      "pr_auc": 0.7114,
+      "alert_rate": 0.0342
+    }
+  },
+  "A7_fp_growth_product_combinations": {
+    "insufficient_data": false,
+    "transaction_count": 21109,
+    "total_orders_analyzed": 21109,
+    "valid_transactions": 21109,
+    "excluded_transactions": 0,
+    "unique_products": 32,
+    "avg_items_per_transaction": 1.55,
+    "required": 30,
+    "combos": [
+      {
+        "item_a": "Sprite",
+        "item_b": "Creamy Sausage Pasta",
+        "category_a": "Softdrinks in Can",
+        "category_b": "Pasta",
+        "pair_count": 22,
+        "support": 0.0013,
+        "confidence": 0.03047,
+        "lift": 1.522,
+        "recommendation_type": "Observed cross-category association",
+        "status": "holdout_validated",
+        "validation_method": "chronological_80_20_holdout",
+        "holdout_pair_count": 5,
+        "holdout_confidence": 0.02924,
+        "holdout_support": 0.00118,
+        "holdout_lift": 1.764,
+        "item_a_menu_item_id": 20,
+        "item_b_menu_item_id": 3,
+        "individual_total": 250.0,
+        "discount_reference_price": 230.0
+      }
+    ],
+    "rejected_combinations": [
+      {
+        "item_a": "Pork Tonkatsu",
+        "item_b": "Spicy Tuna Linguine Pesto",
+        "category_a": "Rice Meals & Bowls - Pork",
+        "category_b": "Pasta",
+        "pair_count": 14,
+        "support": 0.00083,
+        "confidence": 0.02439,
+        "lift": 1.622,
+        "recommendation_type": "Observed cross-category association",
+        "status": "rejected",
+        "validation_method": "chronological_80_20_holdout",
+        "holdout_pair_count": 0,
+        "rejection_reason": "insufficient_holdout_occurrences",
+        "rejection_detail": "seen together only 0x in the holdout window, below the required 5",
+        "item_a_menu_item_id": 7,
+        "item_b_menu_item_id": 2,
+        "individual_total": 379.0,
+        "discount_reference_price": 348.68
+      },
+      {
+        "item_a": "Fish & Chips with Tartar Sauce",
+        "item_b": "Spicy Tuna Linguine Pesto",
+        "category_a": "Starter",
+        "category_b": "Pasta",
+        "pair_count": 15,
+        "support": 0.00089,
+        "confidence": 0.02435,
+        "lift": 1.619,
+        "recommendation_type": "Observed cross-category association",
+        "status": "rejected",
+        "validation_method": "chronological_80_20_holdout",
+        "holdout_pair_count": 2,
+        "rejection_reason": "insufficient_holdout_occurrences",
+        "rejection_detail": "seen together only 2x in the holdout window, below the required 5",
+        "item_a_menu_item_id": 16,
+        "item_b_menu_item_id": 2,
+        "individual_total": 419.0,
+        "discount_reference_price": 385.48
+      },
+      {
+        "item_a": "Pork Tonkatsu",
+        "item_b": "White Truffle Pasta",
+        "category_a": "Rice Meals & Bowls - Pork",
+        "category_b": "Pasta",
+        "pair_count": 11,
+        "support": 0.00065,
+        "confidence": 0.01916,
+        "lift": 1.586,
+        "recommendation_type": "Observed cross-category association",
+        "status": "rejected",
+        "validation_method": "chronological_80_20_holdout",
+        "holdout_pair_count": 1,
+        "rejection_reason": "insufficient_holdout_occurrences",
+        "rejection_detail": "seen together only 1x in the holdout window, below the required 5",
+        "item_a_menu_item_id": 7,
+        "item_b_menu_item_id": 1,
+        "individual_total": 379.0,
+        "discount_reference_price": 348.68
+      },
+      {
+        "item_a": "12 pcs (2 Flavors) Ala Carte Wing Rack",
+        "item_b": "Sulit Deal-3 pcs Wings + Rice",
+        "category_a": "Ala Carte Wings",
+        "category_b": "Super Sulit Deals",
+        "pair_count": 31,
+        "support": 0.00184,
+        "confidence": 0.04882,
+        "lift": 1.462,
+        "recommendation_type": "Observed cross-category association",
+        "status": "rejected",
+        "validation_method": "chronological_80_20_holdout",
+        "holdout_pair_count": 4,
+        "rejection_reason": "insufficient_holdout_occurrences",
+        "rejection_detail": "seen together only 4x in the holdout window, below the required 5",
+        "item_a_menu_item_id": 24,
+        "item_b_menu_item_id": 27,
+        "individual_total": 438.0,
+        "discount_reference_price": 402.96
+      },
+      {
+        "item_a": "Ranch Dip",
+        "item_b": "Spicy Tuna Linguine Pesto",
+        "category_a": "Drinks and Add-ons",
+        "category_b": "Pasta",
+        "pair_count": 13,
+        "support": 0.00077,
+        "confidence": 0.02167,
+        "lift": 1.44,
+        "recommendation_type": "Observed cross-category association",
+        "status": "rejected",
+        "validation_method": "chronological_80_20_holdout",
+        "holdout_pair_count": 2,
+        "rejection_reason": "insufficient_holdout_occurrences",
+        "rejection_detail": "seen together only 2x in the holdout window, below the required 5",
+        "item_a_menu_item_id": 19,
+        "item_b_menu_item_id": 2,
+        "individual_total": 240.0,
+        "discount_reference_price": 220.8
+      },
+      {
+        "item_a": "12 pcs (2 Flavors) Ala Carte Wing Rack",
+        "item_b": "Spicy Tuna Linguine Pesto",
+        "category_a": "Ala Carte Wings",
+        "category_b": "Pasta",
+        "pair_count": 13,
+        "support": 0.00077,
+        "confidence": 0.02047,
+        "lift": 1.361,
+        "recommendation_type": "Observed cross-category association",
+        "status": "rejected",
+        "validation_method": "chronological_80_20_holdout",
+        "holdout_pair_count": 0,
+        "rejection_reason": "insufficient_holdout_occurrences",
+        "rejection_detail": "seen together only 0x in the holdout window, below the required 5",
+        "item_a_menu_item_id": 24,
+        "item_b_menu_item_id": 2,
+        "individual_total": 559.0,
+        "discount_reference_price": 514.28
+      },
+      {
+        "item_a": "Sprite",
+        "item_b": "Spicy Tuna Linguine Pesto",
+        "category_a": "Softdrinks in Can",
+        "category_b": "Pasta",
+        "pair_count": 13,
+        "support": 0.00077,
+        "confidence": 0.01801,
+        "lift": 1.197,
+        "recommendation_type": "Observed cross-category association",
+        "status": "rejected",
+        "validation_method": "chronological_80_20_holdout",
+        "holdout_pair_count": 4,
+        "rejection_reason": "insufficient_holdout_occurrences",
+        "rejection_detail": "seen together only 4x in the holdout window, below the required 5",
+        "item_a_menu_item_id": 20,
+        "item_b_menu_item_id": 2,
+        "individual_total": 280.0,
+        "discount_reference_price": 257.6
+      }
+    ],
+    "mining_basis": {
+      "method": "chronological_train_holdout",
+      "train_transactions": 16887,
+      "holdout_transactions": 4222,
+      "holdout_fraction": 0.2,
+      "candidates_considered": 8,
+      "candidates_validated": 1,
+      "candidates_rejected": 7
+    },
+    "combo_price_basis": "Simple discount reference only (8% off the sum of current menu prices) -- not a cost-based or margin calculation. See combo pricing for a cost-based price range.",
+    "data_quality_note": null,
+    "threshold_tier": "primary",
+    "min_support": 0.00059,
+    "min_confidence": 0.05,
+    "min_lift": 1.1,
+    "min_pair_count": 10,
+    "number_of_frequent_itemsets": 365,
+    "number_of_association_rules": 8,
+    "number_of_final_recommendations": 1
+  },
+  "A8_combo_pricing_data_availability": {
+    "note": "combo_pricing.py is deterministic math, already covered by passing unit tests (not a trained model) -- this just reports whether attach-rate data exists yet.",
+    "draft_combo_rows": 0,
+    "draft_combo_review_rows": 0,
+    "published_combo_rows": null
+  }
+}
