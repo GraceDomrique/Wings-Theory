@@ -636,7 +636,8 @@ function formatDownloadRow(onDownload) {
       }
     },
   }, '↓ Download');
-  return h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center' } }, formatSelect, btn);
+  return h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center' } },
+    h('div', { class: 'field', style: { minWidth: '120px' } }, formatSelect), btn);
 }
 
 function salesCsvControls() {
