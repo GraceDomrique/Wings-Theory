@@ -41,6 +41,10 @@ const ICON = {
 
 export async function render(ctx) {
   const d = await getOwnerOverview();
+  // Defensive against an older/cached backend build that predates the
+  // needRestock/expiringSoon counts this tile reads — same honest-missing
+  // treatment as a null field, not a crash.
+  if (!d.stockAtRisk) d.stockAtRisk = { needRestock: null, expiringSoon: null };
   const stale = d.dataStaleHours !== null && d.dataStaleHours > 24
     ? h('div', { class: 'callout callout-warn', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' } },
       h('p', { style: { margin: 0 } }, h('strong', {}, 'Order data is stale — '),
