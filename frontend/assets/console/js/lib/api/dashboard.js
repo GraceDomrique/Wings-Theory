@@ -223,3 +223,48 @@ export async function getBusinessOverview() {
       : { available: false, reason: raw.outlook.reason },
   };
 }
+
+/**
+ * Admin Today's reference-design landing payload — GET /console/dashboard/
+ * admin-today (wt/dashboard_overview.admin_today()). A richer, separate
+ * aggregation from getSummary() above: that one backs the original fixed-
+ * viewport five-KPI grid (still used for the alerts/useFirst/verify panels
+ * further down this same page — see Today.js), this one backs the new
+ * reference-image sections (store status, today's sales vs yesterday,
+ * inventory pulse, deliveries, order activity, recent orders, the two
+ * anomaly previews, activity log).
+ */
+export async function getAdminToday() {
+  const raw = await api.get('/console/dashboard/admin-today');
+  return {
+    asOf: raw.asOf,
+    businessDate: raw.businessDate,
+    freshness: raw.freshness,
+    storeStatus: raw.storeStatus,
+    todaySales: raw.todaySales,
+    doNow: raw.doNow,
+    next7Days: raw.next7Days,
+    inventoryPulse: raw.inventoryPulse,
+    todaysDeliveries: raw.todaysDeliveries,
+    quickActions: raw.quickActions,
+    orderActivity: raw.orderActivity,
+    recentOrders: raw.recentOrders,
+    unusualUsage: raw.unusualUsage,
+    unusualStockDifference: raw.unusualStockDifference,
+    activityLog: raw.activityLog,
+    instructionsPreview: raw.instructionsPreview,
+  };
+}
+
+/**
+ * Owner Overview's reference-design landing payload — GET /console/
+ * dashboard/owner-overview (wt/dashboard_overview.owner_overview()). Builds
+ * on business_overview()'s own this-week period comparison (same shape
+ * getBusinessOverview() already maps above) plus the sections that payload
+ * doesn't carry: needs-attention, coming-up forecast, sales->stock,
+ * customer pulse, category mix, and business rhythm.
+ */
+export async function getOwnerOverview() {
+  const raw = await api.get('/console/dashboard/owner-overview');
+  return raw;
+}

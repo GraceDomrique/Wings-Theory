@@ -44,11 +44,11 @@ def _sql(instant: _dt.datetime) -> str:
 
 
 def _period_totals(conn, start: _dt.datetime, end: _dt.datetime) -> dict:
-    """Revenue/orders/covers for [start, end) -- same status/void filter and
-    the same two-query shape (orders+covers, then revenue via order_line)
-    api.py's sales_summary already uses for every other date window in this
-    console, just parameterised on an exact instant pair instead of a named
-    preset."""
+    """Revenue/orders/covers/items for [start, end) -- same status/void
+    filter and the same two-query shape (orders+covers, then revenue via
+    order_line) api.py's sales_summary already uses for every other date
+    window in this console, just parameterised on an exact instant pair
+    instead of a named preset."""
     params = {"start": _sql(start), "end": _sql(end)}
     totals = conn.execute(
         """
@@ -58,19 +58,22 @@ def _period_totals(conn, start: _dt.datetime, end: _dt.datetime) -> dict:
         """,
         params,
     ).fetchone()
-    revenue = conn.execute(
+    line_totals = conn.execute(
         """
-        SELECT COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue
+        SELECT COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue,
+               COALESCE(SUM(ol.qty), 0) AS items
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
          WHERE o.status != 'void' AND o.created_at >= :start AND o.created_at < :end
         """,
         params,
-    ).fetchone()["revenue"]
+    ).fetchone()
+    revenue = line_totals["revenue"]
     orders = totals["orders"]
     return {
         "revenue": round(revenue, 2),
         "orders": orders,
         "covers": totals["covers"],
+        "items": line_totals["items"],
         "avg_order": round(revenue / orders, 2) if orders else None,
     }
 
@@ -102,8 +105,29 @@ def _compare_block(conn, label: str, current_start: _dt.datetime, current_end: _
             "orders_pct": _delta_pct(current["orders"], prior["orders"]),
             "avg_order_pct": _delta_pct(current["avg_order"], prior["avg_order"]),
             "covers_pct": _delta_pct(current["covers"], prior["covers"]),
+            "items_pct": _delta_pct(current["items"], prior["items"]),
         },
     }
+
+
+def today_vs_yesterday(conn, now: _dt.datetime | None = None) -> dict:
+    """Admin Today's "Today's Sales" tile: today-so-far vs literally
+    YESTERDAY, same elapsed time since Manila midnight -- distinct from
+    business_overview()'s own `today` block above, which deliberately
+    compares against the SAME WEEKDAY last week (a steadier baseline for a
+    business-performance read). The Admin console asks a narrower, same-day
+    operational question ("are we having a normal day so far, compared with
+    yesterday"), so it gets the literal day-before comparison instead."""
+    now = now or timeutil.utc_now()
+    today = timeutil.business_today(now)
+    today_start = _manila_midnight_utc(today)
+    elapsed = now - today_start
+    yesterday = today - _dt.timedelta(days=1)
+    yesterday_start = _manila_midnight_utc(yesterday)
+    return _compare_block(
+        conn, "vs same time yesterday",
+        today_start, now, yesterday_start, yesterday_start + elapsed,
+    )
 
 
 def _trend_weeks(conn, now: _dt.datetime, weeks: int = 12) -> dict:

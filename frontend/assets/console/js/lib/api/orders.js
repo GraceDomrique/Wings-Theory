@@ -16,6 +16,28 @@ import { api } from './client.js';
  * `end_date`, `all_time`) passed straight through, same pattern as
  * getSales() in ./reports.js.
  */
+/**
+ * One order's full detail + line items — GET /pos/orders/{id} (wt/api.py's
+ * order_detail()). The lifecycle timestamps on `order` (created_at/
+ * committed_at/served_at/voided_at) ARE this schema's status history; there
+ * is no separate status-change log table, so nothing here is reconstructed
+ * or inferred beyond what the order record itself already carries.
+ */
+export async function getOrder(id) {
+  const out = await api.get(`/pos/orders/${id}`);
+  const o = out.order;
+  return {
+    id: o.id, orderNo: o.order_no, status: o.status, tableLabel: o.table_label,
+    headCount: o.head_count, createdBy: o.created_by, createdAt: o.created_at,
+    committedAt: o.committed_at, servedAt: o.served_at, voidedAt: o.voided_at,
+    voidReason: o.void_reason, subtotal: o.subtotal, discountType: o.discount_type,
+    discountAmount: o.discount_amount, serviceCharge: o.service_charge, total: o.total,
+    cashReceived: o.cash_received, changeDue: o.change_due, source: o.source,
+    sourceOrderId: o.source_order_id,
+    lines: (out.lines || []).map((l) => ({ name: l.name, qty: l.qty, unitPrice: l.unit_price, note: l.note })),
+  };
+}
+
 export async function listOrders({ status = 'all', limit = 200, allTime = false, startDate = null, endDate = null } = {}) {
   const params = { status, limit };
   if (allTime) params.all_time = true;

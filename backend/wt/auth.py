@@ -226,6 +226,25 @@ CAPABILITIES = {
     # read-only (approving the IDEA is combo.draft; making it sellable is
     # this), consistent with every other write capability in this table.
     "combo.publish":      ("admin",),
+
+    # 2026-10 Phase 2 audit finding: GET /console/dashboard/owner-overview
+    # and GET /console/sales/owner were gated on inventory.read, same as
+    # every ingredient/stock-reading endpoint — which also grants 'admin'
+    # (inventory.read lists manager/admin/owner, see above). That is correct
+    # for inventory data itself, but these two routes are not inventory
+    # reads: they are the Owner-role strategic business-intelligence
+    # aggregation (category/customer trend analysis, growth drivers,
+    # business rhythm, FP-Growth associations framed as revenue strategy) —
+    # a distinct, Owner-only screen the frontend's own nav tree
+    # (OWNER_TREE's Business Performance group) never shows an admin
+    # account, and the console's role split throughout this file otherwise
+    # keeps that content owner-side (instruction.create, purchase_order.
+    # create above). Nav hiding it is not authorization: an admin token
+    # could call either route directly. Scoped to owner only — nothing an
+    # admin legitimately needs lives behind this capability; Admin Today and
+    # Admin Sales (the operational counterparts) stay on inventory.read,
+    # unchanged, since admin's own operational screens were never the gap.
+    "dashboard.owner_intelligence": ("owner",),
 }
 
 

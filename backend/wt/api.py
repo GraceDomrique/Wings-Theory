@@ -28,6 +28,8 @@ from . import (
     audit, auth, business_overview as business_overview_mod, db, instructions, permissions,
     purchasing, refills, timeutil, unli, verification,
 )
+from . import dashboard_overview as dashboard_overview_mod
+from . import sales_overview as sales_overview_mod
 from .cache import TTLCache
 from .anomaly import detect_anomalies, detect_consumption_anomalies
 from .anomaly import consumption_model_details
@@ -2904,6 +2906,129 @@ def dashboard_business_overview(
     except Exception:
         forecast = None
     return business_overview_mod.business_overview(c, forecast=forecast)
+
+
+def _top_risk_ingredients(c: sqlite3.Connection, limit: int = 6) -> list[dict]:
+    """The forward-depletion engine's own at-risk/critical/out rows, soonest
+    runway first — the same ingredient_forecast() call and cache key
+    dashboard_summary() already uses, shared here rather than recomputed."""
+    fc_key = _depletion_fingerprint(c) + ("ingredients", DEPLETION_HORIZON_DAYS, DEPLETION_LOOKBACK_DAYS)
+    ing_forecast = _forecast_cache.get_or_compute(
+        fc_key, lambda: ingredient_forecast(c, DEPLETION_HORIZON_DAYS, DEPLETION_LOOKBACK_DAYS,
+                                            demand_model=_demand_model(c))
+    )
+    at_risk = [r for r in ing_forecast["ingredients"] if r["status"] in ("out", "critical", "at_risk")]
+    at_risk.sort(key=lambda r: (r["daysOfSupply"] if r["daysOfSupply"] is not None else -1))
+    return at_risk[:limit]
+
+
+def _both_anomaly_passes(c: sqlite3.Connection, lookback_days: int = 90) -> tuple[list[dict], list[dict]]:
+    """Both anomaly passes, cached the same way GET /console/anomalies
+    caches them — a stock-loss list and a consumption list, kept separate
+    (see that endpoint's own docstring for why they must never be merged)."""
+    max_ledger = c.execute("SELECT MAX(id) AS m FROM stock_ledger").fetchone()["m"] or 0
+    max_recon = c.execute("SELECT MAX(id) AS m FROM unli_reconciliation").fetchone()["m"] or 0
+    path = str(db.db_path())
+    losses = _anomaly_cache.get_or_compute(
+        (path, "stock_loss", lookback_days, max_ledger), lambda: detect_anomalies(c, lookback_days))
+    consumption = _anomaly_cache.get_or_compute(
+        (path, "consumption", lookback_days, max_recon), lambda: detect_consumption_anomalies(c, lookback_days))
+    review_statuses = latest_review_statuses(c)
+    losses = [{**a, "review_status": review_statuses.get(a["ledger_id"])} for a in losses]
+    return losses, consumption
+
+
+@app.get("/console/dashboard/admin-today", tags=["console"])
+def dashboard_admin_today(
+    c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("inventory.read")),
+):
+    """Admin Today's single aggregation payload — see wt/dashboard_overview.
+    admin_today() for the composition itself. Builds on the SAME
+    GET /dashboard/summary payload this file already serves (kpis/alerts/
+    buckets/coverage), plus the forward-depletion top risks, both anomaly
+    passes, and the physical-count shortlist every other endpoint in this
+    file already computes — nothing here is a second implementation of any
+    of those."""
+    now = timeutil.utc_now()
+    summary = dashboard_summary(c, p)
+    try:
+        forecast = forecast_store_demand(metric="items", horizon_days=7, lookback_days=90, c=c, _p=p)
+    except Exception:
+        forecast = None
+    stock_loss, consumption = _both_anomaly_passes(c)
+    return dashboard_overview_mod.admin_today(
+        c, now=now, summary=summary, forecast=forecast,
+        stock_loss_anomalies=stock_loss, consumption_anomalies=consumption,
+        counts_due=_count_today(c), top_risks=_top_risk_ingredients(c),
+    )
+
+
+@app.get("/console/dashboard/owner-overview", tags=["console"])
+def dashboard_owner_overview(
+    c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("dashboard.owner_intelligence")),
+):
+    """Owner Overview's single aggregation payload — see wt/dashboard_
+    overview.owner_overview() for the composition. Builds on the existing
+    business_overview() period comparisons/trend/outlook, GET /dashboard/
+    summary's alert list, the existing FP-Growth product_combinations(), and
+    the same forward-depletion top risks admin-today uses — every section is
+    read from a function another endpoint in this file already calls."""
+    now = timeutil.utc_now()
+    summary = dashboard_summary(c, p)
+    try:
+        forecast = forecast_store_demand(metric="sales", horizon_days=7, lookback_days=90, c=c, _p=p)
+    except Exception:
+        forecast = None
+    period_overview = business_overview_mod.business_overview(c, now=now, forecast=forecast)
+    try:
+        combinations = product_combinations(c, lookback_days=90, top_n=5)
+    except Exception:
+        combinations = None
+    return dashboard_overview_mod.owner_overview(
+        c, now=now, summary=summary, period_overview=period_overview, forecast=forecast,
+        combinations=combinations, top_risks=_top_risk_ingredients(c),
+    )
+
+
+@app.get("/console/sales/owner", tags=["console"])
+def sales_owner(
+    period: Literal["this_week", "this_month", "this_year", "custom"] = Query("this_week"),
+    comparison: Literal["previous_period", "last_year", "custom"] = Query("previous_period"),
+    period_start: str | None = Query(default=None, description="custom period start, YYYY-MM-DD"),
+    period_end: str | None = Query(default=None, description="custom period end, YYYY-MM-DD"),
+    comparison_start: str | None = Query(default=None, description="custom comparison start, YYYY-MM-DD"),
+    comparison_end: str | None = Query(default=None, description="custom comparison end, YYYY-MM-DD"),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("dashboard.owner_intelligence")),
+):
+    """Owner Sales — strategic business-intelligence payload. See
+    wt/sales_overview.owner_sales() for the full composition: period/
+    comparison math shared with Admin Sales below, the existing FP-Growth
+    product_combinations() for Often Ordered Together, and the same
+    forward-depletion top risks the other two dashboard endpoints use for
+    Sales -> Stock."""
+    now = timeutil.utc_now()
+    try:
+        combinations = product_combinations(c, lookback_days=365, top_n=10)
+    except Exception:
+        combinations = None
+    return sales_overview_mod.owner_sales(
+        c, now=now, period_preset=period, comparison_mode=comparison,
+        custom_period=(period_start, period_end), custom_comparison=(comparison_start, comparison_end),
+        combinations=combinations, top_risks=_top_risk_ingredients(c, limit=15),
+    )
+
+
+@app.get("/console/sales/admin", tags=["console"])
+def sales_admin(
+    period: Literal["today", "this_week", "this_month"] = Query("today"),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Admin Sales — operational summary + orders. See wt/sales_overview.
+    admin_sales() for the composition. Deliberately narrower than Owner
+    Sales above: no year-over-year, no payday/business-rhythm panel, no
+    extensive FP-Growth section — see that function's own docstring."""
+    now = timeutil.utc_now()
+    return sales_overview_mod.admin_sales(c, now=now, period_preset=period, top_risks=_top_risk_ingredients(c, limit=15))
 
 
 @app.get("/console/forecasts/depletion", tags=["console"])
