@@ -194,6 +194,9 @@ async function stockLossView(isAdmin) {
   drawList();
 
   return h('div', {},
+    h('div', { class: 'callout callout-info', style: { marginBottom: '14px' } },
+      h('p', {}, h('strong', {}, 'What this is. '),
+        'Every time waste is logged or a physical stock count doesn’t match what the system expected, it’s checked against that ingredient’s own normal pattern. Anything unusually large shows up below — a flag worth a look, not proof anything went wrong.')),
     h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3,1fr)', marginBottom: '14px' } },
       Card({}, Stat({ value: count(stockLoss.length), label: 'Flagged stock losses' })),
       Card({}, Stat({ value: count(ingredientsInvolved), label: 'Ingredients involved' })),
@@ -289,6 +292,9 @@ async function varianceView() {
   drawList();
 
   return h('div', {},
+    h('div', { class: 'callout callout-info', style: { marginBottom: '14px' } },
+      h('p', {}, h('strong', {}, 'What this is. '),
+        'For each ingredient, this compares what the recipes + waste log say should have been used against what a physical count actually found. A big gap ("review needed") is worth checking — it could be a missed count, an unrecorded waste, or a real loss.')),
     h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: '14px' } },
       Card({}, Stat({ value: count(items.length), label: 'Ingredients with activity' })),
       Card({}, Stat({ value: count(counted.length), label: 'Physically counted' })),
@@ -335,6 +341,9 @@ async function consumptionAnomalyView() {
   const flavorDetails = models && models.flavor_anomaly_detection;
 
   return h('div', {},
+    h('div', { class: 'callout callout-info', style: { marginBottom: '14px' } },
+      h('p', {}, h('strong', {}, 'What this is. '),
+        'Each day’s unlimited-wings weigh-in is compared against that stream’s own usual pattern. A normal 3-piece refill round never shows up here — only a whole reconciled day whose total measured consumption looked unusually high or low.')),
     Card({},
       CardHeader({
         title: 'Unlimited Wings Consumption Anomaly Detection',

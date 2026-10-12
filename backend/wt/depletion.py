@@ -211,6 +211,32 @@ def prophet_refresh_generation() -> int:
         return _prophet_generation
 
 
+def snapshot_prophet_stores() -> tuple[dict, dict]:
+    """Shallow copy of the live _prophet_store/_hybrid_store, for
+    wt/ml_training.py's train_demand_prophet() to persist as a joblib
+    artifact and to restore from if a refresh regresses (see
+    restore_prophet_stores). Never mutated by anything else -- a fresh dict
+    each call."""
+    with _prophet_lock:
+        return dict(_prophet_store), dict(_hybrid_store)
+
+
+def restore_prophet_stores(snapshot: tuple[dict, dict]) -> None:
+    """Rolls the live stores back to a prior snapshot (ml_training.py calls
+    this when a refresh's fleet WAPE regressed, or when the refresh itself
+    raised) and bumps the generation counter so api.py's cache fingerprint
+    picks up the rollback on the very next request, exactly as it would a
+    forward refresh."""
+    global _prophet_generation
+    prophet_snapshot, hybrid_snapshot = snapshot
+    with _prophet_lock:
+        _prophet_store.clear()
+        _prophet_store.update(prophet_snapshot)
+        _hybrid_store.clear()
+        _hybrid_store.update(hybrid_snapshot)
+        _prophet_generation += 1
+
+
 def _prophet_scope_key(conn: sqlite3.Connection) -> str:
     """Identifies 'which database' for Prophet-cache scoping, read straight
     from the connection itself via PRAGMA database_list rather than id(conn)

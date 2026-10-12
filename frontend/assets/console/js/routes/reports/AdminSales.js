@@ -38,11 +38,11 @@ export async function render(ctx) {
       mount(host, EmptyState({ icon: '⨯', title: 'Could not load sales data', description: e.message || String(e) }));
       return;
     }
-    mount(host, periodTabs(), content(d, ctx));
+    mount(host, content(d, ctx));
   }
 
   function periodTabs() {
-    return h('div', { style: { display: 'flex', gap: '6px', marginBottom: '14px' } },
+    return h('div', { style: { display: 'flex', gap: '6px' } },
       ...PERIODS.map((o) => Button({
         variant: o.value === state.period ? 'primary' : 'default', size: 'sm',
         onClick: () => { state.period = o.value; draw(); },
@@ -52,7 +52,7 @@ export async function render(ctx) {
   function content(d, ctx2) {
     const host2 = h('div');
     mount(host2,
-      summaryCard(d),
+      summaryCard(d, periodTabs()),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1.4fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
         trendCard(d),
         salesMixCard(d)),
@@ -99,10 +99,10 @@ function deltaPill(value) {
   return Pill('flat', '≈ flat');
 }
 
-function summaryCard(d) {
+function summaryCard(d, periodTabs) {
   const s = d.salesSummary;
   return Card({},
-    CardHeader({ title: 'Sales Summary', desc: `${d.period.label} — ${s.comparisonLabel}` }),
+    CardHeader({ title: 'Sales Summary', desc: `${d.period.label} — ${s.comparisonLabel}`, right: periodTabs }),
     h('div', { style: { fontSize: '28px', fontWeight: '700', margin: '4px 0 2px' } }, money(s.revenue, '₱0')),
     h('div', { style: { marginBottom: '8px' } }, deltaPill(s.deltas.revenue_pct)),
     h('p', { class: 't-xs t-faint', style: { marginBottom: '12px' } }, s.interpretation),
@@ -132,7 +132,7 @@ function whatsSellingCard(d) {
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'Nothing sold yet', tight: true })
       : h('div', { class: 'scrollpane' }, ...rows.map((r) => h('div', { class: 'mini-row' },
-        h('span', {}, r.name), Pill('info', `${count(r.qty)} sold`)))));
+        h('span', {}, r.name), Pill('info', `${r.qty} sold`)))));
 }
 
 function orderActivityCard(d) {

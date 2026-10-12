@@ -1,13 +1,11 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
-import { Stat } from '../../components/ui/Stat.js';
-import { Pill } from '../../components/ui/Pill.js';
 import { LineChart } from '../../components/charts/LineChart.js';
 import { Loading } from '../../components/ui/Feedback.js';
 import { palette } from '../../components/charts/base.js';
-import { num, nodata } from '../../lib/format.js';
 import { listDemandSummaries, getForecast } from '../../lib/api/intelligence.js';
 import { getModelDetails } from '../../lib/api/system.js';
+import { session } from '../../lib/api/client.js';
 
 /**
  * Forecast & Insights > Demand Forecasts (restored 2026-10 — the route id
@@ -22,6 +20,7 @@ import { getModelDetails } from '../../lib/api/system.js';
  * worse than no line, because it looks like knowledge.
  */
 export async function render(ctx) {
+  const isOwner = (session.user || {}).role === 'owner';
   const [items, models] = await Promise.all([
     listDemandSummaries(),
     getModelDetails().catch(() => null),
@@ -35,7 +34,9 @@ export async function render(ctx) {
     ? h('div', { class: 'callout callout-warn' },
       h('p', {},
         h('strong', {}, 'Forecast status — building history. '),
-        `Prophet needs ${requiredDays}+ days of real sales per menu item before it can forecast demand reliably. `,
+        isOwner
+          ? `The forecasting system needs ${requiredDays}+ days of real sales per menu item before it can forecast demand reliably. `
+          : `Prophet needs ${requiredDays}+ days of real sales per menu item before it can forecast demand reliably. `,
         best
           ? `The closest item so far has ${best.daysOfHistory} ${best.daysOfHistory === 1 ? 'day' : 'days'} on file. `
           : 'No menu item has any sales on file yet. ',
@@ -147,38 +148,42 @@ export async function render(ctx) {
         data: [...history.map(() => null), ...forecast.map((p) => p.predictedUnits)],
       }],
       color: palette.info,
-      height: 200,
+      height: 340,
     }));
 
     const methodLabel = series.prophetUnavailable || series.method === 'trailing_average'
       ? 'trailing average (Prophet unavailable)'
       : 'Prophet';
+    const methodNote = isOwner ? '' : ` Method used for this chart: ${methodLabel}.`;
     mount(chartNote, h('div', { class: 't-xs t-faint', style: { marginTop: '6px' } },
       aggregated
-        ? `${rawHistory.length} real days on file, shown here as ${history.length} weekly totals — daily points get noisy past ${DAILY_POINT_LIMIT} days. Forecast (dashed) stays daily. Method used for this chart: ${methodLabel}.`
-        : `${rawHistory.length} real days on file, shown daily. Method used for this chart: ${methodLabel}.`));
+        ? `${rawHistory.length} real days on file, shown here as ${history.length} weekly totals — daily points get noisy past ${DAILY_POINT_LIMIT} days. Forecast (dashed) stays daily.${methodNote}`
+        : `${rawHistory.length} real days on file, shown daily.${methodNote}`));
   }
 
   const chartNote = h('div');
 
   await drawChart();
 
+  const legend = h('div', { class: 'forecast-legend' },
+    h('span', { class: 'forecast-legend-item' }, h('span', { class: 'forecast-legend-swatch', style: { background: palette.info } }), 'Actual sales (history)'),
+    h('span', { class: 'forecast-legend-item' }, h('span', { class: 'forecast-legend-swatch dashed', style: { borderColor: palette.amber } }), 'Forecast (projected)'));
+
   return h('div', {},
     banner,
-    freshnessBanner(models),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '2fr 1fr' } },
-      Card({},
-        CardHeader({
-          title: 'Next 7 days — top menu items',
-          desc: 'Forecasts units sold, not raw ingredient grams',
-          right: h('label', { class: 'field', style: { minWidth: '200px' } }, picker),
-        }),
-        h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: '8px' } },
-          h('label', { class: 'field', style: { minWidth: '150px' } },
-            h('span', { class: 't-xs t-faint' }, 'History shown'), lookbackPicker)),
-        chartHost,
-        chartNote),
-      accuracyCard(models, selected)));
+    freshnessBanner(models, isOwner),
+    Card({},
+      CardHeader({
+        title: 'Next 7 days — top menu items',
+        desc: 'Forecasts units sold, not raw ingredient grams',
+        right: h('label', { class: 'field', style: { minWidth: '200px' } }, picker),
+      }),
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '8px' } },
+        legend,
+        h('label', { class: 'field', style: { minWidth: '150px' } },
+          h('span', { class: 't-xs t-faint' }, 'History shown'), lookbackPicker)),
+      chartHost,
+      chartNote));
 }
 
 /**
@@ -191,101 +196,42 @@ export async function render(ctx) {
  * health, answers "is hybrid actually fitted, or just configured?" without
  * requiring a trip to System & Models.
  */
-function freshnessBanner(models) {
+function freshnessBanner(models, isOwner) {
   const status = models && models.prophet_baseline_refresh;
   if (!status) {
     return h('div', { class: 'callout callout-warn' },
       h('p', {},
-        h('strong', {}, 'Replenishment baselines have not been refreshed yet in this database. '),
-        'Ingredient purchase recommendations are running on the simple trailing-average fallback '
-        + 'until the first scheduled or manual refresh completes.'));
+        h('strong', {}, 'Purchase recommendations are still building history. '),
+        isOwner
+          ? 'They are running on a basic estimate until the system has enough data for a full refresh.'
+          : 'Ingredient purchase recommendations are running on the simple trailing-average fallback '
+            + 'until the first scheduled or manual refresh completes.'));
   }
   if (!status.lastRunOk) {
     return h('div', { class: 'callout callout-warn' },
       h('p', {},
-        h('strong', {}, 'The last replenishment baseline refresh failed. '),
-        `(${status.error || 'unknown error'}, at ${status.lastRunAt}.) `,
-        'Purchase recommendations keep using each item\'s last good fit, or the trailing average where none exists.'));
+        h('strong', {}, 'The last purchase-recommendation refresh did not complete. '),
+        isOwner
+          ? `(At ${status.lastRunAt}.) `
+          : `(${status.error || 'unknown error'}, at ${status.lastRunAt}.) `,
+        isOwner
+          ? 'Recommendations are still using the most recent data available.'
+          : 'Purchase recommendations keep using each item\'s last good fit, or the trailing average where none exists.'));
   }
   return h('div', { class: 'callout callout-info' },
     h('p', {},
-      h('strong', {}, `Replenishment baselines last refreshed ${status.lastRunAt} `),
-      `(${status.fitted} item(s) fitted, triggered by ${status.triggeredBy}).`));
+      isOwner
+        ? h('strong', {}, `Purchase recommendations were last updated ${status.lastRunAt}.`)
+        : [h('strong', {}, `Replenishment baselines last refreshed ${status.lastRunAt} `),
+          `(${status.fitted} item(s) fitted, triggered by ${status.triggeredBy}).`]));
 }
 
 /**
- * Model accuracy — from wt.forecasting.evaluate_demand_model()'s real
- * rolling backtest (chronological expanding-window folds, WAPE/MAE/RMSE/
- * MASE per item, scored against three baselines plus Prophet; see
- * EVAL_METHOD_VERSION in wt/forecasting.py). `d.available` is only ever
- * false when there are no POS-visible menu items at all — do not read
- * d.reason/d.mae/d.item_name here, that was a stale shape from before the
- * 2026-09 rolling-backtest rewrite and no longer exists on the response.
+ * Model accuracy card removed (2026-10): the WAPE/MAE/MASE rolling-backtest
+ * breakdown it showed was technical detail nobody on this page's audience
+ * (owner or admin) acted on directly — the chart's own "X real days on
+ * file" note and the insufficient-history gap messaging above already say
+ * what matters ("can this be trusted yet"). The backtest itself still runs
+ * server-side (wt.forecasting.evaluate_demand_model()) and is unaffected;
+ * only this console surface for it is gone.
  */
-function accuracyCard(models, selected) {
-  const d = models && models.demand_forecast ? models.demand_forecast : null;
-
-  if (!d || d.available === false) {
-    return Card({},
-      h('div', { class: 'card-title', style: { marginBottom: '10px' } }, 'Model accuracy'),
-      Stat({ value: nodata('—'), label: 'Not available yet' }),
-      h('div', { class: 't-sm t-soft', style: { marginTop: '12px', lineHeight: '1.6' } },
-        (d && d.reason) || 'No menu items to backtest against yet.'));
-  }
-
-  // The backtest only runs the full rolling evaluation on the
-  // items_considered items with the most real sale history (see
-  // ROLLING_MAX_ITEMS in wt/forecasting.py) — the currently-picked item may
-  // or may not be one of them.
-  const itemResult = selected
-    ? (d.items || []).find((it) => it.item_id === selected.menuItemId)
-    : null;
-  const pvb = d.prophet_vs_baseline || {};
-  const fleetProphet = (d.fleet_summary || {}).prophet || {};
-
-  const perItemBlock = itemResult && !itemResult.insufficient_history
-    ? (() => {
-      const m = itemResult.methods || {};
-      const sel = m[itemResult.selected_method] || {};
-      return [
-        h('div', { style: { display: 'flex', gap: '18px', marginBottom: '10px', flexWrap: 'wrap' } },
-          Stat({ value: sel.wape == null ? nodata('n/a') : num(sel.wape, { decimals: 1 }), label: 'WAPE % (this item)' }),
-          Stat({ value: sel.mae == null ? nodata('n/a') : num(sel.mae, { decimals: 2 }), label: 'MAE' }),
-          Stat({ value: sel.mase == null ? nodata('n/a') : num(sel.mase, { decimals: 2 }), label: 'MASE' })),
-        h('div', { class: 't-sm t-soft', style: { lineHeight: '1.6', marginBottom: '10px' } },
-          `Selected method for ${itemResult.item_name}: ${itemResult.selected_method.replace(/_/g, ' ')} — ${itemResult.selection_reason}`),
-      ];
-    })()
-    : [h('div', { class: 't-sm t-soft', style: { lineHeight: '1.6', marginBottom: '10px' } },
-      selected
-        ? `${selected.name} isn't one of the ${d.items_evaluated} items with the most sales history yet, `
-          + 'so it wasn\'t individually backtested — the fleet numbers below still apply to the model as a whole.'
-        : '')];
-
-  return Card({},
-    h('div', { class: 'card-title', style: { marginBottom: '10px' } }, 'Model accuracy'),
-    ...perItemBlock,
-    h('div', { class: 't-xs t-faint', style: { marginBottom: '4px' } }, 'Fleet-wide (Prophet)'),
-    h('div', { style: { display: 'flex', gap: '18px', marginBottom: '12px', flexWrap: 'wrap' } },
-      Stat({ value: fleetProphet.mean_wape == null ? nodata('n/a') : num(fleetProphet.mean_wape, { decimals: 1 }), label: 'Mean WAPE %' }),
-      Stat({ value: fleetProphet.mean_mae == null ? nodata('n/a') : num(fleetProphet.mean_mae, { decimals: 2 }), label: 'Mean MAE' })),
-    h('div', { class: 't-sm t-soft', style: { lineHeight: '1.6' } },
-      // Plain string interpolation here, not num() — num() returns a DOM
-      // Text node for use as a vdom child, and stringifies to "[object
-      // Text]" if concatenated into a template literal instead.
-      pvb.prophet_actually_better
-        ? `Prophet beats the best baseline by ${fmt1(pvb.absolute_improvement_wape_pts)} WAPE points on this data.`
-        : `Prophet is not measurably better than the best simple baseline on this data yet `
-          + `(fleet mean WAPE ${fmt1(pvb.prophet_mean_wape)}% vs ${fmt1(pvb.best_baseline_mean_wape)}%) — `
-          + 'still shown because it can beat the baseline on individual items even when the fleet average doesn\'t.'),
-    h('div', { class: 't-sm t-soft', style: { marginTop: '6px' } },
-      `Backtested ${d.items_evaluated} of ${d.items_considered} menu items`
-      + (d.evaluated_date_range ? `, ${d.evaluated_date_range.from} → ${d.evaluated_date_range.to}.` : '.')),
-    h('div', { style: { marginTop: '10px' } }, Pill('good', 'holdout tested')));
-}
-
-/** Plain-string one-decimal formatting for prose, as opposed to lib/format.js's
- * num(), which returns a DOM node for use as a vdom child. */
-function fmt1(v) {
-  return v == null ? 'n/a' : v.toFixed(1);
-}

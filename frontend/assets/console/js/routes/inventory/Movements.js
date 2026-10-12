@@ -115,8 +115,6 @@ export async function render(ctx) {
           description: 'Every sale, delivery, waste entry and count correction lands here. Widen the filter to see more.',
         }),
       }),
-      h('p', { class: 't-xs t-soft', style: { marginTop: '10px' } },
-        'Shaded pairs above are one event, not two. A correction returns the stock (“Order voided — return”) and immediately re-books it against the reason it actually went — so the two lines net out and no additional stock was lost. Read either line on its own and it looks like a loss that never happened.'),
       h('div', {
         style: {
           display: 'flex', justifyContent: 'space-between', alignItems: 'center',

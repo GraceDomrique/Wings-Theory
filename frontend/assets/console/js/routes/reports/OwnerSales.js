@@ -281,12 +281,23 @@ function businessRhythmCard(d) {
 function oftenOrderedTogetherCard(d) {
   const o = d.oftenOrderedTogether;
   return Card({},
-    CardHeader({ title: 'Often Ordered Together', desc: 'Product associations (FP-Growth)' }),
+    CardHeader({ title: 'Often Ordered Together', desc: 'What customers tend to order in the same visit' }),
     !o.available || o.pairs.length === 0
       ? EmptyState({ icon: '✓', title: 'Not enough transactions yet for a reliable pattern', description: o.dataQualityNote, tight: true })
-      : o.pairs.map((p) => h('div', { class: 'mini-row' },
-        h('span', {}, `${p.item_a} + ${p.item_b}`),
-        Pill('info', `${(p.confidence * 100).toFixed(0)}% confidence`))));
+      : h('div', {},
+        o.pairs.map((p) => h('div', { class: 'mini-row' },
+          h('span', {}, `${p.item_a} + ${p.item_b}`),
+          Pill('info', `seen together ${(p.confidence * 100).toFixed(0)}% of the time`))),
+        // Technical details collapsed, same pattern as Sales & History >
+        // Product Combinations — the business-readable % is the headline,
+        // FP-Growth/confidence wording is one click away, not front and
+        // center (2026-10, "remove model accuracy from the owner's view").
+        h('div', { class: 'accordion', style: { marginTop: '10px' } },
+          h('details', {},
+            h('summary', { class: 't-xs t-soft' }, 'Technical details'),
+            h('div', { class: 't-xs t-faint', style: { marginTop: '8px' } },
+              'FP-Growth product-association mining. ',
+              o.pairs.map((p) => `${p.item_a} + ${p.item_b}: confidence ${(p.confidence * 100).toFixed(0)}%`).join(' · '))))));
 }
 
 function salesToStockCard(d, ctx) {

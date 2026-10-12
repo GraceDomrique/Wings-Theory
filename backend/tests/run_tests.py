@@ -67,6 +67,17 @@ from wt.resolver import (                                           # noqa: E402
     expand_recipe, flavour_substitutions, order_requirements, validate_recipe,
 )
 
+# ML training/provenance/rollback/transition tests (migration 0050) --
+# test_ml_training.py stays a separate, independently-runnable file
+# (python -m tests.test_ml_training, same house convention as
+# test_dashboards.py) but its TestCase classes are also imported and added
+# to THIS suite below so `python -m tests.run_tests` covers them too.
+from tests.test_ml_training import (                                # noqa: E402
+    TestLabelLeakageGuard, TestMLModeTransitionEndToEnd, TestModelRegistryAtomicity,
+    TestPassBDerivedViewDoubleCounting, TestProvenanceClause, TestReadinessLadderIndependence,
+    TestTrainedArtifactsAreActuallyServed,
+)
+
 
 # ---------------------------------------------------------------------------
 # fixture helpers
@@ -17601,6 +17612,9 @@ def main() -> int:
             TestExpandingWindowValidation, TestReplenishmentBacktestHistoricalReconstruction,
             TestRefillDemandReachesTheForecast, TestHistoricalLeakagePrevention,
             TestReplenishmentBacktestFindings,
+            TestModelRegistryAtomicity, TestProvenanceClause, TestPassBDerivedViewDoubleCounting,
+            TestLabelLeakageGuard, TestReadinessLadderIndependence, TestTrainedArtifactsAreActuallyServed,
+            TestMLModeTransitionEndToEnd,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

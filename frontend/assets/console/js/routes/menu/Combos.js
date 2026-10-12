@@ -35,7 +35,9 @@ import {
  * Deliberately never shows support/confidence/lift as the primary number
  * anywhere on this page (spec: owner/admin business view says "Observed
  * together X% of the time", not FP-growth terminology) — the technical
- * figures stay on Sales & History > Product Combinations' hover detail.
+ * figures stay tucked behind this page's own "Technical details" accordion
+ * (the separate read-only Product Combinations report page was removed as a
+ * duplicate of this same section; nothing it showed is lost).
  */
 // money() returns a Text node (made for use as an h() child), not a string —
 // interpolating it into a template literal stringifies the node itself
@@ -64,17 +66,20 @@ export async function render(ctx) {
     return menuItemsCache;
   }
 
+  let comboConfig = null;
+  let lookbackDays = 365;
+
   async function draw() {
     mount(host, Loading('Loading…'));
-    const [combosReport, drafts, comboConfig, published] = await Promise.all([
-      getCombinations(365), listDraftCombos(), getComboPricingConfig().catch(() => null),
+    const [combosReport, drafts, config, published] = await Promise.all([
+      getCombinations(lookbackDays), listDraftCombos(), getComboPricingConfig().catch(() => null),
       listCombos().catch(() => []),
     ]);
+    comboConfig = config;
     mount(host,
       combosSection(combosReport),
       draftsCard(drafts),
-      publishedCard(published),
-      comboConfig ? comboPricingConfigCard(comboConfig) : null);
+      publishedCard(published));
   }
 
   async function act(fn) {
@@ -82,21 +87,40 @@ export async function render(ctx) {
   }
 
   // -------------------------------------------------------------------
-  // 1. Frequently bought together
+  // 1. Frequently bought together — folds in what used to be the separate
+  // "Product Combinations" report page (removed: it was the same
+  // FP-Growth data as this section, just read-only and one click further
+  // away). The lookback picker and the technical-detail accordion it had
+  // live here now instead.
   // -------------------------------------------------------------------
+  const LOOKBACK_OPTIONS = [
+    { value: '90', label: 'Last 90 days' },
+    { value: '180', label: 'Last 6 months' },
+    { value: '365', label: 'Last 12 months' },
+  ];
+
+  function lookbackPicker() {
+    const select = h('select', {
+      onChange: (e) => { lookbackDays = Number(e.target.value); draw(); },
+    }, ...LOOKBACK_OPTIONS.map((o) => h('option', {
+      value: o.value, selected: Number(o.value) === lookbackDays ? 'selected' : undefined,
+    }, o.label)));
+    return h('label', { class: 'field' }, select);
+  }
+
   function combosSection(combos) {
     if (combos.insufficientData) {
       return Card({},
-        CardHeader({ title: 'Customers often buy together', desc: 'FP-Growth over real order history' }),
+        CardHeader({ title: 'Customers often buy together', desc: 'FP-Growth over real order history', right: lookbackPicker() }),
         EmptyState({ icon: '✦', title: 'Not enough order history yet', description: `Needs at least ${combos.required ?? 30} orders to find a reliable pattern — has ${combos.transactionCount ?? 0} so far.` }));
     }
     if (combos.combos.length === 0) {
       return Card({},
-        CardHeader({ title: 'Customers often buy together', desc: 'FP-Growth over real order history' }),
+        CardHeader({ title: 'Customers often buy together', desc: 'FP-Growth over real order history', right: lookbackPicker() }),
         EmptyState({ icon: '✦', title: 'No reliable pairings found', description: `Enough orders were analysed (${combos.transactionCount}), but no pair cleared the lift and support thresholds. That is a result, not a gap.` }));
     }
     return Card({},
-      CardHeader({ title: 'Customers often buy together', desc: 'Frequently appear in the same order' }),
+      CardHeader({ title: 'Customers often buy together', desc: 'Frequently appear in the same order, across your full order history', right: lookbackPicker() }),
       Table({
         columns: [
           { key: 'pair', label: 'Pair', render: (c) => `${c.itemA} + ${c.itemB}` },
@@ -110,7 +134,12 @@ export async function render(ctx) {
         ],
         rows: combos.combos,
       }),
-      h('div', { class: 'hint', style: { marginTop: '8px' } }, 'Statistical strength (lift/support/confidence) is available on Product Combinations for anyone who wants the detail.'));
+      h('div', { class: 'accordion', style: { marginTop: '10px' } },
+        h('details', {},
+          h('summary', { class: 't-xs t-soft' }, 'Technical details'),
+          h('div', { class: 't-xs t-faint', style: { marginTop: '8px' } },
+            `FP-Growth over ${combos.transactionCount} real orders (last ${lookbackDays} days). `,
+            combos.combos.map((c) => `${c.itemA} + ${c.itemB}: lift ${c.lift === null ? 'n/a' : c.lift.toFixed(2) + '×'}, support ${c.support === null ? 'n/a' : c.support}`).join(' · ')))));
   }
 
   // -------------------------------------------------------------------
@@ -272,10 +301,13 @@ export async function render(ctx) {
         qtyInput.addEventListener('change', () => { row.quantity = Math.max(1, Number(qtyInput.value) || 1); schedulePreview(); });
         const removeBtn = Button({ size: 'sm', variant: 'ghost', onClick: () => { state.rows.splice(idx, 1); renderRows(); schedulePreview(); } }, '✕');
         removeBtn.disabled = state.rows.length <= 2;
-        return h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '6px' } },
-          select, qtyInput, removeBtn);
+        return h('div', { class: 'combo-item-row' },
+          h('span', { class: 'combo-item-row-num' }, String(idx + 1)),
+          select,
+          h('span', { class: 'combo-item-row-x' }, '×'), qtyInput,
+          removeBtn);
       }),
-      Button({ size: 'sm', onClick: () => { state.rows.push({ menuItemId: pickable[0]?.pk ?? null, quantity: 1 }); renderRows(); schedulePreview(); } }, '+ Add item'));
+      Button({ size: 'sm', variant: 'ghost', onClick: () => { state.rows.push({ menuItemId: pickable[0]?.pk ?? null, quantity: 1 }); renderRows(); schedulePreview(); } }, '+ Add item'));
     }
     renderRows();
 
@@ -409,27 +441,37 @@ export async function render(ctx) {
       });
     });
 
+    const pricingRules = pricingRulesSection(comboConfig || {}, (saved) => { comboConfig = saved; runPreview(); });
+
     const modal = Modal({
       title: mode === 'edit' ? 'Edit combo' : mode === 'create' ? 'Build a combo' : 'View opportunity',
       desc: 'Choose the items, set a price and image, preview it, then publish — it will appear on the POS exactly like any other menu item.',
       wide: true,
       onClose: () => {},
     },
-    h('label', { class: 'field' }, 'Name', nameInput),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px', marginTop: '10px' } },
-      h('label', { class: 'field' }, 'Category', categoryInput),
-      h('label', { class: 'field' }, 'Price (₱)', priceInput)),
-    h('div', { class: 'field', style: { marginTop: '10px' } },
-      h('label', {}, 'Items in this combo'),
-      rowsHost),
-    h('div', { style: { display: 'flex', gap: '12px', alignItems: 'flex-start', marginTop: '10px' } },
-      imagePreview,
-      h('div', {},
-        h('label', { class: 't-sm t-soft' }, 'Image'),
-        h('div', {}, fileInput),
-        imageStatus,
-        state.imagePath ? Button({ size: 'sm', variant: 'ghost', onClick: removeImage }, 'Remove image') : null)),
-    previewHost,
+    h('div', { class: 'combo-builder-grid' },
+      h('div', { class: 'combo-builder-col' },
+        h('div', { class: 'eyebrow' }, 'Details'),
+        h('label', { class: 'field' }, 'Name', nameInput),
+        h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px', marginTop: '10px' } },
+          h('label', { class: 'field' }, 'Category', categoryInput),
+          h('label', { class: 'field' }, 'Price (₱)', priceInput)),
+
+        h('div', { class: 'eyebrow', style: { marginTop: '18px' } }, 'Items in this combo'),
+        rowsHost,
+
+        h('div', { class: 'eyebrow', style: { marginTop: '18px' } }, 'Image'),
+        h('div', { style: { display: 'flex', gap: '12px', alignItems: 'flex-start' } },
+          imagePreview,
+          h('div', {},
+            h('div', {}, fileInput),
+            imageStatus,
+            state.imagePath ? Button({ size: 'sm', variant: 'ghost', onClick: removeImage }, 'Remove image') : null)),
+
+        pricingRules),
+      h('div', { class: 'combo-builder-col combo-builder-preview' },
+        h('div', { class: 'eyebrow' }, 'Live preview'),
+        previewHost)),
     err,
     h('div', { style: { marginTop: '14px', display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
       saveDraftBtn, primaryBtn));
@@ -440,15 +482,16 @@ export async function render(ctx) {
 
   /**
    * Combo pricing settings — PATCH /console/combo-pricing-config
-   * (wt/combo_pricing.py), admin-only (inventory.write). Moved here from
-   * Administration > Settings (2026-10 cleanup): it configures what THIS
-   * page does (turns a cost estimate into a suggested price range above),
-   * so it belongs next to its effect, not filed under generic account
-   * settings. Every field is None ("not configured") until set here. The
-   * form always submits its full current state; since the backend only
-   * writes the fields present in the body, a full resend is idempotent.
+   * (wt/combo_pricing.py), admin-only (inventory.write). Lives INSIDE the
+   * builder modal as a collapsible "Pricing rules" section rather than its
+   * own standalone card: it only ever affects the price-range suggestion
+   * the same modal's preview computes, so the admin sets it right where it
+   * takes effect instead of hunting for a disconnected settings page. Every
+   * field is None ("not configured") until set here. The form always
+   * submits its full current state; since the backend only writes the
+   * fields present in the body, a full resend is idempotent.
    */
-  function comboPricingConfigCard(config) {
+  function pricingRulesSection(config, onSaved) {
     const num = (v) => (v === null || v === undefined ? '' : String(v));
 
     const targetInput = h('input', { type: 'number', step: '0.1', min: '1', max: '100', value: num(config.targetFoodCostPct), placeholder: 'e.g. 30' });
@@ -497,8 +540,9 @@ export async function render(ctx) {
       }
       submit.disabled = true;
       try {
-        await setComboPricingConfig(body);
-        toast('Combo pricing settings saved.', 'good');
+        const saved = await setComboPricingConfig(body);
+        toast('Pricing rules saved.', 'good');
+        if (onSaved) onSaved(saved || config);
       } catch (e) {
         err.textContent = e.message; err.style.display = '';
       } finally {
@@ -506,19 +550,20 @@ export async function render(ctx) {
       }
     });
 
-    return Card({ style: { marginTop: '14px' } },
-      CardHeader({ title: 'Combo pricing settings', desc: 'A target food-cost % is required before a preview above can suggest a price range' }),
-      h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px 16px' } },
-        h('label', { class: 'field' }, 'Target food-cost (%)', targetInput),
-        h('label', { class: 'field' }, 'Overhead (% of ingredient cost)', overheadInput),
-        h('label', { class: 'field' }, 'Labor method', laborMethodSelect),
-        h('div'),
-        laborFixedRow, laborPctRow,
-        h('label', { class: 'field' }, 'Preferred minimum price (₱)', minPriceInput),
-        h('label', { class: 'field' }, 'Preferred maximum price (₱)', maxPriceInput),
-        h('label', { class: 'field' }, 'Max discount off individual total (%)', maxDiscountInput)),
-      err,
-      h('div', { style: { marginTop: '12px' } }, submit));
+    return h('details', { class: 'combo-pricing-rules' },
+      h('summary', {}, '⚙ Pricing rules', h('span', { class: 't-xs t-faint' }, ' — target food-cost %, overhead, labor and price bounds')),
+      h('div', { class: 'combo-pricing-rules-body' },
+        h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px 16px' } },
+          h('label', { class: 'field' }, 'Target food-cost (%)', targetInput),
+          h('label', { class: 'field' }, 'Overhead (% of ingredient cost)', overheadInput),
+          h('label', { class: 'field' }, 'Labor method', laborMethodSelect),
+          h('div'),
+          laborFixedRow, laborPctRow,
+          h('label', { class: 'field' }, 'Preferred minimum price (₱)', minPriceInput),
+          h('label', { class: 'field' }, 'Preferred maximum price (₱)', maxPriceInput),
+          h('label', { class: 'field' }, 'Max discount off individual total (%)', maxDiscountInput)),
+        err,
+        h('div', { style: { marginTop: '12px' } }, submit)));
   }
 
   await draw();

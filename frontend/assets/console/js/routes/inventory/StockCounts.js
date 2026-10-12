@@ -91,6 +91,8 @@ export async function render(ctx) {
 
   function drawStats() {
     const counted = [...rowState.values()].filter((r) => r.input.value !== '').length;
+    statsHost.classList.add('grid');
+    statsHost.style.gridTemplateColumns = 'repeat(2,1fr)';
     mount(statsHost,
       Card({}, Stat({ value: count(ingredients.length), label: 'Ingredients' })),
       Card({}, Stat({ value: count(counted), label: 'Entered this session' })));
@@ -192,7 +194,7 @@ export async function render(ctx) {
 
   return h('div', {},
     h('div', { style: { marginBottom: '14px' } }, priorityHost),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2,1fr)', marginBottom: '14px' } }, statsHost),
+    h('div', { style: { marginBottom: '14px' } }, statsHost),
     Card({},
       CardHeader({
         title: 'Physical stock take',

@@ -1,4 +1,4 @@
-import { h } from '../../lib/dom.js';
+import { h, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { RailCard } from '../../components/ui/RailCard.js';
 import { Stat } from '../../components/ui/Stat.js';
@@ -35,33 +35,44 @@ export async function render(ctx) {
         ' (', ageFromNow(d.freshness.latestOrderAt), ').'))
     : null;
 
+  // Layout (2026-10, matched to the reference design): Store Status beside
+  // Today's Sales up top; Do Now, Next 7 Days and Inventory Pulse in one
+  // three-up row; Today's Deliveries, Quick Actions, Order Activity and
+  // Recent Orders in one four-up row (Recent Orders widest, since it has
+  // the most to show); Unusual Usage, Unusual Stock Difference and
+  // Activity Log in the final three-up row.
   return h('div', { class: 'admin-today' },
     stale,
-    storeStatusBanner(d, ctx),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1.3fr 1fr', gap: '14px', alignItems: 'start', marginTop: '14px' } },
-      todaysSalesCard(d),
-      inventoryPulseCard(d, ctx)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', alignItems: 'start', marginTop: '14px' } },
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '14px' } },
+      storeStatusBanner(d, ctx),
+      todaysSalesCard(d)),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
       doNowCard(d, ctx),
       next7DaysCard(d),
-      quickActionsCard(d, ctx)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', alignItems: 'start', marginTop: '14px' } },
+      inventoryPulseCard(d, ctx)),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '0.85fr 0.85fr 0.85fr 1.5fr', gap: '14px', marginTop: '14px' } },
       deliveriesCard(d, ctx),
-      orderActivityCard(d)),
-    h('div', { style: { marginTop: '14px' } }, recentOrdersCard(d)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', alignItems: 'start', marginTop: '14px' } },
+      quickActionsCard(d, ctx),
+      orderActivityCard(d),
+      recentOrdersCard(d)),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
       unusualUsageCard(d, ctx),
-      unusualStockDifferenceCard(d, ctx)),
-    h('div', { style: { marginTop: '14px' } }, activityLogCard(d)));
+      unusualStockDifferenceCard(d, ctx),
+      activityLogCard(d)));
 }
+
+// Dark, moody studio shot (2026-10) -- deliberately NOT the brighter,
+// busier platter shots used elsewhere, since .photo-hero's gradient has to
+// do less work to keep the overlaid white stats readable against it.
+const STORE_STATUS_PHOTO = "url('/img/POSimg/Ala Carte/12pcs-Wings-Rack.jpg')";
 
 function storeStatusBanner(d, ctx) {
   const s = d.storeStatus;
   const ok = s.operational;
-  return Card({ className: 'store-status-banner', style: { borderLeft: `4px solid var(--${ok ? 'good' : 'crit'})` } },
-    h('div', { class: 't-xs', style: { textTransform: 'uppercase', letterSpacing: '.04em', color: `var(--${ok ? 'good' : 'crit'})`, marginBottom: '4px' } },
-      ok ? '● Store Status' : '● Needs attention'),
-    h('div', { style: { fontSize: '20px', fontWeight: '700', marginBottom: '10px' } },
+  const sev = ok ? 'good' : 'crit';
+  return Card({ className: 'store-status-banner photo-hero', style: { backgroundImage: STORE_STATUS_PHOTO } },
+    Pill(sev, ok ? 'Store Status' : 'Needs attention'),
+    h('div', { style: { fontSize: '26px', fontWeight: '700', margin: '8px 0 16px', fontFamily: 'var(--font-display)' } },
       ok ? 'All systems running' : `${s.needAttention} item${s.needAttention === 1 ? '' : 's'} need attention`),
     h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px' } },
       pillStat(s.needAttention, 'Need Attention', s.needAttention ? 'crit' : 'good', () => ctx.navigate('expiry')),
@@ -89,7 +100,7 @@ function deltaPill(value) {
 
 function todaysSalesCard(d) {
   const t = d.todaySales;
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: "Today's Sales", desc: t.comparisonLabel }),
     h('div', { style: { fontSize: '30px', fontWeight: '700', margin: '4px 0 2px' } }, money(t.revenue, '₱0')),
     h('div', { style: { marginBottom: '14px' } }, deltaPill(t.deltas.revenue_pct)),
@@ -101,7 +112,7 @@ function todaysSalesCard(d) {
 
 function inventoryPulseCard(d, ctx) {
   const p = d.inventoryPulse;
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Inventory Pulse', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('onhand') }, 'View Inventory →') }),
     h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px', marginBottom: '12px' } },
       pillStat(p.purchaseNeeded, 'Purchase Needed', p.purchaseNeeded ? 'crit' : 'good', () => ctx.navigate('whattobuy')),
@@ -116,41 +127,68 @@ function inventoryPulseCard(d, ctx) {
         r.daysOfSupply === null ? Pill('flat', 'no usage rate') : Pill(r.status === 'out' ? 'crit' : r.status === 'critical' ? 'crit' : 'warn', `${r.daysOfSupply.toFixed(1)}d left`)))));
 }
 
+// `a.detail` here is a full sentence ("still counted as on hand until it is
+// written off"), not a status word -- rendering it as a filled Pill/chip
+// (meant for short badges like "warn"/"3 open") produced an oversized,
+// awkward red blob next to every row. A plain severity-colored line of text
+// carries the same meaning without the chip treatment it was never sized for.
+const SEV_TEXT_CLASS = { crit: 't-crit', warn: 't-warn', good: 't-good', info: 't-info' };
+
 function doNowCard(d, ctx) {
   const items = d.doNow || [];
-  return Card({ style: { gridColumn: 'span 2' } },
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Do Now', desc: 'Ranked by what breaks first if ignored', right: items.length ? Pill('crit', `${items.length} open`) : Pill('good', 'all clear') }),
     items.length === 0
       ? EmptyState({ icon: '✓', title: 'Nothing needs you right now', tight: true })
       : h('div', { class: 'scrollpane' }, ...items.map((a, i) => h('div', { class: 'mini-row', style: { cursor: a.route ? 'pointer' : 'default' }, onClick: a.route ? () => ctx.navigate(a.route) : undefined },
         h('span', {}, h('span', { class: 't-xs t-faint' }, `${i + 1}. `), a.headline),
-        Pill(a.severity, a.detail)))));
+        h('span', { class: `t-xs t-strong ${SEV_TEXT_CLASS[a.severity] || 't-soft'}`, style: { textAlign: 'right', flexShrink: 0, maxWidth: '48%' } }, a.detail)))));
 }
 
 function next7DaysCard(d) {
   const f = d.next7Days;
   if (!f.available) {
-    return Card({},
+    return Card({ className: 'card-flex' },
       CardHeader({ title: 'Next 7 Days' }),
       EmptyState({ icon: '▤', title: 'Not enough order history yet', description: f.note, tight: true }));
   }
   const colors = f.days.map((x) => ({ Normal: palette.info, Moderate: palette.warn, High: palette.crit, Busiest: palette.crit }[x.level] || palette.info));
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Next 7 Days', desc: 'Expected demand' }),
     BarChart({ labels: f.days.map((x) => x.weekday), data: f.days.map((x) => x.qty), colors, height: 110 }),
     f.note ? h('div', { class: 't-xs', style: { marginTop: '8px' } }, Pill('info', 'Forecast'), ' ', f.note) : null);
 }
 
+// Display-only: pairs each quick action's stable backend `key` (see
+// wt/dashboard_overview.py) with an icon + a tile color for visual variety —
+// same "backend decides the data, this file only decides how it looks"
+// discipline as lib/severity.js, just not generalized into that shared file
+// since nothing else in the console needs an action-to-icon mapping.
+const QUICK_ACTION_ICON = {
+  receive: { sev: 'info', path: '<path d="M3 3h2l.4 2M7 13h10l3.6-8H5.4"/><circle cx="9" cy="20" r="1.5"/><circle cx="18" cy="20" r="1.5"/>' },
+  waste: { sev: 'crit', path: '<path d="M3 6h18"/><path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>' },
+  stockcount: { sev: 'good', path: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>' },
+  createpo: { sev: 'warn', path: '<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><path d="M12 10v4M10 12h4"/>' },
+};
+
 function quickActionsCard(d, ctx) {
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Quick Actions' }),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '8px' } },
-      ...d.quickActions.map((a) => Button({ onClick: () => ctx.navigate(a.route), style: { width: '100%' } }, a.label))));
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px' } },
+      ...d.quickActions.map((a) => {
+        const spec = QUICK_ACTION_ICON[a.key] || { sev: 'flat', path: '<circle cx="12" cy="12" r="9"/>' };
+        return h('button', {
+          class: 'quick-action',
+          onClick: () => ctx.navigate(a.route),
+        },
+        h('span', { class: `kpi-icon kpi-icon-${spec.sev}` }, icon(spec.path, 15)),
+        h('span', {}, a.label));
+      })));
 }
 
 function deliveriesCard(d, ctx) {
   const rows = d.todaysDeliveries || [];
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: "Today's Deliveries", right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('receiving') }, 'View all →') }),
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'Nothing due in today', tight: true })
@@ -165,7 +203,7 @@ function deliveriesCard(d, ctx) {
 
 function orderActivityCard(d) {
   const a = d.orderActivity;
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Order Activity', desc: "Today's orders by status" }),
     h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: '10px' } },
       Stat({ value: count(a.completed), label: 'Completed' }),
@@ -175,7 +213,7 @@ function orderActivityCard(d) {
 
 function recentOrdersCard(d) {
   const rows = d.recentOrders || [];
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Recent Orders' }),
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'No orders yet today', tight: true })
@@ -191,7 +229,7 @@ function recentOrdersCard(d) {
 
 function unusualUsageCard(d, ctx) {
   const rows = d.unusualUsage || [];
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Unusual Usage', desc: 'Consumption anomaly detection', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('losses') }, 'View all →') }),
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'Nothing unusual detected', tight: true })
@@ -204,7 +242,7 @@ function unusualUsageCard(d, ctx) {
 
 function unusualStockDifferenceCard(d, ctx) {
   const rows = d.unusualStockDifference || [];
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Unusual Stock Difference', desc: 'Stock-loss anomaly detection', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('losses') }, 'View all →') }),
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'Nothing unusual detected', tight: true })
@@ -217,7 +255,7 @@ function unusualStockDifferenceCard(d, ctx) {
 
 function activityLogCard(d) {
   const rows = d.activityLog || [];
-  return Card({},
+  return Card({ className: 'card-flex' },
     CardHeader({ title: 'Activity Log', desc: 'Recent actions' }),
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'Nothing recorded yet', tight: true })

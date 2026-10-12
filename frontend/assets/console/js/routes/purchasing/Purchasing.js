@@ -1,15 +1,17 @@
 import { h, mount } from '../../lib/dom.js';
-import { Card, CardHeader } from '../../components/ui/Card.js';
+import { Card, CardHeader, CardTitle } from '../../components/ui/Card.js';
+import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
-import { asText } from '../../lib/format.js';
+import { stamp, asText } from '../../lib/format.js';
 import { listPurchaseOrders, markOrdered, cancelPurchaseOrder, receiveLine } from '../../lib/api/purchaseOrders.js';
 import { session } from '../../lib/api/client.js';
 
 const ACTIVE_STATUSES = ['draft', 'ordered', 'partially_received'];
+const DONE_STATUSES = ['received', 'cancelled'];
 
 function statusLabel(status) {
   switch (status) {
@@ -23,25 +25,52 @@ function statusLabel(status) {
 }
 
 /**
- * Purchasing > Purchase Orders — spec section 13: "What purchases are
- * currently being processed?" Only the in-flight lifecycle states
- * (draft/ordered/partially received); a completed or cancelled order moves
- * to Purchase History instead of sitting here forever. Shared board for
- * both roles — Owner drafts (Purchasing > What to Buy) and can cancel
- * their own; Admin marks ordered and receives. The backend enforces who can
- * do what regardless of which buttons this page shows.
+ * Purchasing > Purchase — spec section 13's two questions ("what's being
+ * processed right now?" and "what have we purchased before?") side by side
+ * on one page instead of two separate sibling routes: a narrower "Currently
+ * processing" rail on the left (the small, active, actionable list) and the
+ * wider searchable "History" table on the right (the large, append-only
+ * record). Same data source (listPurchaseOrders) split client-side by
+ * status, same as the two pages this replaces.
  */
 export async function render(ctx) {
   const role = (session.user || {}).role;
   const isOwner = role === 'owner';
   const isAdmin = role === 'admin';
 
-  let pos = (await listPurchaseOrders()).items.filter((po) => ACTIVE_STATUSES.includes(po.status));
-  const host = h('div');
+  let all = (await listPurchaseOrders()).items;
+  const activeHost = h('div');
+  const historyHost = h('div');
+  const activeCountEl = h('span', {}, '');
 
-  function draw() {
+  let supplierQuery = '';
+  let statusFilter = '';
+  let fromDate = '';
+  let toDate = '';
+
+  function activeOrders() { return all.filter((po) => ACTIVE_STATUSES.includes(po.status)); }
+  function doneOrders() { return all.filter((po) => DONE_STATUSES.includes(po.status)); }
+
+  function matchesHistory(po) {
+    if (statusFilter && po.status !== statusFilter) return false;
+    if (supplierQuery && !(po.supplier || '').toLowerCase().includes(supplierQuery.toLowerCase())) return false;
+    const day = (po.updatedAt || po.createdAt || '').slice(0, 10);
+    if (fromDate && day < fromDate) return false;
+    if (toDate && day > toDate) return false;
+    return true;
+  }
+
+  async function reload() {
+    all = (await listPurchaseOrders()).items;
+    drawActive();
+    drawHistory();
+  }
+
+  function drawActive() {
+    const pos = activeOrders();
+    activeCountEl.textContent = `(${pos.length})`;
     if (pos.length === 0) {
-      mount(host, EmptyState({
+      mount(activeHost, EmptyState({
         icon: '≡',
         title: 'Nothing currently being processed',
         description: isOwner
@@ -50,7 +79,7 @@ export async function render(ctx) {
       }));
       return;
     }
-    mount(host, ...pos.map(poCard));
+    mount(activeHost, ...pos.map(poCard));
   }
 
   function poCard(po) {
@@ -58,7 +87,7 @@ export async function render(ctx) {
     const itemSummary = po.items.map((it) => `${it.ingredientName} × ${asText.num(it.quantity, '', 2)}${it.unit ? ' ' + it.unit : ''}`).join(', ');
     const canCancel = po.status === 'draft' || po.status === 'ordered';
     const outstanding = po.items.some((it) => (it.receivedQtyBase || 0) < it.quantity);
-    return Card({ style: { marginBottom: '12px' } },
+    return h('div', { class: 'po-card' },
       h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' } },
         h('strong', { class: 't-sm' }, `PO-${po.id}`),
         Pill(sev, label)),
@@ -70,13 +99,8 @@ export async function render(ctx) {
           ? Button({ size: 'sm', variant: 'primary', onClick: () => openReceiveModal(po) }, 'Receive')
           : null,
         canCancel
-          ? h('a', { href: '#', class: 't-xs', onClick: (e) => { e.preventDefault(); doCancel(po); } }, 'Cancel')
+          ? Button({ size: 'sm', variant: 'ghost', onClick: () => doCancel(po) }, 'Cancel')
           : null));
-  }
-
-  async function reload() {
-    pos = (await listPurchaseOrders()).items.filter((po) => ACTIVE_STATUSES.includes(po.status));
-    draw();
   }
 
   function doMarkOrdered(po) {
@@ -148,9 +172,63 @@ export async function render(ctx) {
     h('div', { style: { display: 'flex', justifyContent: 'flex-end' } }, submit));
   }
 
-  draw();
+  function drawHistory() {
+    const doneAll = doneOrders();
+    const rows = doneAll.filter(matchesHistory);
+    mount(historyHost, Table({
+      columns: [
+        { key: 'id', label: 'PO', render: (po) => `PO-${po.id}` },
+        { key: 'status', label: 'Status', render: (po) => { const [sev, label] = statusLabel(po.status); return Pill(sev, label); } },
+        { key: 'supplier', label: 'Supplier', render: (po) => po.supplier || h('span', { class: 't-xs t-faint' }, '—') },
+        {
+          key: 'items', label: 'Items',
+          render: (po) => h('span', { class: 't-xs t-soft' }, po.items.map((it) => `${it.ingredientName} × ${asText.num(it.quantity, '', 2)}`).join(', ')),
+        },
+        { key: 'created', label: 'Created', render: (po) => h('span', { class: 'mono t-xs' }, stamp(po.createdAt)) },
+        {
+          key: 'closed', label: 'Closed',
+          render: (po) => h('span', { class: 'mono t-xs' }, stamp(po.updatedAt || po.createdAt)),
+        },
+      ],
+      rows,
+      empty: EmptyState({
+        icon: '≡',
+        title: doneAll.length ? 'No purchase orders match these filters' : 'No purchase history yet',
+        description: doneAll.length ? 'Widen or clear the filters above.' : 'Purchase orders appear here once they are received or cancelled.',
+      }),
+    }));
+  }
 
-  return Card({},
-    CardHeader({ title: `Currently processing (${pos.length})`, desc: 'Nothing here affects stock until a line is received.' }),
-    host);
+  const supplierInput = h('input', { type: 'text', placeholder: 'Filter by supplier…', onInput: (e) => { supplierQuery = e.target.value; drawHistory(); } });
+  const statusPicker = h('select', { onChange: (e) => { statusFilter = e.target.value; drawHistory(); } },
+    h('option', { value: '' }, 'All'),
+    h('option', { value: 'received' }, 'Received'),
+    h('option', { value: 'cancelled' }, 'Cancelled'));
+  const fromInput = h('input', { type: 'date', onChange: (e) => { fromDate = e.target.value; drawHistory(); } });
+  const toInput = h('input', { type: 'date', onChange: (e) => { toDate = e.target.value; drawHistory(); } });
+  const clearBtn = Button({
+    size: 'sm', variant: 'ghost',
+    onClick: () => {
+      supplierQuery = ''; statusFilter = ''; fromDate = ''; toDate = '';
+      supplierInput.value = ''; statusPicker.value = ''; fromInput.value = ''; toInput.value = '';
+      drawHistory();
+    },
+  }, 'Clear filters');
+
+  drawActive();
+  drawHistory();
+
+  return h('div', { class: 'purchasing-layout' },
+    Card({ className: 'purchasing-active' },
+      CardHeader({ title: CardTitle(h('span', {}, 'Currently processing ', activeCountEl)), desc: 'Nothing here affects stock until a line is received.' }),
+      activeHost),
+    Card({ className: 'purchasing-history' },
+      CardHeader({ title: 'History', desc: 'Received and cancelled purchase orders' }),
+      h('div', { style: { display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap', alignItems: 'flex-end' } },
+        h('label', { class: 'field', style: { minWidth: '160px' } }, 'Supplier', supplierInput),
+        h('label', { class: 'field', style: { minWidth: '140px' } }, 'Status', statusPicker),
+        h('label', { class: 'field' }, 'From', fromInput),
+        h('label', { class: 'field' }, 'To', toInput),
+        clearBtn),
+      historyHost));
 }

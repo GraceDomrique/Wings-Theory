@@ -45,6 +45,8 @@ export async function render(ctx) {
   function drawStats() {
     const confirmed = ingredients.filter((i) => i.confidence === 'confirmed').length;
     const unconfirmed = ingredients.length - confirmed;
+    statsHost.classList.add('grid');
+    statsHost.style.gridTemplateColumns = 'repeat(4,1fr)';
     mount(statsHost,
       Card({}, Stat({ value: count(ingredients.length), label: 'Ingredients tracked' })),
       Card({}, Stat({ value: count(confirmed), label: 'Confirmed & stocked' })),
@@ -100,7 +102,7 @@ export async function render(ctx) {
   ctx.setSearchHandler(drawTable);
 
   return h('div', {},
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: '14px' } }, statsHost),
+    h('div', { style: { marginBottom: '14px' } }, statsHost),
     Card({},
       CardHeader({
         title: 'Full record',

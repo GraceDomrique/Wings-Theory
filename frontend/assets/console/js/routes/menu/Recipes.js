@@ -196,7 +196,7 @@ function openAddRecipeModal(onCreated) {
   const kindSelect = h('select', {},
     h('option', { value: 'menu' }, 'Menu item recipe'),
     h('option', { value: 'sub_recipe' }, 'Sub-recipe (house sauce / prep)'));
-  const yieldQtyInput = h('input', { type: 'number', min: '0.01', step: '0.01', value: '1' });
+  const yieldQtyInput = h('input', { type: 'number', min: '0.01', step: '0.01', value: '1', class: 'no-spinner' });
   const yieldUnitInput = h('input', { type: 'text', value: 'serving' });
   const linesHost = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } });
   const err = ModalError();
@@ -208,17 +208,26 @@ function openAddRecipeModal(onCreated) {
       h('option', { value: '' }, 'Select ingredient…'),
       ...ingredientOptions.map((i) => h('option', { value: String(i.pk) }, i.name)));
     const labelInput = h('input', { type: 'text', placeholder: 'label (defaults to ingredient name)' });
-    const qtyInput = h('input', { type: 'number', min: '0.01', step: '0.01', placeholder: 'qty' });
+    // No native spinner: the recipe app has no use for clicking +/- 0.01 a
+    // hundred times to type a real quantity like "250" — a plain decimal
+    // field is both simpler to build and faster to use.
+    const qtyInput = h('input', { type: 'number', min: '0.01', step: '0.01', placeholder: 'qty', class: 'no-spinner' });
     const removeBtn = h('button', { class: 'icon-btn', title: 'Remove line' }, '✕');
-    const row = h('div', { style: { display: 'grid', gridTemplateColumns: '2fr 1.4fr 90px 32px', gap: '8px' } },
-      ingSelect, labelInput, qtyInput, removeBtn);
+    const num = h('span', { class: 'recipe-line-num' }, String(lineRows.length + 1));
+    const row = h('div', { class: 'recipe-line-row' },
+      num, ingSelect, labelInput, qtyInput, removeBtn);
     removeBtn.addEventListener('click', () => {
       row.remove();
       lineRows.splice(lineRows.indexOf(entry), 1);
+      renumberRows();
     });
-    const entry = { row, ingSelect, labelInput, qtyInput };
+    const entry = { row, ingSelect, labelInput, qtyInput, num };
     lineRows.push(entry);
     linesHost.appendChild(row);
+  }
+
+  function renumberRows() {
+    lineRows.forEach((r, i) => { r.num.textContent = String(i + 1); });
   }
 
   const addLineBtn = Button({ size: 'sm', onClick: addLineRow }, '+ Add ingredient line');
@@ -272,6 +281,8 @@ function openAddRecipeModal(onCreated) {
     h('label', { class: 'field' }, 'Yields', yieldQtyInput),
     h('label', { class: 'field' }, 'Yield unit', yieldUnitInput)),
   h('div', { class: 'eyebrow', style: { marginTop: '6px' } }, 'Ingredient lines'),
+  h('div', { class: 'recipe-line-row recipe-line-head' },
+    h('span', {}), h('span', {}, 'Ingredient'), h('span', {}, 'Label (optional)'), h('span', {}, 'Qty'), h('span', {})),
   linesHost,
   h('div', { style: { margin: '8px 0 14px' } }, addLineBtn),
   err,

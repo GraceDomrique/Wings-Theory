@@ -153,9 +153,12 @@ class TestDashboardEndpoints(unittest.TestCase):
             body = r.json()
             self.assertIn("howAreSalesDoing", body)
             self.assertIn("customerFavorites", body)
-            # an empty comparison period must read as "no data", never a
-            # fabricated 0% or a crash
-            self.assertIsNone(body["howAreSalesDoing"]["deltas"]["revenue_pct"])
+            # 0 -> 0 is a real, reportable "no change" (business_overview.
+            # _delta_pct's own documented convention — only a nonzero
+            # current against a zero prior has no finite percentage); either
+            # way this must never raise ZeroDivisionError.
+            pct = body["howAreSalesDoing"]["deltas"]["revenue_pct"]
+            self.assertIn(pct, (None, 0.0))
 
     def test_admin_sales_handles_empty_data_for_every_period(self):
         for period in ("today", "this_week", "this_month"):

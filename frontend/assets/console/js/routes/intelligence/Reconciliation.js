@@ -115,7 +115,7 @@ export async function render(ctx) {
       Card({ style: { marginBottom: '14px' } },
         CardHeader({
           title: 'Portion coefficients',
-          desc: 'The frozen baseline is what variance is measured against; the rolling value is what the till deducts',
+          desc: 'The frozen baseline is what variance is measured against; the rolling value is what the till deducts. This is the measured average total across a whole sitting (multiple refills) — not the 3-piece serving/refill size used per round.',
           right: canApprove() ? [
             Button({ size: 'sm', onClick: () => runRecalibrate(true, draw) }, 'Preview recalibration'),
             Button({ variant: 'primary', size: 'sm', onClick: () => runRecalibrate(false, draw) }, 'Recalibrate'),

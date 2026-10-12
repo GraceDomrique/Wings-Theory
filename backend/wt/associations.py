@@ -43,7 +43,8 @@ import pandas as pd
 from mlxtend.frequent_patterns import association_rules, fpgrowth
 from mlxtend.preprocessing import TransactionEncoder
 
-from . import timeutil
+from . import model_registry, timeutil
+from . import ml_artifacts_io as artifacts
 
 MIN_TRANSACTIONS = 30     # real transactions needed before a frequent-itemset pass is trustworthy
 
@@ -917,6 +918,28 @@ def product_combinations(conn: sqlite3.Connection, lookback_days: int = 365, top
                 "tier (support/confidence loosened; the pair-count and lift floors were not)."
             )
     return result
+
+
+def active_combo_recommendations(conn: sqlite3.Connection) -> dict:
+    """Serves the result wt/ml_training.py's train_fpgrowth_combos() last
+    persisted and activated -- a loadable record of a specific, already
+    holdout-validated mining run, rather than re-mining in-process on every
+    call. product_combinations() itself is UNCHANGED (still always mines
+    fresh -- every existing caller/test keeps its current behavior); this
+    is an additive serving path for the ML registry dashboard and any
+    future caller that wants "the currently active trained model" rather
+    than "mine this exact instant". Falls back to a fresh
+    product_combinations() call, with a note saying so, if no artifact has
+    been activated yet or it fails to load (same safety posture as the
+    IsolationForest passes' artifact fallback)."""
+    path = model_registry.active_artifact_path(conn, "fpgrowth_combos")
+    if path:
+        try:
+            payload = artifacts.load_json(path)
+            return {**payload["result"], "served_from": "artifact", "artifact_path": path}
+        except Exception:
+            pass
+    return {**product_combinations(conn), "served_from": "fresh_mine_fallback", "artifact_path": None}
 
 
 def _combined_validation_table(product_combinations_result: dict, temporal_stability_result: dict) -> list[dict]:

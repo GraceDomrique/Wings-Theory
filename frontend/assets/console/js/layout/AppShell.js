@@ -33,12 +33,12 @@ export function AppShell({ routes, onSignOut }) {
     title: 'Today',
     sub: PAGE_SUB.today,
     onSearch: (q) => { if (searchHandler) searchHandler(q); },
+    onSignOut,
   });
 
   const sidebar = Sidebar({
     activeId: 'today',
     onNavigate: (id) => navigate(id),
-    onSignOut,
   });
 
   let searchHandler = null;

@@ -110,10 +110,7 @@ export async function render(ctx) {
           ? Button({ size: 'sm', variant: 'primary', onClick: () => openCompleteModal(ins) }, 'Mark complete')
           : null,
         canCancel
-          ? h('a', {
-            href: '#', class: 't-xs',
-            onClick: (e) => { e.preventDefault(); doCancel(ins); },
-          }, 'Cancel')
+          ? Button({ size: 'sm', variant: 'ghost', onClick: () => doCancel(ins) }, 'Cancel')
           : null));
   }
 

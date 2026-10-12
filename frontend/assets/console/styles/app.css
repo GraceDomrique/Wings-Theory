@@ -5,26 +5,63 @@
 
 *{box-sizing:border-box;}
 html,body{height:100%;}
+/* Role accent lives on body (not .sidebar) so BOTH the sidebar and the
+   topbar -- siblings in the shell, neither an ancestor of the other -- can
+   read the same source of truth. AppShell adds body.role-admin/role-owner
+   once per session (see app.js); default values below are the owner's. */
 body{
+  --role-accent:var(--amber);
+  --role-accent-ink:#221805;
+  --role-accent-tint:var(--amber-tint);
+  --role-accent-tint-ink:var(--amber-deep);
   margin:0; background:var(--bg); color:var(--ink);
   font-family:var(--font-body); font-size:13.5px; line-height:1.45;
   -webkit-font-smoothing:antialiased;
 }
+body.role-admin{
+  --role-accent:var(--accent-blue);
+  --role-accent-ink:#FFFFFF;
+  --role-accent-tint:var(--accent-blue-tint);
+  --role-accent-tint-ink:var(--accent-blue-deep);
+}
 ::selection{background:var(--amber-tint); color:var(--amber-deep);}
-a{color:inherit;}
+a{color:inherit; text-decoration:none;}
 button{font-family:inherit; cursor:pointer;}
 ::-webkit-scrollbar{width:8px; height:8px;}
 ::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px;}
 ::-webkit-scrollbar-track{background:transparent;}
+
+/* Dark-panel scrollbars (sidebar nav, topbar dropdowns) must not use the
+   light --line thumb above -- on a navy panel that reads as a bright white
+   bar, not a subtle UI detail. Thin + low-opacity white, visible on hover
+   only slightly stronger, same treatment Firefox gets via scrollbar-color. */
+.sidebar, .nav-tree{
+  scrollbar-width:thin; scrollbar-color:rgba(255,255,255,0.14) transparent;
+}
+.sidebar::-webkit-scrollbar, .nav-tree::-webkit-scrollbar{width:5px;}
+.sidebar::-webkit-scrollbar-thumb, .nav-tree::-webkit-scrollbar-thumb{
+  background:rgba(255,255,255,0.14); border-radius:3px;
+}
+.sidebar::-webkit-scrollbar-thumb:hover, .nav-tree::-webkit-scrollbar-thumb:hover{
+  background:rgba(255,255,255,0.26);
+}
+.sidebar::-webkit-scrollbar-track, .nav-tree::-webkit-scrollbar-track{background:transparent;}
 
 /* ============ SHELL ============ */
 .shell{display:grid; grid-template-columns:236px 1fr; height:100vh; overflow:hidden; transition:grid-template-columns .15s ease;}
 body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
 
 /* ---- Sidebar ---- */
+/* Deepened to navy-black (2026-10 reference-design pass) -- was var(--ink),
+   a warm near-black shared with body text, which read as brown rather than
+   the reference's navy. This is a sidebar-local literal, same precedent as
+   the cream/near-black shades below it (#EDE7D9 etc.) that were already
+   hardcoded here rather than in tokens.css, since nothing else in the
+   console uses this exact dark palette. Accent itself is --role-accent* on
+   body (above), not redeclared here, so the topbar can read the same vars. */
 .sidebar{
-  background:var(--ink); color:#EDE7D9; display:flex; flex-direction:column;
-  padding:18px 12px; border-right:1px solid #14120E; overflow-y:auto;
+  background:#12141D; color:#EDE7D9; display:flex; flex-direction:column;
+  padding:18px 12px; border-right:1px solid #090A10; overflow-y:auto;
 }
 .brand{display:flex; align-items:center; gap:10px; padding:6px 8px 18px; border-bottom:1px solid rgba(255,255,255,0.08); margin-bottom:14px;}
 .brand-mark{
@@ -34,7 +71,11 @@ body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
 .brand-text .t1{font-family:var(--font-display); font-weight:700; font-size:15.5px; letter-spacing:.2px; color:#fff;}
 .brand-text .t2{font-size:10px; letter-spacing:1.4px; text-transform:uppercase; color:#9C9385; margin-top:1px;}
 
-.nav-tree{display:flex; flex-direction:column;}
+/* flex:1 so the nav list (not the sidebar's own overflow) absorbs leftover
+   vertical space -- otherwise .sidebar-photo and .sidebar-foot below it
+   would sit wherever the nav tree's natural height left them rather than
+   anchored together at the bottom (only .sidebar-foot had margin-top:auto). */
+.nav-tree{display:flex; flex-direction:column; flex:1; overflow-y:auto; min-height:0;}
 .nav-group{margin-bottom:2px;}
 .nav-item{
   display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:8px; color:#D8D1C2;
@@ -42,10 +83,10 @@ body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
 }
 .nav-item svg{width:16px; height:16px; flex-shrink:0; opacity:.85;}
 .nav-item:hover{background:rgba(255,255,255,0.06); color:#fff;}
-.nav-item.active{background:var(--amber); color:#221805; font-weight:600;}
+.nav-item.active{background:var(--role-accent); color:var(--role-accent-ink); font-weight:600;}
 .nav-item.active svg{opacity:1;}
 .nav-badge{margin-left:auto; background:var(--crit); color:#fff; font-size:10px; font-weight:700; padding:1px 6px; border-radius:20px;}
-.nav-item.active .nav-badge{background:#221805; color:var(--amber-tint);}
+.nav-item.active .nav-badge{background:var(--role-accent-ink); color:var(--role-accent);}
 
 /* Accordion group — a parent that expands/collapses and never mounts a
    page of its own; only its children (indented .nav-item buttons below it)
@@ -64,12 +105,32 @@ body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
 .nav-group-body{padding-left:14px; border-left:1px solid rgba(255,255,255,0.08); margin:2px 0 6px 20px;}
 .nav-group-body .nav-item{font-size:12.5px; padding:7px 10px;}
 
-.sidebar-foot{margin-top:auto; padding:10px; border-top:1px solid rgba(255,255,255,0.08); display:flex; align-items:center; gap:9px;}
-.avatar{width:30px; height:30px; border-radius:50%; background:var(--amber-tint); color:var(--amber-deep); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:12px; flex-shrink:0;}
-.sidebar-foot .name{font-size:12.5px; font-weight:600; color:#fff;}
-.sidebar-foot .role{font-size:10.5px; color:#9C9385;}
-.sidebar-foot .signout{margin-left:auto; background:transparent; border:none; color:#9C9385; font-size:10.5px; padding:4px; border-radius:6px;}
-.sidebar-foot .signout:hover{color:#fff;}
+/* Lower-sidebar wing photograph (reference screenshots, 2026-10 -- enlarged
+   and bled to the sidebar's own edges per 2026-10 revision: a small inset
+   rounded box read as "a thumbnail," not "integrated into the sidebar." The
+   negative side margins cancel .sidebar's own 12px padding so the photo
+   runs genuinely edge-to-edge like the reference, and the gradient's final
+   stop matches .sidebar's own background color exactly so the photo melts
+   into the dark panel below it rather than ending on a visible seam. */
+.sidebar-photo{
+  position:relative; margin:16px -12px 0; overflow:hidden;
+  height:240px; flex-shrink:0; background-size:cover; background-position:center 32%;
+}
+.sidebar-photo::before{
+  content:''; position:absolute; inset:0;
+  background:linear-gradient(180deg, rgba(18,20,29,0) 30%, rgba(18,20,29,0.45) 60%, #12141D 100%);
+}
+.sidebar-photo-tag{
+  position:absolute; left:18px; right:18px; bottom:16px; z-index:1;
+  font-family:var(--font-display); font-weight:700; font-size:14px; line-height:1.3;
+  letter-spacing:.3px; color:#fff; text-shadow:0 1px 4px rgba(0,0,0,0.6);
+}
+.sidebar-photo-tag .sub{display:block; font-family:var(--font-body); font-weight:500; font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:#D8D1C2; margin-top:3px;}
+body.nav-collapsed .sidebar-photo{display:none;}
+
+/* --role-accent-tint* lives on body, so this renders correctly wherever the
+   avatar is reused (currently only the topbar's profile chip). */
+.avatar{width:30px; height:30px; border-radius:50%; background:var(--role-accent-tint); color:var(--role-accent-tint-ink); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:12px; flex-shrink:0;}
 
 /* Collapsible rail (2026-10). .nav-item-label wraps every piece of text
    next to an icon so the collapsed state can hide labels without hiding
@@ -88,26 +149,43 @@ body.nav-collapsed .brand-text,
 body.nav-collapsed .nav-item-label,
 body.nav-collapsed .nav-group-label,
 body.nav-collapsed .nav-group-chevron,
-body.nav-collapsed .nav-badge,
-body.nav-collapsed .sidebar-foot .signout{display:none;}
+body.nav-collapsed .nav-badge{display:none;}
 body.nav-collapsed .nav-item,
 body.nav-collapsed .nav-item-top,
 body.nav-collapsed .nav-group-toggle,
 body.nav-collapsed .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
 body.nav-collapsed .nav-group-body{display:none !important;}
-body.nav-collapsed .sidebar-foot{justify-content:center;}
 body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:0;}
 
 /* ---- Main ---- */
 .main{display:flex; flex-direction:column; min-width:0; height:100vh; overflow:hidden;}
+/* Dark header (2026-10 reference-design revision) -- was a plain white bar,
+   which the reference's dark/structured header reads nothing like. Same
+   navy (#12141D) as .sidebar so the shell reads as one dark frame around
+   the (still light) content area, with a role-accent bottom edge tying it
+   to the active sidebar color. */
 .topbar{
   display:flex; align-items:center; justify-content:space-between; gap:16px;
-  padding:14px 26px; border-bottom:1px solid var(--line); background:var(--surface); flex-shrink:0;
+  padding:14px 26px; background:#12141D; border-bottom:3px solid var(--role-accent); flex-shrink:0;
 }
-.breadcrumb{font-size:11px; font-weight:600; letter-spacing:.3px; text-transform:uppercase; color:var(--ink-faint); margin-bottom:2px;}
-.topbar h1{font-family:var(--font-display); font-size:21px; font-weight:600; margin:0;}
-.topbar .sub{font-size:12px; color:var(--ink-soft); margin-top:1px;}
+.breadcrumb{font-size:11px; font-weight:600; letter-spacing:.3px; text-transform:uppercase; color:var(--role-accent); margin-bottom:2px;}
+.topbar h1{font-family:var(--font-display); font-size:21px; font-weight:600; margin:0; color:#fff;}
+.topbar .sub{font-size:12px; color:#9C9385; margin-top:1px;}
 .topbar-right{display:flex; align-items:center; gap:10px;}
+.topbar .search{
+  display:flex; align-items:center; gap:8px; background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.12);
+  border-radius:8px; padding:7px 12px; color:#9C9385; font-size:12.5px; width:230px;
+}
+.topbar .search input{border:none; background:transparent; outline:none; font-family:inherit; font-size:12.5px; color:#fff; width:100%; min-width:0;}
+.topbar .search input::placeholder{color:#7A7366;}
+.topbar .kbd{margin-left:auto; font-family:var(--font-mono); font-size:10px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.14); border-radius:4px; padding:1px 5px; color:#9C9385; flex-shrink:0;}
+.topbar .icon-btn{width:32px; height:32px; border-radius:8px; border:1px solid rgba(255,255,255,0.14); background:rgba(255,255,255,0.07); display:flex; align-items:center; justify-content:center; color:#D8D1C2; flex-shrink:0;}
+.topbar .icon-btn:hover{background:rgba(255,255,255,0.14); color:#fff;}
+
+/* Elsewhere (Recipes/MenuAvailability toolbars, Modal's close button), these
+   two classes stay on the light surface they were always on -- only scoped
+   .topbar .icon-btn/.search above changed. */
+.icon-btn{width:32px; height:32px; border-radius:8px; border:1px solid var(--line); background:var(--surface); display:flex; align-items:center; justify-content:center; color:var(--ink-soft); flex-shrink:0;}
 .search{
   display:flex; align-items:center; gap:8px; background:var(--surface-sunk); border:1px solid var(--line);
   border-radius:8px; padding:7px 12px; color:var(--ink-faint); font-size:12.5px; width:230px;
@@ -115,7 +193,13 @@ body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:
 .search input{border:none; background:transparent; outline:none; font-family:inherit; font-size:12.5px; color:var(--ink); width:100%; min-width:0;}
 .search input::placeholder{color:var(--ink-faint);}
 .kbd{margin-left:auto; font-family:var(--font-mono); font-size:10px; background:var(--surface); border:1px solid var(--line); border-radius:4px; padding:1px 5px; color:var(--ink-faint); flex-shrink:0;}
-.icon-btn{width:32px; height:32px; border-radius:8px; border:1px solid var(--line); background:var(--surface); display:flex; align-items:center; justify-content:center; color:var(--ink-soft); flex-shrink:0;}
+
+/* Topbar profile chip -- who's signed in, plus the single icon-only sign-out
+   control (moved here from the sidebar foot so it isn't duplicated). */
+.topbar-profile{display:flex; align-items:center; gap:8px; padding-left:10px; border-left:1px solid rgba(255,255,255,0.14); flex-shrink:0;}
+.topbar-profile .name{font-size:12px; font-weight:600; color:var(--ink); line-height:1.3;}
+.topbar-profile .role{font-size:10.5px; color:var(--ink-soft); line-height:1.3; text-transform:capitalize;}
+.topbar-profile .icon-btn{margin-left:2px;}
 
 .content{flex:1; overflow-y:auto; padding:20px 26px 32px;}
 
@@ -128,10 +212,127 @@ body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:
 .card-head{display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:12px; gap:10px;}
 .card-title{font-family:var(--font-display); font-size:15px; font-weight:600;}
 .card-desc{font-size:11.5px; color:var(--ink-soft); margin-top:2px;}
+
+/* Purchase page (merged Purchase Orders + Purchase History): the small,
+   actionable "currently processing" rail sits beside the larger, searchable
+   history table rather than stacked as two separate pages. */
+.purchasing-layout{display:grid; grid-template-columns:minmax(300px,380px) 1fr; gap:16px; align-items:start;}
+.purchasing-active{max-height:calc(100vh - 160px); overflow-y:auto;}
+.po-card{border:1px solid var(--line); border-radius:10px; padding:12px 14px; margin-bottom:10px; background:var(--surface-2,var(--surface));}
+.po-card:last-child{margin-bottom:0;}
+@media (max-width:980px){.purchasing-layout{grid-template-columns:1fr;} .purchasing-active{max-height:none;}}
+
+/* Build-a-combo modal: a two-column working layout (form + live preview)
+   instead of one long vertical stack, with pricing rules folded in as a
+   collapsible section right next to the price field it affects. */
+.combo-builder-grid{display:grid; grid-template-columns:1.2fr 1fr; gap:22px;}
+.combo-builder-col{min-width:0;}
+.combo-builder-preview{border-left:1px solid var(--line-soft); padding-left:22px;}
+@media (max-width:760px){.combo-builder-grid{grid-template-columns:1fr;} .combo-builder-preview{border-left:none; padding-left:0; border-top:1px solid var(--line-soft); padding-top:16px;}}
+
+.combo-item-row{display:flex; gap:8px; align-items:center; margin-bottom:8px; background:var(--surface-2,#f6f3ec); border:1px solid var(--line-soft); border-radius:8px; padding:6px 8px;}
+.combo-item-row select{flex:1; min-width:0;}
+.combo-item-row input[type=number]{width:56px;}
+.combo-item-row-num{flex-shrink:0; width:18px; height:18px; border-radius:50%; background:var(--line); color:var(--ink-soft); font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center;}
+.combo-item-row-x{flex-shrink:0; color:var(--ink-faint); font-size:11px;}
+
+.combo-pricing-rules{margin-top:16px; border:1px solid var(--line-soft); border-radius:8px; padding:0; overflow:hidden;}
+.combo-pricing-rules summary{cursor:pointer; padding:9px 12px; font-size:12px; font-weight:600; list-style:none; display:flex; align-items:baseline; gap:6px;}
+.combo-pricing-rules summary::-webkit-details-marker{display:none;}
+.combo-pricing-rules-body{padding:4px 12px 14px;}
+
+/* Order detail modal: receipt + timeline, not a generic label/value grid. */
+.order-ribbon{display:flex; align-items:center; justify-content:space-between; background:var(--role-accent-tint); border-radius:8px; padding:10px 14px; margin-bottom:14px;}
+.order-ribbon.voided{background:rgba(211,47,47,0.12);}
+.order-ribbon-badge{font-size:12px; font-weight:700; text-transform:capitalize; color:var(--role-accent-tint-ink);}
+.order-ribbon.voided .order-ribbon-badge{color:var(--crit);}
+.order-ribbon-table{font-size:11.5px; color:var(--ink-soft); font-weight:600;}
+.order-stat-strip{display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:6px;}
+.order-stat{border:1px solid var(--line-soft); border-radius:8px; padding:9px 10px; text-align:center;}
+.order-stat-value{font-size:15px; font-weight:700; font-family:var(--font-display);}
+.order-stat-label{font-size:10px; color:var(--ink-faint); text-transform:uppercase; letter-spacing:.5px; margin-top:2px;}
+.order-receipt{border:1px dashed var(--line); border-radius:8px; padding:4px 12px;}
+.order-receipt-line{display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px dashed var(--line-soft); font-size:12.5px;}
+.order-receipt-line:last-child{border-bottom:none;}
+.order-receipt-qty{flex-shrink:0; color:var(--ink-faint); font-size:11px; width:26px;}
+.order-receipt-name{flex:1;}
+.order-receipt-amount{flex-shrink:0; font-weight:600;}
+.order-timeline{display:flex; align-items:flex-start; gap:4px;}
+.order-timeline-step{display:flex; align-items:center; gap:8px; flex:1; position:relative;}
+.order-timeline-step:not(:last-child)::after{content:''; flex:1; height:2px; background:var(--line); margin:0 6px;}
+.order-timeline-dot{width:10px; height:10px; border-radius:50%; background:var(--good); flex-shrink:0;}
+.order-timeline-step.crit .order-timeline-dot{background:var(--crit);}
+@media (max-width:620px){.order-stat-strip{grid-template-columns:repeat(2,1fr);} .order-timeline{flex-direction:column; align-items:flex-start; gap:12px;} .order-timeline-step:not(:last-child)::after{display:none;}}
+
+/* A quantity field whose unit is fixed (not a user choice) shown as a badge
+   docked to the input, and the native spinner suppressed since +/- 0.01
+   clicks are not a realistic way to enter a delivery quantity. */
+.no-spinner::-webkit-outer-spin-button,
+.no-spinner::-webkit-inner-spin-button{-webkit-appearance:none; margin:0;}
+.no-spinner[type=number]{-moz-appearance:textfield;}
+.field-with-badge{display:flex; align-items:stretch;}
+.field-with-badge input{border-top-right-radius:0; border-bottom-right-radius:0; flex:1; min-width:0;}
+.field-unit-badge{display:flex; align-items:center; padding:0 10px; background:var(--surface-2,#f1ece3); border:1px solid var(--line); border-left:none; border-top-right-radius:8px; border-bottom-right-radius:8px; font-size:11.5px; font-weight:600; color:var(--ink-soft); text-transform:lowercase;}
+
+/* Forecast chart legend: explicit, so the history/forecast colors are never
+   left to be inferred from the chart alone. */
+.forecast-legend{display:flex; gap:16px; flex-wrap:wrap;}
+.forecast-legend-item{display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--ink-soft); font-weight:600;}
+.forecast-legend-swatch{width:16px; height:3px; border-radius:2px; display:inline-block;}
+.forecast-legend-swatch.dashed{height:0; border-top:2px dashed; background:none;}
+
+/* Add-recipe modal line rows: numbered, labeled columns instead of a bare
+   unlabeled grid. */
+.recipe-line-row{display:grid; grid-template-columns:20px 2fr 1.4fr 90px 32px; gap:8px; align-items:center; margin-bottom:6px;}
+.recipe-line-num{width:18px; height:18px; border-radius:50%; background:var(--line); color:var(--ink-soft); font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center;}
+.recipe-line-head{font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--ink-faint); font-weight:600; margin-bottom:4px;}
 .eyebrow{font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:var(--ink-faint); font-weight:600; margin-bottom:6px;}
+/* The one large "business at a glance" panel atop each dashboard (Store
+   Status / Business Pulse) -- a genuine photographic hero (2026-10 revision:
+   an icon-tile-on-white card here read as "a card with a colored icon," not
+   the reference's large photographic banner). Stats/text sit directly on
+   the photo over a bottom-weighted dark gradient, white on dark rather than
+   ink-on-white -- every text class used inside it is re-pointed to a light
+   color below rather than left to inherit --ink-soft/--ink-faint, which
+   would be close to invisible on a dark photo. */
+.photo-hero{
+  position:relative; overflow:hidden; color:#fff; min-height:238px;
+  display:flex; flex-direction:column; justify-content:flex-end;
+  background-size:cover; background-position:center; padding:22px 24px 20px;
+}
+.photo-hero::before{
+  content:''; position:absolute; inset:0;
+  background:linear-gradient(180deg, rgba(14,13,10,0.1) 0%, rgba(14,13,10,0.35) 40%, rgba(14,13,10,0.88) 100%);
+}
+.photo-hero > *{position:relative; z-index:1;}
+.photo-hero .card-head{align-items:center;}
+.photo-hero .card-title{color:#fff; font-size:16.5px;}
+.photo-hero .card-desc{color:#D8D1C2;}
+.photo-hero .t-xs.t-faint, .photo-hero .t-sm.t-soft, .photo-hero p.t-xs.t-faint{color:#D8D1C2;}
+.photo-hero .stat .l{color:#C7BFAE;}
+.photo-hero .btn{background:rgba(255,255,255,0.14); border-color:rgba(255,255,255,0.3); color:#fff; align-self:flex-start;}
+.photo-hero .btn:hover{background:rgba(255,255,255,0.24); border-color:rgba(255,255,255,0.4);}
+/* A pillStat tile is an opaque white .card sitting ON TOP of the hero photo
+   (storeStatusBanner's "Need Attention/Deliveries/..." row) -- it must NOT
+   inherit .photo-hero's white-on-photo text treatment above, or its own
+   number/label render white-on-white and vanish (2026-10 contrast bug). */
+.photo-hero .card{color:var(--ink);}
+.photo-hero .card .t-xs.t-faint{color:var(--ink-faint);}
 .card-sunk{background:var(--surface-sunk); box-shadow:none;}
 .card-flush{padding:0; overflow:hidden;}
 .card-actions{display:flex; gap:8px; flex-shrink:0;}
+
+/* Opt-in modifier (dashboard grids only, see Admin Today / Owner Overview) --
+   lets a grid row use align-items:stretch so every card in it shares the
+   row's full height (no ragged bottoms / gaps of bare page background
+   between cards of different natural height), while keeping its own header
+   pinned to the top and its empty/placeholder content centered in whatever
+   room is left rather than stranded with dead space underneath it. Left as
+   an opt-in class, not a change to .card itself, so every other screen in
+   the console keeps its current block-flow sizing untouched. */
+.card-flex{display:flex; flex-direction:column;}
+.card-flex > .empty{flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;}
+.card-flex > .scrollpane{flex:1; min-height:0;}
 
 .btn{
   border-radius:7px; border:1px solid var(--line); background:var(--surface); color:var(--ink);
@@ -287,6 +488,19 @@ td.num{text-align:right;}
 .kpi-icon-info{background:var(--info-tint); color:var(--info);}
 .kpi-icon-flat{background:var(--surface-sunk); color:var(--ink-faint);}
 
+/* Quick Actions tile (2026-10) -- was a plain text Button grid with no
+   icons at all; reuses .kpi-icon's existing colored-circle treatment so a
+   glance at the icon color hints at the action's nature (receiving=info,
+   waste=crit, counting=good, purchasing=warn) without inventing a new
+   palette. */
+.quick-action{
+  display:flex; align-items:center; gap:10px; padding:10px 12px; border-radius:9px;
+  border:1px solid var(--line); background:var(--surface-sunk); width:100%; text-align:left;
+  font-size:12.5px; font-weight:600; color:var(--ink);
+}
+.quick-action:hover{background:var(--surface); border-color:var(--ink-faint);}
+.quick-action .kpi-icon{width:30px; height:30px; border-radius:8px;}
+
 .alert-row{display:flex; align-items:flex-start; gap:10px; padding:10px 12px; border-radius:8px; margin-bottom:6px;}
 .alert-row:hover{background:var(--surface-sunk);}
 .alert-row.clickable{cursor:pointer;}
@@ -324,6 +538,21 @@ canvas{max-width:100%;}
   .g-instructions{grid-column:1/3; grid-row:auto;}
   .g-expiry{grid-column:1/2; grid-row:auto;}
   .g-verify{grid-column:2/3; grid-row:auto;}
+}
+
+/* 2026-10 Phase 2 audit: the dashboards' own multi-column section grids
+   (Owner Overview, Admin Today, Owner Sales, Admin Sales) set their column
+   count per-usage via inline style, since .grid itself (above) carries no
+   default. None of those usages had a tablet-width fallback, so a 3- or
+   4-column row just kept shrinking past legibility instead of stacking.
+   !important is needed to win over the inline grid-template-columns each
+   call site sets — the standard, narrowly-scoped way to override an inline
+   style from a breakpoint without touching every call site individually.
+   860px (not the 1300px breakpoint above, which is the older Today grid's
+   own) is chosen so nothing changes until a viewport is genuinely
+   tablet-portrait width or narrower. */
+@media (max-width:860px){
+  .grid{grid-template-columns:1fr !important;}
 }
 
 /* The sign-in gate's own styling lives in styles/login-brand.css, scoped to

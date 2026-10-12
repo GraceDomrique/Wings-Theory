@@ -27,16 +27,26 @@ export async function render(ctx) {
       `${i.name} — bought by the ${i.onHandUnit}`)));
   if (ctx.selection.ingredient) picker.value = String(ctx.selection.ingredient.pk);
 
-  const qtyInput = h('input', { type: 'number', step: '0.01', min: '0', placeholder: '0.00' });
+  // There is no free choice of unit here: each ingredient has exactly one
+  // purchase unit it is always received in (set once, under Verification),
+  // and the backend's receive() call takes the quantity in THAT unit only
+  // — a dropdown offering "kg / g / pieces" as if any could be picked per
+  // delivery would silently misrecord stock the moment someone chose the
+  // wrong one. Instead, the ingredient's actual unit is shown as a fixed
+  // badge right on the field (not just a hint underneath), so it is
+  // unmistakable without pretending there's a choice to make.
+  const qtyInput = h('input', { type: 'number', step: '0.01', min: '0', placeholder: '0.00', class: 'no-spinner' });
+  const unitBadge = h('span', { class: 'field-unit-badge' }, 'unit');
   const lotInput = h('input', { type: 'text', placeholder: 'optional' });
   const expiryInput = h('input', { type: 'date' });
-  const unitHint = h('div', { class: 'hint' }, 'In the ingredient’s purchase unit.');
+  const unitHint = h('div', { class: 'hint' }, 'Select an ingredient to see its purchase unit.');
 
   picker.addEventListener('change', () => {
     const ing = ingredients.find((i) => String(i.pk) === picker.value);
+    unitBadge.textContent = ing ? ing.onHandUnit : 'unit';
     unitHint.textContent = ing
-      ? `In ${ing.onHandUnit}. Stock is held internally in ${ing.baseUnit}.`
-      : 'In the ingredient’s purchase unit.';
+      ? `Stock is held internally in ${ing.baseUnit}.`
+      : 'Select an ingredient to see its purchase unit.';
   });
 
   const submit = Button({ variant: 'primary' }, 'Confirm delivery');
@@ -113,7 +123,8 @@ export async function render(ctx) {
       }),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '12px' } },
         h('label', { class: 'field' }, 'Ingredient', picker),
-        h('label', { class: 'field' }, 'Quantity received', qtyInput, unitHint),
+        h('label', { class: 'field' }, 'Quantity received',
+          h('div', { class: 'field-with-badge' }, qtyInput, unitBadge), unitHint),
         h('label', { class: 'field' }, 'Lot / batch no.', lotInput,
           h('div', { class: 'hint' }, 'Optional — helps trace a recall.')),
         h('label', { class: 'field' }, 'Expiry date', expiryInput,

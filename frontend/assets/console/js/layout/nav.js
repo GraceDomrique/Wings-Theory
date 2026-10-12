@@ -42,7 +42,7 @@ export const ADMIN_TREE = [
       { id: 'onhand', label: 'On Hand' },
       { id: 'receiving', label: 'Receiving' },
       { id: 'expiry', label: 'Expiry' },
-      { id: 'stockcounts', label: 'Stock Counts' },
+      { id: 'stockcounts', label: 'Physical Stock Count' },
       { id: 'losses', label: 'Losses & Variance' },
       { id: 'unli', label: 'Unlimited Wings' },
       { id: 'movements', label: 'Movements' },
@@ -65,8 +65,7 @@ export const ADMIN_TREE = [
     children: [
       { id: 'forecasts', label: 'Demand Forecasts' },
       { id: 'whattobuy', label: 'What to Buy' },
-      { id: 'purchaseorders', label: 'Purchase Orders' },
-      { id: 'purchasehistory', label: 'Purchase History' },
+      { id: 'purchasing', label: 'Purchase' },
     ],
   },
   {
@@ -77,7 +76,6 @@ export const ADMIN_TREE = [
       { id: 'salesoverview', label: 'Sales Overview' },
       { id: 'orderhistory', label: 'Order History' },
       { id: 'bestsellers', label: 'Best Sellers' },
-      { id: 'combinations', label: 'Product Combinations' },
       // Not in the spec's literal Admin tree, but valuation and the
       // printable Attention Needed list (spec section 27's "Business
       // Reports") pre-existed here and have no other home on Admin's side
@@ -94,8 +92,6 @@ export const ADMIN_TREE = [
     children: [
       { id: 'verify', label: 'Setup & Verification', badge: 'verification' },
       { id: 'users', label: 'Users & Access' },
-      { id: 'models', label: 'System & Models' },
-      { id: 'dataintegrity', label: 'Data Integrity' },
       { id: 'audit', label: 'Audit Trail' },
       { id: 'settings', label: 'Settings' },
     ],
@@ -121,8 +117,7 @@ export const OWNER_TREE = [
     children: [
       { id: 'forecasts', label: 'Demand Forecasts' },
       { id: 'whattobuy', label: 'Purchase Needs' },
-      { id: 'purchaseorders', label: 'Purchase Orders' },
-      { id: 'purchasehistory', label: 'Purchase History' },
+      { id: 'purchasing', label: 'Purchase' },
     ],
   },
   {
@@ -133,7 +128,6 @@ export const OWNER_TREE = [
       { id: 'salesoverview', label: 'Sales' },
       { id: 'orderhistory', label: 'Orders' },
       { id: 'bestsellers', label: 'Best Sellers' },
-      { id: 'combinations', label: 'Product Combinations' },
     ],
   },
   {
@@ -223,24 +217,20 @@ export const PAGE_SUB = {
   movements: 'Every stock change, in order — received, used, wasted, counted, corrected.',
   menu: 'What we’re selling, for how much, and whether it’s available right now.',
   recipes: 'What each menu item is made of, and what it costs to make.',
-  combos: 'What sells together, combo ideas worth a real price, and what to publish to the POS.',
+  combos: 'What sells together (from real order history), combo ideas worth a real price, and what to publish to the POS.',
   forecasts: 'Predicted demand for each menu item, and how well that prediction has held up.',
   whattobuy: 'What needs buying, why, and how much.',
-  purchaseorders: 'Purchases currently being processed, from draft to received.',
-  purchasehistory: 'Every purchase order ever placed, searchable by date and supplier.',
+  purchasing: 'Purchase orders being processed, and every order ever placed, in one place.',
   salesoverview: 'How the business is performing, and how it compares to before.',
   orderhistory: 'Every past order, searchable and ready to inspect.',
   bestsellers: 'What sells the most, and how that’s shifted over time.',
-  combinations: 'What customers commonly order together.',
   inventoryoverview: 'Current stock, its value, and what needs a closer look.',
-  reports: 'Inventory value and a printable list of what needs attention.',
+  reports: 'Inventory value, at a glance.',
   historicalrecords: 'A jumping-off point into every historical record the business keeps.',
   downloads: 'Printable and exportable records.',
   instructions: 'Operational tasks from Owner to Admin, tracked from open to complete.',
   verify: 'Setup numbers that still need a real, confirmed value.',
   users: 'Who has access, and what they can do.',
-  models: 'How the forecasting, anomaly and combination models are performing.',
-  dataintegrity: 'Automatic structural checks over the stored data itself.',
   audit: 'Who changed what, and when.',
   settings: 'Account security.',
 };

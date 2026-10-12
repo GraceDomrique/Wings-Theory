@@ -52,7 +52,8 @@ import statistics
 import numpy as np
 from sklearn.ensemble import IsolationForest
 
-from . import audit, timeutil
+from . import audit, model_registry, timeutil
+from . import ml_artifacts_io as artifacts
 from .db import write_tx
 from .errors import InvalidStateError, NotFoundError
 
@@ -308,6 +309,98 @@ SYNTHETIC_SEED_USER_IDS = ("xlsx_history_import", "demo_seed")
 # risk at this project's current scale.
 _REAL_USER_CLAUSE = "(l.user_id IS NULL OR l.user_id IN (SELECT username FROM app_user))"
 
+# The one, current synthetic importer this registry's SIMULATED/MIXED modes
+# train on (migration 0050). Deliberately NOT the same set as
+# SYNTHETIC_SEED_USER_IDS above -- those are retired seeders with no batch
+# tracking; "simulated" for mode purposes means "the currently-approved
+# simulated_workbook_import batch", never an arbitrary past synthetic write.
+CURRENT_SYNTHETIC_IMPORTER_USER_ID = "simulated_workbook_import"
+
+# schema_version embedded in every artifact this module writes/reads (see
+# ml_training.py's train_*() functions and ml_startup.py's compatibility
+# check) -- bump whenever a feature list below changes shape, so a stale
+# artifact built under the old shape is rejected at startup instead of
+# silently fed the wrong number of columns.
+ANOMALY_ARTIFACT_SCHEMA_VERSION = "anomaly_isoforest_v1"
+
+
+def _provenance_branches(conn: sqlite3.Connection, user_col: str, batch_col: str, mode: str) -> tuple[str, str, tuple]:
+    """Returns (real_predicate, synthetic_predicate, synthetic_params) —
+    the two eligibility tests kept SEPARATE (not OR'd together) for queries
+    that UNION two differently-shaped sources (e.g. Pass B's real
+    unli_reconciliation rows vs. its derived-from-flavor synthetic rows)
+    rather than filtering one shared table. REAL keeps today's exact
+    behavior (the OR-NULL/app_user test, unchanged bit for bit); SIMULATED
+    is rows from the current synthetic importer whose batch is in
+    ml_approved_synthetic_batch (never a stale generation a future
+    re-import might leave behind); MIXED returns both predicates "live" so
+    a caller ORs them -- never an unfiltered 'all rows'."""
+    real = f"({user_col} IS NULL OR {user_col} IN (SELECT username FROM app_user))"
+    approved = model_registry.approved_batch_ids(conn)
+    if approved:
+        placeholders = ",".join("?" * len(approved))
+        simulated = f"({user_col} = ? AND {batch_col} IN ({placeholders}))"
+        sim_params = (CURRENT_SYNTHETIC_IMPORTER_USER_ID, *approved)
+    else:
+        simulated, sim_params = "0", ()
+    if mode == "REAL":
+        return real, "0", ()
+    if mode == "SIMULATED":
+        return "0", simulated, sim_params
+    if mode == "MIXED":
+        return real, simulated, sim_params
+    raise ValueError(f"unknown mode {mode!r}")
+
+
+def _provenance_clause(conn: sqlite3.Connection, user_col: str, batch_col: str, mode: str) -> tuple[str, tuple]:
+    """Single combined predicate for queries that filter one shared table
+    (Pass A, Pass C) -- see _provenance_branches for the per-branch form
+    Pass B's UNION needs. Returns (sql_fragment, extra_params): extra_params
+    must be spliced into the query's param tuple at the fragment's
+    position."""
+    real, simulated, sim_params = _provenance_branches(conn, user_col, batch_col, mode)
+    if mode == "REAL":
+        return real, ()
+    if mode == "SIMULATED":
+        return simulated, sim_params
+    return f"({real} OR {simulated})", sim_params
+
+
+def _row_provenance(user_id: str | None) -> str:
+    return "synthetic" if user_id == CURRENT_SYNTHETIC_IMPORTER_USER_ID else "real"
+
+
+def _score_with_isolation_forest(
+    conn: sqlite3.Connection, model_key: str, X: "np.ndarray", *, use_artifact: bool,
+) -> tuple["np.ndarray", "np.ndarray", str]:
+    """Returns (preds, raw_scores, source). source is 'artifact' when a
+    trained, persisted model served the prediction (the normal live path);
+    'fit_fresh' when use_artifact is False (ml_training.py building a
+    candidate) or no artifact exists yet for this model_key (a brand-new
+    registry before its first training run -- the system still produces
+    predictions rather than refusing to serve anything)."""
+    if use_artifact:
+        path = model_registry.active_artifact_path(conn, model_key)
+        if path:
+            try:
+                payload = artifacts.load_joblib(path)
+                model = payload["model"]
+                return model.predict(X), model.decision_function(X), "artifact"
+            except Exception:
+                # Missing/corrupt artifact file, or a pickle that no longer
+                # loads under the running sklearn version -- never let a
+                # bad artifact take the whole detection pass down. Falls
+                # through to a fresh fit, same as "no artifact yet". See
+                # ml_startup.py for the equivalent safety net at process
+                # startup (which additionally rolls back the registry
+                # pointer so this fallback stops being needed on the next
+                # call).
+                pass
+    model = IsolationForest(n_estimators=N_ESTIMATORS, contamination="auto", random_state=RANDOM_STATE)
+    preds = model.fit_predict(X)
+    raw_scores = model.decision_function(X)
+    return preds, raw_scores, "fit_fresh"
+
 # --- reproducibility: version tags frozen onto every anomaly_validation_
 # sample row at evaluation time (migration 0041) ---------------------------
 #
@@ -361,7 +454,9 @@ def _rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
-def _evaluate_stock_loss(conn: sqlite3.Connection, lookback_days: int = 90) -> tuple[list[dict], float | None]:
+def _evaluate_stock_loss(
+    conn: sqlite3.Connection, lookback_days: int = 90, *, mode: str | None = None, use_artifact: bool = True,
+) -> tuple[list[dict], float | None]:
     """The shared evaluation core behind detect_anomalies() (below) AND
     sample_for_review() -- one real-eligible record list, each carrying its
     model_prediction/score/method, so a human sampling "near threshold" rows
@@ -380,6 +475,8 @@ def _evaluate_stock_loss(conn: sqlite3.Connection, lookback_days: int = 90) -> t
     against -- or None when the forest did not train this call (pool below
     MIN_POOLED_SAMPLES, so every prediction came from the rule alone).
     """
+    mode = mode or model_registry.get_mode(conn, "stock_loss_isoforest")
+    prov_clause, prov_params = _provenance_clause(conn, "l.user_id", "l.source_batch_id", mode)
     placeholders = ",".join("?" * len(ANOMALY_REASONS))
     rows = conn.execute(
         f"""
@@ -389,10 +486,10 @@ def _evaluate_stock_loss(conn: sqlite3.Connection, lookback_days: int = 90) -> t
           FROM stock_ledger l JOIN ingredient i ON i.id = l.ingredient_id
          WHERE l.reason IN ({placeholders})
            AND l.created_at >= ?
-           AND {_REAL_USER_CLAUSE}
+           AND {prov_clause}
          ORDER BY l.ingredient_id, l.created_at
         """,
-        (*ANOMALY_REASONS, timeutil.utc_bound_n_manila_days_ago(lookback_days)),
+        (*ANOMALY_REASONS, timeutil.utc_bound_n_manila_days_ago(lookback_days), *prov_params),
     ).fetchall()
     if not rows:
         return [], None
@@ -413,16 +510,17 @@ def _evaluate_stock_loss(conn: sqlite3.Connection, lookback_days: int = 90) -> t
             "row": r, "mag": mag, "balance_before": balance_before,
             "fraction": fraction, "relative_mag": relative_mag,
             "prediction": "unflagged", "score": None, "method": None,
+            "provenance": _row_provenance(r["user_id"]),
         })
 
     decision_threshold = None
 
     if len(records) >= MIN_POOLED_SAMPLES:
         X = np.array([[rec["relative_mag"], rec["fraction"]] for rec in records])
-        model = IsolationForest(n_estimators=N_ESTIMATORS, contamination="auto",
-                                random_state=RANDOM_STATE)
-        preds = model.fit_predict(X)
-        raw_scores = model.decision_function(X)   # lower (more negative) = more anomalous
+        preds, raw_scores, model_source = _score_with_isolation_forest(
+            conn, "stock_loss_isoforest", X, use_artifact=use_artifact)
+        for rec in records:
+            rec["_model_source"] = model_source
         for rec, raw in zip(records, raw_scores):
             rec["_raw_score"] = float(raw)
             rec["score"] = round(-rec["_raw_score"], 3)   # public sign: higher = more anomalous
@@ -455,12 +553,15 @@ def _evaluate_stock_loss(conn: sqlite3.Connection, lookback_days: int = 90) -> t
     return records, decision_threshold
 
 
-def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 90) -> list[dict]:
-    """See SYNTHETIC_SEED_USER_IDS's own comment for why rows sourced from
-    the demo/import seeders (and any future equivalent) are excluded from
-    both training and flagging here -- confirmed, not assumed, against the
-    real production ledger."""
-    records, _ = _evaluate_stock_loss(conn, lookback_days)
+def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 90, *, mode: str | None = None) -> list[dict]:
+    """Live predictions. mode defaults to this model's current registry
+    mode (migration 0050) -- SIMULATED/MIXED means the currently-approved
+    synthetic import batch's rows are included here, not just in
+    wt/demo_validation.py's isolated harness (see _provenance_clause).
+    Serves from the persisted, scheduler-trained artifact when one exists
+    (use_artifact=True, the default inside _evaluate_stock_loss) rather than
+    refitting inline -- see _score_with_isolation_forest."""
+    records, _ = _evaluate_stock_loss(conn, lookback_days, mode=mode)
     flagged = []
     for rec in records:
         if rec["prediction"] != "flagged":
@@ -484,6 +585,7 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 90) -> list[
             "note": r["note"], "user_id": r["user_id"],
             "method": rec["method"], "score": rec["score"],
             "why": why, "severity": severity,
+            "provenance": rec["provenance"], "model_source": rec.get("_model_source"),
         })
     flagged.sort(key=lambda f: f["created_at"], reverse=True)
     return flagged
@@ -492,7 +594,7 @@ def detect_anomalies(conn: sqlite3.Connection, lookback_days: int = 90) -> list[
 # ===========================================================================
 # Consumption anomalies — the specified model, over reconciled service days
 # ===========================================================================
-def _consumption_records(conn: sqlite3.Connection, lookback_days: int) -> list[dict]:
+def _consumption_records(conn: sqlite3.Connection, lookback_days: int, *, mode: str | None = None) -> list[dict]:
     """The seven-feature vectors, one per GENUINE reconciled service day per
     stream.
 
@@ -533,23 +635,76 @@ def _consumption_records(conn: sqlite3.Connection, lookback_days: int) -> list[d
                                   Catches a day that is odd in absolute terms
                                   even when its per-head rate looks ordinary.
     """
+    mode = mode or model_registry.get_mode(conn, "unli_consumption_isoforest")
+    real_clause, synthetic_clause, sim_params = _provenance_branches(
+        conn, "recorded_by", "source_batch_id", mode)
+    lookback_param = timeutil.business_date_n_days_ago(lookback_days)
+    tol_row = conn.execute("SELECT value FROM app_setting WHERE key='unli_variance_tolerance'").fetchone()
+    tol = float(tol_row["value"]) if tol_row else 0.10
+    # Real rows come from unli_reconciliation (any stream) exactly as
+    # before, with every column detect_consumption_anomalies()'s describe()
+    # reads. Synthetic rows come from v_unli_wings_daily_from_flavor
+    # (migration 0050/0051) -- a day-level aggregate of the imported
+    # per-flavor reconciliation data, 'wings' stream only -- shaped to match
+    # the same columns (status/validation_state computed the same way
+    # record_reconciliation() would have, from the same configured
+    # tolerance; reconciliation_id left NULL since there is no real
+    # unli_reconciliation row to point at -- sample_consumption_for_review()
+    # excludes NULL-id rows from the human-review queue for exactly that
+    # reason, see its own filter). ANTI-JOINED against real
+    # unli_reconciliation by (unli_item_id, service_date) so a date that
+    # already has a genuine reconciliation row is never also pulled in from
+    # the derived view: one underlying fact per day, never counted from
+    # both places. rice/fries/drinks have no synthetic source and only ever
+    # appear via real_rows.
     rows = conn.execute(
         f"""
-        SELECT d.*, b.lambda_value AS baseline_lambda
-          FROM v_unli_daily_consumption d
+        WITH real_rows AS (
+            SELECT reconciliation_id, service_date, unli_item_id, item_key, label,
+                   ingredient_name, base_unit, heads, theoretical_base, actual_base,
+                   variance_base, actual_per_head, variance_ratio, leftover_ratio, status,
+                   validation_state, recorded_by, NULL AS source_batch_id
+              FROM v_unli_daily_consumption
+             WHERE service_date >= ?
+               AND heads > 0
+               AND validation_state <> 'rejected'
+               AND {real_clause}
+        ),
+        synthetic_rows AS (
+            SELECT NULL AS reconciliation_id, f.service_date, f.unli_item_id,
+                   ui.item_key, ui.label, i.name AS ingredient_name, i.base_unit,
+                   f.heads, f.theoretical_base, f.actual_base, f.variance_base,
+                   f.actual_per_head, f.variance_ratio, f.leftover_ratio,
+                   CASE WHEN ABS(COALESCE(f.variance_ratio, 0)) <= ? THEN 'within_tolerance'
+                        WHEN f.variance_ratio > 0 THEN 'over_tolerance'
+                        ELSE 'under_tolerance' END AS status,
+                   'validated' AS validation_state,
+                   f.recorded_by, f.source_batch_id
+              FROM v_unli_wings_daily_from_flavor f
+              JOIN unli_item ui ON ui.id = f.unli_item_id
+              JOIN ingredient i ON i.id = ui.ingredient_id
+             WHERE f.service_date >= ?
+               AND f.heads > 0
+               AND NOT EXISTS (
+                     SELECT 1 FROM unli_reconciliation ur
+                      WHERE ur.unli_item_id = f.unli_item_id AND ur.service_date = f.service_date
+                   )
+               AND {synthetic_clause}
+        ),
+        combined AS (
+            SELECT * FROM real_rows UNION ALL SELECT * FROM synthetic_rows
+        )
+        SELECT cc.*, bl.lambda_value AS baseline_lambda
+          FROM combined cc
           LEFT JOIN (
                 SELECT unli_item_id, lambda_value FROM unli_coefficient c1
                  WHERE role = 'baseline'
                    AND id = (SELECT MAX(c2.id) FROM unli_coefficient c2
                               WHERE c2.unli_item_id = c1.unli_item_id AND c2.role = 'baseline')
-               ) b ON b.unli_item_id = d.unli_item_id
-         WHERE d.service_date >= ?
-           AND d.heads > 0
-           AND d.validation_state <> 'rejected'
-           AND {_REAL_RECORDER_CLAUSE}
-         ORDER BY d.unli_item_id, d.service_date
+               ) bl ON bl.unli_item_id = cc.unli_item_id
+         ORDER BY cc.unli_item_id, cc.service_date
         """,
-        (timeutil.business_date_n_days_ago(lookback_days),),
+        (lookback_param, tol, lookback_param, *sim_params),
     ).fetchall()
     if not rows:
         return []
@@ -572,6 +727,7 @@ def _consumption_records(conn: sqlite3.Connection, lookback_days: int) -> list[d
 
         records.append({
             "row": r,
+            "provenance": _row_provenance(r["recorded_by"]),
             "features": {
                 "actual_per_head": rate,
                 "variance_ratio": r["variance_ratio"] or 0.0,
@@ -598,7 +754,9 @@ def _robust_center_spread(values: list[float]) -> tuple[float, float]:
     return med, mad * _MAD_TO_SIGMA
 
 
-def _evaluate_consumption(conn: sqlite3.Connection, lookback_days: int = 90) -> tuple[list[dict], float | None]:
+def _evaluate_consumption(
+    conn: sqlite3.Connection, lookback_days: int = 90, *, mode: str | None = None, use_artifact: bool = True,
+) -> tuple[list[dict], float | None]:
     """The shared evaluation core behind detect_consumption_anomalies() AND
     sample_consumption_for_review() — see _evaluate_stock_loss()'s identical
     role for the stock-loss pass.
@@ -654,7 +812,8 @@ def _evaluate_consumption(conn: sqlite3.Connection, lookback_days: int = 90) -> 
     rows when this is not None, and classifies 'model_flagged' using
     iforest_prediction alone, never rule_flagged.
     """
-    records = _consumption_records(conn, lookback_days)
+    mode = mode or model_registry.get_mode(conn, "unli_consumption_isoforest")
+    records = _consumption_records(conn, lookback_days, mode=mode)
     if not records:
         return [], None
 
@@ -727,14 +886,13 @@ def _evaluate_consumption(conn: sqlite3.Connection, lookback_days: int = 90) -> 
     decision_threshold = None
     if len(records) >= MIN_RECONCILED_DAYS:
         X = np.array([[rec["features"][name] for name in FEATURE_NAMES] for rec in records])
-        model = IsolationForest(n_estimators=N_ESTIMATORS, contamination="auto",
-                                random_state=RANDOM_STATE)
-        preds = model.fit_predict(X)
-        raw_scores = model.decision_function(X)
+        preds, raw_scores, model_source = _score_with_isolation_forest(
+            conn, "unli_consumption_isoforest", X, use_artifact=use_artifact)
         for rec, raw in zip(records, raw_scores):
             rec["iforest_prediction"] = "unflagged"
             rec["_raw_score"] = float(raw)
             rec["score"] = round(-rec["_raw_score"], 3)
+            rec["_model_source"] = model_source
         candidates = sorted(
             (rec for rec, pred in zip(records, preds) if pred == -1),
             key=lambda rec: rec["_raw_score"],
@@ -748,7 +906,9 @@ def _evaluate_consumption(conn: sqlite3.Connection, lookback_days: int = 90) -> 
     return records, decision_threshold
 
 
-def detect_consumption_anomalies(conn: sqlite3.Connection, lookback_days: int = 90) -> list[dict]:
+def detect_consumption_anomalies(
+    conn: sqlite3.Connection, lookback_days: int = 90, *, mode: str | None = None,
+) -> list[dict]:
     """IsolationForest over the reconciled daily consumption dataset.
 
     Same two-layer shape as the stock-loss pass, for the same reason: a shop
@@ -765,7 +925,7 @@ def detect_consumption_anomalies(conn: sqlite3.Connection, lookback_days: int = 
     exactly as before — see _evaluate_consumption()'s own docstring for
     where the two are now kept separate for validation purposes only.
     """
-    records, _ = _evaluate_consumption(conn, lookback_days)
+    records, _ = _evaluate_consumption(conn, lookback_days, mode=mode)
 
     def describe(rec) -> dict:
         r, f = rec["row"], rec["features"]
@@ -775,13 +935,14 @@ def detect_consumption_anomalies(conn: sqlite3.Connection, lookback_days: int = 
             "item_key": r["item_key"], "label": r["label"],
             "ingredient_name": r["ingredient_name"], "base_unit": r["base_unit"],
             "heads": r["heads"],
-            "theoretical_base": round(r["theoretical_base"], 2),
+            "theoretical_base": round(r["theoretical_base"], 2) if r["theoretical_base"] is not None else None,
             "actual_base": round(r["actual_base"], 2),
             "actual_per_head": round(f["actual_per_head"], 2),
-            "variance_base": round(r["variance_base"], 2),
+            "variance_base": round(r["variance_base"], 2) if r["variance_base"] is not None else None,
             "variance_pct": round((r["variance_ratio"] or 0.0) * 100, 1),
             "status": r["status"], "validation_state": r["validation_state"],
             "features": {k: round(v, 4) for k, v in f.items()},
+            "provenance": rec["provenance"], "model_source": rec.get("_model_source"),
         }
 
     tol_row = conn.execute(
@@ -1629,11 +1790,19 @@ def sample_consumption_for_review(
         conn.execute("SELECT reconciliation_id FROM unli_consumption_validation_sample").fetchall()
     }
 
+    # A synthetic, derived-from-flavor row (reconciliation_id IS NULL, see
+    # _consumption_records) has no real unli_reconciliation row to point at
+    # -- it is correctly part of the IsolationForest's training/scoring
+    # pool above, but cannot be sent to a human reviewer or persisted here
+    # (the table's reconciliation_id column is NOT NULL UNIQUE REFERENCES
+    # unli_reconciliation(id)).
     flagged = [rec for rec in records
               if rec["iforest_prediction"] == "flagged"
+              and rec["row"]["reconciliation_id"] is not None
               and rec["row"]["reconciliation_id"] not in already_sampled]
     unflagged = [rec for rec in records
                 if rec["iforest_prediction"] == "unflagged"
+                and rec["row"]["reconciliation_id"] is not None
                 and rec["row"]["reconciliation_id"] not in already_sampled]
 
     flagged_cap = n_flagged if n_flagged is not None else min(len(flagged), CONSUMPTION_DEFAULT_FLAGGED_SAMPLE_CAP)
@@ -1974,7 +2143,7 @@ _REAL_FLAVOR_RECORDER_CLAUSE = (
 )
 
 
-def _flavor_consumption_records(conn: sqlite3.Connection, lookback_days: int) -> list[dict]:
+def _flavor_consumption_records(conn: sqlite3.Connection, lookback_days: int, *, mode: str | None = None) -> list[dict]:
     """One feature vector per (service_date, flavor) reconciled observation.
     All seven features are derived only from columns unli_flavor_
     reconciliation actually has (migration 0044) -- no invented
@@ -2008,6 +2177,8 @@ def _flavor_consumption_records(conn: sqlite3.Connection, lookback_days: int) ->
                                     variance_ratio (measured vs provisional),
                                     read directly -- not recomputed.
     """
+    mode = mode or model_registry.get_mode(conn, "flavor_consumption_isoforest")
+    prov_clause, prov_params = _provenance_clause(conn, "fr.recorded_by", "fr.source_batch_id", mode)
     rows = conn.execute(
         f"""
         SELECT fr.id AS reconciliation_id, fr.service_date, fr.flavor_id,
@@ -2020,10 +2191,10 @@ def _flavor_consumption_records(conn: sqlite3.Connection, lookback_days: int) ->
          WHERE fr.service_date >= ?
            AND fr.heads > 0
            AND fr.observation_status <> 'rejected'
-           AND {_REAL_FLAVOR_RECORDER_CLAUSE}
+           AND {prov_clause}
          ORDER BY fr.flavor_id, fr.service_date
         """,
-        (timeutil.business_date_n_days_ago(lookback_days),),
+        (timeutil.business_date_n_days_ago(lookback_days), *prov_params),
     ).fetchall()
     if not rows:
         return []
@@ -2050,6 +2221,7 @@ def _flavor_consumption_records(conn: sqlite3.Connection, lookback_days: int) ->
 
         records.append({
             "row": r,
+            "provenance": _row_provenance(r["recorded_by"]),
             "features": {
                 "consumption_per_head": rate,
                 "refill_intensity": (r["servings"] / r["heads"]) if r["heads"] else 0.0,
@@ -2066,13 +2238,14 @@ def _flavor_consumption_records(conn: sqlite3.Connection, lookback_days: int) ->
 
 
 def _evaluate_flavor_consumption(
-    conn: sqlite3.Connection, lookback_days: int = 90,
+    conn: sqlite3.Connection, lookback_days: int = 90, *, mode: str | None = None, use_artifact: bool = True,
 ) -> tuple[list[dict], float | None]:
     """Same rule+forest shape as _evaluate_consumption(), applied to the
     flavour-level dataset. See that function's own docstring for the
     iforest_prediction/score/rule_flagged/rule_causes contract -- identical
     here."""
-    records = _flavor_consumption_records(conn, lookback_days)
+    mode = mode or model_registry.get_mode(conn, "flavor_consumption_isoforest")
+    records = _flavor_consumption_records(conn, lookback_days, mode=mode)
     if not records:
         return [], None
 
@@ -2136,14 +2309,13 @@ def _evaluate_flavor_consumption(
     decision_threshold = None
     if len(records) >= FLAVOR_MIN_RECONCILED_DAYS:
         X = np.array([[rec["features"][name] for name in FLAVOR_FEATURE_NAMES] for rec in records])
-        model = IsolationForest(n_estimators=N_ESTIMATORS, contamination="auto",
-                                random_state=RANDOM_STATE)
-        preds = model.fit_predict(X)
-        raw_scores = model.decision_function(X)
+        preds, raw_scores, model_source = _score_with_isolation_forest(
+            conn, "flavor_consumption_isoforest", X, use_artifact=use_artifact)
         for rec, raw in zip(records, raw_scores):
             rec["iforest_prediction"] = "unflagged"
             rec["_raw_score"] = float(raw)
             rec["score"] = round(-rec["_raw_score"], 3)
+            rec["_model_source"] = model_source
         candidates = sorted(
             (rec for rec, pred in zip(records, preds) if pred == -1),
             key=lambda rec: rec["_raw_score"],
@@ -2157,13 +2329,15 @@ def _evaluate_flavor_consumption(
     return records, decision_threshold
 
 
-def detect_flavor_consumption_anomalies(conn: sqlite3.Connection, lookback_days: int = 90) -> list[dict]:
+def detect_flavor_consumption_anomalies(
+    conn: sqlite3.Connection, lookback_days: int = 90, *, mode: str | None = None,
+) -> list[dict]:
     """Flavour-level counterpart to detect_consumption_anomalies() -- see
     the module docstring above for why this is a separate detector rather
     than a change to the 4-stream one. Same descriptive-only contract:
     flags, explains, nothing downstream acts on one.
     """
-    records, _ = _evaluate_flavor_consumption(conn, lookback_days)
+    records, _ = _evaluate_flavor_consumption(conn, lookback_days, mode=mode)
 
     tol_row = conn.execute(
         "SELECT value FROM app_setting WHERE key='unli_variance_tolerance'"
@@ -2182,6 +2356,7 @@ def detect_flavor_consumption_anomalies(conn: sqlite3.Connection, lookback_days:
             "consumption_per_head": round(f["consumption_per_head"], 2),
             "variance_pct": round((r["variance_ratio"] or 0.0) * 100, 1),
             "features": {k: round(v, 4) for k, v in f.items()},
+            "provenance": rec["provenance"], "model_source": rec.get("_model_source"),
         }
 
     def why(method: str, score: float, r, f) -> str:
@@ -2752,7 +2927,7 @@ def flavor_real_data_readiness(conn: sqlite3.Connection, lookback_days: int = 90
     scoping (the validation-sample table), the same structural exclusion
     the rest of this module relies on throughout.
     """
-    records = _flavor_consumption_records(conn, lookback_days)
+    records = _flavor_consumption_records(conn, lookback_days, mode="REAL")
     real_observations = len(records)
     distinct_dates = len({r["row"]["service_date"] for r in records})
 
@@ -2796,29 +2971,148 @@ def flavor_real_data_readiness(conn: sqlite3.Connection, lookback_days: int = 90
             "value": len(reviewed_flavor_ids), "required": FLAVOR_MIN_FLAVOR_COVERAGE,
             "met": len(reviewed_flavor_ids) >= FLAVOR_MIN_FLAVOR_COVERAGE},
     }
-    all_met = all(c["met"] for c in criteria.values())
-
-    if real_observations == 0:
-        state, reason = "SIMULATION_ONLY", (
-            "zero genuine (non-synthetic) flavour reconciliation observations exist yet"
-        )
-    elif not criteria["real_observations"]["met"] or not criteria["service_date_coverage_days"]["met"]:
-        state, reason = "INSUFFICIENT_REAL_DATA", (
-            "real observation volume and/or date coverage is below the minimum needed to "
-            "train or evaluate meaningfully"
-        )
-    elif not all_met:
-        state, reason = "READY_WITH_LIMITATIONS", (
-            "the forest can train on real data, but human-reviewed ground truth is not yet "
-            "sufficient for a scientific Precision/Recall claim"
-        )
-    else:
-        state, reason = "READY_REAL_DATA", (
-            "sufficient real observations, date coverage, and genuinely human-reviewed labels "
-            "on both sides of the model's own prediction"
-        )
+    state, reason = _readiness_ladder(
+        criteria, zero_observations=(real_observations == 0),
+        insufficient_volume=(not criteria["real_observations"]["met"]
+                              or not criteria["service_date_coverage_days"]["met"]),
+        no_evidence_reason="zero genuine (non-synthetic) flavour reconciliation observations exist yet",
+    )
 
     return {
         "state": state, "reason": reason, "criteria": criteria,
         "model_version": FLAVOR_MODEL_VERSION, "eligibility_version": FLAVOR_ELIGIBILITY_VERSION,
+    }
+
+
+def _readiness_ladder(
+    criteria: dict[str, dict], *, zero_observations: bool, insufficient_volume: bool,
+    no_evidence_reason: str,
+) -> tuple[str, str]:
+    """The SIMULATED->MIXED->REAL readiness state machine shared by every
+    pass's own *_real_data_readiness() wrapper (originally built for the
+    flavour pass alone; generalized here so Pass A/B promote through the
+    exact same ladder with their own domain-specific criteria dicts rather
+    than a parallel, possibly-drifting copy of this logic). Each model's
+    mode-transition decision (wt/ml_training.py) steps mode forward exactly
+    once (SIMULATED->MIXED, never SIMULATED->REAL) only when this returns
+    READY_REAL_DATA."""
+    all_met = all(c["met"] for c in criteria.values())
+    if zero_observations:
+        return "SIMULATION_ONLY", no_evidence_reason
+    if insufficient_volume:
+        return "INSUFFICIENT_REAL_DATA", (
+            "real observation volume and/or date coverage is below the minimum needed to "
+            "train or evaluate meaningfully"
+        )
+    if not all_met:
+        return "READY_WITH_LIMITATIONS", (
+            "the forest can train on real data, but human-reviewed ground truth is not yet "
+            "sufficient for a scientific Precision/Recall claim"
+        )
+    return "READY_REAL_DATA", (
+        "sufficient real observations, date coverage, and genuinely human-reviewed labels "
+        "on both sides of the model's own prediction"
+    )
+
+
+def stock_loss_real_data_readiness(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:
+    """Pass A's counterpart to flavor_real_data_readiness() — same ladder
+    (_readiness_ladder), same reuse-not-reinvent principle for thresholds:
+    MIN_POOLED_SAMPLES/MIN_VALIDATED_LABELS are this pass's own existing
+    training/validation-metrics minimums, not new numbers invented for this
+    function."""
+    records, _ = _evaluate_stock_loss(conn, lookback_days, mode="REAL", use_artifact=False)
+    real_observations = len(records)
+    distinct_days = len({r["row"]["created_at"][:10] for r in records})
+
+    labeled = conn.execute(
+        "SELECT * FROM anomaly_validation_sample WHERE model_version=? AND eligibility_version=?",
+        (ANOMALY_MODEL_VERSION, ELIGIBILITY_FILTER_VERSION),
+    ).fetchall()
+    reviewed = [r for r in labeled if r["human_label"] != "pending"]
+    confirmed_or_fp = [r for r in reviewed if r["human_label"] in ("confirmed_anomaly", "expected_or_normal")]
+    flagged_side = sum(1 for r in confirmed_or_fp if r["model_prediction"] == "flagged")
+    unflagged_side = sum(1 for r in confirmed_or_fp if r["model_prediction"] == "unflagged")
+
+    criteria = {
+        "real_observations": {
+            "value": real_observations, "required": MIN_POOLED_SAMPLES * 2,
+            "met": real_observations >= MIN_POOLED_SAMPLES * 2},
+        "service_date_coverage_days": {
+            "value": distinct_days, "required": 14,
+            "met": distinct_days >= 14},
+        "reviewed_predictions": {
+            "value": len(reviewed), "required": MIN_VALIDATED_LABELS,
+            "met": len(reviewed) >= MIN_VALIDATED_LABELS},
+        "scientific_validation_labels": {
+            "value": len(confirmed_or_fp), "required": MIN_VALIDATED_LABELS,
+            "met": len(confirmed_or_fp) >= MIN_VALIDATED_LABELS},
+        "labels_on_flagged_side": {
+            "value": flagged_side, "required": MIN_LABELS_PER_PREDICTION_SIDE,
+            "met": flagged_side >= MIN_LABELS_PER_PREDICTION_SIDE},
+        "labels_on_unflagged_side": {
+            "value": unflagged_side, "required": MIN_LABELS_PER_PREDICTION_SIDE,
+            "met": unflagged_side >= MIN_LABELS_PER_PREDICTION_SIDE},
+    }
+    state, reason = _readiness_ladder(
+        criteria, zero_observations=(real_observations == 0),
+        insufficient_volume=(not criteria["real_observations"]["met"]
+                              or not criteria["service_date_coverage_days"]["met"]),
+        no_evidence_reason="zero genuine (non-synthetic) stock-loss ledger observations exist yet",
+    )
+    return {
+        "state": state, "reason": reason, "criteria": criteria,
+        "model_version": ANOMALY_MODEL_VERSION, "eligibility_version": ELIGIBILITY_FILTER_VERSION,
+    }
+
+
+def consumption_real_data_readiness(conn: sqlite3.Connection, lookback_days: int = 90) -> dict:
+    """Pass B's counterpart — see stock_loss_real_data_readiness's own
+    comment. 'wings' stream only has any real path today since that is the
+    only stream _consumption_records' derived-view fallback covers; a real
+    rice/fries/drinks reconciliation would count here too the moment one
+    exists, through the same v_unli_daily_consumption read REAL mode
+    already uses."""
+    records, _ = _evaluate_consumption(conn, lookback_days, mode="REAL", use_artifact=False)
+    real_observations = len(records)
+    distinct_dates = len({r["row"]["service_date"] for r in records})
+
+    labeled = conn.execute(
+        "SELECT * FROM unli_consumption_validation_sample WHERE model_version=? AND eligibility_version=?",
+        (CONSUMPTION_MODEL_VERSION, CONSUMPTION_ELIGIBILITY_VERSION),
+    ).fetchall()
+    reviewed = [r for r in labeled if r["human_label"] != "pending"]
+    confirmed_or_fp = [r for r in reviewed if r["human_label"] in ("confirmed_anomaly", "expected_or_explained")]
+    flagged_side = sum(1 for r in confirmed_or_fp if r["model_prediction"] == "flagged")
+    unflagged_side = sum(1 for r in confirmed_or_fp if r["model_prediction"] == "unflagged")
+
+    criteria = {
+        "real_observations": {
+            "value": real_observations, "required": MIN_RECONCILED_DAYS * 2,
+            "met": real_observations >= MIN_RECONCILED_DAYS * 2},
+        "service_date_coverage_days": {
+            "value": distinct_dates, "required": 14,
+            "met": distinct_dates >= 14},
+        "reviewed_predictions": {
+            "value": len(reviewed), "required": CONSUMPTION_MIN_SCIENTIFIC_VALIDATION_LABELS,
+            "met": len(reviewed) >= CONSUMPTION_MIN_SCIENTIFIC_VALIDATION_LABELS},
+        "scientific_validation_labels": {
+            "value": len(confirmed_or_fp), "required": CONSUMPTION_MIN_SCIENTIFIC_VALIDATION_LABELS,
+            "met": len(confirmed_or_fp) >= CONSUMPTION_MIN_SCIENTIFIC_VALIDATION_LABELS},
+        "labels_on_flagged_side": {
+            "value": flagged_side, "required": CONSUMPTION_MIN_LABELS_PER_PREDICTION_SIDE,
+            "met": flagged_side >= CONSUMPTION_MIN_LABELS_PER_PREDICTION_SIDE},
+        "labels_on_unflagged_side": {
+            "value": unflagged_side, "required": CONSUMPTION_MIN_LABELS_PER_PREDICTION_SIDE,
+            "met": unflagged_side >= CONSUMPTION_MIN_LABELS_PER_PREDICTION_SIDE},
+    }
+    state, reason = _readiness_ladder(
+        criteria, zero_observations=(real_observations == 0),
+        insufficient_volume=(not criteria["real_observations"]["met"]
+                              or not criteria["service_date_coverage_days"]["met"]),
+        no_evidence_reason="zero genuine (non-synthetic) reconciled consumption days exist yet",
+    )
+    return {
+        "state": state, "reason": reason, "criteria": criteria,
+        "model_version": CONSUMPTION_MODEL_VERSION, "eligibility_version": CONSUMPTION_ELIGIBILITY_VERSION,
     }

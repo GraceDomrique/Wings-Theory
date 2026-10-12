@@ -14,10 +14,17 @@
    collapsing into one warm blur. POS/KDS are untouched: they load
    design-system.css, a completely separate token set/file, not this one.*/
 :root{
-  --bg:#F7F5F0;
+  /* 2026-10 card-contrast fix: --bg was only a few points of lightness off
+     --surface (#F7F5F0 vs #FFFFFF), with a near-invisible --line and a 4%
+     shadow, so a card's edge barely registered against the page -- the
+     "white on white" problem. --bg is cooled/darkened and --line/--shadow
+     strengthened below; --surface itself stays pure white on purpose
+     (cards must still read as the brightest surface, just now against a
+     canvas that's visibly behind them). */
+  --bg:#EDE8DC;
   --surface:#FFFFFF;
   --surface-sunk:#FBF9F4;
-  --line:#E7E2D8;
+  --line:#DCD4C2;
   --line-soft:#F0EDE4;
   --ink:#1F1C17;
   --ink-soft:#6E6656;
@@ -25,6 +32,13 @@
   --amber:#FF6F20;
   --amber-deep:#B34700;
   --amber-tint:#FFCC80;
+  /* Admin's nav accent (owner keeps --amber above) -- spec: "Admin active
+     navigation uses blue." A distinct, more saturated blue than --info
+     (which is reserved for informational status pills), so the two never
+     get confused when they appear near each other. */
+  --accent-blue:#2F63D6;
+  --accent-blue-deep:#1E45A8;
+  --accent-blue-tint:#D6E2FB;
   --good:#3E7A55;
   --good-tint:#E4F1E7;
   /* --warn is read as TEXT color on --warn-tint (.pill-warn, its dot via
@@ -49,7 +63,10 @@
   --cocoa-faint:#A3886A;
   --radius:10px;
   --radius-sm:6px;
-  --shadow:0 1px 2px rgba(31,28,23,0.04), 0 1px 10px rgba(31,28,23,0.03);
+  /* Strengthened alongside --bg/--line above -- was 4%/3% alpha, invisible
+     against the old near-white canvas. Still a soft, refined lift (not a
+     hard drop shadow), just one a card edge actually shows at a glance. */
+  --shadow:0 1px 3px rgba(31,28,23,0.08), 0 2px 14px rgba(31,28,23,0.06);
   --font-display:'Fraunces', serif;
   --font-body:'Inter', sans-serif;
   --font-mono:'JetBrains Mono', monospace;

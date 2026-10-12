@@ -2,11 +2,12 @@ import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
-import { Modal } from '../../components/ui/Modal.js';
+import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading } from '../../components/ui/Feedback.js';
-import { money, stamp, asText } from '../../lib/format.js';
+import { money, stamp } from '../../lib/format.js';
 import { listOrders } from '../../lib/api/orders.js';
+import { openOrderDetail } from './orderDetailModal.js';
 
 /**
  * Sales & History > Order History (Owner's sidebar label: "Orders") — spec
@@ -71,25 +72,6 @@ export async function render(ctx) {
     }
   }
 
-  function openDetail(o) {
-    Modal({ title: `Order ${o.orderNo || '#' + o.id}`, desc: stamp(o.createdAt), onClose: () => {} },
-      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2,1fr)', gap: '10px', marginBottom: '14px' } },
-        detailField('Status', o.voidedAt ? 'Voided' : o.status),
-        detailField('Table', o.tableLabel || '—'),
-        detailField('Head count', o.headCount ?? '—'),
-        detailField('Source', o.source || '—'),
-        detailField('Subtotal', money(o.subtotal, 'n/a')),
-        detailField('Discount', o.discountAmount ? `${asText.money(o.discountAmount)} (${o.discountType || ''})` : '—'),
-        detailField('Service charge', money(o.serviceCharge, '—')),
-        detailField('Total', money(o.currentTotal ?? o.total, 'n/a'))),
-      o.itemNames ? h('div', { class: 't-sm' }, h('strong', {}, 'Items: '), o.itemNames) : null,
-      o.voidedAt ? h('div', { class: 'callout callout-crit', style: { marginTop: '10px' } }, h('p', {}, 'This order was voided at ', stamp(o.voidedAt), '.')) : null);
-  }
-
-  function detailField(label, value) {
-    return h('div', {}, h('div', { class: 't-xs t-faint' }, label), h('div', { class: 't-sm', style: { fontWeight: '600' } }, value));
-  }
-
   function drawCard() {
     const host = h('div');
 
@@ -103,7 +85,11 @@ export async function render(ctx) {
           { key: 'items', label: 'Items', render: (o) => h('span', { class: 't-xs t-soft' }, o.itemNames || `${o.lineCount} item${o.lineCount === 1 ? '' : 's'}`) },
           { key: 'total', label: 'Total', render: (o) => h('span', { class: 'mono t-sm' }, money(o.currentTotal ?? o.total, 'n/a')) },
           { key: 'status', label: 'Status', render: statusPill },
-          { key: 'view', label: '', render: (o) => h('a', { href: '#', class: 't-xs', onClick: (e) => { e.preventDefault(); openDetail(o); } }, 'View') },
+          {
+            key: 'view',
+            label: '',
+            render: (o) => Button({ size: 'sm', variant: 'ghost', onClick: () => openOrderDetail(o.id) }, 'View'),
+          },
         ],
         rows,
         empty: EmptyState({

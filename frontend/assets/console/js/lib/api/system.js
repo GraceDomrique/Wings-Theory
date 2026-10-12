@@ -89,6 +89,37 @@ export async function getDataQuality() {
 }
 
 /**
+ * ML model registry (migration 0050) — current mode, lock state, the
+ * active training run (trained_at, dataset_version, real/synthetic
+ * counts, metrics, artifact_path), and real-data-readiness per model.
+ * Nothing here is recomputed on this side; every field is exactly what
+ * wt/model_registry.py persisted.
+ */
+export function getMlModels() {
+  return api.get('/console/ml/models');
+}
+
+export function getMlModelHistory(modelKey) {
+  return api.get(`/console/ml/models/${modelKey}/history`);
+}
+
+/** Manual "train now" — retrains under the model's CURRENT mode. */
+export function trainMlModel(modelKey) {
+  return api.post(`/console/ml/models/${modelKey}/train`);
+}
+
+/** Manual mode promotion — retrains under the NEXT mode, only actually
+ * moves if that run passes validation. 403s for a mode_locked model. */
+export function promoteMlModel(modelKey) {
+  return api.post(`/console/ml/models/${modelKey}/promote`);
+}
+
+/** Runs the full daily train+promote cycle immediately, for every model. */
+export function runMlCycleNow() {
+  return api.post('/console/ml/cycle');
+}
+
+/**
  * Recent login attempts (login_event, migration 0017) and recent
  * attributable actions (admin_audit_log, migration 0016) — readable by
  * owner and admin (audit.read), both append-only on the backend. "Who did

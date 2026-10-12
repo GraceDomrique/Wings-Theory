@@ -23,9 +23,9 @@ export async function render(ctx) {
 
   return h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2,1fr)' } },
     record('Order history', `Every past order, searchable by date, table or item.`, count(orders.orders.length), () => ctx.navigate('orderhistory')),
-    record('Purchase history', `Every purchase order that was received or cancelled.`, count(closedPos.length), () => ctx.navigate('purchasehistory')),
+    record('Purchase history', `Every purchase order that was received or cancelled.`, count(closedPos.length), () => ctx.navigate('purchasing')),
     record('Losses & variance', `Unusual stock loss and expected-vs-counted variance, with review status.`, null, () => ctx.navigate('losses')),
-    record('Business reports', `Inventory value and a printable attention list.`, null, () => ctx.navigate('reports')));
+    record('Business reports', `Inventory value, at a glance.`, null, () => ctx.navigate('reports')));
 }
 
 function record(title, desc, statValue, onOpen) {

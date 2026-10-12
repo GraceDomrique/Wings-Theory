@@ -34,7 +34,7 @@ const COLLAPSE_ICON = '<path d="M15 18l-6-6 6-6"/>';
  * saved state, so a direct hash visit or reload never lands on a page whose
  * own entry is hidden inside a collapsed group.
  */
-export function Sidebar({ activeId, onNavigate, onSignOut }) {
+export function Sidebar({ activeId, onNavigate }) {
   const leafButtons = new Map();
   const badges = new Map();
   const groupBodies = new Map();
@@ -44,6 +44,12 @@ export function Sidebar({ activeId, onNavigate, onSignOut }) {
   const tree = treeForRole(role);
   const expanded = loadExpanded();
   let collapsed = loadCollapsed();
+
+  // body (not just the sidebar) carries the role class, so --role-accent*
+  // (app.css) is readable by the topbar too -- a sibling of .sidebar in the
+  // shell, not a descendant of it.
+  document.body.classList.toggle('role-admin', role !== 'owner');
+  document.body.classList.toggle('role-owner', role === 'owner');
 
   function applyCollapsedClass() {
     document.body.classList.toggle('nav-collapsed', collapsed);
@@ -130,10 +136,6 @@ export function Sidebar({ activeId, onNavigate, onSignOut }) {
     return h('div', { class: 'nav-group' }, toggle, body);
   });
 
-  const user = session.user || {};
-  const initials = (user.displayName || user.username || '?')
-    .split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
-
   const collapseLabel = h('span', { class: 'nav-item-label' }, collapsed ? '' : 'Collapse');
   const collapseToggle = h('span', { class: 'nav-collapse-chevron' + (collapsed ? '' : ' open') }, icon(COLLAPSE_ICON));
   const collapseBtn = h('button', {
@@ -142,6 +144,16 @@ export function Sidebar({ activeId, onNavigate, onSignOut }) {
     onClick: () => setCollapsed(!collapsed),
   }, collapseToggle, collapseLabel);
 
+  // Reference screenshots: lower-sidebar wing photograph, blended into the
+  // dark sidebar via a gradient (pure CSS, see .sidebar-photo in app.css) --
+  // landing-hero.jpg is the same top-down wings shot already used on the
+  // public landing page, so this introduces no new asset.
+  const photo = h('div', {
+    class: 'sidebar-photo',
+    style: { backgroundImage: "url('/img/landing-hero.jpg')" },
+  }, h('div', { class: 'sidebar-photo-tag' },
+    'GOOD FOOD', h('span', { class: 'sub' }, 'Better days')));
+
   const el = h('aside', { class: 'sidebar' },
     h('div', { class: 'brand' },
       h('div', { class: 'brand-mark' }, 'W'),
@@ -149,12 +161,7 @@ export function Sidebar({ activeId, onNavigate, onSignOut }) {
         h('div', { class: 't1' }, 'Wings Theory'),
         h('div', { class: 't2' }, 'Operations Console'))),
     h('nav', { class: 'nav-tree' }, ...nodes),
-    h('div', { class: 'sidebar-foot' },
-      h('div', { class: 'avatar' }, initials),
-      h('div', { class: 'nav-item-label' },
-        h('div', { class: 'name' }, user.displayName || user.username || 'Signed in'),
-        h('div', { class: 'role' }, user.role || '')),
-      h('button', { class: 'signout', title: 'Sign out', onClick: onSignOut }, 'Sign out')),
+    photo,
     collapseBtn);
 
   /** Called on every route change. A leaf outside the currently-collapsed

@@ -81,6 +81,11 @@ from .anomaly import (
     scientific_flavor_validation_metrics,
 )
 from .data_quality import data_quality_report
+from . import model_registry as ml_registry
+from . import ml_training
+from .associations import active_combo_recommendations
+from .ml_scheduler import get_scheduler_status, run_scheduled_cycle, start_ml_scheduler
+from .ml_startup import validate_artifacts_on_startup
 from .reservation import (
     availability_for_menu_item, commit_order, ingredient_reconciliation_report,
     inventory_valuation, receive_stock, record_count, record_usage,
@@ -152,6 +157,14 @@ def _startup() -> None:
     # tests never spends real time fitting Prophet in the background.
     if os.environ.get("WT_ENV") != "test":
         start_prophet_refresh_scheduler(db.get_conn)
+    # ML model registry (migration 0050): validate every active artifact
+    # before serving a single request (corrupt/stale -> roll back once,
+    # then rule-only/fresh-fit fallback -- see ml_startup.py), then start
+    # the daily train/promote cycle. Skipped under WT_ENV=test for the same
+    # reason the Prophet scheduler above is.
+    validate_artifacts_on_startup(conn)
+    if os.environ.get("WT_ENV") != "test":
+        start_ml_scheduler(db.get_conn)
 
 
 @app.exception_handler(WTError)
@@ -3980,6 +3993,93 @@ def model_details_endpoint(
         # a fresh fit actually backing it; see run_prophet_refresh_job().
         "prophet_baseline_refresh": _get_prophet_refresh_status(c),
     }
+
+
+@app.get("/console/ml/models", tags=["console"])
+def ml_models_endpoint(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+    _pg: dict = Depends(needs_page("system")),
+):
+    """Every model in ml_model_registry (migration 0050): current mode,
+    whether it's mode_locked (Prophet/FP-Growth -- no synthetic sales
+    dataset exists to switch to), and its active training run (trained_at,
+    dataset_version, real/synthetic counts, metrics, artifact_path). This
+    is what the System & Settings ML Model Status card reads. Readiness per
+    model reuses ml_training.READINESS_FUNCS -- the same mapping
+    promote_mode() gates manual promotion on, so this panel never shows
+    'ready' when a click would actually be refused."""
+    models = ml_registry.list_models(c)
+    for m in models:
+        fn = ml_training.READINESS_FUNCS.get(m["model_key"])
+        m["readiness"] = fn(c) if fn else None
+    return {"models": models, "scheduler_status": get_scheduler_status(c)}
+
+
+@app.get("/console/ml/models/{model_key}/history", tags=["console"])
+def ml_model_history_endpoint(
+    model_key: str, limit: int = Query(20, ge=1, le=100),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+    _pg: dict = Depends(needs_page("system")),
+):
+    """Every training run recorded for this model (active, superseded,
+    rolled_back, and failed attempts) -- the audit trail behind the
+    dashboard card's single "active" row."""
+    if model_key not in ml_registry.MODEL_KEYS:
+        raise NotFoundError(f"unknown model_key '{model_key}'")
+    return {"model_key": model_key, "history": ml_registry.training_history(c, model_key, limit=limit)}
+
+
+@app.post("/console/ml/models/{model_key}/train", tags=["console"])
+def ml_model_train_endpoint(
+    model_key: str, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")), _pg: dict = Depends(needs_page("system")),
+):
+    """Manual 'train now' -- retrains under the model's CURRENT mode (never
+    changes mode; see .../mode for promotion). Same train_one() the daily
+    scheduler calls, so a manual trigger and the background cycle are never
+    two different code paths."""
+    if model_key not in ml_registry.MODEL_KEYS:
+        raise NotFoundError(f"unknown model_key '{model_key}'")
+    return ml_training.train_one(c, model_key, triggered_by=p["sub"])
+
+
+@app.post("/console/ml/models/{model_key}/promote", tags=["console"])
+def ml_model_promote_endpoint(
+    model_key: str, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")), _pg: dict = Depends(needs_page("system")),
+):
+    """Manual mode promotion: retrains under the NEXT mode (SIMULATED-
+    >MIXED or MIXED->REAL, never skipped) and only actually moves mode
+    forward if that candidate run passes validation -- see
+    ml_training.promote_mode()/model_registry.activate_training_run(). 403s
+    for a mode_locked model (Prophet/FP-Growth)."""
+    if model_key not in ml_registry.MODEL_KEYS:
+        raise NotFoundError(f"unknown model_key '{model_key}'")
+    return ml_training.promote_mode(c, model_key, triggered_by=p["sub"])
+
+
+@app.post("/console/ml/cycle", tags=["console"])
+def ml_run_cycle_endpoint(
+    c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("inventory.write")), _pg: dict = Depends(needs_page("system")),
+):
+    """Manual 'run the full daily cycle now' (train every model, then
+    evaluate auto-promotion) -- the exact function the background scheduler
+    calls on its own tick, exposed for verification without waiting for the
+    next scheduled run."""
+    return run_scheduled_cycle(c, triggered_by=p["sub"])
+
+
+@app.get("/console/ml/combo-recommendations", tags=["console"])
+def ml_combo_recommendations_endpoint(
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+    _pg: dict = Depends(needs_page("system")),
+):
+    """The currently-ACTIVE, already-trained FP-Growth artifact's
+    recommendations (served_from: 'artifact') -- distinct from
+    /console/combos/combinations, which always mines fresh on every call.
+    See associations.active_combo_recommendations()."""
+    return active_combo_recommendations(c)
 
 
 # ===========================================================================
