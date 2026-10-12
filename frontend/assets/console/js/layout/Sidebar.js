@@ -152,6 +152,7 @@ export function Sidebar({ activeId, onNavigate }) {
     class: 'sidebar-photo',
     style: { backgroundImage: "url('/img/landing-hero.jpg')" },
   }, h('div', { class: 'sidebar-photo-tag' },
+    h('div', { class: 'sidebar-photo-wordmark' }, 'Wings Theory'),
     'GOOD FOOD', h('span', { class: 'sub' }, 'Better days')));
 
   const el = h('aside', { class: 'sidebar' },

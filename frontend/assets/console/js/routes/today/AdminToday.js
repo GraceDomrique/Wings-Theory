@@ -66,6 +66,16 @@ export async function render(ctx) {
 // do less work to keep the overlaid white stats readable against it.
 const STORE_STATUS_PHOTO = "url('/img/POSimg/Ala Carte/12pcs-Wings-Rack.jpg')";
 
+// Simple line-icon paths for the stat tiles below (24x24 viewbox, matches
+// icon()'s stroke treatment) -- distinct per stat so the dark tiles read at
+// a glance without relying on color alone.
+const STAT_ICON = {
+  attention: '<path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>',
+  truck: '<path d="M1 3h15v13H1z"/><path d="M16 8h4l3 3v5h-7V8z"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/>',
+  box: '<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
+  check: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>',
+};
+
 function storeStatusBanner(d, ctx) {
   const s = d.storeStatus;
   const ok = s.operational;
@@ -75,10 +85,26 @@ function storeStatusBanner(d, ctx) {
     h('div', { style: { fontSize: '26px', fontWeight: '700', margin: '8px 0 16px', fontFamily: 'var(--font-display)' } },
       ok ? 'All systems running' : `${s.needAttention} item${s.needAttention === 1 ? '' : 's'} need attention`),
     h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px' } },
-      pillStat(s.needAttention, 'Need Attention', s.needAttention ? 'crit' : 'good', () => ctx.navigate('expiry')),
-      pillStat(s.deliveriesToday, 'Deliveries Today', 'info', () => ctx.navigate('receiving')),
-      pillStat(s.runningLow, 'Running Low', s.runningLow ? 'warn' : 'good', () => ctx.navigate('whattobuy')),
-      pillStat(s.stockHealthy, 'Stock Healthy', 'good', () => ctx.navigate('onhand'))));
+      heroStat(s.needAttention, 'Need Attention', s.needAttention ? 'crit' : 'good', STAT_ICON.attention, () => ctx.navigate('expiry')),
+      heroStat(s.deliveriesToday, 'Deliveries Today', 'info', STAT_ICON.truck, () => ctx.navigate('receiving')),
+      heroStat(s.runningLow, 'Running Low', s.runningLow ? 'warn' : 'good', STAT_ICON.box, () => ctx.navigate('whattobuy')),
+      heroStat(s.stockHealthy, 'Stock Healthy', 'good', STAT_ICON.check, () => ctx.navigate('onhand'))));
+}
+
+// Dark icon-badge tile for storeStatusBanner's row, sitting on the hero
+// photo -- distinct from pillStat() below (an opaque white card used
+// elsewhere on this page, off the photo) since the two need opposite
+// contrast treatments.
+function heroStat(value, label, severity, iconPath, onClick) {
+  return h('div', {
+    class: `stat-tile stat-tile-${severity}`,
+    style: { cursor: onClick ? 'pointer' : 'default' },
+    onClick,
+  },
+    h('span', { class: `kpi-icon kpi-icon-${severity}` }, icon(iconPath, 15)),
+    h('div', {},
+      h('div', { class: 'stat-tile-value' }, count(value)),
+      h('div', { class: 'stat-tile-label' }, label)));
 }
 
 function pillStat(value, label, severity, onClick) {

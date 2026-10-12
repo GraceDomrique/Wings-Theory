@@ -31,6 +31,9 @@ import * as inventoryoverview from './routes/owner/InventoryOverview.js';
 import * as historicalrecords from './routes/owner/HistoricalRecords.js';
 import * as downloads from './routes/owner/Downloads.js';
 import * as unlisummary from './routes/owner/UnliSummary.js';
+import * as stockreplenishment from './routes/owner/StockReplenishment.js';
+import * as costslosses from './routes/owner/CostsLosses.js';
+import * as reportshistory from './routes/owner/ReportsHistory.js';
 
 import * as instructions from './routes/instructions/Instructions.js';
 import * as verify from './routes/verify/Verification.js';
@@ -52,6 +55,7 @@ const routes = {
   forecasts, whattobuy, purchasing,
   salesoverview, orderhistory, bestsellers, reports,
   inventoryoverview, historicalrecords, downloads, unlisummary,
+  stockreplenishment, costslosses, reportshistory,
   instructions, verify, users, audit, settings,
 };
 

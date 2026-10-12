@@ -104,6 +104,14 @@ export const ADMIN_TREE = [
   },
 ];
 
+/**
+ * 2026-10-13 rebuild: Owner's tree is now exactly SEVEN flat top-level
+ * pages — the approved "Business Command Center" IA — with no accordion
+ * groups. Each page composes what used to be several separate sidebar
+ * leaves as internal tabs instead (see each page's own route module).
+ * Account Settings ('settings') is rendered separately at the bottom of
+ * the sidebar, outside this tree, same as before.
+ */
 export const OWNER_TREE = [
   {
     id: 'today',
@@ -111,51 +119,25 @@ export const OWNER_TREE = [
     icon: G('<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>'),
   },
   {
-    id: 'grp-purchasing',
-    label: 'Purchasing',
-    icon: G('<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><circle cx="9" cy="22" r="1"/><circle cx="16" cy="22" r="1"/>'),
-    children: [
-      { id: 'forecasts', label: 'Demand Forecasts' },
-      { id: 'whattobuy', label: 'Purchase Needs' },
-      { id: 'purchasing', label: 'Purchase' },
-    ],
-  },
-  {
-    id: 'grp-business',
-    label: 'Business Performance',
+    id: 'salesoverview',
+    label: 'Sales & Performance',
     icon: G('<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>'),
-    children: [
-      { id: 'salesoverview', label: 'Sales' },
-      { id: 'orderhistory', label: 'Orders' },
-      { id: 'bestsellers', label: 'Best Sellers' },
-    ],
   },
   {
-    id: 'grp-invloss',
-    label: 'Inventory & Losses',
+    id: 'stockreplenishment',
+    label: 'Stock & Replenishment',
     icon: G('<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>'),
-    children: [
-      { id: 'inventoryoverview', label: 'Inventory Overview' },
-      { id: 'expiry', label: 'Expiry' },
-      { id: 'losses', label: 'Losses' },
-      { id: 'unlisummary', label: 'Unlimited Wings Summary' },
-    ],
+    badge: 'stockreplenishment',
   },
   {
-    id: 'grp-reports',
-    label: 'Reports & History',
-    icon: G('<path d="M4 19V5a2 2 0 012-2h9l5 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M9 13h6M9 17h6M9 9h2"/>'),
-    children: [
-      { id: 'reports', label: 'Business Reports' },
-      { id: 'historicalrecords', label: 'Historical Records' },
-      { id: 'downloads', label: 'Downloads' },
-      // 2026-10: owner gained read-only audit.read (see wt/auth.py) so the
-      // accountability record — who changed what, where, and when, across
-      // both roles — isn't admin-only. Same route id/component as Admin's
-      // Audit Trail; this grants no new capability, just a sidebar entry
-      // pointing at a page owner can now actually reach.
-      { id: 'audit', label: 'Audit Trail' },
-    ],
+    id: 'purchasing',
+    label: 'Purchase Orders',
+    icon: G('<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><circle cx="9" cy="22" r="1"/><circle cx="16" cy="22" r="1"/>'),
+  },
+  {
+    id: 'costslosses',
+    label: 'Costs & Losses',
+    icon: G('<circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5a2.5 2.5 0 012.5-1h.5a2 2 0 010 4h-1a2 2 0 000 4h.5a2.5 2.5 0 002.5-1"/>'),
   },
   {
     id: 'instructions',
@@ -163,6 +145,25 @@ export const OWNER_TREE = [
     icon: G('<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>'),
     badge: 'instructions',
   },
+  {
+    id: 'reportshistory',
+    label: 'Reports & History',
+    icon: G('<path d="M4 19V5a2 2 0 012-2h9l5 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M9 13h6M9 17h6M9 9h2"/>'),
+  },
+];
+
+/**
+ * Route ids that must stay reachable for Owner (internal links, deep
+ * links from a composite page's "View all"/drawer, etc.) but are no
+ * longer their own sidebar entries — their content now lives inside one
+ * of the seven pages above, either merged as a tab or linked to directly.
+ * Kept out of OWNER_TREE (so Sidebar.js never renders them) but still
+ * valid for AppShell's per-navigation role guard — see routeRoles() below.
+ */
+const OWNER_EXTRA_ROUTE_IDS = [
+  'forecasts', 'whattobuy', 'orderhistory', 'bestsellers',
+  'inventoryoverview', 'expiry', 'losses', 'unlisummary',
+  'reports', 'historicalrecords', 'downloads', 'audit',
 ];
 
 export function treeForRole(role) {
@@ -178,15 +179,17 @@ function leafIds(tree) {
  * direct hash visit (typed URL, bookmark, reload) that bypasses the
  * sidebar entirely. A route reachable from only one role's tree (e.g.
  * 'onhand', admin-only) is guarded accordingly; one present in both (e.g.
- * 'expiry') is open to both. */
+ * 'expiry') is open to both. Owner additionally reaches OWNER_EXTRA_ROUTE_IDS
+ * — pages folded into one of the seven primary pages but still valid
+ * navigation targets, not shown in the sidebar. */
 export function routeRoles(id) {
   const roles = [];
   if (leafIds(ADMIN_TREE).includes(id)) roles.push('admin');
-  if (leafIds(OWNER_TREE).includes(id)) roles.push('owner');
+  if (leafIds(OWNER_TREE).includes(id) || OWNER_EXTRA_ROUTE_IDS.includes(id)) roles.push('owner');
   return roles;
 }
 
-export const ROUTE_IDS = [...new Set([...leafIds(ADMIN_TREE), ...leafIds(OWNER_TREE)])];
+export const ROUTE_IDS = [...new Set([...leafIds(ADMIN_TREE), ...leafIds(OWNER_TREE), ...OWNER_EXTRA_ROUTE_IDS])];
 
 /** {groupLabel, leafLabel} for the breadcrumb and topbar title, resolved
  * against the CURRENT role's tree (the same id can carry a different label
@@ -195,6 +198,18 @@ export const ROUTE_IDS = [...new Set([...leafIds(ADMIN_TREE), ...leafIds(OWNER_T
 export function breadcrumbFor(role, id) {
   const tree = treeForRole(role);
   for (const node of tree) {
+    if (node.id === id) return { groupLabel: null, leafLabel: node.label };
+    if (node.children) {
+      const child = node.children.find((c) => c.id === id);
+      if (child) return { groupLabel: node.label, leafLabel: child.label };
+    }
+  }
+  // Not a leaf of this role's own tree (one of OWNER_EXTRA_ROUTE_IDS, folded
+  // into a composite page but still a valid navigation target) — fall back
+  // to the other role's tree so the topbar still shows a real label instead
+  // of the bare route id.
+  const other = treeForRole(role === 'owner' ? 'admin' : 'owner');
+  for (const node of other) {
     if (node.id === id) return { groupLabel: null, leafLabel: node.label };
     if (node.children) {
       const child = node.children.find((c) => c.id === id);
@@ -228,6 +243,9 @@ export const PAGE_SUB = {
   reports: 'Inventory value, at a glance.',
   historicalrecords: 'A jumping-off point into every historical record the business keeps.',
   downloads: 'Printable and exportable records.',
+  stockreplenishment: 'Inventory visibility and purchase recommendations — what to buy, what is expiring, and why.',
+  costslosses: 'Inventory value, recorded losses, unusual consumption, and unlimited-wings reconciliation — all read-only.',
+  reportshistory: 'Historical business records, year over year, with downloadable reports.',
   instructions: 'Operational tasks from Owner to Admin, tracked from open to complete.',
   verify: 'Setup numbers that still need a real, confirmed value.',
   users: 'Who has access, and what they can do.',

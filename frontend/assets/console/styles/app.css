@@ -76,10 +76,10 @@ body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
    would sit wherever the nav tree's natural height left them rather than
    anchored together at the bottom (only .sidebar-foot had margin-top:auto). */
 .nav-tree{display:flex; flex-direction:column; flex:1; overflow-y:auto; min-height:0;}
-.nav-group{margin-bottom:2px;}
+.nav-group{margin-bottom:4px;}
 .nav-item{
-  display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:8px; color:#D8D1C2;
-  font-size:13px; font-weight:500; cursor:pointer; margin-bottom:2px; border:none; background:transparent; width:100%; text-align:left;
+  display:flex; align-items:center; gap:10px; padding:10px 10px; border-radius:8px; color:#D8D1C2;
+  font-size:13px; font-weight:500; cursor:pointer; margin-bottom:3px; border:none; background:transparent; width:100%; text-align:left;
 }
 .nav-item svg{width:16px; height:16px; flex-shrink:0; opacity:.85;}
 .nav-item:hover{background:rgba(255,255,255,0.06); color:#fff;}
@@ -92,7 +92,7 @@ body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
    page of its own; only its children (indented .nav-item buttons below it)
    are real routes. */
 .nav-group-toggle{
-  display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:8px; color:#D8D1C2;
+  display:flex; align-items:center; gap:10px; padding:10px 10px; border-radius:8px; color:#D8D1C2;
   font-size:12.5px; font-weight:600; letter-spacing:.2px; cursor:pointer; border:none; background:transparent;
   width:100%; text-align:left;
 }
@@ -126,6 +126,11 @@ body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
   letter-spacing:.3px; color:#fff; text-shadow:0 1px 4px rgba(0,0,0,0.6);
 }
 .sidebar-photo-tag .sub{display:block; font-family:var(--font-body); font-weight:500; font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:#D8D1C2; margin-top:3px;}
+/* Script-style wordmark above the GOOD FOOD caption (reference mockup) --
+   italic Fraunces stands in for a cursive face since the console only ever
+   self-hosts Fraunces/Inter/JetBrains Mono (LAN deployment, no remote font
+   fetches), rather than pulling in a dedicated script font for one line. */
+.sidebar-photo-wordmark{font-style:italic; font-size:19px; font-weight:600; margin-bottom:4px; letter-spacing:.2px;}
 body.nav-collapsed .sidebar-photo{display:none;}
 
 /* --role-accent-tint* lives on body, so this renders correctly wherever the
@@ -318,6 +323,20 @@ body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:
    number/label render white-on-white and vanish (2026-10 contrast bug). */
 .photo-hero .card{color:var(--ink);}
 .photo-hero .card .t-xs.t-faint{color:var(--ink-faint);}
+
+/* Dark icon-badge stat tile (storeStatusBanner, AdminToday.js) -- sits on
+   the hero photo like pillStat's white card above, but translucent-dark +
+   white text instead, with a colored kpi-icon badge standing in for the
+   left color rail so each tile reads at a glance without relying on a
+   border color alone. */
+.stat-tile{
+  display:flex; align-items:center; gap:10px;
+  padding:10px 12px; border-radius:10px;
+  background:rgba(20,18,14,0.55); border:1px solid rgba(255,255,255,0.1);
+  backdrop-filter:blur(2px);
+}
+.stat-tile-value{font-size:19px; font-weight:700; color:#fff; line-height:1.2;}
+.stat-tile-label{font-size:11px; color:#D8D1C2;}
 .card-sunk{background:var(--surface-sunk); box-shadow:none;}
 .card-flush{padding:0; overflow:hidden;}
 .card-actions{display:flex; gap:8px; flex-shrink:0;}

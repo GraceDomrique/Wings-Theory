@@ -20,7 +20,7 @@ from typing import Any, Literal
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -41,6 +41,7 @@ from .combo_pricing import (
     review_draft_combo, set_combo_pricing_config, suggest_price_range,
 )
 from . import combos as combos_mod
+from .reports_export import generate_expiry_report, generate_purchasing_report
 from .errors import (
     AuthenticationError,
     NotFoundError,
@@ -2335,6 +2336,74 @@ def ingredient_reconciliation(
     does the same expected-vs-actual comparison for unlimited-refill
     streams specifically."""
     return ingredient_reconciliation_report(c, days)
+
+
+@app.get("/console/reports/purchasing-list", tags=["console"])
+def purchasing_list_report(
+    scope: Literal["needs_purchasing", "urgent_only", "selected", "all"] = Query(
+        "needs_purchasing", description="which rows to include"),
+    ingredient_ids: str | None = Query(
+        None, description="comma-separated ingredient ids, used when scope=selected"),
+    group_by_supplier: bool = Query(True, description="PDF only — group the table by supplier"),
+    format: Literal["pdf", "csv", "xlsx"] = Query("pdf"),
+    include_costs: bool = Query(True, description="include estimated unit/purchase cost columns"),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Server-generated purchasing-recommendation report for Owner's Stock &
+    Replenishment page -- PDF/CSV/XLSX, built from the same
+    ingredient_forecast() call /console/forecasts/ingredients makes for the
+    Needs Purchasing tab, so this report can never recommend something
+    different from what that tab already shows. Generated fresh from the
+    database on every request; the client supplies only the scope/format
+    selection, never row data -- see wt/reports_export.py."""
+    ids: list[int] | None = None
+    if ingredient_ids:
+        try:
+            ids = [int(x) for x in ingredient_ids.split(",") if x.strip() != ""]
+        except ValueError:
+            raise ValidationError("ingredient_ids must be a comma-separated list of integers")
+    content, filename, content_type = generate_purchasing_report(
+        c, scope=scope, ingredient_ids=ids, group_by_supplier=group_by_supplier,
+        fmt=format, include_costs=include_costs,
+    )
+    return Response(content=content, media_type=content_type,
+                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/console/reports/expiry", tags=["console"])
+def expiry_report(
+    filter: Literal["expired_only", "within_3", "within_7", "within_14", "within_30", "custom"] = Query(
+        "within_7"),
+    date_from: str | None = Query(None, description="Manila ISO date, inclusive — used when filter=custom"),
+    date_to: str | None = Query(None, description="Manila ISO date, inclusive — used when filter=custom"),
+    include_missing_expiry: bool = Query(False, description="also include batches with no recorded expiry"),
+    format: Literal["pdf", "csv", "xlsx"] = Query("pdf"),
+    c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
+):
+    """Server-generated expiry report -- PDF/CSV/XLSX, built from the same
+    open-FEFO-batch query and annotate_batch_expiry() calculation GET
+    /console/expiry runs for the Expiring Soon tab, so this report can
+    never disagree with it. Generated fresh from the database on every
+    request -- see wt/reports_export.py."""
+    if filter == "custom":
+        if date_from:
+            try:
+                _date.fromisoformat(date_from)
+            except ValueError:
+                raise ValidationError("date_from must be an ISO date (YYYY-MM-DD)")
+        if date_to:
+            try:
+                _date.fromisoformat(date_to)
+            except ValueError:
+                raise ValidationError("date_to must be an ISO date (YYYY-MM-DD)")
+        if date_from and date_to and _date.fromisoformat(date_to) < _date.fromisoformat(date_from):
+            raise ValidationError("date_to cannot be before date_from")
+    content, filename, content_type = generate_expiry_report(
+        c, filter=filter, date_from=date_from, date_to=date_to,
+        include_missing_expiry=include_missing_expiry, fmt=format,
+    )
+    return Response(content=content, media_type=content_type,
+                     headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.get("/console/reports/sales", tags=["console"])

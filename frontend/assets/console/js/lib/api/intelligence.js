@@ -95,6 +95,10 @@ export async function getReplenishment() {
     rows: (out.ingredients || []).map((d) => ({
       ingredientId: d.ingredientId,
       name: d.name,
+      // Real passthrough -- wt/depletion.py's ingredient_forecast() row
+      // always carries this; just not previously surfaced here. null when
+      // the ingredient genuinely has no category recorded, never guessed.
+      category: d.category || null,
       onHand: d.available ?? null,
       baseUnit: d.baseUnit,
       usedPerDay: d.forecastDailyConsumption > 0 ? d.forecastDailyConsumption : null,

@@ -66,6 +66,12 @@ export async function render(ctx) {
     drawHistory();
   }
 
+  // Spec section 10 names four explicit sections (Draft / In Progress /
+  // Completed / Cancelled) plus Purchase History. "Currently processing"
+  // already covers Draft+In Progress in one actionable rail; this just adds
+  // visible status subheadings within it rather than one undifferentiated
+  // list, so an owner scanning the page can tell drafts (theirs to act on)
+  // apart from orders already placed (Admin's to receive).
   function drawActive() {
     const pos = activeOrders();
     activeCountEl.textContent = `(${pos.length})`;
@@ -74,12 +80,21 @@ export async function render(ctx) {
         icon: '≡',
         title: 'Nothing currently being processed',
         description: isOwner
-          ? 'Draft one from What to Buy to get started.'
+          ? 'Draft one from Stock & Replenishment to get started.'
           : 'None have been drafted by the Owner yet.',
       }));
       return;
     }
-    mount(activeHost, ...pos.map(poCard));
+    const drafts = pos.filter((po) => po.status === 'draft');
+    const inProgress = pos.filter((po) => po.status === 'ordered' || po.status === 'partially_received');
+    const sections = [
+      ['Draft', drafts],
+      ['In Progress', inProgress],
+    ].filter(([, list]) => list.length > 0);
+    mount(activeHost, ...sections.flatMap(([label, list]) => [
+      h('div', { class: 'eyebrow', style: { margin: '4px 0 8px' } }, `${label} (${list.length})`),
+      ...list.map(poCard),
+    ]));
   }
 
   function poCard(po) {
@@ -202,7 +217,7 @@ export async function render(ctx) {
   const supplierInput = h('input', { type: 'text', placeholder: 'Filter by supplier…', onInput: (e) => { supplierQuery = e.target.value; drawHistory(); } });
   const statusPicker = h('select', { onChange: (e) => { statusFilter = e.target.value; drawHistory(); } },
     h('option', { value: '' }, 'All'),
-    h('option', { value: 'received' }, 'Received'),
+    h('option', { value: 'received' }, 'Completed'),
     h('option', { value: 'cancelled' }, 'Cancelled'));
   const fromInput = h('input', { type: 'date', onChange: (e) => { fromDate = e.target.value; drawHistory(); } });
   const toInput = h('input', { type: 'date', onChange: (e) => { toDate = e.target.value; drawHistory(); } });

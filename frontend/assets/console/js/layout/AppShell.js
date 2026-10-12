@@ -141,6 +141,18 @@ export function AppShell({ routes, onSignOut }) {
       const open = await listInstructions('open');
       sidebar.setBadge('instructions', open.count);
     } catch { /* a badge is not worth surfacing an error for */ }
+    // Owner's Stock & Replenishment badge — count of ingredients currently
+    // recommended for purchase (same needsBuying() rule the page itself
+    // uses: out/critical/at_risk status or below the configured reorder
+    // point). Owner-only: admin doesn't have this page in its nav tree.
+    if ((session.user || {}).role === 'owner') {
+      try {
+        const { getReplenishment } = await import('../lib/api/intelligence.js');
+        const { rows } = await getReplenishment();
+        const needsBuying = rows.filter((r) => r.status === 'crit' || r.status === 'warn' || r.belowReorderPoint);
+        sidebar.setBadge('stockreplenishment', needsBuying.length);
+      } catch { /* a badge is not worth surfacing an error for */ }
+    }
   }
 
   window.addEventListener('hashchange', draw);

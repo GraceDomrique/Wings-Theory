@@ -32,8 +32,17 @@ mlxtend>=0.23,<1
 pandas>=2.0,<3
 
 # wt/xlsx_history_import.py reads the owner's .xlsx workbooks directly
-# (pandas alone needs an engine for .xlsx; this is that engine).
+# (pandas alone needs an engine for .xlsx; this is that engine). Also used,
+# write-side this time, by wt/reports_export.py for the Owner's downloadable
+# .xlsx purchasing-list/expiry reports.
 openpyxl>=3.1,<4
+
+# wt/reports_export.py — server-generated, paginated PDF reports (the
+# purchasing-recommendation and expiry reports on Owner's Stock &
+# Replenishment page). Pure-Python, no system dependency (unlike e.g.
+# WeasyPrint's Cairo/Pango requirement), which matters on the same bare
+# Windows mini-PC noted above for prophet/passlib.
+reportlab>=4.0,<5
 
 # wt/combos.py's menu-item image upload: decodes an uploaded combo/menu-item
 # image, verifies the bytes actually are a JPEG/PNG/WEBP (not just named
