@@ -1,11 +1,12 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
-import { Stat } from '../../components/ui/Stat.js';
+import { StatTile } from '../../components/ui/StatTile.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading } from '../../components/ui/Feedback.js';
 import { LineChart } from '../../components/charts/LineChart.js';
+import { DoughnutChart } from '../../components/charts/DoughnutChart.js';
 import { palette, destroyAllCharts } from '../../components/charts/base.js';
 import { money, count, stamp } from '../../lib/format.js';
 import { getOwnerSales } from '../../lib/api/sales.js';
@@ -94,8 +95,21 @@ function pulseSeverity(label) {
   return 'flat';
 }
 
+const ICON = {
+  revenue: '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+  orders: '<path d="M4 19V5a2 2 0 012-2h9l5 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M9 13h6M9 17h6M9 9h2"/>',
+  items: '<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
+  avg: '<circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5a2.5 2.5 0 012.5-1h.5a2 2 0 010 4h-1a2 2 0 000 4h.5a2.5 2.5 0 002.5-1"/>',
+};
+
 function content(d, ctx) {
+  const s = d.howAreSalesDoing;
   return h('div', {},
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', marginBottom: '14px' } },
+      StatTile({ iconPath: ICON.revenue, severity: 'good', value: money(s.revenue, '₱0'), label: 'Total Revenue', sub: deltaPill(s.deltas.revenue_pct) }),
+      StatTile({ iconPath: ICON.orders, severity: 'info', value: count(s.orders), label: 'Orders', sub: deltaPill(s.deltas.orders_pct) }),
+      StatTile({ iconPath: ICON.items, severity: 'flat', value: count(s.items), label: 'Items Sold' }),
+      StatTile({ iconPath: ICON.avg, severity: 'flat', value: s.avgOrder === null ? null : money(s.avgOrder), label: 'Average Order Value' })),
     howAreSalesDoingCard(d),
     h('div', { style: { margin: '14px 0' } }, mainChartCard(d)),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px' } },
@@ -124,13 +138,7 @@ function howAreSalesDoingCard(d) {
       title: 'How Are Sales Doing?', desc: `${d.period.label} ${d.comparison.label}`,
       right: h('div', { style: { display: 'flex', gap: '6px' } }, ...d.salesPulse.map((p) => Pill(pulseSeverity(p), p))),
     }),
-    h('div', { style: { fontSize: '30px', fontWeight: '700', margin: '4px 0 2px' } }, money(s.revenue, '₱0')),
-    h('div', { style: { marginBottom: '10px' } }, deltaPill(s.deltas.revenue_pct)),
-    h('p', { class: 't-xs t-faint', style: { marginBottom: '14px' } }, s.interpretation),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: '14px' } },
-      Stat({ value: count(s.orders), label: 'Orders' }),
-      Stat({ value: count(s.items), label: 'Items Sold' }),
-      Stat({ value: s.avgOrder === null ? null : money(s.avgOrder), label: 'Average Order' })));
+    h('p', { class: 't-sm t-soft' }, s.interpretation));
 }
 
 function mainChartCard(d) {
@@ -200,7 +208,10 @@ function customerFavoritesCard(d) {
 function categoryPerformanceCard(d) {
   const rows = d.categoryPerformance || [];
   return Card({},
-    CardHeader({ title: 'Category Performance' }),
+    CardHeader({ title: 'Sales by Category' }),
+    rows.length > 0
+      ? DoughnutChart({ labels: rows.map((c) => c.category), data: rows.map((c) => c.sharePct), height: 160 })
+      : null,
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'No sales recorded this period yet', tight: true })
       : rows.map((c) => h('div', { style: { marginBottom: '10px' } },

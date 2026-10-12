@@ -1,6 +1,7 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
+import { StatTile } from '../../components/ui/StatTile.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Table } from '../../components/ui/Table.js';
@@ -54,6 +55,13 @@ import { session } from '../../lib/api/client.js';
 const CURRENT_YEAR = new Date().getFullYear();
 const YEARS = [CURRENT_YEAR, CURRENT_YEAR - 1];
 const LOSS_WINDOWS = [30, 90, 365];
+
+const ICON = {
+  revenue: '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+  orders: '<path d="M4 19V5a2 2 0 012-2h9l5 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M9 13h6M9 17h6M9 9h2"/>',
+  items: '<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
+  avg: '<circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5a2.5 2.5 0 012.5-1h.5a2 2 0 010 4h-1a2 2 0 000 4h.5a2.5 2.5 0 002.5-1"/>',
+};
 
 const TABS = [
   { id: 'sales', label: 'Historical Sales' },
@@ -209,13 +217,11 @@ async function salesTab() {
 
   function statsCard(d) {
     const s = d.howAreSalesDoing;
-    return Card({},
-      CardHeader({ title: d.period.label, desc: d.comparison.label }),
-      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '14px' } },
-        Stat({ value: money(s.revenue), label: 'Revenue' }),
-        Stat({ value: count(s.orders), label: 'Orders' }),
-        Stat({ value: count(s.items), label: 'Items Sold' }),
-        Stat({ value: s.avgOrder === null ? null : money(s.avgOrder), label: 'Average Order' })));
+    return h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '14px', marginBottom: '14px' } },
+      StatTile({ iconPath: ICON.revenue, severity: 'good', value: money(s.revenue), label: `Total Revenue ${d.period.label}` }),
+      StatTile({ iconPath: ICON.orders, severity: 'info', value: count(s.orders), label: 'Total Orders' }),
+      StatTile({ iconPath: ICON.items, severity: 'flat', value: count(s.items), label: 'Items Sold' }),
+      StatTile({ iconPath: ICON.avg, severity: 'flat', value: s.avgOrder === null ? null : money(s.avgOrder), label: 'Average Order Value' }));
   }
 
   function monthlyCard(months, monthRow) {

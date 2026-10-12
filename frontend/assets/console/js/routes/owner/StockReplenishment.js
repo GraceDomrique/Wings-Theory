@@ -1,6 +1,6 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card } from '../../components/ui/Card.js';
-import { Stat } from '../../components/ui/Stat.js';
+import { StatTile } from '../../components/ui/StatTile.js';
 import { Button } from '../../components/ui/Button.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Table } from '../../components/ui/Table.js';
@@ -39,6 +39,13 @@ import { session } from '../../lib/api/client.js';
  */
 const NO_SUPPLIER = 'No supplier assigned';
 const needsBuying = (r) => r.status === 'crit' || r.status === 'warn' || r.belowReorderPoint;
+
+const ICON = {
+  needsPurchase: '<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  runningLow: '<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
+  expiring: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
+  incoming: '<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><circle cx="9" cy="22" r="1"/><circle cx="16" cy="22" r="1"/>',
+};
 
 export async function render(ctx) {
   const isOwner = (session.user || {}).role === 'owner';
@@ -613,14 +620,26 @@ export async function render(ctx) {
   draw();
 
   return h('div', {},
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: '14px' } },
-      Card({}, Stat({ value: count(criticalCount), label: 'Ingredients needing purchase' })),
-      Card({}, Stat({ value: count(runningLowCount), label: 'Running low' })),
-      Card({}, Stat({ value: count(expiringSoonCount), label: 'Expiring soon' })),
-      Card({}, Stat({ value: count(incomingItemCount), label: 'Incoming purchase order items' }))),
-    h('div', { style: { display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' } },
+    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' } },
       Button({ variant: 'primary', onClick: openPurchasingReportModal }, 'Generate Purchasing List'),
       Button({ variant: 'default', onClick: openExpiryReportModal }, 'Generate Expiry Report')),
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: '14px' } },
+      StatTile({
+        iconPath: ICON.needsPurchase, severity: criticalCount > 0 ? 'crit' : 'good',
+        value: count(criticalCount), label: 'Need Purchasing',
+      }),
+      StatTile({
+        iconPath: ICON.runningLow, severity: runningLowCount > 0 ? 'warn' : 'good',
+        value: count(runningLowCount), label: 'Running Low',
+      }),
+      StatTile({
+        iconPath: ICON.expiring, severity: expiringSoonCount > 0 ? 'warn' : 'good',
+        value: count(expiringSoonCount), label: 'Expiring Soon',
+      }),
+      StatTile({
+        iconPath: ICON.incoming, severity: 'info',
+        value: count(incomingItemCount), label: 'Incoming Orders',
+      })),
     h('div', { style: { marginBottom: '12px' } }, tabbar),
     body);
 }

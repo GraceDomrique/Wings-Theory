@@ -266,5 +266,19 @@ export async function getAdminToday() {
  */
 export async function getOwnerOverview() {
   const raw = await api.get('/console/dashboard/owner-overview');
-  return raw;
+  return {
+    ...raw,
+    // `trend` is business_overview()'s own snake_case compare-block,
+    // passed through unmapped by the backend (see owner_overview()'s
+    // docstring) — same reshaping getBusinessOverview() already does above,
+    // kept local here rather than sharing periodBlock() since this is the
+    // only other caller.
+    trend: raw.trend
+      ? {
+        weeks: (raw.trend.weeks || []).map((w) => ({ weekStart: w.week_start, revenue: w.revenue })),
+        averageRevenue: raw.trend.average_revenue,
+        belowAverageStreak: raw.trend.below_average_streak,
+      }
+      : null,
+  };
 }

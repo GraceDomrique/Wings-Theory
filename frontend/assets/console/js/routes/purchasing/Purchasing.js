@@ -1,17 +1,21 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader, CardTitle } from '../../components/ui/Card.js';
+import { StatTile } from '../../components/ui/StatTile.js';
 import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
-import { stamp, asText } from '../../lib/format.js';
+import { stamp, asText, count } from '../../lib/format.js';
 import { listPurchaseOrders, markOrdered, cancelPurchaseOrder, receiveLine } from '../../lib/api/purchaseOrders.js';
 import { session } from '../../lib/api/client.js';
 
 const ACTIVE_STATUSES = ['draft', 'ordered', 'partially_received'];
 const DONE_STATUSES = ['received', 'cancelled'];
+const ICON = {
+  cart: '<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><circle cx="9" cy="22" r="1"/><circle cx="16" cy="22" r="1"/>',
+};
 
 function statusLabel(status) {
   switch (status) {
@@ -233,7 +237,23 @@ export async function render(ctx) {
   drawActive();
   drawHistory();
 
-  return h('div', { class: 'purchasing-layout' },
+  const draftCount = all.filter((po) => po.status === 'draft').length;
+  const inProgressCount = all.filter((po) => po.status === 'ordered' || po.status === 'partially_received').length;
+  const completedCount = all.filter((po) => po.status === 'received').length;
+  const cancelledCount = all.filter((po) => po.status === 'cancelled').length;
+
+  return h('div', {},
+    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' } },
+      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', flex: '1' } },
+        StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(draftCount), label: 'Draft' }),
+        StatTile({ iconPath: ICON.cart, severity: inProgressCount > 0 ? 'warn' : 'good', value: count(inProgressCount), label: 'In Progress' }),
+        StatTile({ iconPath: ICON.cart, severity: 'good', value: count(completedCount), label: 'Completed' }),
+        StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(cancelledCount), label: 'Cancelled' })),
+      isOwner ? Button({ variant: 'primary', onClick: () => ctx.navigate('stockreplenishment'), style: { flexShrink: 0 } }, '+ Create Purchase Order') : null),
+    purchasingLayout());
+
+  function purchasingLayout() {
+    return h('div', { class: 'purchasing-layout' },
     Card({ className: 'purchasing-active' },
       CardHeader({ title: CardTitle(h('span', {}, 'Currently processing ', activeCountEl)), desc: 'Nothing here affects stock until a line is received.' }),
       activeHost),
@@ -246,4 +266,5 @@ export async function render(ctx) {
         h('label', { class: 'field' }, 'To', toInput),
         clearBtn),
       historyHost));
+  }
 }

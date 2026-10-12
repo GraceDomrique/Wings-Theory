@@ -1,24 +1,44 @@
-import { h } from '../../lib/dom.js';
+import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
+import { StatTile } from '../../components/ui/StatTile.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { BarChart } from '../../components/charts/BarChart.js';
+import { LineChart } from '../../components/charts/LineChart.js';
 import { palette } from '../../components/charts/base.js';
-import { money, count, stamp, ageFromNow } from '../../lib/format.js';
+import {
+  money, count, stamp, ageFromNow,
+} from '../../lib/format.js';
 import { getOwnerOverview } from '../../lib/api/dashboard.js';
 import { openOrderDetail } from '../reports/orderDetailModal.js';
 
 /**
- * Owner Overview — the reference-design business-at-a-glance landing screen
- * (2026-10). One aggregation call (getOwnerOverview -> GET /console/
- * dashboard/owner-overview, wt/dashboard_overview.owner_overview()) built
- * on the existing business_overview() period math, GET /dashboard/summary's
- * own alert list, the existing FP-Growth product_combinations(), and the
- * forward-depletion forecast — see that module's docstring for the full
- * composition. Nothing here fits its own model or invents a figure.
+ * Owner Overview — reference-mockup landing screen (2026-10 relayout):
+ * attention banner -> 4 headline stat tiles -> 2-col (sales trend / Owner
+ * Decisions) -> 3-col (Inventory Outlook / Next 7 Days / Recent Activity)
+ * -> full Recent Orders table. Everything the earlier version of this page
+ * showed (Customer Pulse, Top Categories, Business Rhythm, Sales->Stock,
+ * Messages) still renders, just folded into a second section below the
+ * mockup's own sections rather than removed, per "preserve existing
+ * functionality" — the mockup doesn't show them, it doesn't say to delete
+ * them either.
+ *
+ * One aggregation call (getOwnerOverview -> GET /console/dashboard/
+ * owner-overview, wt/dashboard_overview.owner_overview()). Nothing here
+ * fits its own model or invents a figure — a mockup widget needing data
+ * the backend doesn't expose (e.g. a unified order+PO activity log) renders
+ * from the closest real data this payload actually carries, never a
+ * fabricated stand-in.
  */
+
+const ICON = {
+  revenue: '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+  orders: '<path d="M4 19V5a2 2 0 012-2h9l5 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M9 13h6M9 17h6M9 9h2"/>',
+  stock: '<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+};
+
 export async function render(ctx) {
   const d = await getOwnerOverview();
   const stale = d.dataStaleHours !== null && d.dataStaleHours > 24
@@ -29,19 +49,50 @@ export async function render(ctx) {
       Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('salesoverview'), style: { flexShrink: 0 } }, 'Look at a longer period →'))
     : null;
 
+  const bannerHost = h('div');
+  const drawBanner = (expanded) => mount(bannerHost, attentionBanner(d, ctx, expanded, drawBanner));
+  drawBanner(false);
+
   return h('div', { class: 'owner-overview' },
     stale,
+    bannerHost,
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', margin: '14px 0' } },
+      StatTile({
+        iconPath: ICON.revenue, severity: 'good', label: "Today's Revenue",
+        value: d.todayRevenue ? money(d.todayRevenue.revenue, '₱0') : null,
+        sub: d.todayRevenue ? deltaLine(d.todayRevenue.deltaPct, 'vs yesterday') : null,
+      }),
+      StatTile({
+        iconPath: ICON.revenue, severity: 'info', label: "This Month's Revenue",
+        value: d.monthRevenue ? money(d.monthRevenue.revenue, '₱0') : null,
+        sub: d.monthRevenue ? deltaLine(d.monthRevenue.deltaPct, 'vs last month') : null,
+      }),
+      StatTile({
+        iconPath: ICON.orders, severity: 'flat', label: 'Orders Today',
+        value: d.todayRevenue ? count(d.todayRevenue.orders) : null,
+        sub: d.todayRevenue ? deltaLine(d.todayRevenue.ordersDeltaPct, 'vs yesterday') : null,
+      }),
+      StatTile({
+        iconPath: ICON.stock, severity: (d.stockAtRisk.needRestock || 0) > 0 ? 'crit' : 'good', label: 'Stock at Risk',
+        value: count((d.stockAtRisk.needRestock || 0) + (d.stockAtRisk.expiringSoon || 0)),
+        sub: h('span', { class: 't-xs t-faint' }, `${d.stockAtRisk.needRestock || 0} urgent · ${d.stockAtRisk.expiringSoon || 0} low`),
+      })),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '14px' } },
-      businessPulseCard(d, ctx),
-      needsAttentionCard(d, ctx)),
+      salesTrendCard(d, ctx),
+      ownerDecisionsCard(d, ctx)),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
+      inventoryOutlookCard(d, ctx),
       comingUpCard(d),
-      salesToStockCard(d, ctx),
-      customerPulseCard(d)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
-      topCategoriesCard(d),
-      businessRhythmCard(d)),
+      recentActivityCard(d)),
     h('div', { style: { marginTop: '14px' } }, recentOrdersCard(d, ctx)),
+
+    // Everything the prior layout showed that the mockup doesn't call out
+    // by name — preserved, not deleted.
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
+      salesToStockCard(d, ctx),
+      customerPulseCard(d),
+      topCategoriesCard(d)),
+    h('div', { style: { marginTop: '14px' } }, businessRhythmCard(d)),
     h('div', { style: { marginTop: '14px' } }, messagesCard(d, ctx)));
 }
 
@@ -52,60 +103,158 @@ function deltaPill(value) {
   return Pill('flat', '≈ flat');
 }
 
+function deltaLine(value, against) {
+  return h('span', {}, deltaPill(value), h('span', { class: 't-xs t-faint' }, ` ${against}`));
+}
+
 function statusSeverity(status) {
   if (status === 'Doing Well') return 'good';
   if (status === 'Worth Watching') return 'warn';
   return 'flat';
 }
 
-// Different shot from the sidebar's (landing-hero.jpg) and Admin's own hero
-// (the dark studio rack shot) so Owner/Admin and sidebar/hero don't all
-// repeat the same single photo across the shell.
-const BUSINESS_PULSE_PHOTO = "url('/img/POSimg/Unlimited/Wings-Platter-36pcs-6flavors.jpg')";
+// =============================================================================
+// Attention banner — mockup's "N matters need your attention" strip.
+// =============================================================================
 
-function businessPulseCard(d, ctx) {
-  const p = d.businessPulse;
-  const sev = statusSeverity(p.status);
-  return Card({ className: 'photo-hero', style: { backgroundImage: BUSINESS_PULSE_PHOTO } },
-    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '2px' } },
-      h('div', { class: 't-xs', style: { textTransform: 'uppercase', letterSpacing: '.06em', color: '#D8D1C2', fontWeight: '700' } },
-        `Business Pulse — this week ${p.label || ''}`),
-      Pill(sev, p.status)),
-    h('div', { style: { fontSize: '32px', fontWeight: '700', margin: '6px 0 2px', fontFamily: 'var(--font-display)' } }, money(p.revenue, '₱0')),
-    h('div', { style: { marginBottom: '8px' } }, deltaPill(p.deltas.revenue_pct)),
-    h('p', { class: 't-xs t-faint', style: { marginBottom: '14px', maxWidth: '440px' } }, p.interpretation),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: '14px', maxWidth: '420px' } },
-      Stat({ value: count(p.orders), label: 'Orders' }),
-      Stat({ value: count(p.items), label: 'Items Sold' }),
-      Stat({ value: p.avgOrder === null ? null : money(p.avgOrder), label: 'Average Order' })),
-    Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('salesoverview'), style: { marginTop: '14px' } }, 'View Performance →'));
+function attentionBanner(d, ctx, expanded = false, onToggle = null) {
+  const items = d.needsAttention || [];
+  if (items.length === 0) {
+    return h('div', { class: 'callout callout-info' },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
+        Pill('good', '✓'), h('strong', {}, 'Nothing needs your attention right now.')));
+  }
+  const shown = expanded ? items : items.slice(0, 2);
+  return h('div', { class: 'callout callout-warn' },
+    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', marginBottom: '8px' } },
+      h('strong', {}, `${items.length} matter${items.length === 1 ? '' : 's'} need${items.length === 1 ? 's' : ''} your attention`),
+      items.length > 2
+        ? Button({ variant: 'ghost', size: 'sm', onClick: () => onToggle && onToggle(!expanded) }, expanded ? 'Show less' : 'View All →')
+        : null),
+    h('div', {}, ...shown.map((a) => h('div', {
+      class: 'mini-row', style: { cursor: a.route ? 'pointer' : 'default', border: 'none', padding: '4px 0' },
+      onClick: a.route ? () => ctx.navigate(a.route) : undefined,
+    },
+    h('span', { class: 't-sm' }, '• ', a.headline),
+    Pill(a.severity, a.kind.replace(/_/g, ' '))))));
 }
 
-function needsAttentionCard(d, ctx) {
-  const items = d.needsAttention || [];
+// =============================================================================
+// Sales trend — 12-week revenue trend (the only pre-aggregated series this
+// payload carries; a true daily "last 7 days" series isn't computed here,
+// so this is labeled for what it actually is rather than mislabeled).
+// =============================================================================
+
+function salesTrendCard(d, ctx) {
+  const p = d.businessPulse;
+  const sev = statusSeverity(p.status);
+  const t = d.trend;
+  return Card({},
+    CardHeader({
+      title: 'Sales Performance', desc: `This week ${p.label || ''}`,
+      right: h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+        Pill(sev, p.status), deltaPill(p.deltas.revenue_pct)),
+    }),
+    t && t.weeks && t.weeks.length > 0
+      ? LineChart({
+        labels: t.weeks.map((w) => w.weekStart.slice(5)),
+        data: t.weeks.map((w) => w.revenue),
+        color: palette.amber, height: 170,
+      })
+      : EmptyState({ icon: '▤', title: 'Not enough history yet', tight: true }),
+    h('p', { class: 't-xs t-faint', style: { margin: '10px 0 0' } }, p.interpretation),
+    Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('salesoverview'), style: { marginTop: '10px' } }, 'View Performance →'));
+}
+
+// =============================================================================
+// Owner Decisions — what's waiting on an Owner action, from the same
+// attention feed plus the counts this payload already carries.
+// =============================================================================
+
+function ownerDecisionsCard(d, ctx) {
+  const rows = [];
+  if ((d.stockAtRisk.needRestock || 0) > 0) {
+    rows.push({ text: `${d.stockAtRisk.needRestock} ingredient${d.stockAtRisk.needRestock === 1 ? '' : 's'} need${d.stockAtRisk.needRestock === 1 ? 's' : ''} purchasing decisions`, route: 'stockreplenishment', sev: 'crit' });
+  }
+  if ((d.stockAtRisk.expiringSoon || 0) > 0) {
+    rows.push({ text: `${d.stockAtRisk.expiringSoon} ingredient${d.stockAtRisk.expiringSoon === 1 ? '' : 's'} expiring soon`, route: 'stockreplenishment', sev: 'warn' });
+  }
+  const openIns = (d.instructionsPreview || {}).openInstructions || 0;
+  if (openIns > 0) {
+    rows.push({ text: `${openIns} instruction${openIns === 1 ? '' : 's'} awaiting acknowledgment`, route: 'instructions', sev: 'warn' });
+  }
+  for (const a of d.needsAttention || []) {
+    if (!rows.some((r) => r.text.includes(a.headline))) rows.push({ text: a.headline, route: a.route, sev: a.severity });
+  }
   return Card({ className: 'card-flex' },
-    CardHeader({ title: 'Needs Your Attention', right: items.length ? Pill('crit', items.length) : Pill('good', 'clear') }),
-    items.length === 0
-      ? EmptyState({ icon: '✓', title: 'Nothing urgent right now', tight: true })
-      : h('div', { class: 'scrollpane' }, ...items.map((a) => h('div', {
-        class: 'mini-row', style: { cursor: a.route ? 'pointer' : 'default' },
-        onClick: a.route ? () => ctx.navigate(a.route) : undefined,
-      },
-      h('span', {}, h('div', {}, a.headline), h('div', { class: 'sub' }, a.detail)),
-      Pill(a.severity, a.kind.replace(/_/g, ' '))))));
+    CardHeader({ title: 'Owner Decisions' }),
+    rows.length === 0
+      ? EmptyState({ icon: '✓', title: 'Nothing waiting on you', tight: true })
+      : h('div', {}, ...rows.slice(0, 5).map((r) => h('div', {
+        class: 'mini-row', style: { cursor: r.route ? 'pointer' : 'default' },
+        onClick: r.route ? () => ctx.navigate(r.route) : undefined,
+      }, h('span', { class: 't-sm' }, r.text), Pill(r.sev, '→')))));
+}
+
+// =============================================================================
+// Inventory Outlook / Next 7 Days / Recent Activity — 3-col row.
+// =============================================================================
+
+function inventoryOutlookCard(d) {
+  return Card({ className: 'card-flex' },
+    CardHeader({ title: 'Inventory Outlook' }),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px' } },
+      Stat({ value: count(d.stockAtRisk.needRestock), label: 'Need Restock' }),
+      Stat({ value: count(d.stockAtRisk.expiringSoon), label: 'Expiring Soon' }),
+      Stat({ value: count((d.needsAttention || []).length), label: 'Priority Risks' })));
 }
 
 function comingUpCard(d) {
   const f = d.comingUp;
   if (!f.available) {
-    return Card({ className: 'card-flex' }, CardHeader({ title: 'Coming Up' }), EmptyState({ icon: '▤', title: 'Not enough history yet', description: f.note, tight: true }));
+    return Card({ className: 'card-flex' }, CardHeader({ title: 'Next 7 Days' }), EmptyState({ icon: '▤', title: 'Not enough history yet', description: f.note, tight: true }));
   }
   const colors = f.days.map((x) => ({ Normal: palette.info, Moderate: palette.warn, High: palette.crit, Busiest: palette.crit }[x.level] || palette.info));
   return Card({ className: 'card-flex' },
-    CardHeader({ title: 'Coming Up', desc: 'Expected business activity, next 7 days' }),
+    CardHeader({ title: 'Next 7 Days', desc: 'Expected business activity' }),
     BarChart({ labels: f.days.map((x) => x.weekday), data: f.days.map((x) => x.qty), colors, height: 100 }),
     f.note ? h('div', { class: 't-xs', style: { marginTop: '8px' } }, f.note) : null);
 }
+
+function recentActivityCard(d) {
+  const rows = (d.recentOrders || []).slice(0, 5);
+  return Card({ className: 'card-flex' },
+    CardHeader({ title: 'Recent Activity' }),
+    rows.length === 0
+      ? EmptyState({ icon: '✓', title: 'No activity recorded this week yet', tight: true })
+      : h('div', { class: 'scrollpane' }, ...rows.map((o) => h('div', {
+        class: 'mini-row', style: { cursor: 'pointer' }, onClick: () => openOrderDetail(o.id),
+      },
+      h('span', {},
+        h('div', {}, `New order ${o.orderNo || `#${o.id}`} ${o.status === 'served' ? 'completed' : o.status}`),
+        h('div', { class: 'sub' }, ageFromNow(o.createdAt))),
+      Pill(o.status === 'served' ? 'good' : o.status === 'void' ? 'crit' : 'info', o.status)))));
+}
+
+function recentOrdersCard(d, ctx) {
+  const rows = d.recentOrders || [];
+  return Card({},
+    CardHeader({ title: 'Recent Orders', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('orderhistory') }, 'View All →') }),
+    rows.length === 0
+      ? EmptyState({ icon: '✓', title: 'No orders recorded this week yet', tight: true })
+      : h('table', {},
+        h('thead', {}, h('tr', {}, h('th', {}, 'Order #'), h('th', {}, 'Time'), h('th', {}, 'Items'), h('th', {}, 'Total'), h('th', {}, 'Status'))),
+        h('tbody', {}, ...rows.map((o) => h('tr', { style: { cursor: 'pointer' }, onClick: () => openOrderDetail(o.id) },
+          h('td', {}, o.orderNo || `#${o.id}`),
+          h('td', {}, stamp(o.createdAt)),
+          h('td', {}, count(o.items)),
+          h('td', {}, money(o.total)),
+          h('td', {}, Pill(o.status === 'served' ? 'good' : o.status === 'void' ? 'crit' : 'info', o.status)))))));
+}
+
+// =============================================================================
+// Preserved from the prior layout — not shown in the mockup, not deleted.
+// =============================================================================
 
 function salesToStockCard(d, ctx) {
   const s = d.salesToStock;
@@ -180,22 +329,6 @@ function businessRhythmCard(d) {
       ...tiles.map((t) => h('div', { class: 'card', style: { padding: '10px 12px' } },
         h('div', { style: { fontWeight: '600', fontSize: '12.5px', marginBottom: '4px' } }, t.title),
         h('div', { class: 't-xs t-faint' }, t.body)))));
-}
-
-function recentOrdersCard(d, ctx) {
-  const rows = d.recentOrders || [];
-  return Card({},
-    CardHeader({ title: 'Recent Orders', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('orderhistory') }, 'View All →') }),
-    rows.length === 0
-      ? EmptyState({ icon: '✓', title: 'No orders recorded this week yet', tight: true })
-      : h('table', {},
-        h('thead', {}, h('tr', {}, h('th', {}, 'Order #'), h('th', {}, 'Time'), h('th', {}, 'Items'), h('th', {}, 'Total'), h('th', {}, 'Status'))),
-        h('tbody', {}, ...rows.map((o) => h('tr', { style: { cursor: 'pointer' }, onClick: () => openOrderDetail(o.id) },
-          h('td', {}, o.orderNo || `#${o.id}`),
-          h('td', {}, stamp(o.createdAt)),
-          h('td', {}, count(o.items)),
-          h('td', {}, money(o.total)),
-          h('td', {}, Pill(o.status === 'served' ? 'good' : o.status === 'void' ? 'crit' : 'info', o.status)))))));
 }
 
 function messagesCard(d, ctx) {

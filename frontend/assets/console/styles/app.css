@@ -572,6 +572,31 @@ canvas{max-width:100%;}
    tablet-portrait width or narrower. */
 @media (max-width:860px){
   .grid{grid-template-columns:1fr !important;}
+
+  /* The shell itself had no narrow-viewport treatment at all -- a phone or
+     narrow tablet rendered the full 236px labeled sidebar plus content side
+     by side, squeezing the page into an unreadable sliver (2026-10, found
+     testing Owner Overview on a 375px mobile viewport against the reference
+     mockup's own mobile panel). Rather than build an off-canvas drawer,
+     this reuses the EXISTING manual-collapse icon rail (.nav-collapsed,
+     above) unconditionally at this width -- same 68px rail, same hidden
+     labels, same icons-with-tooltips navigation, just applied by viewport
+     instead of by the Collapse button. The manual toggle still works above
+     this width, and still works below it too (collapsing an already-narrow
+     rail is a no-op).  */
+  .shell{grid-template-columns:68px 1fr;}
+  .sidebar-photo{display:none;}
+  .brand-text,
+  .nav-item-label,
+  .nav-group-label,
+  .nav-group-chevron,
+  .nav-badge{display:none;}
+  .nav-item,
+  .nav-item-top,
+  .nav-group-toggle,
+  .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
+  .nav-group-body{display:none !important;}
+  .brand{justify-content:center; padding-left:0; padding-right:0;}
 }
 
 /* The sign-in gate's own styling lives in styles/login-brand.css, scoped to

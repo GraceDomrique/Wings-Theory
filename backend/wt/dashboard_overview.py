@@ -339,15 +339,46 @@ def _needs_attention(summary: dict, declining: list[dict]) -> list[dict]:
     return items[:4]
 
 
+def _period_tile(block: dict) -> dict:
+    """Shrink a business_overview() compare-block down to the single-figure
+    shape the Overview page's stat tiles need (current revenue + its own
+    vs-prior delta), rather than exposing the full current/prior/deltas
+    object every stat tile would otherwise have to reach into."""
+    return {
+        "revenue": block["current"]["revenue"],
+        "orders": block["current"]["orders"],
+        "deltaPct": block["deltas"]["revenue_pct"],
+        "ordersDeltaPct": block["deltas"]["orders_pct"],
+        "label": block["label"],
+    }
+
+
+def _kpi_value(summary: dict, key: str) -> int | None:
+    """Pull one named KPI's value out of dashboard_summary()'s own kpis
+    list (needRestock, expiringSoon, expired, ...) rather than re-deriving
+    it -- Overview's "Stock at Risk" tile reuses the exact same forward-
+    depletion count Stock & Replenishment's own page is built on."""
+    for kpi in summary.get("kpis", []):
+        if kpi["key"] == key:
+            return kpi["value"]
+    return None
+
+
 def owner_overview(conn, *, now: _dt.datetime, summary: dict, period_overview: dict,
                     forecast: dict | None, combinations: dict | None,
-                    top_risks: list[dict]) -> dict:
+                    top_risks: list[dict], today_vs_yesterday: dict | None = None) -> dict:
     """Owner Overview — see module docstring. `period_overview` is the
     already-computed business_overview() payload (today/thisWeek/thisMonth
     period comparisons + 12-week trend + outlook); this function adds the
     sections that payload does not carry: attention list, category mix,
     customer pulse, business rhythm, and recent orders, all computed from
-    the same customer_order/order_line tables."""
+    the same customer_order/order_line tables. `today_vs_yesterday`, if
+    given, is business_overview.today_vs_yesterday()'s own block (same
+    literal "vs yesterday" comparison Admin Today's tile already uses) —
+    the Overview page's "Today's Revenue" tile reads this reuse rather than
+    period_overview["today"], which compares against the same weekday last
+    week instead, a different (also honest, just not what this tile says)
+    baseline."""
     today = timeutil.business_today(now)
     week_start, _ = _week_bounds(today)
     week_start_dt = bo._manila_midnight_utc(week_start)
@@ -394,6 +425,12 @@ def owner_overview(conn, *, now: _dt.datetime, summary: dict, period_overview: d
             "revenue": week["current"]["revenue"], "orders": week["current"]["orders"],
             "items": week["current"]["items"], "avgOrder": week["current"]["avg_order"],
             "deltas": week["deltas"], "label": week["label"],
+        },
+        "todayRevenue": _period_tile(today_vs_yesterday) if today_vs_yesterday else None,
+        "monthRevenue": _period_tile(period_overview["this_month"]),
+        "stockAtRisk": {
+            "needRestock": _kpi_value(summary, "needRestock"),
+            "expiringSoon": _kpi_value(summary, "expiringSoon"),
         },
         "needsAttention": _needs_attention(summary, pulse["slowing"]),
         "comingUp": _forecast_strip(forecast),

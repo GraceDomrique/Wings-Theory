@@ -1,12 +1,14 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
+import { StatTile } from '../../components/ui/StatTile.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Table } from '../../components/ui/Table.js';
 import { Modal, ModalError } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
+import { DoughnutChart } from '../../components/charts/DoughnutChart.js';
 import {
   count, qty, delta, stamp, pct, humanise, nodata, money,
 } from '../../lib/format.js';
@@ -18,6 +20,12 @@ import { createInstruction } from '../../lib/api/instructions.js';
 
 const ANOMALY_LOOKBACK_DAYS = 90;
 const VARIANCE_LOOKBACK_DAYS = 30;
+
+const ICON = {
+  value: '<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
+  losses: '<circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5a2.5 2.5 0 012.5-1h.5a2 2 0 010 4h-1a2 2 0 000 4h.5a2.5 2.5 0 002.5-1"/>',
+  alert: '<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+};
 
 const CATEGORY_LABEL = {
   wastage: 'Wastage',
@@ -102,7 +110,23 @@ export async function render(ctx) {
     })
     .slice(0, 8);
 
+  const monthLossQty = [...wastageByUnit.values(), ...spoilageByUnit.values()].reduce((a, b) => a + b, 0);
+
   return h('div', {},
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3,1fr)', gap: '14px', marginBottom: '14px' } },
+      StatTile({
+        iconPath: ICON.value, severity: 'good',
+        value: valuation.available ? money(valuation.totalValue) : null,
+        missing: 'not available', label: 'Estimated Inventory Value',
+      }),
+      StatTile({
+        iconPath: ICON.losses, severity: monthLossQty > 0 ? 'warn' : 'good',
+        value: count(lossRows.length), label: `Recorded Losses (last ${ANOMALY_LOOKBACK_DAYS}d)`,
+      }),
+      StatTile({
+        iconPath: ICON.alert, severity: stockLoss.length > 0 ? 'crit' : 'good',
+        value: count(stockLoss.length), label: 'Unusual Usage Items',
+      })),
     inventoryValueSection(valuation),
     recordedLossesSection({
       wastageRows, spoilageRows, wastageByUnit, spoilageByUnit, unitTotalsNode,
@@ -119,17 +143,24 @@ function inventoryValueSection(valuation) {
   const missing = hasBreakdown ? Math.max(0, valuation.totalItems - valuation.pricedItems) : null;
 
   return h('div', { style: { marginBottom: '14px' } },
-    h('div', { class: 'grid', style: { gridTemplateColumns: hasBreakdown ? 'repeat(3,1fr)' : 'repeat(1,1fr)' } },
-      Card({}, Stat({
-        value: valuation.available ? money(valuation.totalValue) : nodata('not available'),
-        label: 'Estimated Value on Hand',
-      })),
-      hasBreakdown ? Card({}, Stat({ value: count(valuation.pricedItems), label: 'Ingredients With Verified Cost' })) : null,
-      hasBreakdown ? Card({}, Stat({ value: count(missing), label: 'Ingredients Missing Cost Data' })) : null),
-    !valuation.available
-      ? h('div', { style: { marginTop: '10px' } },
-        Card({}, CardHeader({ title: 'Inventory value' }), h('div', { class: 't-sm t-soft' }, valuation.reason)))
-      : null);
+    Card({},
+      CardHeader({ title: 'Inventory Value', desc: hasBreakdown ? 'Ingredients priced vs. missing a verified cost' : undefined }),
+      hasBreakdown
+        ? DoughnutChart({
+          labels: ['Priced', 'Missing cost'], data: [valuation.pricedItems, missing], height: 160,
+          empty: { icon: '◍', title: 'No ingredients to break down', tight: true },
+        })
+        : null,
+      h('div', { class: 'grid', style: { gridTemplateColumns: hasBreakdown ? 'repeat(3,1fr)' : 'repeat(1,1fr)', marginTop: '12px' } },
+        Stat({
+          value: valuation.available ? money(valuation.totalValue) : nodata('not available'),
+          label: 'Estimated Value on Hand',
+        }),
+        hasBreakdown ? Stat({ value: count(valuation.pricedItems), label: 'Ingredients With Verified Cost' }) : null,
+        hasBreakdown ? Stat({ value: count(missing), label: 'Ingredients Missing Cost Data' }) : null),
+      !valuation.available
+        ? h('div', { class: 't-sm t-soft', style: { marginTop: '10px' } }, valuation.reason)
+        : null));
 }
 
 function recordedLossesSection({

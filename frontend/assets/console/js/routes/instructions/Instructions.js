@@ -1,6 +1,7 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Pill } from '../../components/ui/Pill.js';
+import { Tabbar } from '../../components/ui/Tabbar.js';
 import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
@@ -38,6 +39,7 @@ export async function render(ctx) {
 
   let items = (await listInstructions()).items;
   const listHost = h('div');
+  const tabbarHost = h('div');
 
   function statusMeta(status) {
     switch (status) {
@@ -58,11 +60,30 @@ export async function render(ctx) {
     }
   }
 
+  const STATUS_TABS = ['open', 'acknowledged', 'in_progress', 'completed', 'cancelled'];
+  let statusFilter = 'all';
+
+  function tabItems() {
+    return [
+      { id: 'all', label: `All (${items.length})` },
+      ...STATUS_TABS.map((s) => ({ id: s, label: `${statusMeta(s)[1]} (${items.filter((i) => i.status === s).length})` })),
+    ];
+  }
+
+  function visibleItems() {
+    return statusFilter === 'all' ? items : items.filter((i) => i.status === statusFilter);
+  }
+
   function draw() {
-    if (items.length === 0) {
+    mount(tabbarHost, Tabbar({
+      items: tabItems(), activeId: statusFilter,
+      onChange: (id) => { statusFilter = id; draw(); },
+    }));
+    const shown = visibleItems();
+    if (shown.length === 0) {
       mount(listHost, Card({}, EmptyState({
         icon: '✓',
-        title: 'No instructions',
+        title: statusFilter === 'all' ? 'No instructions' : `No ${statusMeta(statusFilter)[1].toLowerCase()} instructions`,
         description: isOwner
           ? 'Send one to Admin using "+ New instruction" above.'
           : 'Nothing has been sent by the Owner yet.',
@@ -70,7 +91,7 @@ export async function render(ctx) {
       })));
       return;
     }
-    mount(listHost, ...items.map(instructionCard));
+    mount(listHost, ...shown.map(instructionCard));
   }
 
   function instructionCard(ins) {
@@ -208,6 +229,7 @@ export async function render(ctx) {
   return h('div', {},
     h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: '12px' } },
       isOwner ? Button({ variant: 'primary', onClick: openNewInstructionModal }, '+ New instruction') : null),
+    h('div', { style: { marginBottom: '12px' } }, tabbarHost),
     Card({},
       CardHeader({ title: 'Instructions', desc: 'Operational tasks from Owner to Admin — open through complete.' }),
       listHost));

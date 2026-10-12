@@ -85,7 +85,7 @@ from .data_quality import data_quality_report
 from . import model_registry as ml_registry
 from . import ml_training
 from .associations import active_combo_recommendations
-from .ml_scheduler import get_scheduler_status, run_scheduled_cycle, start_ml_scheduler
+from .ml_scheduler import get_scheduler_status, run_scheduled_cycle, scheduler_enabled, start_ml_scheduler
 from .ml_startup import validate_artifacts_on_startup
 from .reservation import (
     availability_for_menu_item, commit_order, ingredient_reconciliation_report,
@@ -155,14 +155,20 @@ def _startup() -> None:
     # endpoint. This spawns one daemon thread and returns immediately;
     # fitting itself happens off the request path, on a fixed interval, and
     # is skipped entirely during the test suite (WT_ENV=test) so running
-    # tests never spends real time fitting Prophet in the background.
-    if os.environ.get("WT_ENV") != "test":
+    # tests never spends real time fitting Prophet in the background. Also
+    # skipped whenever scheduler_enabled() says no (production, by default
+    # -- deployment requirement: automatic retraining must be off in
+    # production unless explicitly re-enabled; see ml_scheduler.
+    # scheduler_enabled's own docstring for the WT_ML_SCHEDULER_ENABLED
+    # override, which governs this scheduler too).
+    if os.environ.get("WT_ENV") != "test" and scheduler_enabled():
         start_prophet_refresh_scheduler(db.get_conn)
     # ML model registry (migration 0050): validate every active artifact
     # before serving a single request (corrupt/stale -> roll back once,
     # then rule-only/fresh-fit fallback -- see ml_startup.py), then start
-    # the daily train/promote cycle. Skipped under WT_ENV=test for the same
-    # reason the Prophet scheduler above is.
+    # the daily train/promote cycle (start_ml_scheduler is itself a no-op
+    # under scheduler_enabled()==False). Skipped under WT_ENV=test for the
+    # same reason the Prophet scheduler above is.
     validate_artifacts_on_startup(conn)
     if os.environ.get("WT_ENV") != "test":
         start_ml_scheduler(db.get_conn)
@@ -3062,6 +3068,7 @@ def dashboard_owner_overview(
     except Exception:
         forecast = None
     period_overview = business_overview_mod.business_overview(c, now=now, forecast=forecast)
+    today_vs_yesterday = business_overview_mod.today_vs_yesterday(c, now=now)
     try:
         combinations = product_combinations(c, lookback_days=90, top_n=5)
     except Exception:
@@ -3069,6 +3076,7 @@ def dashboard_owner_overview(
     return dashboard_overview_mod.owner_overview(
         c, now=now, summary=summary, period_overview=period_overview, forecast=forecast,
         combinations=combinations, top_risks=_top_risk_ingredients(c),
+        today_vs_yesterday=today_vs_yesterday,
     )
 
 
