@@ -150,10 +150,15 @@ export async function render(ctx) {
   }
 
   function recommendationCard(r) {
-    const checkbox = h('input', {
+    // Was a bare checkbox dropped into the title row with no label, easy to
+    // mistake for a stray UI bug. It's real — it scopes the downloadable
+    // purchasing report's "Selected ingredients" option, below — so it
+    // moves to the footer, next to the recommendation it actually
+    // qualifies, as a labeled toggle rather than an unexplained box beside
+    // the ingredient's name.
+    const includeToggle = h('input', {
       type: 'checkbox',
       checked: selected.has(r.ingredientId),
-      title: 'Include in the purchasing report’s "Selected ingredients" scope',
       onChange: (e) => {
         if (e.target.checked) selected.add(r.ingredientId);
         else selected.delete(r.ingredientId);
@@ -162,7 +167,6 @@ export async function render(ctx) {
     return Card({ style: { marginBottom: '14px' } },
       h('div', { class: 'card-head' },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
-          checkbox,
           h('span', { class: 'card-title' }, r.name),
           statusPill(r)),
         isOwner
@@ -182,7 +186,7 @@ export async function render(ctx) {
         + 'stock can differ due to spills, over-portioning, or spoilage.'),
       h('div', {
         style: {
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px',
           marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--line)',
         },
       },
@@ -191,7 +195,9 @@ export async function render(ctx) {
         h('div', { style: { fontWeight: '600' } },
           r.suggestedOrderQty !== null
             ? `Buy ~${asText.num(r.suggestedOrderQty, '', 2)} ${r.suggestedOrderUnit || r.baseUnit}`
-            : 'Not enough history yet to suggest a quantity'))));
+            : 'Not enough history yet to suggest a quantity')),
+      h('label', { class: 't-xs t-soft', style: { display: 'flex', alignItems: 'center', gap: '6px', flexShrink: '0' } },
+        includeToggle, 'Include in report')));
   }
 
   function reasonText(r) {

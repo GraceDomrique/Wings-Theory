@@ -1,0 +1,9 @@
+Alert_Rate,Dataset,F1,FN,FP,Model,PR_AUC,Precision,ROC_AUC,Recall,Status,TN,TP
+,"SYNTHETIC (RNG, scaled to real on-hand/consumption rates)",0.96,0,2,"stock_loss_isoforest (RNG fixtures, prod generator)",,0.923,,1.0,measured (SYNTHETIC VALIDATION),238,24
+,"SYNTHETIC (RNG, scaled to real baseline lambda/head counts)",0.973,0,1,unli_consumption_isoforest (RNG fixtures),,0.947,,1.0,measured (SYNTHETIC VALIDATION),59,18
+0.1584,SYNTHETIC (1-year historical/inventory workbook's own injected labels),0.561,6,892,"stock_loss_isoforest (default thresholds, 1yr workbook ground truth)",,0.391,,0.99,measured (SYNTHETIC VALIDATION),7778,573
+0.1627,SYNTHETIC (1-year historical/inventory workbook's own injected labels),0.576,11,354,"stock_loss_isoforest (chronologically calibrated, 1yr workbook)",0.5007,0.412,0.9552,0.958,measured (SYNTHETIC VALIDATION),3087,248
+0.1753,SYNTHETIC (1-year historical workbook's own injected labels),0.322,5,206,"flavor_consumption_isoforest (default thresholds, 1yr workbook)",,0.195,,0.909,measured (SYNTHETIC VALIDATION),1199,50
+0.0342,SYNTHETIC (1-year historical workbook's own injected labels),0.596,13,6,"flavor_consumption_isoforest (chronologically calibrated, 1yr workbook)",0.7114,0.7,0.9823,0.519,measured (SYNTHETIC VALIDATION),551,14
+0.1973,"SYNTHETIC (1-year historical workbook, flavor-aggregated)",0.71,8,28,"unli_consumption_isoforest (default thresholds, 1yr workbook aggregate)",,0.611,,0.846,measured (SYNTHETIC VALIDATION),285,44
+0.2192,"SYNTHETIC (1-year historical workbook, flavor-aggregated)",0.643,6,14,"unli_consumption_isoforest (chronologically calibrated, 1yr workbook aggregate)",0.6871,0.562,0.9098,0.75,measured (SYNTHETIC VALIDATION),108,18

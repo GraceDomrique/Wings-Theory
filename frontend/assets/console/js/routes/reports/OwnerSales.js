@@ -102,6 +102,20 @@ const ICON = {
   avg: '<circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5a2.5 2.5 0 012.5-1h.5a2 2 0 010 4h-1a2 2 0 000 4h.5a2.5 2.5 0 002.5-1"/>',
 };
 
+// 2026-10 relayout: the page used to read as ~14 equally-weighted cards in
+// one long column — every insight competing for the same attention whether
+// it was "how much did we make" or "what hour do most orders land in".
+// What matters most for a same-glance read (revenue, the trend, what
+// changed and why) now leads; the deeper, more analytical cuts (heatmap,
+// then-vs-now, rhythm, pairings) are grouped under their own "Deeper
+// analysis" divider below the fold — still one click away, in whatever
+// order a reader opens this page, never removed.
+function sectionDivider(title, desc) {
+  return h('div', { style: { margin: '26px 0 14px', paddingTop: '14px', borderTop: '1px solid var(--line)' } },
+    h('div', { class: 'eyebrow' }, title),
+    desc ? h('div', { class: 't-xs t-faint', style: { marginTop: '2px' } }, desc) : null);
+}
+
 function content(d, ctx) {
   const s = d.howAreSalesDoing;
   return h('div', {},
@@ -118,16 +132,17 @@ function content(d, ctx) {
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
       customerFavoritesCard(d, ctx),
       categoryPerformanceCard(d)),
-    h('div', { style: { marginTop: '14px' } }, heatmapCard(d)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
+    h('div', { style: { marginTop: '14px' } }, salesToStockCard(d, ctx)),
+
+    sectionDivider('Deeper analysis', 'Patterns worth knowing, not needed for a daily glance'),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px' } },
       thenVsNowCard(d),
       salesHighlightsCard(d)),
+    h('div', { style: { marginTop: '14px' } }, heatmapCard(d)),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
       businessRhythmCard(d),
       oftenOrderedTogetherCard(d)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
-      salesToStockCard(d, ctx),
-      watchThisItemCard(d)),
+    h('div', { style: { marginTop: '14px' } }, watchThisItemCard(d)),
     h('div', { style: { marginTop: '14px' } }, recentOrdersCard(d, ctx)));
 }
 

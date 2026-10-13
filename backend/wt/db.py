@@ -23,6 +23,7 @@ import re
 import shutil
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -287,6 +288,76 @@ def backup_now(
     return dest
 
 
+@contextmanager
+def _migration_lock(conn: sqlite3.Connection):
+    """Cross-process mutual exclusion around migrate()'s ENTIRE pending-
+    migration sequence -- closing a race this module's own BEGIN IMMEDIATE/
+    COMMIT per migration file cannot. Each migration file commits (and so
+    releases SQLite's own write lock) separately; between those commits,
+    a SECOND process that read applied_version() before the FIRST committed
+    anything still believes the same migrations are pending, and the two
+    can interleave applying them -- SQLite's per-statement locking
+    serializes each individual transaction, never this function's
+    multi-transaction loop as a whole. (This is the confirmed mechanism
+    behind the 2026-10-13 production corruption: schema_version was found
+    frozen below a migration a backup had already been taken for, while
+    real application writes committed in the same window -- i.e. a second
+    writer was active while a first process's migration was still only
+    partway through its own multi-commit sequence.)
+
+    Uses a plain OS-level advisory lock on a sibling `<db file>.migrate.lock`
+    file, held for this process's entire migrate() call -- deliberately NOT
+    a SQLite transaction, so it is unaffected by this function's own
+    per-migration commits/rollbacks. A connection with no on-disk file
+    (:memory:) is private to one process by construction and skips locking
+    entirely -- there is nothing else to race against.
+    """
+    row = conn.execute("PRAGMA database_list").fetchone()
+    file_path = row["file"] if row and row["file"] else None
+    if not file_path:
+        yield
+        return
+
+    lock_path = f"{file_path}.migrate.lock"
+    fh = open(lock_path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            # msvcrt has no blocking-wait primitive -- poll non-blocking
+            # acquisition instead. 60s comfortably covers the slowest
+            # migration this codebase has ever shipped; a lock still held
+            # past that means something else is wrong, and raising beats
+            # hanging a server's startup forever.
+            deadline = time.monotonic() + 60.0
+            while True:
+                try:
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError(
+                            f"could not acquire migration lock {lock_path} within 60s "
+                            "-- another process may be mid-migration or stuck"
+                        ) from None
+                    time.sleep(0.2)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
 def migrate(conn: sqlite3.Connection | None = None, verbose: bool = False) -> int:
     """Apply every migration above the current version, each in its own
     transaction. Returns the resulting version.
@@ -296,56 +367,65 @@ def migrate(conn: sqlite3.Connection | None = None, verbose: bool = False) -> in
     initialized for the first time), it is backed up before any pending
     migration is applied. A fresh, empty database has nothing worth backing
     up yet, so this does not clutter backups/ on every test run.
+
+    The entire read-pending/backup/apply sequence below runs inside
+    _migration_lock() -- see that function's docstring for exactly which
+    race this closes. A second process that was waiting on the lock
+    re-reads applied_version() once it acquires it (current is recomputed
+    fresh each call), so if the first process already applied everything,
+    the second simply finds nothing pending and returns immediately --
+    never re-applies, never crashes on "already exists".
     """
     conn = conn or get_conn()
-    current = applied_version(conn)
-    pending = [(v, n, p) for v, n, p in _discover() if v > current]
-    if not pending:
-        return current
+    with _migration_lock(conn):
+        current = applied_version(conn)
+        pending = [(v, n, p) for v, n, p in _discover() if v > current]
+        if not pending:
+            return current
 
-    if current > 0:
-        # The file this specific connection actually has open, from SQLite
-        # itself via PRAGMA database_list — not db_path()/WT_DB. Those can
-        # disagree: every test in this suite (and seed.run(), and reset())
-        # calls migrate() with a connection opened against an explicit
-        # tempfile path, never against the environment default. Backing up
-        # by re-deriving the path from WT_DB here would silently back up
-        # some other database instead of the one actually being migrated —
-        # None for an in-memory connection, which correctly skips the
-        # backup rather than falling back to an unrelated file on disk.
-        row = conn.execute("PRAGMA database_list").fetchone()
-        file_path = row["file"] if row and row["file"] else None
-        if file_path:
-            dest = backup_now(
-                f"pre_migrate_to_v{pending[-1][0]:04d}", path=file_path, conn=conn,
-            )
-            if verbose and dest:
-                print(f"  backed up to {dest}")
-
-    for version, name, path in pending:
-        sql = path.read_text(encoding="utf-8")
-        statements = _split_statements(sql)
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            for stmt in statements:
-                conn.execute(stmt)
-            already = conn.execute(
-                "SELECT 1 FROM schema_version WHERE version=?", (version,)
-            ).fetchone()
-            if not already:
-                conn.execute(
-                    "INSERT INTO schema_version (version, name) VALUES (?,?)",
-                    (version, name),
+        if current > 0:
+            # The file this specific connection actually has open, from SQLite
+            # itself via PRAGMA database_list — not db_path()/WT_DB. Those can
+            # disagree: every test in this suite (and seed.run(), and reset())
+            # calls migrate() with a connection opened against an explicit
+            # tempfile path, never against the environment default. Backing up
+            # by re-deriving the path from WT_DB here would silently back up
+            # some other database instead of the one actually being migrated —
+            # None for an in-memory connection, which correctly skips the
+            # backup rather than falling back to an unrelated file on disk.
+            row = conn.execute("PRAGMA database_list").fetchone()
+            file_path = row["file"] if row and row["file"] else None
+            if file_path:
+                dest = backup_now(
+                    f"pre_migrate_to_v{pending[-1][0]:04d}", path=file_path, conn=conn,
                 )
-        except Exception:
-            conn.rollback()
-            raise
-        else:
-            conn.commit()
-        if verbose:
-            print(f"  applied {version:04d}_{name}")
-        current = version
-    return current
+                if verbose and dest:
+                    print(f"  backed up to {dest}")
+
+        for version, name, path in pending:
+            sql = path.read_text(encoding="utf-8")
+            statements = _split_statements(sql)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for stmt in statements:
+                    conn.execute(stmt)
+                already = conn.execute(
+                    "SELECT 1 FROM schema_version WHERE version=?", (version,)
+                ).fetchone()
+                if not already:
+                    conn.execute(
+                        "INSERT INTO schema_version (version, name) VALUES (?,?)",
+                        (version, name),
+                    )
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+            if verbose:
+                print(f"  applied {version:04d}_{name}")
+            current = version
+        return current
 
 
 def integrity_report(conn: sqlite3.Connection | None = None) -> dict:

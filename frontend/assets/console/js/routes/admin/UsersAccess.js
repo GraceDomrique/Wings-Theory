@@ -7,8 +7,10 @@ import { Modal, ModalError } from '../../components/ui/Modal.js';
 import { toast } from '../../components/ui/Feedback.js';
 import { ageFromNow } from '../../lib/format.js';
 import { session } from '../../lib/api/client.js';
-import { listUsers, createUser, resetPassword } from '../../lib/api/account.js';
-import { getCapabilityMatrix } from '../../lib/api/permissions.js';
+import {
+  listUsers, createUser, resetPassword, changePassword, MIN_PASSWORD_LENGTH,
+} from '../../lib/api/account.js';
+import { getCapabilityMatrix, getUserCapabilities, setUserCapability } from '../../lib/api/permissions.js';
 
 /**
  * Administration > Users & Access — spec section 21ish (the "who has
@@ -26,6 +28,18 @@ import { getCapabilityMatrix } from '../../lib/api/permissions.js';
  * whatever roles the server actually returns, so the display can't drift
  * out of step with the policy again the way the old hand-picked column
  * list eventually would have.
+ *
+ * 2026-10 addition: "Who can do what" is where the actual per-user editing
+ * happens now (migration 0052's user_capability_override) — a "Checking
+ * permissions for" picker right on that card switches its role columns out
+ * for one real checkbox column for the picked account, so admin can grant
+ * or revoke an individual capability for one account, right there, without
+ * touching the role default every other account of that role still
+ * follows. Not a separate modal off the account card — this IS the "Who
+ * can do what" list, just made editable per account instead of read-only
+ * per role. New accounts may also be provisioned as Owner here; every
+ * Owner account shares the exact same capability set (auth.CAPABILITIES
+ * has no separate "main owner" tier).
  */
 
 const ROLE_COLOR = {
@@ -103,7 +117,7 @@ export async function render(ctx) {
           ' · last signed in ', ageFromNow(u.lastLoginAt, 'never'),
           locked ? ` · locked until ${u.lockedUntil}` : '',
           u.mustChangePassword ? ' · must change password' : ''),
-        h('div', { style: { marginTop: '10px' } }, resetBtn)));
+        h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px' } }, resetBtn)));
   }
 
   function drawUsers(list) {
@@ -140,7 +154,8 @@ export async function render(ctx) {
     const roleSelect = h('select', {},
       h('option', { value: 'cashier' }, 'Cashier'),
       h('option', { value: 'kitchen' }, 'Kitchen'),
-      h('option', { value: 'admin' }, 'Admin'));
+      h('option', { value: 'admin' }, 'Admin'),
+      h('option', { value: 'owner' }, 'Owner'));
     const err = ModalError();
     const resultHost = h('div', { style: { marginTop: '10px' } });
     const submit = Button({ variant: 'primary' }, 'Create account');
@@ -162,7 +177,7 @@ export async function render(ctx) {
     });
     Modal({
       title: 'Add a user',
-      desc: 'A temporary password is generated and shown once — never stored or logged. Owner and legacy Manager accounts cannot be created here; Owner is provisioned once at deployment.',
+      desc: 'A temporary password is generated and shown once — never stored or logged. A new Owner account holds the exact same capabilities as every other Owner account — there is no separate "main owner" privilege level.',
       onClose: () => {},
     },
       h('label', { class: 'field' }, 'Username', usernameInput),
@@ -171,42 +186,140 @@ export async function render(ctx) {
       err, submit, resultHost);
   }
 
-  // --- capability matrix: grouped, collapsible, filterable ---
+  function myPasswordCard() {
+    const current = h('input', { type: 'password', autocomplete: 'current-password' });
+    const next = h('input', { type: 'password', autocomplete: 'new-password' });
+    const confirm = h('input', { type: 'password', autocomplete: 'new-password' });
+    const err = h('div', { class: 'login-err', style: { display: 'none' } });
+    const submit = Button({ variant: 'primary', size: 'sm' }, 'Change password');
+    submit.addEventListener('click', async () => {
+      err.style.display = 'none';
+      if (!current.value) { err.textContent = 'Enter your current password.'; err.style.display = ''; return; }
+      if (next.value.length < MIN_PASSWORD_LENGTH) {
+        err.textContent = `New password must be at least ${MIN_PASSWORD_LENGTH} characters.`; err.style.display = ''; return;
+      }
+      if (next.value !== confirm.value) { err.textContent = 'New password and confirmation do not match.'; err.style.display = ''; return; }
+      submit.disabled = true;
+      try {
+        await changePassword({ currentPassword: current.value, newPassword: next.value, confirmNewPassword: confirm.value });
+        current.value = ''; next.value = ''; confirm.value = '';
+        toast('Password changed. Every other signed-in device has been logged out.', 'good');
+      } catch (e) {
+        err.textContent = e.message; err.style.display = '';
+      } finally { submit.disabled = false; }
+    });
+    return Card({},
+      CardHeader({ title: 'Change my password', desc: `At least ${MIN_PASSWORD_LENGTH} characters, not the shared default` }),
+      h('label', { class: 'field', style: { marginBottom: '10px', display: 'block' } }, 'Current password', current),
+      h('label', { class: 'field', style: { marginBottom: '10px', display: 'block' } }, 'New password', next),
+      h('label', { class: 'field', style: { marginBottom: '10px', display: 'block' } }, 'Confirm new password', confirm),
+      err, submit);
+  }
+
+  // --- "Who can do what": grouped, collapsible, filterable — and, once
+  // admin picks an account in the "Checking permissions for" selector,
+  // editable for that one account right here, in place of the read-only
+  // role columns. No separate modal: this list IS the editor.
   const matrixHost = h('div');
   let filterQuery = '';
+  let editingUsername = ''; // '' = reference mode (role columns, read-only)
+  let editingCapabilities = null; // this account's getUserCapabilities() rows, while editing
 
   function tick(allowed) {
     return allowed ? h('span', { class: 't-good t-strong' }, '✓') : h('span', { class: 't-faint' }, '—');
   }
 
+  async function toggleForEditingUser(row, checkbox, resetLink) {
+    checkbox.disabled = true;
+    try {
+      const out = await setUserCapability(editingUsername, row.capability, checkbox.checked);
+      editingCapabilities = out.capabilities;
+      const fresh = out.capabilities.find((r) => r.capability === row.capability);
+      resetLink.style.display = fresh.override === null ? 'none' : '';
+    } catch (e) {
+      checkbox.checked = !checkbox.checked;
+      toast(e.message, 'bad');
+    } finally { checkbox.disabled = false; }
+  }
+
   function drawMatrix() {
     const q = filterQuery.trim().toLowerCase();
+    const sourceRows = editingUsername
+      ? editingCapabilities.map((r) => ({ capability: r.capability, _override: r }))
+      : capabilities;
     const byGroup = new Map();
-    for (const row of capabilities) {
+    for (const row of sourceRows) {
       if (q && !row.capability.toLowerCase().includes(q)) continue;
       const g = groupFor(row.capability);
       if (!byGroup.has(g)) byGroup.set(g, []);
       byGroup.get(g).push(row);
     }
     const groupOrder = [...new Set(GROUPS.map(([, label]) => label))].concat(['Other']);
+
+    const columns = editingUsername
+      ? [
+        { key: 'cap', label: 'Capability', render: (r) => h('span', { class: 'mono t-xs' }, r.capability) },
+        {
+          key: 'allowed', label: `Allowed for ${editingUsername}`,
+          render: (r) => {
+            const fresh = r._override;
+            const checkbox = h('input', { type: 'checkbox', checked: fresh.effective || undefined });
+            const resetLink = h('a', {
+              href: '#', class: 't-xs', style: { marginLeft: '8px', display: fresh.override === null ? 'none' : '' },
+              onClick: async (e) => {
+                e.preventDefault();
+                checkbox.disabled = true;
+                try {
+                  const out = await setUserCapability(editingUsername, r.capability, null);
+                  editingCapabilities = out.capabilities;
+                  const after = out.capabilities.find((x) => x.capability === r.capability);
+                  checkbox.checked = after.effective;
+                  resetLink.style.display = 'none';
+                } catch (e2) { toast(e2.message, 'bad'); } finally { checkbox.disabled = false; }
+              },
+            }, 'Reset to role default');
+            checkbox.addEventListener('change', () => toggleForEditingUser(r, checkbox, resetLink));
+            return h('span', { style: { display: 'flex', alignItems: 'center' } }, checkbox, resetLink);
+          },
+        },
+      ]
+      : [
+        { key: 'cap', label: 'Capability', render: (r) => h('span', { class: 'mono t-xs' }, r.capability) },
+        ...roles.map((role) => ({ key: role, label: role.charAt(0).toUpperCase() + role.slice(1), render: (r) => tick(r[role]) })),
+      ];
+
     const sections = groupOrder
       .filter((g) => byGroup.has(g))
-      .map((g) => h('details', { open: q ? 'open' : undefined, style: { marginTop: '10px' } },
+      .map((g) => h('details', { open: q || editingUsername ? 'open' : undefined, style: { marginTop: '10px' } },
         h('summary', { style: { cursor: 'pointer', fontWeight: '600', fontSize: '12.5px', padding: '4px 0' } }, g),
-        Table({
-          columns: [
-            { key: 'cap', label: 'Capability', render: (r) => h('span', { class: 'mono t-xs' }, r.capability) },
-            ...roles.map((role) => ({ key: role, label: role.charAt(0).toUpperCase() + role.slice(1), render: (r) => tick(r[role]) })),
-          ],
-          rows: byGroup.get(g),
-        })));
+        Table({ columns, rows: byGroup.get(g) })));
 
     mount(matrixHost, sections.length
       ? h('div', {}, ...sections)
       : h('div', { class: 't-sm t-faint', style: { padding: '10px 0' } }, 'No capability matches that filter.'));
   }
 
+  async function setEditingUser(username) {
+    editingUsername = username;
+    if (!username) { editingCapabilities = null; drawMatrix(); return; }
+    mount(matrixHost, h('div', { class: 't-sm t-faint' }, 'Loading…'));
+    try {
+      const data = await getUserCapabilities(username);
+      editingCapabilities = data.capabilities;
+    } catch (e) {
+      toast(e.message, 'bad');
+      editingUsername = ''; editingCapabilities = null;
+      userSelect.value = '';
+    }
+    drawMatrix();
+  }
+
   const filterInput = h('input', { type: 'text', placeholder: 'Filter capabilities…', onInput: (e) => { filterQuery = e.target.value; drawMatrix(); } });
+  const userSelect = h('select', {
+    onChange: (e) => setEditingUser(e.target.value),
+  },
+    h('option', { value: '' }, 'All roles (reference)'),
+    ...(users || []).map((u) => h('option', { value: u.username }, `${u.displayName || u.username} (${u.role})`)));
   drawMatrix();
 
   return h('div', {},
@@ -220,11 +333,16 @@ export async function render(ctx) {
           }),
           usersHost))
       : null,
+    isAdmin ? h('div', { style: { marginBottom: '14px' } }, myPasswordCard()) : null,
     Card({},
       CardHeader({
         title: 'Who can do what',
-        desc: 'Grouped by area, every real role included — the policy itself still lives in wt/auth.py',
-        right: h('label', { class: 'field' }, filterInput),
+        desc: editingUsername
+          ? `Editing ${editingUsername}'s own capabilities — a change here affects only this account, not its role`
+          : 'Grouped by area, every real role included — the policy itself still lives in wt/auth.py',
+        right: h('div', { style: { display: 'flex', gap: '10px', flexWrap: 'wrap' } },
+          isAdmin ? h('label', { class: 'field' }, h('div', { class: 't-xs t-faint' }, 'Checking permissions for'), userSelect) : null,
+          h('label', { class: 'field' }, h('div', { class: 't-xs t-faint', style: { visibility: 'hidden' } }, '.'), filterInput)),
       }),
       matrixHost,
       h('div', { class: 't-xs t-faint', style: { marginTop: '10px' } },

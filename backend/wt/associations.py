@@ -931,7 +931,11 @@ def active_combo_recommendations(conn: sqlite3.Connection) -> dict:
     than "mine this exact instant". Falls back to a fresh
     product_combinations() call, with a note saying so, if no artifact has
     been activated yet or it fails to load (same safety posture as the
-    IsolationForest passes' artifact fallback)."""
+    IsolationForest passes' artifact fallback) -- UNLESS the fresh-fit
+    fallback is disallowed in this environment (production by default; see
+    ml_artifacts_io.fresh_fit_fallback_allowed), in which case this reports
+    'served_from': 'unavailable' with no recommendations rather than mining
+    in-request."""
     path = model_registry.active_artifact_path(conn, "fpgrowth_combos")
     if path:
         try:
@@ -939,6 +943,13 @@ def active_combo_recommendations(conn: sqlite3.Connection) -> dict:
             return {**payload["result"], "served_from": "artifact", "artifact_path": path}
         except Exception:
             pass
+    if not artifacts.fresh_fit_fallback_allowed():
+        return {
+            "combos": [], "rejected_combinations": [], "insufficient_data": True,
+            "served_from": "unavailable", "artifact_path": None,
+            "empty_reason": "no trained fpgrowth_combos artifact is active, and in-request "
+                            "mining is disabled in this environment",
+        }
     return {**product_combinations(conn), "served_from": "fresh_mine_fallback", "artifact_path": None}
 
 

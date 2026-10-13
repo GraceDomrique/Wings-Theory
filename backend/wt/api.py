@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 from . import (
     audit, auth, business_overview as business_overview_mod, db, instructions, permissions,
-    purchasing, refills, timeutil, unli, verification,
+    purchasing, refills, timeutil, unli, user_permissions, verification,
 )
 from . import dashboard_overview as dashboard_overview_mod
 from . import sales_overview as sales_overview_mod
@@ -282,7 +282,7 @@ def principal(
 
 
 def needs(capability: str):
-    def _dep(p: dict = Depends(principal)) -> dict:
+    def _dep(p: dict = Depends(principal), c: sqlite3.Connection = Depends(conn)) -> dict:
         # Gated here, not in principal() itself: principal() also backs
         # /auth/change_password (bare Depends(principal), never needs()), and
         # that is the one endpoint a flagged account must still be able to
@@ -292,7 +292,19 @@ def needs(capability: str):
             raise PasswordChangeRequiredError(
                 "sign-in still uses a temporary password — set a new password to continue"
             )
-        auth.require(p, capability)
+        # A per-user override (Administration > Users & Access, migration
+        # 0052) wins over the role default either way: True lets this one
+        # account past a capability its role normally lacks, False blocks it
+        # from one its role normally has. No override row at all (the
+        # common case) falls through to the exact same role check as before.
+        override = user_permissions.get_overrides_for_user(c, p.get("sub")).get(capability)
+        if override is None:
+            auth.require(p, capability)
+        elif not override:
+            raise PermissionError_(
+                f"capability '{capability}' has been revoked for this account",
+                capability=capability,
+            )
         return p
     return _dep
 
@@ -525,25 +537,20 @@ def create_user(
     anywhere else, with must_change_password=1 so the account holder must set
     their own password before reaching anything capability-gated.
 
-    role='owner' is refused unconditionally, regardless of whether one
-    already exists — OWNER is the business owner/CEO, not a staff role ADMIN
-    provisions through account management. The only way an OWNER account is
-    created is the deployment-only wt/owner_provisioning.py CLI, run once by
-    whoever controls the deployment; there is deliberately no HTTP path to it
-    at all, so no crafted request against this endpoint can reach it either.
+    role='owner' is allowed (2026-10 revision — previously refused
+    unconditionally in favor of the deployment-only wt/owner_provisioning.py
+    CLI). An admin may now provision additional OWNER accounts the same way
+    as any other role; every OWNER account holds the exact same fixed,
+    read-only CAPABILITIES rows (see wt/auth.py) regardless of which path
+    created it — there is no "main owner" with extra privilege, so a new
+    owner account is automatically at parity with every other one.
 
-    role='manager' is likewise refused: the current business roles are
+    role='manager' is refused: the current business roles are
     OWNER/ADMIN/CASHIER/KITCHEN, and ADMIN is now the sole administrative
     role. A legacy 'manager' account that already exists in the database
     keeps working (auth.CAPABILITIES and auth.ROLES both still recognize the
     role — nothing here revokes or converts it) — this endpoint only closes
     off creating any *new* one."""
-    if body.role == "owner":
-        raise PermissionError_(
-            "OWNER accounts cannot be created through account management — "
-            "OWNER is provisioned once, at deployment, outside this endpoint",
-            capability="user.manage",
-        )
     if body.role == "manager":
         raise PermissionError_(
             "'manager' is a legacy role and can no longer be assigned to a new "
@@ -575,6 +582,40 @@ def create_user(
         "temporary_password": temp_password,
         "note": "Shown once. Give this to the user directly — it is not stored or logged anywhere.",
     }
+
+
+@app.get("/console/users/{username}/capabilities", tags=["console"])
+def get_user_capabilities(
+    username: str, c: sqlite3.Connection = Depends(conn),
+    _p: dict = Depends(needs("user.manage")),
+):
+    """This one account's full capability row — role default, any explicit
+    override, and the effective (override-wins) result — for the per-user
+    editor on Users & Access. 404s rather than returning an all-default
+    matrix for a typo'd username."""
+    row = c.execute("SELECT role FROM app_user WHERE username=?", (username,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"unknown user '{username}'")
+    return {"username": username, "role": row["role"],
+            "capabilities": user_permissions.get_effective_capability_matrix(c, username, row["role"])}
+
+
+class SetUserCapabilityIn(BaseModel):
+    capability: str
+    allowed: bool | None = None  # null clears the override, reverting to the role default
+
+
+@app.put("/console/users/{username}/capabilities", tags=["console"])
+def set_user_capability(
+    username: str, body: SetUserCapabilityIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("user.manage")),
+):
+    row = c.execute("SELECT role FROM app_user WHERE username=?", (username,)).fetchone()
+    if not row:
+        raise HTTPException(404, f"unknown user '{username}'")
+    with db.write_tx(c):
+        matrix = user_permissions.set_override(c, username, body.capability, body.allowed, p["sub"])
+    return {"username": username, "role": row["role"], "capabilities": matrix}
 
 
 @app.get("/console/audit/logins", tags=["console"])
@@ -1399,7 +1440,7 @@ def list_orders(
            "o.committed_at, o.served_at, o.voided_at, o.subtotal, o.discount_type, "
            "o.discount_amount, o.service_charge, o.total, "
            "o.total + COALESCE(ch.addon_total, 0) AS current_total, "
-           "o.cash_received, o.change_due, o.source, o.source_order_id, "
+           "o.cash_received, o.change_due, o.source, o.source_order_id, o.is_demo, "
            "(SELECT GROUP_CONCAT(m.name, ', ') FROM order_line ol "
            "   JOIN menu_item m ON m.id = ol.menu_item_id WHERE ol.order_id = o.id) AS item_names "
            "FROM customer_order o "
@@ -1445,7 +1486,7 @@ def order_detail(
         "SELECT id, order_no, status, table_label, head_count, created_by, created_at, "
         "committed_at, served_at, voided_at, void_reason, subtotal, discount_type, "
         "discount_amount, service_charge, total, "
-        "cash_received, change_due, source, source_order_id FROM customer_order WHERE id=?",
+        "cash_received, change_due, source, source_order_id, is_demo FROM customer_order WHERE id=?",
         (order_pk,),
     ).fetchone()
     if not order:
@@ -2509,7 +2550,7 @@ def sales_summary(
         f"""
         SELECT COUNT(*) AS orders, COALESCE(SUM(o.head_count), 0) AS covers
           FROM customer_order o
-         WHERE o.status != 'void' AND o.created_at >= :bound{upper_clause}
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= :bound{upper_clause}
         """,
         params,
     ).fetchone()
@@ -2517,7 +2558,7 @@ def sales_summary(
         f"""
         SELECT COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE o.status != 'void' AND o.created_at >= :bound{upper_clause}
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= :bound{upper_clause}
         """,
         params,
     ).fetchone()["revenue"]
@@ -2527,7 +2568,7 @@ def sales_summary(
           FROM order_line ol
           JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND o.created_at >= :bound{upper_clause}
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= :bound{upper_clause}
          GROUP BY m.id ORDER BY revenue DESC
         """,
         params,
@@ -2543,7 +2584,7 @@ def sales_summary(
                COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue
           FROM customer_order o
           LEFT JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.created_at >= :bound{upper_clause}
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= :bound{upper_clause}
          GROUP BY {day_bd} ORDER BY day
         """,
         params,
@@ -2558,7 +2599,7 @@ def sales_summary(
                (SELECT COALESCE(SUM(ol2.qty*ol2.unit_price),0) FROM order_line ol2
                  WHERE ol2.order_id=o.id) AS total
           FROM customer_order o
-         WHERE o.created_at >= :bound{upper_clause}
+         WHERE o.is_demo = 0 AND o.created_at >= :bound{upper_clause}
          ORDER BY o.created_at DESC LIMIT 50
         """,
         params,
@@ -2605,7 +2646,7 @@ def _forecast_preview(c: sqlite3.Connection, horizon_days: int = 7, lookback_day
           FROM order_line ol
           JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND m.pos_visible = 1
+         WHERE o.status != 'void' AND o.is_demo = 0 AND m.pos_visible = 1
          GROUP BY m.id
          ORDER BY SUM(ol.qty) DESC
          LIMIT ?

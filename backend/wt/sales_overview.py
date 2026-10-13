@@ -121,7 +121,7 @@ def _series_daily(conn, start: _dt.datetime, end: _dt.datetime) -> list[dict]:
         SELECT {day_bd} AS day, COUNT(DISTINCT o.id) AS orders,
                COALESCE(SUM(ol.qty*ol.unit_price),0) AS revenue
           FROM customer_order o LEFT JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.created_at >= ? AND o.created_at < ?
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? AND o.created_at < ?
          GROUP BY {day_bd} ORDER BY day
         """,
         (bo._sql(start), bo._sql(end)),
@@ -136,7 +136,7 @@ def _series_monthly(conn, start: _dt.datetime, end: _dt.datetime) -> list[dict]:
         SELECT {month_expr} AS month, COUNT(DISTINCT o.id) AS orders,
                COALESCE(SUM(ol.qty*ol.unit_price),0) AS revenue
           FROM customer_order o LEFT JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.created_at >= ? AND o.created_at < ?
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? AND o.created_at < ?
          GROUP BY month ORDER BY month
         """,
         (bo._sql(start), bo._sql(end)),
@@ -161,7 +161,7 @@ def _busy_times(conn, start: _dt.datetime, end: _dt.datetime) -> dict:
     rows = conn.execute(
         """
         SELECT o.created_at FROM customer_order o
-         WHERE o.status != 'void' AND o.created_at >= ? AND o.created_at < ?
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? AND o.created_at < ?
         """,
         (bo._sql(start), bo._sql(end)),
     ).fetchall()
@@ -188,7 +188,7 @@ def _day_time_heatmap(conn, now: _dt.datetime, window_days: int = 84) -> dict:
         SELECT o.created_at, COALESCE(
                  (SELECT SUM(ol.qty*ol.unit_price) FROM order_line ol WHERE ol.order_id=o.id), 0
                ) AS revenue
-          FROM customer_order o WHERE o.status != 'void' AND o.created_at >= ? AND o.created_at < ?
+          FROM customer_order o WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? AND o.created_at < ?
         """,
         (bo._sql(start), bo._sql(now)),
     ).fetchall()
@@ -218,7 +218,7 @@ def _sales_highlights(conn, start: _dt.datetime, end: _dt.datetime) -> dict:
         SELECT o.id, o.order_no, o.created_at,
                COALESCE(SUM(ol.qty*ol.unit_price),0) AS total
           FROM customer_order o LEFT JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.created_at >= ? AND o.created_at < ?
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? AND o.created_at < ?
          GROUP BY o.id ORDER BY total DESC LIMIT 1
         """,
         (bo._sql(start), bo._sql(end)),
@@ -428,7 +428,7 @@ def owner_sales(conn, *, now: _dt.datetime, period_preset: str, comparison_mode:
     favorites = _customer_favorites(current_items, prior_items, changes)
     categories = _category_performance(conn, period["startDt"], period["endDt"], comparison["startDt"], comparison["endDt"])
 
-    earliest = conn.execute("SELECT MIN(created_at) AS t FROM customer_order WHERE status != 'void'").fetchone()["t"]
+    earliest = conn.execute("SELECT MIN(created_at) AS t FROM customer_order WHERE status != 'void' AND is_demo = 0").fetchone()["t"]
     yoy = None
     if earliest and (now - _dt.datetime.strptime(earliest, _SQL_FMT).replace(tzinfo=_dt.timezone.utc)).days >= 365 \
             and comparison_mode != "last_year":

@@ -15,6 +15,7 @@ background tick are never two different code paths).
 from __future__ import annotations
 
 import json
+import os
 import threading
 import datetime as _dt
 
@@ -23,6 +24,20 @@ from . import ml_training as training
 from .db import write_tx
 
 TICK_SECONDS = 24 * 3600
+
+
+def scheduler_enabled() -> bool:
+    """Deployment requirement: automatic scheduled retraining must be OFF
+    by default in production, and on only through an explicit, separately
+    enabled configuration -- never merely because the app started up.
+    WT_ML_SCHEDULER_ENABLED=0/1 is that explicit switch; absent it,
+    production defaults to disabled and every other environment (dev, the
+    WT_ENV=test suite's own separate skip in api.py) keeps today's
+    always-on behavior."""
+    override = os.environ.get("WT_ML_SCHEDULER_ENABLED")
+    if override is not None:
+        return override == "1"
+    return os.environ.get("WT_ENV") != "production"
 
 # Single source of truth for "which readiness function backs which model" --
 # see ml_training.READINESS_FUNCS's own comment: promote_mode() (manual) and
@@ -123,13 +138,28 @@ def run_scheduled_cycle(conn, *, triggered_by: str) -> dict:
 
 def start_ml_scheduler(get_conn) -> None:
     """Spawns the one background thread, daily tick, non-blocking at
-    startup -- mirrors depletion.start_prophet_refresh_scheduler() exactly."""
+    startup -- mirrors depletion.start_prophet_refresh_scheduler() exactly.
+
+    The wait happens BEFORE the first cycle, not after: app startup must
+    only load already-trained artifacts (ml_startup.validate_artifacts_on_
+    startup, called just before this), never kick off a retrain of its own.
+    A restart therefore never trains anything by itself -- the next
+    scheduled cycle lands a full TICK_SECONDS after the process came up,
+    same as any other tick, and the only way to train sooner is the
+    explicit manual trigger (POST .../ml/train-cycle -> run_scheduled_cycle).
+
+    A no-op in production unless scheduler_enabled() says otherwise (see
+    its own docstring) -- the caller (wt/api.py's startup event) does not
+    need its own copy of this gate, so there is exactly one place that
+    decides whether the automatic cycle runs at all."""
+    if not scheduler_enabled():
+        return
     def _loop():
         while True:
+            threading.Event().wait(TICK_SECONDS)
             try:
                 run_scheduled_cycle(get_conn(), triggered_by="scheduler")
             except Exception:  # noqa: BLE001 -- the loop must never die
                 pass
-            threading.Event().wait(TICK_SECONDS)
     t = threading.Thread(target=_loop, name="ml-scheduler", daemon=True)
     t.start()

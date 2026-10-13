@@ -14445,19 +14445,26 @@ class TestOwnerRoleAndProvisioning(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 403, r.text)
 
-    def test_admin_direct_api_attempt_to_create_owner_is_rejected(self):
-        """ADMIN cannot create OWNER through the normal account-management
-        endpoint — enforced server-side regardless of what the frontend
-        exposes, and regardless of whether an OWNER already exists (a
-        crafted request naming a brand-new username must still be refused,
-        not merely blocked by a duplicate-username check)."""
+    def test_admin_can_create_an_additional_owner_account(self):
+        """2026-10 revision: ADMIN may now provision additional OWNER
+        accounts through the normal account-management endpoint — the
+        deployment-only CLI (owner_provisioning.provision_first_owner) is
+        still the only way to provision the very FIRST owner (see
+        test_a_second_owner_cannot_be_provisioned_once_one_exists below,
+        which is unaffected by this), but once at least one owner exists,
+        admin can add more here. Every OWNER account shares the identical,
+        fixed CAPABILITIES rows — there is no higher 'main owner' tier, so a
+        second owner account is automatically at parity with the first."""
         r = self.client.post(
             "/console/users", headers=self.H_ADMIN,
-            json={"username": "sneaky_new_owner", "display_name": "X", "role": "owner"},
+            json={"username": "second_admin_made_owner", "display_name": "X", "role": "owner"},
         )
-        self.assertEqual(r.status_code, 403, r.text)
-        usernames = {u["username"] for u in self.client.get("/console/users", headers=self.H_ADMIN).json()["users"]}
-        self.assertNotIn("sneaky_new_owner", usernames)
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["role"], "owner")
+        row = self.conn.execute(
+            "SELECT role FROM app_user WHERE username='second_admin_made_owner'"
+        ).fetchone()
+        self.assertEqual(row["role"], "owner")
 
     def test_admin_direct_api_attempt_to_create_manager_is_rejected(self):
         """'manager' is a legacy role: OWNER/ADMIN/CASHIER/KITCHEN are the

@@ -1,0 +1,6 @@
+Accuracy,Dataset,F1,FN,FP,Model,Precision,Recall,Status,TN,TP
+,REAL (human-reviewed ledger rows),,,,stock_loss_isoforest (Pass A),,,"NOT MEASURABLE: Validation metrics unavailable — insufficient confirmed labels on real (non-synthetic-seed) ledger rows (0/20 required: confirmed_anomaly or false_positive reviews). Existing reviews of synthetic-seed rows (see SYNTHETIC_SEED_USER_IDS) do not count toward this, since those rows are no longer in the model's candidate population.",,
+,REAL (human-reviewed validation sample),,,,unli_consumption_isoforest (Pass B),,,NOT MEASURABLE: insufficient_validation_data,,
+,REAL (human-reviewed validation sample),,,,flavor_consumption_isoforest,,,NOT MEASURABLE: insufficient_validation_data,,
+0.7361,"REAL (ledger backtest, heuristic rule not a trained model)",,0,513,replenishment_early_warning (ewma demand),0.0,,measured,1431,0
+0.7361,"REAL (ledger backtest, heuristic rule not a trained model)",,0,513,replenishment_early_warning (prophet demand),0.0,,measured,1431,0

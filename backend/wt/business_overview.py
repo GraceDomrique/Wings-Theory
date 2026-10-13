@@ -54,7 +54,7 @@ def _period_totals(conn, start: _dt.datetime, end: _dt.datetime) -> dict:
         """
         SELECT COUNT(*) AS orders, COALESCE(SUM(o.head_count), 0) AS covers
           FROM customer_order o
-         WHERE o.status != 'void' AND o.created_at >= :start AND o.created_at < :end
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= :start AND o.created_at < :end
         """,
         params,
     ).fetchone()
@@ -63,7 +63,7 @@ def _period_totals(conn, start: _dt.datetime, end: _dt.datetime) -> dict:
         SELECT COALESCE(SUM(ol.qty * ol.unit_price), 0) AS revenue,
                COALESCE(SUM(ol.qty), 0) AS items
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE o.status != 'void' AND o.created_at >= :start AND o.created_at < :end
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= :start AND o.created_at < :end
         """,
         params,
     ).fetchone()

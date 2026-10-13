@@ -207,7 +207,7 @@ def _category_mix(conn, start: _dt.datetime, end: _dt.datetime) -> list[dict]:
         SELECT m.category AS category, SUM(ol.qty * ol.unit_price) AS revenue
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND o.created_at >= ? AND o.created_at < ?
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? AND o.created_at < ?
          GROUP BY m.category ORDER BY revenue DESC
         """,
         (bo._sql(start), bo._sql(end)),
@@ -227,7 +227,7 @@ def _item_qty_by_period(conn, start: _dt.datetime, end: _dt.datetime) -> dict[st
                COUNT(DISTINCT o.id) AS orders
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND o.created_at >= ? AND o.created_at < ?
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? AND o.created_at < ?
          GROUP BY m.id
         """,
         (bo._sql(start), bo._sql(end)),
@@ -278,7 +278,7 @@ def _business_rhythm(conn, now: _dt.datetime, window_days: int = 56) -> dict:
         SELECT o.created_at, COALESCE(
                  (SELECT SUM(ol.qty*ol.unit_price) FROM order_line ol WHERE ol.order_id = o.id), 0
                ) AS revenue
-          FROM customer_order o WHERE o.status != 'void' AND o.created_at >= ? AND o.created_at < ?
+          FROM customer_order o WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? AND o.created_at < ?
         """,
         (bo._sql(start), bo._sql(now)),
     ).fetchall()

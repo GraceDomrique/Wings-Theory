@@ -300,7 +300,7 @@ def _trading_days(conn: sqlite3.Connection, lookback_days: int,
         params.append(timeutil.utc_upper_bound_sql(now))
     rows = conn.execute(
         f"SELECT DISTINCT {bd} AS d FROM customer_order "
-        f"WHERE status != 'void' AND created_at >= ?{upper} ORDER BY d",
+        f"WHERE status != 'void' AND is_demo = 0 AND created_at >= ?{upper} ORDER BY d",
         params,
     ).fetchall()
     return [r["d"] for r in rows]
@@ -318,7 +318,7 @@ def _item_daily_qty(conn: sqlite3.Connection, lookback_days: int,
         f"""
         SELECT ol.menu_item_id AS pk, {bd} AS d, SUM(ol.qty) AS qty
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE o.status != 'void' AND o.created_at >= ?{upper}
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ?{upper}
          GROUP BY pk, d
         """,
         params,
@@ -350,7 +350,7 @@ def _heads_daily(conn: sqlite3.Connection, lookback_days: int,
           FROM customer_order o
           JOIN order_line ol ON ol.order_id = o.id
           JOIN menu_item  m  ON m.id = ol.menu_item_id
-         WHERE m.is_unli = 1 AND o.status != 'void' AND o.created_at >= ?{upper}
+         WHERE m.is_unli = 1 AND o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ?{upper}
          GROUP BY d
         """,
         params,
@@ -376,7 +376,7 @@ def _intraday_share(conn: sqlite3.Connection, lookback_days: int,
         SELECT CAST(strftime('%H', o.created_at, '{shift}') AS INTEGER) AS hr,
                SUM(ol.qty) AS qty
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE o.status != 'void' AND o.created_at >= ?{upper}
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ?{upper}
          GROUP BY hr
         """,
         params,
@@ -1279,7 +1279,7 @@ def _refill_lambda(conn: sqlite3.Connection, lookback_days: int,
           FROM customer_order o
           JOIN order_line ol ON ol.order_id = o.id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE m.is_unli = 1 AND o.status != 'void' AND o.created_at >= ?
+         WHERE m.is_unli = 1 AND o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ?
          {heads_upper_clause}
         """,
         (lower, *upper_params),
@@ -1886,7 +1886,7 @@ def _consumption_by_item(conn: sqlite3.Connection, ingredient_id: int,
           JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item     m ON m.id = ol.menu_item_id
           JOIN v_recipe_leaf l ON l.recipe_id = m.recipe_id
-         WHERE l.ingredient_id = ? AND o.status != 'void' AND o.created_at >= ? {clause}
+         WHERE l.ingredient_id = ? AND o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ? {clause}
          GROUP BY m.id
          ORDER BY qty_base DESC
         """,
@@ -2097,7 +2097,7 @@ def _received_within_window(conn: sqlite3.Connection, start_iso: str, end_iso: s
 
 def _orders_between(conn: sqlite3.Connection, start_iso: str, end_iso: str) -> int:
     return int(conn.execute(
-        "SELECT COUNT(*) FROM customer_order WHERE status != 'void' "
+        "SELECT COUNT(*) FROM customer_order WHERE status != 'void' AND is_demo = 0 "
         "AND created_at >= ? AND created_at < ?", (start_iso, end_iso)).fetchone()[0])
 
 

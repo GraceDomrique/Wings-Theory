@@ -26,6 +26,9 @@ venv/
 backend/.secret
 backend/dev/.secret
 
+# Runtime lock file created by wt/db.py's cross-process migration lock
+*.migrate.lock
+
 # OS noise
 .DS_Store
 Thumbs.db

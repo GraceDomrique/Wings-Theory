@@ -64,3 +64,19 @@ export async function getCapabilityMatrix() {
     return row;
   });
 }
+
+/**
+ * Per-user capability overrides (migration 0052) — the editable layer on
+ * top of the role-default matrix above. GET returns {username, role,
+ * capabilities: [{capability, default, override, effective}]}; PUT sets or
+ * clears (allowed=null) one override and returns the same refreshed shape.
+ */
+export function getUserCapabilities(username) {
+  return api.get(`/console/users/${encodeURIComponent(username)}/capabilities`);
+}
+
+export function setUserCapability(username, capability, allowed) {
+  return api.put(`/console/users/${encodeURIComponent(username)}/capabilities`, {
+    capability, allowed,
+  });
+}

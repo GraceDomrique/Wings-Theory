@@ -137,6 +137,7 @@ export async function render(ctx) {
 
     mount(chartHost, LineChart({
       labels,
+      label: 'Actual sales',
       // History and forecast are separate series so the reader can see where
       // measurement stops and projection starts. Padding with nulls (not
       // zeros) keeps them aligned without inventing data points.
@@ -176,11 +177,11 @@ export async function render(ctx) {
       CardHeader({
         title: 'Next 7 days — top menu items',
         desc: 'Forecasts units sold, not raw ingredient grams',
-        right: h('label', { class: 'field', style: { minWidth: '200px' } }, picker),
+        right: h('label', { class: 'field', style: { minWidth: 'min(200px, 100%)' } }, picker),
       }),
       h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px', flexWrap: 'wrap', gap: '8px' } },
         legend,
-        h('label', { class: 'field', style: { minWidth: '150px' } },
+        h('label', { class: 'field', style: { minWidth: 'min(150px, 100%)' } },
           h('span', { class: 't-xs t-faint' }, 'History shown'), lookbackPicker)),
       chartHost,
       chartNote));

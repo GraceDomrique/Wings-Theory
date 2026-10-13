@@ -372,13 +372,20 @@ def _row_provenance(user_id: str | None) -> str:
 
 def _score_with_isolation_forest(
     conn: sqlite3.Connection, model_key: str, X: "np.ndarray", *, use_artifact: bool,
-) -> tuple["np.ndarray", "np.ndarray", str]:
-    """Returns (preds, raw_scores, source). source is 'artifact' when a
-    trained, persisted model served the prediction (the normal live path);
-    'fit_fresh' when use_artifact is False (ml_training.py building a
-    candidate) or no artifact exists yet for this model_key (a brand-new
-    registry before its first training run -- the system still produces
-    predictions rather than refusing to serve anything)."""
+) -> tuple["np.ndarray | None", "np.ndarray | None", str]:
+    """Returns (preds, raw_scores, source).
+
+    source is 'artifact' when a trained, persisted model served the
+    prediction (the normal live path); 'fit_fresh' when use_artifact is
+    False (ml_training.py building a candidate) or no artifact exists yet
+    AND the fresh-fit fallback is allowed in this environment (see
+    _fresh_fit_fallback_allowed) -- outside production this still produces
+    predictions rather than refusing to serve anything.
+
+    In production with no valid artifact, returns (None, None,
+    'unavailable') instead of fitting fresh: the caller's own rule-based
+    layer (large_fraction / variance-MAD) keeps answering, and the ML
+    verdict is reported absent rather than fabricated."""
     if use_artifact:
         path = model_registry.active_artifact_path(conn, model_key)
         if path:
@@ -390,12 +397,14 @@ def _score_with_isolation_forest(
                 # Missing/corrupt artifact file, or a pickle that no longer
                 # loads under the running sklearn version -- never let a
                 # bad artifact take the whole detection pass down. Falls
-                # through to a fresh fit, same as "no artifact yet". See
-                # ml_startup.py for the equivalent safety net at process
-                # startup (which additionally rolls back the registry
-                # pointer so this fallback stops being needed on the next
-                # call).
+                # through to the fresh-fit-or-unavailable decision below,
+                # same as "no artifact yet". See ml_startup.py for the
+                # equivalent safety net at process startup (which
+                # additionally rolls back the registry pointer so this
+                # fallback stops being needed on the next call).
                 pass
+        if not artifacts.fresh_fit_fallback_allowed():
+            return None, None, "unavailable"
     model = IsolationForest(n_estimators=N_ESTIMATORS, contamination="auto", random_state=RANDOM_STATE)
     preds = model.fit_predict(X)
     raw_scores = model.decision_function(X)
@@ -521,23 +530,28 @@ def _evaluate_stock_loss(
             conn, "stock_loss_isoforest", X, use_artifact=use_artifact)
         for rec in records:
             rec["_model_source"] = model_source
-        for rec, raw in zip(records, raw_scores):
-            rec["_raw_score"] = float(raw)
-            rec["score"] = round(-rec["_raw_score"], 3)   # public sign: higher = more anomalous
-        # Cap to the worst-scoring MAX_STOCK_LOSS_FLAG_FRACTION of the pool —
-        # see that constant's comment for why 'auto' alone over-flags this
-        # data. Sorted first so a cap that bites keeps the genuinely worst
-        # entries, not an arbitrary slice of an over-broad verdict.
-        candidates = sorted(
-            (rec for rec, pred in zip(records, preds) if pred == -1),
-            key=lambda rec: rec["_raw_score"],
-        )
-        cap = max(1, int(len(records) * MAX_STOCK_LOSS_FLAG_FRACTION)) if candidates else 0
-        for rec in candidates[:cap]:
-            rec["prediction"] = "flagged"
-            rec["method"] = "isolation_forest"
-        if cap and candidates:
-            decision_threshold = candidates[min(cap, len(candidates)) - 1]["score"]
+        if model_source != "unavailable":
+            for rec, raw in zip(records, raw_scores):
+                rec["_raw_score"] = float(raw)
+                rec["score"] = round(-rec["_raw_score"], 3)   # public sign: higher = more anomalous
+            # Cap to the worst-scoring MAX_STOCK_LOSS_FLAG_FRACTION of the
+            # pool — see that constant's comment for why 'auto' alone
+            # over-flags this data. Sorted first so a cap that bites keeps
+            # the genuinely worst entries, not an arbitrary slice of an
+            # over-broad verdict.
+            candidates = sorted(
+                (rec for rec, pred in zip(records, preds) if pred == -1),
+                key=lambda rec: rec["_raw_score"],
+            )
+            cap = max(1, int(len(records) * MAX_STOCK_LOSS_FLAG_FRACTION)) if candidates else 0
+            for rec in candidates[:cap]:
+                rec["prediction"] = "flagged"
+                rec["method"] = "isolation_forest"
+            if cap and candidates:
+                decision_threshold = candidates[min(cap, len(candidates)) - 1]["score"]
+        # model_source == 'unavailable': no artifact, production forbids a
+        # fresh in-request fit. The rule-based pass below still runs on
+        # every record -- it never depended on the ML layer having run.
 
     # Always runs, even when IsolationForest didn't (too little pooled
     # volume) or didn't flag a given entry — an ingredient's first big loss
@@ -888,20 +902,25 @@ def _evaluate_consumption(
         X = np.array([[rec["features"][name] for name in FEATURE_NAMES] for rec in records])
         preds, raw_scores, model_source = _score_with_isolation_forest(
             conn, "unli_consumption_isoforest", X, use_artifact=use_artifact)
-        for rec, raw in zip(records, raw_scores):
-            rec["iforest_prediction"] = "unflagged"
-            rec["_raw_score"] = float(raw)
-            rec["score"] = round(-rec["_raw_score"], 3)
-            rec["_model_source"] = model_source
-        candidates = sorted(
-            (rec for rec, pred in zip(records, preds) if pred == -1),
-            key=lambda rec: rec["_raw_score"],
-        )
-        cap = max(1, int(len(records) * MAX_FLAG_FRACTION))
-        for rec in candidates[:cap]:
-            rec["iforest_prediction"] = "flagged"
-        if cap and candidates:
-            decision_threshold = candidates[min(cap, len(candidates)) - 1]["score"]
+        if model_source == "unavailable":
+            for rec in records:
+                rec["iforest_prediction"] = "unflagged"
+                rec["_model_source"] = model_source
+        else:
+            for rec, raw in zip(records, raw_scores):
+                rec["iforest_prediction"] = "unflagged"
+                rec["_raw_score"] = float(raw)
+                rec["score"] = round(-rec["_raw_score"], 3)
+                rec["_model_source"] = model_source
+            candidates = sorted(
+                (rec for rec, pred in zip(records, preds) if pred == -1),
+                key=lambda rec: rec["_raw_score"],
+            )
+            cap = max(1, int(len(records) * MAX_FLAG_FRACTION))
+            for rec in candidates[:cap]:
+                rec["iforest_prediction"] = "flagged"
+            if cap and candidates:
+                decision_threshold = candidates[min(cap, len(candidates)) - 1]["score"]
 
     return records, decision_threshold
 
@@ -2311,20 +2330,25 @@ def _evaluate_flavor_consumption(
         X = np.array([[rec["features"][name] for name in FLAVOR_FEATURE_NAMES] for rec in records])
         preds, raw_scores, model_source = _score_with_isolation_forest(
             conn, "flavor_consumption_isoforest", X, use_artifact=use_artifact)
-        for rec, raw in zip(records, raw_scores):
-            rec["iforest_prediction"] = "unflagged"
-            rec["_raw_score"] = float(raw)
-            rec["score"] = round(-rec["_raw_score"], 3)
-            rec["_model_source"] = model_source
-        candidates = sorted(
-            (rec for rec, pred in zip(records, preds) if pred == -1),
-            key=lambda rec: rec["_raw_score"],
-        )
-        cap = max(1, int(len(records) * FLAVOR_MAX_FLAG_FRACTION))
-        for rec in candidates[:cap]:
-            rec["iforest_prediction"] = "flagged"
-        if cap and candidates:
-            decision_threshold = candidates[min(cap, len(candidates)) - 1]["score"]
+        if model_source == "unavailable":
+            for rec in records:
+                rec["iforest_prediction"] = "unflagged"
+                rec["_model_source"] = model_source
+        else:
+            for rec, raw in zip(records, raw_scores):
+                rec["iforest_prediction"] = "unflagged"
+                rec["_raw_score"] = float(raw)
+                rec["score"] = round(-rec["_raw_score"], 3)
+                rec["_model_source"] = model_source
+            candidates = sorted(
+                (rec for rec, pred in zip(records, preds) if pred == -1),
+                key=lambda rec: rec["_raw_score"],
+            )
+            cap = max(1, int(len(records) * FLAVOR_MAX_FLAG_FRACTION))
+            for rec in candidates[:cap]:
+                rec["iforest_prediction"] = "flagged"
+            if cap and candidates:
+                decision_threshold = candidates[min(cap, len(candidates)) - 1]["score"]
 
     return records, decision_threshold
 

@@ -34,9 +34,9 @@ export function Topbar({ title, sub, onSearch, onSignOut }) {
 
   const profile = h('div', { class: 'topbar-profile' },
     h('div', { class: 'avatar' }, initials),
-    h('div', {},
+    h('div', { class: 'id' },
       h('div', { class: 'name' }, user.displayName || user.username || 'Signed in'),
-      h('div', { class: 'role' }, user.role || '')),
+      user.role ? h('div', { class: 'role' }, user.role) : null),
     signOutBtn);
 
   const el = h('div', { class: 'topbar' },

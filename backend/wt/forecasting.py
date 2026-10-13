@@ -321,7 +321,7 @@ def effective_now(conn: sqlite3.Connection, *, now: _dt.datetime | None = None) 
         f"""
         SELECT {timeutil.sql_business_date("created_at")} AS d, COUNT(*) AS n
           FROM customer_order
-         WHERE status != 'void' AND created_at >= ?{upper}
+         WHERE status != 'void' AND is_demo = 0 AND created_at >= ?{upper}
          GROUP BY d
         """,
         params,
@@ -383,7 +383,7 @@ def _daily_series(conn: sqlite3.Connection, menu_item_pk: int, lookback_days: in
         f"""
         SELECT {bd} AS d, SUM(ol.qty) AS qty
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
-         WHERE ol.menu_item_id = ? AND o.status != 'void'
+         WHERE ol.menu_item_id = ? AND o.status != 'void' AND o.is_demo = 0
            AND o.created_at >= ?{upper}
          GROUP BY {bd}
         """,
@@ -700,17 +700,29 @@ def _mase(actual: list[float], pred: list[float], train_qtys: list[float]) -> fl
     return _mae(actual, pred) / scale
 
 
+def _bias(actual: list[float], pred: list[float]) -> float | None:
+    """Mean signed error (pred - actual): positive means the method tends to
+    over-forecast on this data, negative means it tends to under-forecast.
+    Unlike MAE/RMSE, errors are not absolute-valued, so this can cancel out
+    across folds -- it answers "which way does it lean", not "how big"."""
+    if not actual:
+        return None
+    return sum(p - a for a, p in zip(actual, pred)) / len(actual)
+
+
 def _score(actual: list[float], pred: list[float], train_qtys: list[float]) -> dict:
     wape = _wape(actual, pred)
     smape = _smape(actual, pred)
     mape = _mape_safe(actual, pred)
     mase = _mase(actual, pred, train_qtys)
+    bias = _bias(actual, pred)
     return {
         "mae": round(_mae(actual, pred), 4),
         "rmse": round(_rmse(actual, pred), 4),
         "wape": round(wape, 2) if wape is not None else None,
         "smape": round(smape, 2) if smape is not None else None,
         "mape": round(mape, 1) if mape is not None else None,
+        "bias": round(bias, 4) if bias is not None else None,
         "mape_note": ("computed over actual>0 days only; omitted on days with zero "
                       "real demand rather than treated as infinite or dropped silently"),
         "mase": round(mase, 3) if mase is not None else None,
@@ -1036,6 +1048,7 @@ def _backtest_series(rows: list[dict], series: list[dict],
             "mae": _avg("mae", scores), "rmse": _avg("rmse", scores),
             "wape": _avg("wape", scores), "smape": _avg("smape", scores),
             "mape": _avg("mape", scores), "mase": _avg("mase", scores),
+            "bias": _avg("bias", scores),
         }
 
     # Model selection: lowest mean WAPE wins (well-defined whenever any real
@@ -1224,10 +1237,13 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
                 if r["methods"].get(method, {}).get("wape") is not None]
         maes = [r["methods"][method]["mae"] for r in scored_items
                if r["methods"].get(method, {}).get("mae") is not None]
+        biases = [r["methods"][method]["bias"] for r in scored_items
+                 if r["methods"].get(method, {}).get("bias") is not None]
         fleet_by_method[method] = {
             "items_scored": len(maes),
             "mean_wape": round(sum(wapes) / len(wapes), 2) if wapes else None,
             "mean_mae": round(sum(maes) / len(maes), 4) if maes else None,
+            "mean_bias": round(sum(biases) / len(biases), 4) if biases else None,
         }
 
     selection_counts: dict[str, int] = {}
@@ -1356,7 +1372,7 @@ def _store_daily_series(conn: sqlite3.Connection, lookback_days: int,
                COALESCE(SUM(ol.qty * ol.unit_price), 0) AS sales
           FROM customer_order o
           JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.created_at >= ?{upper}
+         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ?{upper}
          GROUP BY d
         """,
         params,

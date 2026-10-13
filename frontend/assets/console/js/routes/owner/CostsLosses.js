@@ -5,6 +5,7 @@ import { StatTile } from '../../components/ui/StatTile.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Table } from '../../components/ui/Table.js';
+import { Tabbar } from '../../components/ui/Tabbar.js';
 import { Modal, ModalError } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
@@ -112,8 +113,40 @@ export async function render(ctx) {
 
   const monthLossQty = [...wastageByUnit.values(), ...spoilageByUnit.values()].reduce((a, b) => a + b, 0);
 
+  // 2026-10 relayout: five sections used to run down one long page end to
+  // end — a reader had to scroll past Menu Cost Insights' tables to get
+  // back to Unusual Usage. Same five sections, now one tab each (matching
+  // the approved reference mockup), with the four headline figures staying
+  // visible above the tabs regardless of which one is open.
+  const TABS = [
+    { id: 'inventory', label: 'Inventory Value' },
+    { id: 'losses', label: 'Recorded Losses' },
+    { id: 'usage', label: 'Unusual Usage' },
+    { id: 'unli', label: 'Unlimited Wings' },
+    { id: 'margins', label: 'Menu Cost Insights' },
+  ];
+  let activeTab = TABS.some((t) => t.id === ctx.tab) ? ctx.tab : 'inventory';
+  const body = h('div');
+  const tabbar = Tabbar({
+    items: TABS, activeId: activeTab,
+    onChange: (id) => { activeTab = id; draw(); },
+  });
+
+  function draw() {
+    mount(body,
+      activeTab === 'inventory' ? inventoryValueSection(valuation)
+        : activeTab === 'losses' ? recordedLossesSection({
+          wastageRows, spoilageRows, wastageByUnit, spoilageByUnit, unitTotalsNode,
+          varianceItems, countedVariance, flaggedVariance, topLossIngredients,
+        })
+          : activeTab === 'usage' ? unusualUsageSection(ctx, { stockLoss, consumptionAnomalies })
+            : activeTab === 'unli' ? unliSection(ctx, reconHistory)
+              : menuCostSection(margins, lowestMarginItems));
+  }
+  draw();
+
   return h('div', {},
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3,1fr)', gap: '14px', marginBottom: '14px' } },
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', marginBottom: '14px' } },
       StatTile({
         iconPath: ICON.value, severity: 'good',
         value: valuation.available ? money(valuation.totalValue) : null,
@@ -126,15 +159,13 @@ export async function render(ctx) {
       StatTile({
         iconPath: ICON.alert, severity: stockLoss.length > 0 ? 'crit' : 'good',
         value: count(stockLoss.length), label: 'Unusual Usage Items',
+      }),
+      StatTile({
+        iconPath: ICON.losses, severity: consumptionAnomalies.length > 0 ? 'crit' : 'good',
+        value: count(consumptionAnomalies.length), label: 'Unlimited Wings Alerts',
       })),
-    inventoryValueSection(valuation),
-    recordedLossesSection({
-      wastageRows, spoilageRows, wastageByUnit, spoilageByUnit, unitTotalsNode,
-      varianceItems, countedVariance, flaggedVariance, topLossIngredients,
-    }),
-    unusualUsageSection(ctx, { stockLoss, consumptionAnomalies }),
-    unliSection(ctx, reconHistory),
-    menuCostSection(margins, lowestMarginItems));
+    tabbar,
+    body);
 }
 
 function inventoryValueSection(valuation) {

@@ -93,7 +93,6 @@ export const ADMIN_TREE = [
       { id: 'verify', label: 'Setup & Verification', badge: 'verification' },
       { id: 'users', label: 'Users & Access' },
       { id: 'audit', label: 'Audit Trail' },
-      { id: 'settings', label: 'Settings' },
     ],
   },
   {
@@ -250,5 +249,4 @@ export const PAGE_SUB = {
   verify: 'Setup numbers that still need a real, confirmed value.',
   users: 'Who has access, and what they can do.',
   audit: 'Who changed what, and when.',
-  settings: 'Account security.',
 };

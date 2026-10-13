@@ -219,7 +219,24 @@ def _pick_expires_at(rng: random.Random, category: str, expiry_mode: str,
     roll = rng.random()
     if guarantee_fresh:
         days_out = rng.randint(healthy_lo, healthy_hi)
-    elif roll < 0.75:
+        expires = received_date + _dt.timedelta(days=days_out)
+        # reserve_order's own FEFO freshness check runs at the REAL wall-
+        # clock moment this generator happens to execute, not at the
+        # synthetic `received_date` being backdated to -- so a "fresh for
+        # healthy_hi days from received_date" batch can still read as
+        # already-expired the instant it's created, whenever received_date
+        # is further in the past than a short category's own healthy
+        # window (wet_food: 10-25 days) reaches. That turned a reactive
+        # shortfall top-up into one that could never actually resolve the
+        # shortfall it exists to fix -- not a data problem, a clock
+        # mismatch. Clamped to real-today-plus-the-same-window instead,
+        # which keeps every OTHER guarantee_fresh call (received_date at or
+        # near real "now", the tool's normal day-by-day use) unchanged.
+        real_today = _dt.date.today()
+        if expires <= real_today:
+            expires = real_today + _dt.timedelta(days=days_out)
+        return expires.isoformat()
+    if roll < 0.75:
         days_out = rng.randint(healthy_lo, healthy_hi)
     elif roll < 0.93:
         days_out = rng.randint(near_lo, near_hi)
@@ -513,11 +530,22 @@ def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rn
     if extra_lines:
         _add_lines(conn, order_pk, extra_lines, extra_prices or {})
 
-    try:
-        reserve_order(conn, order_pk, user_id=USER_ID)
-    except InsufficientStockError as e:
-        _restock_shortfalls(conn, e.shortfalls, ts, restock_reference_date or day, rng)
-        reserve_order(conn, order_pk, user_id=USER_ID)
+    # One retry after a restock isn't always enough when this runs on top
+    # of a real, already-depleted stock position (as opposed to a freshly
+    # seeded catalog with every ingredient at a full starting level, this
+    # function's original scenario) -- a second ingredient can come up
+    # short on the retry itself. Bounded at 3 attempts total rather than an
+    # unbounded loop, so a genuinely unfixable structural block (see
+    # _restock_shortfalls' own "reason", not "needed" distinction) still
+    # surfaces as an error instead of spinning.
+    for attempt in range(3):
+        try:
+            reserve_order(conn, order_pk, user_id=USER_ID)
+            break
+        except InsufficientStockError as e:
+            if attempt == 2:
+                raise
+            _restock_shortfalls(conn, e.shortfalls, ts, restock_reference_date or day, rng)
 
     if rng.random() < walkout_rate:
         release_order(conn, order_pk, "demo: table left before kitchen started", user_id=USER_ID)
@@ -550,11 +578,15 @@ def _seed_unlimited_order(conn: sqlite3.Connection, day: _dt.date, hour: int, rn
 
         use_premium = flavors_premium and rng.random() < 0.12
         flavor = rng.choice(flavors_premium) if use_premium else rng.choice(flavors_included)
-        try:
-            refill = record_refill(conn, session_pk, flavor["id"], user_id=USER_ID)
-        except InsufficientStockError as e:
-            _restock_shortfalls(conn, e.shortfalls, round_ts, restock_reference_date or day, rng)
-            refill = record_refill(conn, session_pk, flavor["id"], user_id=USER_ID)
+        refill = None
+        for attempt in range(3):
+            try:
+                refill = record_refill(conn, session_pk, flavor["id"], user_id=USER_ID)
+                break
+            except InsufficientStockError as e:
+                if attempt == 2:
+                    raise
+                _restock_shortfalls(conn, e.shortfalls, round_ts, restock_reference_date or day, rng)
         refill_pk = refill["id"]
         conn.execute("UPDATE unli_refill SET created_at=? WHERE id=?", (round_ts, refill_pk))
         conn.execute("UPDATE unli_refill_line SET created_at=? WHERE refill_id=?", (round_ts, refill_pk))
@@ -769,11 +801,17 @@ def _run(conn: sqlite3.Connection, days: int, seed: int, void_rate: float, verbo
             order_pk, order_no = _new_order(conn, f"T-{rng.randint(1, 14):02d}", head_count)
             _add_lines(conn, order_pk, lines, price_by_id)
 
-            try:
-                reserve_order(conn, order_pk, user_id=USER_ID)
-            except InsufficientStockError as e:
-                stats["restocked_ingredients"] += _restock_shortfalls(conn, e.shortfalls, ts, day, rng)
-                reserve_order(conn, order_pk, user_id=USER_ID)
+            # Same bounded-retry reasoning as _seed_unlimited_order's own
+            # reserve_order call above: one restock isn't always enough
+            # when running on top of a real, already-depleted position.
+            for attempt in range(3):
+                try:
+                    reserve_order(conn, order_pk, user_id=USER_ID)
+                    break
+                except InsufficientStockError as e:
+                    if attempt == 2:
+                        raise
+                    stats["restocked_ingredients"] += _restock_shortfalls(conn, e.shortfalls, ts, day, rng)
 
             if rng.random() < void_rate:
                 release_order(conn, order_pk, "demo: customer changed mind", user_id=USER_ID)

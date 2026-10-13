@@ -1,4 +1,4 @@
-import { h, mount } from '../../lib/dom.js';
+import { h, mount, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
 import { StatTile } from '../../components/ui/StatTile.js';
@@ -38,6 +38,33 @@ const ICON = {
   orders: '<path d="M4 19V5a2 2 0 012-2h9l5 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M9 13h6M9 17h6M9 9h2"/>',
   stock: '<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
 };
+
+// One icon + pastel tint per "needs your attention" kind — a quick visual
+// anchor so the list reads at a glance instead of as a column of identical
+// bullet dots. Falls back to a plain alert triangle + its own severity's
+// tint for any kind not listed here, same defensive-default pattern the
+// rest of this page already uses for missing data.
+const ATTENTION_ICON = {
+  expired: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
+  restock: '<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
+  expiring: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
+  blocked: '<circle cx="12" cy="12" r="9"/><path d="M4.9 4.9l14.2 14.2"/>',
+  declining_sales: '<path d="M22 17l-9-9-4 4-6-6"/><path d="M22 7v10h-10"/>',
+};
+const ATTENTION_ICON_DEFAULT = '<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>';
+const SEV_TINT = { crit: 'var(--crit-tint)', warn: 'var(--warn-tint)', good: 'var(--good-tint)', info: 'var(--info-tint)', flat: 'var(--line-soft)' };
+const SEV_INK = { crit: 'var(--crit)', warn: 'var(--warn)', good: 'var(--good)', info: 'var(--info)', flat: 'var(--ink-soft)' };
+
+// One icon + pastel tint per Business Rhythm insight, same idea — see
+// businessRhythmCard below.
+const RHYTHM_ICON = {
+  'Weekends Matter': '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+  'Dinner Leads': '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
+  'Peak Hour': '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+  'Payday Pattern': '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+};
+const RHYTHM_TINT = ['var(--amber-tint)', 'var(--info-tint)', 'var(--good-tint)', 'var(--cocoa-tint)'];
+const RHYTHM_INK = ['var(--amber-deep)', 'var(--info)', 'var(--good)', 'var(--cocoa-deep)'];
 
 export async function render(ctx) {
   const d = await getOwnerOverview();
@@ -124,23 +151,30 @@ function statusSeverity(status) {
 function attentionBanner(d, ctx, expanded = false, onToggle = null) {
   const items = d.needsAttention || [];
   if (items.length === 0) {
-    return h('div', { class: 'callout callout-info' },
-      h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
-        Pill('good', '✓'), h('strong', {}, 'Nothing needs your attention right now.')));
+    return h('div', { class: 'attn-card attn-clear' },
+      h('div', { class: 'attn-icon', style: { background: 'var(--good-tint)', color: 'var(--good)' } }, icon('<path d="M20 6L9 17l-5-5"/>', 18)),
+      h('strong', {}, 'Nothing needs your attention right now.'));
   }
-  const shown = expanded ? items : items.slice(0, 2);
-  return h('div', { class: 'callout callout-warn' },
-    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', marginBottom: '8px' } },
-      h('strong', {}, `${items.length} matter${items.length === 1 ? '' : 's'} need${items.length === 1 ? 's' : ''} your attention`),
-      items.length > 2
+  const shown = expanded ? items : items.slice(0, 3);
+  return h('div', { class: 'attn-card' },
+    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', marginBottom: '10px' } },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+        h('div', { class: 'attn-icon', style: { background: 'var(--amber-tint)', color: 'var(--amber-deep)' } },
+          icon('<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>', 16)),
+        h('strong', {}, `${items.length} matter${items.length === 1 ? '' : 's'} need${items.length === 1 ? 's' : ''} your attention`)),
+      items.length > 3
         ? Button({ variant: 'ghost', size: 'sm', onClick: () => onToggle && onToggle(!expanded) }, expanded ? 'Show less' : 'View All →')
         : null),
-    h('div', {}, ...shown.map((a) => h('div', {
-      class: 'mini-row', style: { cursor: a.route ? 'pointer' : 'default', border: 'none', padding: '4px 0' },
+    h('div', { class: 'attn-grid' }, ...shown.map((a) => h('div', {
+      class: 'attn-item', style: { cursor: a.route ? 'pointer' : 'default' },
       onClick: a.route ? () => ctx.navigate(a.route) : undefined,
     },
-    h('span', { class: 't-sm' }, '• ', a.headline),
-    Pill(a.severity, a.kind.replace(/_/g, ' '))))));
+    h('div', {
+      class: 'attn-icon', style: { background: SEV_TINT[a.severity] || SEV_TINT.flat, color: SEV_INK[a.severity] || SEV_INK.flat },
+    }, icon(ATTENTION_ICON[a.kind] || ATTENTION_ICON_DEFAULT, 16)),
+    h('div', { style: { minWidth: 0 } },
+      h('div', { class: 't-sm', style: { fontWeight: '600' } }, a.headline),
+      h('div', { class: 't-xs t-faint' }, a.kind.replace(/_/g, ' ')))))));
 }
 
 // =============================================================================
@@ -329,10 +363,15 @@ function businessRhythmCard(d) {
   }
   return Card({},
     CardHeader({ title: 'Business Rhythm', desc: `Recurring patterns, last ${r.windowDays} days` }),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px' } },
-      ...tiles.map((t) => h('div', { class: 'card', style: { padding: '10px 12px' } },
-        h('div', { style: { fontWeight: '600', fontSize: '12.5px', marginBottom: '4px' } }, t.title),
-        h('div', { class: 't-xs t-faint' }, t.body)))));
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: '12px' } },
+      ...tiles.map((t, i) => h('div', {
+        class: 'rhythm-tile', style: { background: RHYTHM_TINT[i % RHYTHM_TINT.length] },
+      },
+      h('div', { class: 'attn-icon', style: { background: 'rgba(255,255,255,0.6)', color: RHYTHM_INK[i % RHYTHM_INK.length] } },
+        icon(RHYTHM_ICON[t.title] || ICON.revenue, 18)),
+      h('div', { style: { minWidth: 0 } },
+        h('div', { style: { fontWeight: '700', fontSize: '13px', color: RHYTHM_INK[i % RHYTHM_INK.length], marginBottom: '3px' } }, t.title),
+        h('div', { class: 't-xs', style: { color: 'var(--ink-soft)', lineHeight: '1.4' } }, t.body))))));
 }
 
 function messagesCard(d, ctx) {

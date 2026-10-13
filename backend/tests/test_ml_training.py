@@ -24,7 +24,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from wt import anomaly, db, ml_startup, ml_training  # noqa: E402
+from wt import anomaly, db, ml_scheduler, ml_startup, ml_training  # noqa: E402
+from wt import ml_artifacts_io as artifacts  # noqa: E402
 from wt import model_registry as mr  # noqa: E402
 from wt.db import write_tx  # noqa: E402
 from wt.errors import PermissionError_  # noqa: E402
@@ -504,13 +505,186 @@ class TestMLModeTransitionEndToEnd(_MLTestBase):
         self.assertTrue(any(f["model_source"] == "artifact" for f in flagged_after_rollback))
 
 
+class TestProductionDefaultsOff(unittest.TestCase):
+    """Deployment requirement: automatic scheduled retraining and the
+    implicit in-request fresh-fit fallback must both be OFF by default in
+    production, and on only through an explicit, separately enabled
+    override -- never merely because WT_ENV happens to be unset."""
+
+    def _with_env(self, **kv):
+        prev = {k: os.environ.get(k) for k in kv}
+        os.environ.update({k: v for k, v in kv.items() if v is not None})
+        for k, v in kv.items():
+            if v is None:
+                os.environ.pop(k, None)
+        return prev
+
+    def _restore_env(self, prev):
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def test_scheduler_disabled_by_default_in_production_enabled_elsewhere(self):
+        prev = self._with_env(WT_ENV="production", WT_ML_SCHEDULER_ENABLED=None)
+        try:
+            self.assertFalse(ml_scheduler.scheduler_enabled())
+        finally:
+            self._restore_env(prev)
+        prev = self._with_env(WT_ENV="dev", WT_ML_SCHEDULER_ENABLED=None)
+        try:
+            self.assertTrue(ml_scheduler.scheduler_enabled())
+        finally:
+            self._restore_env(prev)
+
+    def test_scheduler_explicit_override_wins_either_direction(self):
+        prev = self._with_env(WT_ENV="production", WT_ML_SCHEDULER_ENABLED="1")
+        try:
+            self.assertTrue(ml_scheduler.scheduler_enabled())
+        finally:
+            self._restore_env(prev)
+        prev = self._with_env(WT_ENV="dev", WT_ML_SCHEDULER_ENABLED="0")
+        try:
+            self.assertFalse(ml_scheduler.scheduler_enabled())
+        finally:
+            self._restore_env(prev)
+
+    def test_fresh_fit_fallback_disabled_by_default_in_production_enabled_elsewhere(self):
+        prev = self._with_env(WT_ENV="production", WT_ML_ALLOW_FRESH_FIT_FALLBACK=None)
+        try:
+            self.assertFalse(artifacts.fresh_fit_fallback_allowed())
+        finally:
+            self._restore_env(prev)
+        prev = self._with_env(WT_ENV="dev", WT_ML_ALLOW_FRESH_FIT_FALLBACK=None)
+        try:
+            self.assertTrue(artifacts.fresh_fit_fallback_allowed())
+        finally:
+            self._restore_env(prev)
+
+
+class TestArtifactPathPortability(unittest.TestCase):
+    """Deployment requirement: ml_training_run.artifact_path must not bake
+    in a machine-specific absolute path -- moving backend/ (db + ml_
+    artifacts/ together) to a different machine/drive/OS must keep every
+    artifact resolvable."""
+
+    def test_dump_returns_a_relative_ml_artifacts_path(self):
+        token = artifacts.new_run_token()
+        path = artifacts.dump_json({"schema_version": "t", "feature_names": None}, "unit_test_model", token)
+        self.assertFalse(Path(path).is_absolute(), f"artifact_path must be relative, got {path!r}")
+        self.assertTrue(path.startswith("ml_artifacts/"))
+        try:
+            self.assertEqual(artifacts.load_json(path), {"schema_version": "t", "feature_names": None})
+        finally:
+            artifacts.resolve_path(path).unlink()
+
+    def test_resolve_path_honors_a_pre_existing_absolute_path_unchanged(self):
+        abs_path = str(artifacts.ARTIFACT_DIR / "does_not_need_to_exist_for_this_check.joblib")
+        self.assertEqual(artifacts.resolve_path(abs_path), Path(abs_path))
+
+    def test_resolve_path_is_independent_of_how_the_path_was_spelled(self):
+        token = artifacts.new_run_token()
+        path = artifacts.dump_json({"schema_version": "t", "feature_names": None}, "unit_test_model2", token)
+        try:
+            # Same artifact, reached via the relative form the DB now
+            # stores and via a bare filename -- both must resolve to the
+            # exact same file on disk.
+            bare_filename = Path(path).name
+            self.assertEqual(artifacts.resolve_path(path), artifacts.resolve_path(bare_filename))
+        finally:
+            artifacts.resolve_path(path).unlink()
+
+
+class TestProductionForbidsFreshFit(_MLTestBase):
+    """Deployment requirement: a production request must never implicitly
+    train a model. With WT_ENV=production and no active stock_loss_isoforest
+    artifact, _score_with_isolation_forest()/_evaluate_stock_loss() must
+    report the ML layer 'unavailable' rather than fitting an IsolationForest
+    in-request -- while the unconditional rule-based layer (large_fraction)
+    keeps answering."""
+
+    def test_detect_anomalies_reports_unavailable_instead_of_fitting_fresh_in_production(self):
+        self.assertIsNone(mr.active_run(self.conn, "stock_loss_isoforest"),
+                          "this class's own DB must have no trained artifact yet")
+        ing = self._fresh_ingredient_id()
+        for i in range(anomaly.MIN_POOLED_SAMPLES + 5):
+            self._insert_ledger_row(
+                delta=-(2 + (i % 5)), balance_after=300 - i, user_id=None,
+                ingredient_id=ing, ref_id=f"PROD-GATE-{i}", batch_id=None,
+                created_at=f"2026-05-{(i % 28) + 1:02d}",
+            )
+        os.environ["WT_ENV"] = "production"
+        try:
+            records, _ = anomaly._evaluate_stock_loss(self.conn, 365, mode="REAL")
+        finally:
+            os.environ["WT_ENV"] = "test"
+        this_ing_records = [r for r in records if r["row"]["ingredient_id"] == ing]
+        self.assertTrue(this_ing_records)
+        self.assertTrue(all(r["_model_source"] == "unavailable" for r in this_ing_records),
+                        "no artifact + production must never fall through to a fresh in-request fit")
+        self.assertTrue(all(r["method"] != "isolation_forest" for r in this_ing_records),
+                        "the ML layer must not have flagged anything it never actually scored")
+
+        # The explicit override still allows the old dev-friendly behavior.
+        os.environ["WT_ENV"] = "production"
+        os.environ["WT_ML_ALLOW_FRESH_FIT_FALLBACK"] = "1"
+        try:
+            records2, _ = anomaly._evaluate_stock_loss(self.conn, 365, mode="REAL")
+        finally:
+            os.environ["WT_ENV"] = "test"
+            os.environ.pop("WT_ML_ALLOW_FRESH_FIT_FALLBACK", None)
+        this_ing_records2 = [r for r in records2 if r["row"]["ingredient_id"] == ing]
+        self.assertTrue(any(r["_model_source"] == "fit_fresh" for r in this_ing_records2),
+                        "the explicit override must restore the fresh-fit fallback")
+
+
+class TestStartupNeverRetrains(_MLTestBase):
+    """wt/api.py's startup event calls ml_startup.validate_artifacts_on_
+    startup() (load-only) and then ml_scheduler.start_ml_scheduler() (spawns
+    the daily-tick thread). That thread must never run a training cycle
+    before its first full TICK_SECONDS wait -- otherwise every restart would
+    silently retrain, which is exactly what the deployment-readiness
+    requirement rules out."""
+
+    def test_scheduler_thread_does_not_run_a_cycle_before_its_first_wait(self):
+        calls = []
+        original_wait = ml_scheduler.threading.Event.wait
+
+        def _recording_wait(self_evt, timeout=None):
+            if timeout != ml_scheduler.TICK_SECONDS:
+                # Not the scheduler loop's own wait (e.g. Thread.start()'s
+                # internal readiness Event) -- behave normally.
+                return original_wait(self_evt, timeout)
+            calls.append(timeout)
+            # Halt the daemon thread right here, before it can ever reach
+            # run_scheduled_cycle() -- recording that wait() was called with
+            # the right timeout is all this test needs.
+            raise RuntimeError("stop after recording the first wait() call")
+
+        ml_scheduler.threading.Event.wait = _recording_wait
+        try:
+            ml_scheduler.start_ml_scheduler(lambda: self.conn)
+            # Give the daemon thread a moment to reach its first wait() call.
+            time.sleep(0.2)
+        finally:
+            ml_scheduler.threading.Event.wait = original_wait
+
+        self.assertTrue(calls, "the scheduler thread never called Event.wait()")
+        self.assertEqual(calls[0], ml_scheduler.TICK_SECONDS,
+                         "the thread's first action must be the full tick wait, not an immediate cycle")
+        self.assertIsNone(mr.active_run(self.conn, "stock_loss_isoforest"),
+                          "starting the scheduler must not have trained anything yet")
+
+
 def main() -> int:
     loader = unittest.TestLoader()
     suite = unittest.TestSuite(
         loader.loadTestsFromTestCase(t) for t in (
             TestModelRegistryAtomicity, TestProvenanceClause, TestPassBDerivedViewDoubleCounting,
             TestLabelLeakageGuard, TestReadinessLadderIndependence, TestTrainedArtifactsAreActuallyServed,
-            TestMLModeTransitionEndToEnd,
+            TestMLModeTransitionEndToEnd, TestProductionDefaultsOff, TestArtifactPathPortability,
+            TestProductionForbidsFreshFit, TestStartupNeverRetrains,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)

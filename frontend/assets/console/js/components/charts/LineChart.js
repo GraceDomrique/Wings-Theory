@@ -18,7 +18,7 @@ import { EmptyState } from '../ui/EmptyState.js';
  *        when supplied, rendered instead of the chart
  * @param {{label:string, data:(number|null)[], color:string, dashed?:boolean}[]} [opts.extraSeries]
  */
-export function LineChart({ labels, data, color, height = 130, insufficient, extraSeries = [] }) {
+export function LineChart({ labels, data, color, height = 130, insufficient, extraSeries = [], label = 'Forecast' }) {
   const hasReal = Array.isArray(data) && data.some((v) => v !== null && v !== undefined);
   if (insufficient || !hasReal) {
     return EmptyState(insufficient || {
@@ -38,7 +38,7 @@ export function LineChart({ labels, data, color, height = 130, insufficient, ext
       labels,
       datasets: [
         {
-          label: 'Forecast',
+          label,
           data,
           borderColor: stroke,
           backgroundColor: stroke + '22',

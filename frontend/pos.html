@@ -1318,9 +1318,43 @@
       same "1 column" bucket as a phone below, at a width that clearly still
       fits 2 — cards ended up stretched full-width with a small photo and a
       lot of dead space next to the text. Phones only past this point. */
+      /* Phones keep 2-up, not 1 — a single full-width card was mostly empty
+      space beside a small photo. Below this width the horizontal
+      image-left/text-right row (see .mcard/.tile above) doesn't leave the
+      text panel enough room for the name + price, so the card switches back
+      to the original image-top/details-below layout instead of shrinking
+      the row further. */
       @media (max-width: 600px) {
         #grid {
-          grid-template-columns: 1fr;
+          grid-template-columns: repeat(2, 1fr);
+          gap: 8px;
+        }
+        .mcard {
+          flex-direction: column;
+          height: auto;
+        }
+        .tile {
+          width: 100%;
+          max-width: none;
+          height: 96px;
+          border-radius: 16px 16px 0 0;
+        }
+        .tile::after {
+          background: linear-gradient(
+            to bottom,
+            transparent 45%,
+            rgba(15, 13, 11, 0.55) 72%,
+            var(--ink-1) 96%
+          );
+        }
+        .mcard .body {
+          padding: 8px 10px 10px;
+        }
+        .mcard .nm {
+          font-size: 14px;
+        }
+        .mcard .price {
+          font-size: 16px;
         }
       }
       @media (max-width: 860px) {

@@ -39,7 +39,6 @@ import * as instructions from './routes/instructions/Instructions.js';
 import * as verify from './routes/verify/Verification.js';
 import * as users from './routes/admin/UsersAccess.js';
 import * as audit from './routes/admin/AuditTrail.js';
-import * as settings from './routes/admin/Settings.js';
 
 /**
  * Entry point. Decides between the login gate and the shell, and owns nothing
@@ -56,7 +55,7 @@ const routes = {
   salesoverview, orderhistory, bestsellers, reports,
   inventoryoverview, historicalrecords, downloads, unlisummary,
   stockreplenishment, costslosses, reportshistory,
-  instructions, verify, users, audit, settings,
+  instructions, verify, users, audit,
 };
 
 const root = document.getElementById('root');

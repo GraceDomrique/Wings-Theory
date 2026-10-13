@@ -1,18 +1,17 @@
 import { h, mount } from '../../lib/dom.js';
-import { Card, CardHeader, CardTitle } from '../../components/ui/Card.js';
+import { Card, CardHeader } from '../../components/ui/Card.js';
 import { StatTile } from '../../components/ui/StatTile.js';
 import { Table } from '../../components/ui/Table.js';
+import { Tabbar } from '../../components/ui/Tabbar.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
-import { stamp, asText, count } from '../../lib/format.js';
+import { stamp, date, asText, count } from '../../lib/format.js';
 import { listPurchaseOrders, markOrdered, cancelPurchaseOrder, receiveLine } from '../../lib/api/purchaseOrders.js';
 import { session } from '../../lib/api/client.js';
 
-const ACTIVE_STATUSES = ['draft', 'ordered', 'partially_received'];
-const DONE_STATUSES = ['received', 'cancelled'];
 const ICON = {
   cart: '<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><circle cx="9" cy="22" r="1"/><circle cx="16" cy="22" r="1"/>',
 };
@@ -28,14 +27,24 @@ function statusLabel(status) {
   }
 }
 
+const TABS = [
+  { id: 'draft', label: 'Draft Orders', statuses: ['draft'] },
+  { id: 'inprogress', label: 'In Progress', statuses: ['ordered', 'partially_received'] },
+  { id: 'completed', label: 'Completed', statuses: ['received'] },
+  { id: 'cancelled', label: 'Cancelled', statuses: ['cancelled'] },
+  { id: 'history', label: 'Purchase History', statuses: null }, // null = every status
+];
+
 /**
  * Purchasing > Purchase — spec section 13's two questions ("what's being
- * processed right now?" and "what have we purchased before?") side by side
- * on one page instead of two separate sibling routes: a narrower "Currently
- * processing" rail on the left (the small, active, actionable list) and the
- * wider searchable "History" table on the right (the large, append-only
- * record). Same data source (listPurchaseOrders) split client-side by
- * status, same as the two pages this replaces.
+ * processed right now?" and "what have we purchased before?"), both reached
+ * through one status-tabbed table (2026-10 relayout, matching the approved
+ * reference mockup) rather than a narrow card rail beside a separate history
+ * table. Clicking a row opens that order's own detail panel below — items,
+ * running totals, and whichever actions its status/role combination allows
+ * — instead of the old pattern of one modal per action with no persistent
+ * place to see "what IS this order" at a glance. Same data source
+ * (listPurchaseOrders) split client-side by status, same as before.
  */
 export async function render(ctx) {
   const role = (session.user || {}).role;
@@ -43,83 +52,33 @@ export async function render(ctx) {
   const isAdmin = role === 'admin';
 
   let all = (await listPurchaseOrders()).items;
-  const activeHost = h('div');
-  const historyHost = h('div');
-  const activeCountEl = h('span', {}, '');
+  const listHost = h('div');
+  const detailHost = h('div');
 
+  let activeTab = TABS.some((t) => t.id === ctx.tab) ? ctx.tab : 'draft';
+  let selectedId = null;
   let supplierQuery = '';
-  let statusFilter = '';
   let fromDate = '';
   let toDate = '';
 
-  function activeOrders() { return all.filter((po) => ACTIVE_STATUSES.includes(po.status)); }
-  function doneOrders() { return all.filter((po) => DONE_STATUSES.includes(po.status)); }
-
-  function matchesHistory(po) {
-    if (statusFilter && po.status !== statusFilter) return false;
-    if (supplierQuery && !(po.supplier || '').toLowerCase().includes(supplierQuery.toLowerCase())) return false;
-    const day = (po.updatedAt || po.createdAt || '').slice(0, 10);
-    if (fromDate && day < fromDate) return false;
-    if (toDate && day > toDate) return false;
-    return true;
+  function rowsForTab() {
+    const tab = TABS.find((t) => t.id === activeTab);
+    let rows = tab.statuses ? all.filter((po) => tab.statuses.includes(po.status)) : all.slice();
+    if (activeTab === 'history') {
+      rows = rows.filter((po) => {
+        if (supplierQuery && !(po.supplier || '').toLowerCase().includes(supplierQuery.toLowerCase())) return false;
+        const day = (po.updatedAt || po.createdAt || '').slice(0, 10);
+        if (fromDate && day < fromDate) return false;
+        if (toDate && day > toDate) return false;
+        return true;
+      });
+    }
+    return rows.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
   }
 
   async function reload() {
     all = (await listPurchaseOrders()).items;
-    drawActive();
-    drawHistory();
-  }
-
-  // Spec section 10 names four explicit sections (Draft / In Progress /
-  // Completed / Cancelled) plus Purchase History. "Currently processing"
-  // already covers Draft+In Progress in one actionable rail; this just adds
-  // visible status subheadings within it rather than one undifferentiated
-  // list, so an owner scanning the page can tell drafts (theirs to act on)
-  // apart from orders already placed (Admin's to receive).
-  function drawActive() {
-    const pos = activeOrders();
-    activeCountEl.textContent = `(${pos.length})`;
-    if (pos.length === 0) {
-      mount(activeHost, EmptyState({
-        icon: '≡',
-        title: 'Nothing currently being processed',
-        description: isOwner
-          ? 'Draft one from Stock & Replenishment to get started.'
-          : 'None have been drafted by the Owner yet.',
-      }));
-      return;
-    }
-    const drafts = pos.filter((po) => po.status === 'draft');
-    const inProgress = pos.filter((po) => po.status === 'ordered' || po.status === 'partially_received');
-    const sections = [
-      ['Draft', drafts],
-      ['In Progress', inProgress],
-    ].filter(([, list]) => list.length > 0);
-    mount(activeHost, ...sections.flatMap(([label, list]) => [
-      h('div', { class: 'eyebrow', style: { margin: '4px 0 8px' } }, `${label} (${list.length})`),
-      ...list.map(poCard),
-    ]));
-  }
-
-  function poCard(po) {
-    const [sev, label] = statusLabel(po.status);
-    const itemSummary = po.items.map((it) => `${it.ingredientName} × ${asText.num(it.quantity, '', 2)}${it.unit ? ' ' + it.unit : ''}`).join(', ');
-    const canCancel = po.status === 'draft' || po.status === 'ordered';
-    const outstanding = po.items.some((it) => (it.receivedQtyBase || 0) < it.quantity);
-    return h('div', { class: 'po-card' },
-      h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '4px' } },
-        h('strong', { class: 't-sm' }, `PO-${po.id}`),
-        Pill(sev, label)),
-      h('div', { class: 't-xs t-soft', style: { marginBottom: '8px' } }, itemSummary),
-      po.expectedDeliveryDate ? h('div', { class: 't-xs t-faint', style: { marginBottom: '8px' } }, `Expected ${po.expectedDeliveryDate}`) : null,
-      h('div', { style: { display: 'flex', gap: '8px' } },
-        isAdmin && po.status === 'draft' ? Button({ size: 'sm', onClick: () => doMarkOrdered(po) }, 'Mark ordered') : null,
-        isAdmin && (po.status === 'ordered' || po.status === 'partially_received') && outstanding
-          ? Button({ size: 'sm', variant: 'primary', onClick: () => openReceiveModal(po) }, 'Receive')
-          : null,
-        canCancel
-          ? Button({ size: 'sm', variant: 'ghost', onClick: () => doCancel(po) }, 'Cancel')
-          : null));
+    draw();
   }
 
   function doMarkOrdered(po) {
@@ -191,51 +150,100 @@ export async function render(ctx) {
     h('div', { style: { display: 'flex', justifyContent: 'flex-end' } }, submit));
   }
 
-  function drawHistory() {
-    const doneAll = doneOrders();
-    const rows = doneAll.filter(matchesHistory);
-    mount(historyHost, Table({
-      columns: [
-        { key: 'id', label: 'PO', render: (po) => `PO-${po.id}` },
-        { key: 'status', label: 'Status', render: (po) => { const [sev, label] = statusLabel(po.status); return Pill(sev, label); } },
-        { key: 'supplier', label: 'Supplier', render: (po) => po.supplier || h('span', { class: 't-xs t-faint' }, '—') },
-        {
-          key: 'items', label: 'Items',
-          render: (po) => h('span', { class: 't-xs t-soft' }, po.items.map((it) => `${it.ingredientName} × ${asText.num(it.quantity, '', 2)}`).join(', ')),
-        },
-        { key: 'created', label: 'Created', render: (po) => h('span', { class: 'mono t-xs' }, stamp(po.createdAt)) },
-        {
-          key: 'closed', label: 'Closed',
-          render: (po) => h('span', { class: 'mono t-xs' }, stamp(po.updatedAt || po.createdAt)),
-        },
-      ],
-      rows,
-      empty: EmptyState({
-        icon: '≡',
-        title: doneAll.length ? 'No purchase orders match these filters' : 'No purchase history yet',
-        description: doneAll.length ? 'Widen or clear the filters above.' : 'Purchase orders appear here once they are received or cancelled.',
-      }),
-    }));
-  }
-
-  const supplierInput = h('input', { type: 'text', placeholder: 'Filter by supplier…', onInput: (e) => { supplierQuery = e.target.value; drawHistory(); } });
-  const statusPicker = h('select', { onChange: (e) => { statusFilter = e.target.value; drawHistory(); } },
-    h('option', { value: '' }, 'All'),
-    h('option', { value: 'received' }, 'Completed'),
-    h('option', { value: 'cancelled' }, 'Cancelled'));
-  const fromInput = h('input', { type: 'date', onChange: (e) => { fromDate = e.target.value; drawHistory(); } });
-  const toInput = h('input', { type: 'date', onChange: (e) => { toDate = e.target.value; drawHistory(); } });
+  const supplierInput = h('input', { type: 'text', placeholder: 'Filter by supplier…', onInput: (e) => { supplierQuery = e.target.value; draw(); } });
+  const fromInput = h('input', { type: 'date', onChange: (e) => { fromDate = e.target.value; draw(); } });
+  const toInput = h('input', { type: 'date', onChange: (e) => { toDate = e.target.value; draw(); } });
   const clearBtn = Button({
     size: 'sm', variant: 'ghost',
     onClick: () => {
-      supplierQuery = ''; statusFilter = ''; fromDate = ''; toDate = '';
-      supplierInput.value = ''; statusPicker.value = ''; fromInput.value = ''; toInput.value = '';
-      drawHistory();
+      supplierQuery = ''; fromDate = ''; toDate = '';
+      supplierInput.value = ''; fromInput.value = ''; toInput.value = '';
+      draw();
     },
   }, 'Clear filters');
+  const historyFilters = h('div', { style: { display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap', alignItems: 'flex-end' } },
+    h('label', { class: 'field', style: { minWidth: '160px' } }, 'Supplier', supplierInput),
+    h('label', { class: 'field' }, 'From', fromInput),
+    h('label', { class: 'field' }, 'To', toInput),
+    clearBtn);
 
-  drawActive();
-  drawHistory();
+  const tabbarHost = h('div');
+
+  function drawTabbar() {
+    mount(tabbarHost, Tabbar({
+      items: TABS.map((t) => ({ id: t.id, label: `${t.label} (${(t.statuses ? all.filter((po) => t.statuses.includes(po.status)) : all).length})` })),
+      activeId: activeTab,
+      onChange: (id) => { activeTab = id; selectedId = null; draw(); },
+    }));
+  }
+
+  function draw() {
+    drawTabbar();
+    const rows = rowsForTab();
+    if (!rows.some((po) => po.id === selectedId)) selectedId = rows.length ? rows[0].id : null;
+
+    mount(listHost,
+      activeTab === 'history' ? historyFilters : null,
+      Table({
+        columns: [
+          { key: 'id', label: 'PO Number', render: (po) => `PO-${po.id}` },
+          { key: 'supplier', label: 'Supplier', render: (po) => po.supplier || h('span', { class: 't-xs t-faint' }, '—') },
+          { key: 'created', label: 'Created Date', render: (po) => date(po.createdAt) },
+          { key: 'items', label: 'Items', render: (po) => count(po.items.length) },
+          { key: 'status', label: 'Status', render: (po) => { const [sev, label] = statusLabel(po.status); return Pill(sev, label); } },
+          { key: 'expected', label: 'Expected Delivery', render: (po) => (po.expectedDeliveryDate ? date(po.expectedDeliveryDate) : h('span', { class: 't-xs t-faint' }, '—')) },
+        ],
+        rows,
+        rowClass: (po) => (po.id === selectedId ? 'row-selected' : ''),
+        onRowClick: (po) => { selectedId = po.id; drawDetail(); },
+        empty: EmptyState({
+          icon: '≡',
+          title: all.length ? 'No purchase orders match this view' : 'No purchase orders yet',
+          description: isOwner ? 'Draft one from Stock & Replenishment to get started.' : 'None have been drafted by the Owner yet.',
+        }),
+      }));
+    drawDetail();
+  }
+
+  function drawDetail() {
+    const po = all.find((p) => p.id === selectedId);
+    if (!po) { mount(detailHost, h('div')); return; }
+    const [sev, label] = statusLabel(po.status);
+    const canCancel = po.status === 'draft' || po.status === 'ordered';
+    const outstanding = po.items.some((it) => (it.receivedQtyBase || 0) < it.quantity);
+
+    mount(detailHost, Card({},
+      CardHeader({
+        title: `PO-${po.id}`,
+        desc: `Supplier: ${po.supplier || '—'} · Created ${stamp(po.createdAt)} by ${po.createdBy || '—'}`,
+        right: Pill(sev, label),
+      }),
+      h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '18px' } },
+        h('div', {},
+          h('div', { class: 'eyebrow', style: { marginBottom: '8px' } }, `Items (${po.items.length})`),
+          Table({
+            columns: [
+              { key: 'ingredient', label: 'Ingredient', render: (it) => it.ingredientName },
+              { key: 'qty', label: 'Ordered', render: (it) => `${asText.num(it.quantity, '', 2)} ${it.unit || ''}` },
+              { key: 'received', label: 'Received', render: (it) => `${asText.num(it.receivedQtyBase || 0, '', 2)} ${it.baseUnit || ''}` },
+              { key: 'note', label: 'Note', render: (it) => it.note || h('span', { class: 't-xs t-faint' }, '—') },
+            ],
+            rows: po.items,
+          }),
+          po.notes ? h('p', { class: 't-sm t-soft', style: { marginTop: '10px' } }, h('strong', {}, 'Note: '), po.notes) : null,
+          po.cancelReason ? h('div', { class: 'callout callout-info', style: { marginTop: '10px' } }, h('p', {}, h('strong', {}, 'Cancel reason: '), po.cancelReason)) : null),
+        h('div', {},
+          h('div', { class: 'eyebrow', style: { marginBottom: '8px' } }, 'Actions'),
+          h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+            isAdmin && po.status === 'draft' ? Button({ size: 'sm', onClick: () => doMarkOrdered(po) }, 'Mark ordered') : null,
+            isAdmin && (po.status === 'ordered' || po.status === 'partially_received') && outstanding
+              ? Button({ size: 'sm', variant: 'primary', onClick: () => openReceiveModal(po) }, 'Receive delivery')
+              : null,
+            canCancel ? Button({ size: 'sm', variant: 'ghost', onClick: () => doCancel(po) }, 'Cancel order') : null,
+            po.expectedDeliveryDate ? h('div', { class: 't-xs t-faint', style: { marginTop: '6px' } }, `Expected delivery: ${date(po.expectedDeliveryDate)}`) : null))));
+  }
+
+  draw();
 
   const draftCount = all.filter((po) => po.status === 'draft').length;
   const inProgressCount = all.filter((po) => po.status === 'ordered' || po.status === 'partially_received').length;
@@ -243,28 +251,21 @@ export async function render(ctx) {
   const cancelledCount = all.filter((po) => po.status === 'cancelled').length;
 
   return h('div', {},
+    // Was crammed into the same row as the 4 stat tiles (flex:1 grid plus a
+    // button squeezed beside it) -- its own header line now, so the action
+    // reads as "the thing you do on this page" rather than a fifth,
+    // oddly-shaped tile.
     h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' } },
-      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', flex: '1' } },
-        StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(draftCount), label: 'Draft' }),
-        StatTile({ iconPath: ICON.cart, severity: inProgressCount > 0 ? 'warn' : 'good', value: count(inProgressCount), label: 'In Progress' }),
-        StatTile({ iconPath: ICON.cart, severity: 'good', value: count(completedCount), label: 'Completed' }),
-        StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(cancelledCount), label: 'Cancelled' })),
-      isOwner ? Button({ variant: 'primary', onClick: () => ctx.navigate('stockreplenishment'), style: { flexShrink: 0 } }, '+ Create Purchase Order') : null),
-    purchasingLayout());
-
-  function purchasingLayout() {
-    return h('div', { class: 'purchasing-layout' },
-    Card({ className: 'purchasing-active' },
-      CardHeader({ title: CardTitle(h('span', {}, 'Currently processing ', activeCountEl)), desc: 'Nothing here affects stock until a line is received.' }),
-      activeHost),
-    Card({ className: 'purchasing-history' },
-      CardHeader({ title: 'History', desc: 'Received and cancelled purchase orders' }),
-      h('div', { style: { display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap', alignItems: 'flex-end' } },
-        h('label', { class: 'field', style: { minWidth: '160px' } }, 'Supplier', supplierInput),
-        h('label', { class: 'field', style: { minWidth: '140px' } }, 'Status', statusPicker),
-        h('label', { class: 'field' }, 'From', fromInput),
-        h('label', { class: 'field' }, 'To', toInput),
-        clearBtn),
-      historyHost));
-  }
+      h('div', {},
+        h('div', { class: 'eyebrow', style: { marginBottom: '2px' } }, 'Purchase orders'),
+        h('div', { class: 't-sm t-faint' }, 'Draft, in progress, completed and cancelled, all in one place.')),
+      isOwner ? Button({ variant: 'primary', onClick: () => ctx.navigate('stockreplenishment') }, '+ Create Purchase Order') : null),
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', marginBottom: '18px' } },
+      StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(draftCount), label: 'Draft' }),
+      StatTile({ iconPath: ICON.cart, severity: inProgressCount > 0 ? 'warn' : 'good', value: count(inProgressCount), label: 'In Progress' }),
+      StatTile({ iconPath: ICON.cart, severity: 'good', value: count(completedCount), label: 'Completed' }),
+      StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(cancelledCount), label: 'Cancelled' })),
+    tabbarHost,
+    h('div', { style: { marginTop: '14px', marginBottom: '14px' } }, listHost),
+    detailHost);
 }

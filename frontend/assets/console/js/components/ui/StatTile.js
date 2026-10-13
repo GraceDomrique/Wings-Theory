@@ -32,11 +32,11 @@ export function StatTile({
     style: onClick ? { cursor: 'pointer' } : undefined,
   },
   h('div', {
-    style: { display: 'flex', alignItems: 'flex-start', gap: '10px' },
+    style: { display: 'flex', flexDirection: 'column', gap: '10px' },
     onClick,
   },
   iconPath ? h('span', { class: `kpi-icon kpi-icon-${severity}` }, icon(iconPath, 15)) : null,
-  h('div', { style: { flex: '1', minWidth: '0' } },
+  h('div', { style: { minWidth: '0' } },
     stat,
     sub ? h('div', { class: 't-xs', style: { marginTop: '4px' } }, sub) : null)));
 }

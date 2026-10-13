@@ -78,14 +78,32 @@ export async function render(ctx) {
     onChange: (id) => { activeTab = id; draw(); },
   });
 
+  // Each tab used to re-fetch and rebuild its content from scratch on every
+  // switch, even flipping back to one already open — that network
+  // round-trip (two calls for Historical Sales alone) is what made
+  // switching feel slow, not a CSS transition. Built once per tab per
+  // visit to this page, then reused — switching back to an already-loaded
+  // tab is instant, no refetch, no rebuild. destroyAllCharts() is NOT
+  // called here on a cache hit (or before building a not-yet-cached tab) —
+  // it tears down every live Chart.js instance globally, which would blank
+  // out a chart on an already-cached tab the moment any other tab's
+  // content is built. The router (AppShell/app.js) still calls it when
+  // leaving this page entirely, so nothing leaks across routes.
+  const tabCache = new Map();
+
   async function draw() {
-    destroyAllCharts();
+    if (tabCache.has(activeTab)) {
+      mount(body, tabCache.get(activeTab));
+      return;
+    }
     mount(body, Loading('Loading…'));
     try {
-      if (activeTab === 'sales') mount(body, await salesTab());
-      else if (activeTab === 'purchasing') mount(body, await purchasingTab());
-      else if (activeTab === 'losses') mount(body, await lossesTab());
-      else mount(body, await downloadsTab());
+      const content = activeTab === 'sales' ? await salesTab()
+        : activeTab === 'purchasing' ? await purchasingTab()
+          : activeTab === 'losses' ? await lossesTab()
+            : await downloadsTab();
+      tabCache.set(activeTab, content);
+      mount(body, content);
     } catch (e) {
       mount(body, EmptyState({ icon: '⨯', title: 'Could not load this tab', description: e.message || String(e) }));
     }
