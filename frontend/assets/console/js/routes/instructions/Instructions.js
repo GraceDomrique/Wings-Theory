@@ -181,7 +181,7 @@ export async function render(ctx) {
             h('div', { class: 'timeline-dot' }),
             h('div', {},
               h('div', { class: 't-sm', style: { fontWeight: '600' } }, s.label),
-              h('div', { class: 't-xs t-faint' }, stamp(s.at)))))))));
+              h('div', { class: 't-xs t-faint' }, stamp(s.at))))))))));
   }
 
   async function act(fn) {

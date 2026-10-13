@@ -240,7 +240,7 @@ export async function render(ctx) {
               ? Button({ size: 'sm', variant: 'primary', onClick: () => openReceiveModal(po) }, 'Receive delivery')
               : null,
             canCancel ? Button({ size: 'sm', variant: 'ghost', onClick: () => doCancel(po) }, 'Cancel order') : null,
-            po.expectedDeliveryDate ? h('div', { class: 't-xs t-faint', style: { marginTop: '6px' } }, `Expected delivery: ${date(po.expectedDeliveryDate)}`) : null))));
+            po.expectedDeliveryDate ? h('div', { class: 't-xs t-faint', style: { marginTop: '6px' } }, `Expected delivery: ${date(po.expectedDeliveryDate)}`) : null)))));
   }
 
   draw();
