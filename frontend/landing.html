@@ -6,6 +6,7 @@
 <title>Wings Theory</title>
 <meta name="description" content="Wings Theory — the ordering, stock and recipe system behind the counter.">
 <link rel="stylesheet" href="/assets/brand.css">
+<script src="/assets/bfcache-guard.js"></script>
 <style>
 *{box-sizing:border-box}
 html,body{margin:0;min-height:100%;background:#080706;color:#f7f4ef;
@@ -92,19 +93,15 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
 .learn-link{display:inline-block;margin-top:18px;font-size:13px;font-weight:600;color:var(--gold);
   background:none;border:0;padding:0;cursor:pointer;text-decoration:underline;text-underline-offset:3px}
 
-.metrics{display:flex;gap:28px;margin-top:34px;flex-wrap:wrap}
-.metric{min-width:120px}
-.metric b{display:block;font-size:22px;color:#f6f1ea;letter-spacing:-.03em}
-.metric span{font-size:10px;color:var(--muted-2);letter-spacing:.16em;text-transform:uppercase}
-
-/* ---------- learn more panel ---------- */
-.learn{max-width:760px;margin-top:0;max-height:0;overflow:hidden;opacity:0;
-  transition:max-height .5s ease,opacity .4s ease,margin-top .4s ease}
-.learn.open{max-height:280px;opacity:1;margin-top:26px}
-.learn-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
-.lcard{background:rgba(255,255,255,.045);border:1px solid var(--line-soft);border-radius:12px;padding:14px 12px;text-align:left}
-.lcard b{display:block;font-size:12.5px;color:var(--gold);margin-bottom:4px;letter-spacing:.02em}
-.lcard span{font-size:11.5px;color:var(--muted);line-height:1.5}
+/* ---------- powering section ---------- */
+.powering{margin-top:40px;max-width:720px}
+.powering-heading{font-size:11px;font-weight:900;letter-spacing:.22em;text-transform:uppercase;
+  color:var(--muted-2);margin:0 0 20px}
+.features{display:flex;gap:clamp(20px,4vw,56px);flex-wrap:nowrap}
+.feature{flex:1 1 0;min-width:0;display:flex;flex-direction:column;align-items:flex-start;gap:10px}
+.feature .ficon{width:26px;height:26px;color:var(--orange);stroke-width:1.8}
+.feature b{display:block;font-size:16px;font-weight:800;letter-spacing:.01em;color:#f6f1ea}
+.feature span{font-size:11.5px;color:var(--muted);letter-spacing:.04em}
 
 /* ---------- access card ---------- */
 .access{position:relative;width:min(100%,430px);justify-self:end;padding:28px;
@@ -197,8 +194,9 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
   main{width:min(100% - 28px,700px)}
   h1{font-size:56px}
   .hero-copy{font-size:14px;line-height:1.65}
-  .metrics{gap:18px}
-  .learn-grid{grid-template-columns:1fr}
+  .powering{margin-top:30px}
+  .features{flex-direction:column;gap:20px}
+  .feature{flex:1 1 auto;min-width:0}
   .access{padding:21px;border-radius:20px}
   .footer{font-size:8px}
 }
@@ -222,22 +220,27 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
   <main>
     <section class="hero">
       <div class="eyebrow">Flavor &middot; Science &middot; Perfection</div>
-      <h1>RUN THE BUSINESS.<br><span class="accent">KNOW WHAT'S NEXT.</span></h1>
-      <p class="hero-copy">One operating layer for orders, recipes, ingredient usage, stock movement,
-        replenishment decisions and kitchen execution. Built for speed behind the counter.</p>
-      <button class="learn-link" id="learnBtn" aria-expanded="false">What's included &darr;</button>
+      <h1>FROM WINGS TO <span class="accent">WISDOM.</span><br><span class="accent">EVERY DETAIL CONNECTED.</span></h1>
+      <p class="hero-copy">Track what sells, understand what gets used, and anticipate what you'll need next.</p>
 
-      <div class="metrics">
-        <div class="metric"><b>LIVE</b><span>Stock visibility</span></div>
-        <div class="metric"><b>REAL-TIME</b><span>Order flow</span></div>
-        <div class="metric"><b>ML-READY</b><span>Forecasting layer</span></div>
-      </div>
-
-      <section class="learn" id="learn">
-        <div class="learn-grid">
-          <div class="lcard"><b>Point of sale</b><span>Order entry with live availability, flavor selection and receipts.</span></div>
-          <div class="lcard"><b>Inventory</b><span>Recipe-level ingredient tracking, expiry monitoring and replenishment.</span></div>
-          <div class="lcard"><b>Kitchen display</b><span>Live tickets from till to pass, with every modifier the cashier entered.</span></div>
+      <section class="powering">
+        <h2 class="powering-heading">Powering Wings Theory</h2>
+        <div class="features">
+          <div class="feature">
+            <svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M2.97 12.92A2 2 0 0 0 2 14.63v3.24a2 2 0 0 0 .97 1.71l3 1.8a2 2 0 0 0 2.06 0L12 19v-5.5l-5-3-4.03 2.42Z"/><path d="m7 16.5-4.74-2.85"/><path d="m7 16.5 5-3"/><path d="M7 16.5v5.17"/><path d="M12 13.5V19l3.97 2.38a2 2 0 0 0 2.06 0l3-1.8a2 2 0 0 0 .97-1.71v-3.24a2 2 0 0 0-.97-1.71L17 10.5l-5 3Z"/><path d="m17 16.5-5-3"/><path d="m17 16.5 4.74-2.85"/><path d="M17 16.5v5.17"/><path d="M7.97 4.42A2 2 0 0 0 7 6.13v4.37l5 3 5-3V6.13a2 2 0 0 0-.97-1.71l-3-1.8a2 2 0 0 0-2.06 0l-3 1.8Z"/><path d="M12 8 7.26 5.15"/><path d="m12 8 4.74-2.85"/><path d="M12 13.5V8"/></svg>
+            <b>TRACK.</b>
+            <span>Stock &amp; Ingredients</span>
+          </div>
+          <div class="feature">
+            <svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21a1 1 0 0 0 1-1v-5.35c0-.457.316-.844.727-1.041a4 4 0 0 0-2.134-7.589 5 5 0 0 0-9.186 0 4 4 0 0 0-2.134 7.588c.411.198.727.585.727 1.041V20a1 1 0 0 0 1 1Z"/><path d="M6 17h12"/></svg>
+            <b>CONNECT.</b>
+            <span>Orders &amp; Kitchen</span>
+          </div>
+          <div class="feature">
+            <svg class="ficon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16v5"/><path d="M16 14v7"/><path d="M20 10v11"/><path d="m22 3-8.646 8.646a.5.5 0 0 1-.708 0L9.354 8.354a.5.5 0 0 0-.707 0L2 15"/><path d="M4 18v3"/><path d="M8 14v7"/></svg>
+            <b>ANTICIPATE.</b>
+            <span>Demand &amp; Restocking</span>
+          </div>
         </div>
       </section>
     </section>
@@ -409,14 +412,6 @@ h1 .accent{color:transparent;background:linear-gradient(105deg,#fff 12%,var(--go
       }
     }
   })();
-
-  /* ---------------- learn more ---------------- */
-  var learn = $('#learn'), learnBtn = $('#learnBtn');
-  learnBtn.addEventListener('click', function () {
-    var open = learn.classList.toggle('open');
-    this.setAttribute('aria-expanded', open ? 'true' : 'false');
-    this.textContent = open ? "Show less ↑" : "What's included ↓";
-  });
 
   /* ---------------- sign in ---------------- */
   var form = $('#loginForm'), loginBtn = $('#loginBtn'), err = $('#loginErr');

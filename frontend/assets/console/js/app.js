@@ -1,7 +1,7 @@
 import { mount } from './lib/dom.js';
 import { AppShell } from './layout/AppShell.js';
 import { Login } from './layout/Login.js';
-import { session, ALLOWED_ROLES } from './lib/api/client.js';
+import { session, ALLOWED_ROLES, logout } from './lib/api/client.js';
 import { destroyAllCharts } from './components/charts/base.js';
 
 import * as today from './routes/today/Today.js';
@@ -39,6 +39,7 @@ import * as instructions from './routes/instructions/Instructions.js';
 import * as verify from './routes/verify/Verification.js';
 import * as users from './routes/admin/UsersAccess.js';
 import * as audit from './routes/admin/AuditTrail.js';
+import * as settings from './routes/account/Settings.js';
 
 /**
  * Entry point. Decides between the login gate and the shell, and owns nothing
@@ -56,6 +57,7 @@ const routes = {
   inventoryoverview, historicalrecords, downloads, unlisummary,
   stockreplenishment, costslosses, reportshistory,
   instructions, verify, users, audit,
+  settings,
 };
 
 const root = document.getElementById('root');
@@ -64,7 +66,7 @@ function showShell() {
   const shell = AppShell({
     routes,
     onSignOut: (expired = false) => {
-      session.end();
+      logout();
       destroyAllCharts();
       showLogin(expired === true);
     },

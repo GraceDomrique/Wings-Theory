@@ -4,6 +4,7 @@ import { Stat } from '../../components/ui/Stat.js';
 import { Table } from '../../components/ui/Table.js';
 import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
+import { Modal } from '../../components/ui/Modal.js';
 import { toast } from '../../components/ui/Feedback.js';
 import { count, qty } from '../../lib/format.js';
 import { listIngredients, bulkCount, getCountToday } from '../../lib/api/inventory.js';
@@ -169,18 +170,72 @@ export async function render(ctx) {
   }
 
   const noteInput = h('input', { type: 'text', placeholder: 'e.g. weekly stock take (optional)', style: { minWidth: '220px' } });
-  const submit = Button({ variant: 'primary', size: 'sm', onClick: submitCounts }, 'Submit counts');
+  const submit = Button({ variant: 'primary', size: 'sm', onClick: openReview }, 'Review & submit');
 
-  async function submitCounts() {
-    const items = [...rowState.entries()]
+  /** Blank inputs are never treated as a counted zero — only rows where the
+   * input genuinely has a value go into the submission, same rule the
+   * single-ingredient drawer count already follows. */
+  function collectItems() {
+    return [...rowState.entries()]
       .filter(([, s]) => s.input.value !== '')
       .map(([pk, s]) => ({ pk, actualBase: Number(s.input.value) }));
+  }
+
+  /** Review before submission (spec: "confirmation before posting
+   * adjustments") — a modal listing exactly what will be written, so a
+   * manager sees the full set of corrections once before any of them hit
+   * the ledger, rather than finding out row-by-row after the fact. */
+  function openReview() {
+    const items = collectItems();
     if (items.length === 0) { toast('Enter at least one physical count.', 'crit'); return; }
+
+    const confirmBtn = Button({ variant: 'primary', size: 'sm' }, `Confirm & submit ${items.length} count${items.length === 1 ? '' : 's'}`);
+    confirmBtn.addEventListener('click', () => doSubmit(items, () => modal.close()));
+
+    const modal = Modal({
+      title: 'Review before submitting',
+      desc: `${items.length} ingredient${items.length === 1 ? '' : 's'} will be corrected to the quantity entered — everything else stays untouched.`,
+      wide: true,
+      onClose: () => {},
+    },
+    h('div', { style: { maxHeight: '360px', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: '8px', marginBottom: '14px' } },
+      Table({
+        columns: [
+          { key: 'name', label: 'Ingredient', render: (it) => ingredients.find((i) => i.pk === it.pk)?.name || `#${it.pk}` },
+          {
+            key: 'physical',
+            label: 'Physical count',
+            render: (it) => {
+              const ing = ingredients.find((i) => i.pk === it.pk);
+              return h('span', { class: 'mono t-sm' }, qty(it.actualBase, ing ? ing.baseUnit : ''));
+            },
+          },
+          {
+            key: 'diff',
+            label: 'Difference',
+            render: (it) => {
+              const ing = ingredients.find((i) => i.pk === it.pk);
+              const diffBase = it.actualBase - (ing?.onHandBaseQty ?? 0);
+              const sign = diffBase > 0 ? '+' : '';
+              return h('span', { class: `mono t-sm ${diffBase === 0 ? '' : diffBase < 0 ? 't-crit' : 't-warn'}` }, `${sign}${diffBase.toFixed(2)} ${ing ? ing.baseUnit : ''}`);
+            },
+          },
+        ],
+        rows: items,
+      })),
+    noteInput.value.trim() ? h('div', { class: 't-xs t-faint', style: { marginBottom: '10px' } }, 'Note: ', noteInput.value.trim()) : null,
+    h('div', { style: { display: 'flex', gap: '8px', justifyContent: 'flex-end' } },
+      Button({ size: 'sm', onClick: () => modal.close() }, 'Cancel, keep editing'),
+      confirmBtn));
+  }
+
+  async function doSubmit(items, onDone) {
     submit.disabled = true;
     try {
       const r = await bulkCount(items, noteInput.value.trim() || null);
       toast(`Stock count submitted — ${r.updated} updated${r.failed ? `, ${r.failed} failed` : ''}.`, r.failed ? 'warn' : 'good');
       noteInput.value = '';
+      onDone();
       await reload();
     } catch (e) {
       toast(e.message, 'crit');

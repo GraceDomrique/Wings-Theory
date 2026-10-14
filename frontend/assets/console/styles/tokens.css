@@ -2,71 +2,84 @@
    font or radius. If a value is needed that isn't here, it doesn't exist
    in the design system.
 
-   2026-09-30: accent repainted to the "Autumn Blaze"/"Blackened Orange"
-   palette ACE picked (owner/admin console redesign) -- --bg and --surface
-   stay the same warm cream/white base ("white/cream is the base" was
-   explicit); only the amber, warn and crit tokens below changed.
-   --good/--info keep their existing hues on purpose: they are the ONLY
-   two colors in this system that are not
-   some shade of orange/red/yellow, so "healthy" (good, green) and
-   "excess/informational" (info, blue) stay visually distinct from
-   "buy soon" (warn) and "critical/urgent" (crit) at a glance rather than
-   collapsing into one warm blur. POS/KDS are untouched: they load
-   design-system.css, a completely separate token set/file, not this one.*/
+   2026-10-14 palette refresh (two passes): the previous "Autumn Blaze" accent
+   read as a generic, slightly saturated dashboard-template palette
+   (bright-ish orange on near-white, thick colored left-border on every
+   status card). This moves to a quieter, warmer restaurant-operations
+   palette — ivory/stone surfaces, a burnt-orange brand accent, and status
+   colors dialled back from "alert siren" to "legible but calm." Status
+   cards moved from a colored left stripe to a soft tinted background
+   instead (see .rail / .status-card in app.css) — color still carries
+   meaning, it just isn't the loudest thing on the page. Variable NAMES are
+   unchanged from the original palette on purpose: every component already
+   reads these, so a value swap here is what actually propagates a refresh
+   everywhere without touching every call site individually.
+
+   Second pass pins five of these to exact hexes a stakeholder specified
+   (charcoal #171C20, ivory #F2F0EB, burnt orange #D96724, slate blue
+   #405E72, muted green #386A55, muted red #B65349) — adopted directly
+   except --crit, which is #9C453C: #B65349 itself is only 3.93:1 against
+   --crit-tint, below AA for the pill/status TEXT this token is also used
+   as (not just a button/swatch fill) — darkened to 5.10:1 while staying in
+   the same muted-red family. Every other requested hex passed its AA check
+   as given (computed against each token's own -tint pairing). */
 :root{
-  /* 2026-10 card-contrast fix: --bg was only a few points of lightness off
-     --surface (#F7F5F0 vs #FFFFFF), with a near-invisible --line and a 4%
-     shadow, so a card's edge barely registered against the page -- the
-     "white on white" problem. --bg is cooled/darkened and --line/--shadow
-     strengthened below; --surface itself stays pure white on purpose
-     (cards must still read as the brightest surface, just now against a
-     canvas that's visibly behind them). */
-  --bg:#EDE8DC;
-  --surface:#FFFFFF;
-  --surface-sunk:#FBF9F4;
-  --line:#DCD4C2;
-  --line-soft:#F0EDE4;
-  --ink:#1F1C17;
-  --ink-soft:#6E6656;
-  --ink-faint:#A39A87;
-  --amber:#FF6F20;
-  --amber-deep:#B34700;
-  --amber-tint:#FFCC80;
-  /* Admin's nav accent (owner keeps --amber above) -- spec: "Admin active
-     navigation uses blue." A distinct, more saturated blue than --info
-     (which is reserved for informational status pills), so the two never
-     get confused when they appear near each other. */
-  --accent-blue:#2F63D6;
-  --accent-blue-deep:#1E45A8;
-  --accent-blue-tint:#D6E2FB;
-  --good:#3E7A55;
-  --good-tint:#E4F1E7;
-  /* --warn is read as TEXT color on --warn-tint (.pill-warn, its dot via
-     currentColor) -- FF9800 itself reads at only ~1.8:1 there, so it's
-     darkened the same way --amber-deep/--crit already are, not softened
-     to a different family. Still orange, just a "blackened" shade of the
-     FF9800 the palette named -- ~9:1 against --warn-tint. */
-  --warn:#A65C00;
-  --warn-tint:#FFE7C2;
-  --crit:#D32F2F;
-  --crit-tint:#FBE0DE;
-  --info:#3D6A96;
-  --info-tint:#E5EEF6;
-  /* 2026-10: cocoa/brown family, added for Messages (a conversation surface,
-     deliberately NOT orange-accented like the rest of the console so a
-     reply doesn't read as an alert) -- same warm-cream family as --bg, just
-     a browner hue instead of amber. */
+  /* ---- Surfaces ---- */
+  --bg:#F2F0EB;              /* warm ivory — page canvas */
+  --surface:#FFFEFB;         /* warm white — primary cards */
+  --surface-sunk:#EEECE5;    /* soft stone — secondary/recessed surface */
+  --surface-2:#EEECE5;       /* alias some older call sites already reference */
+  --line:#DDDCD5;
+  --line-soft:#E8E6DF;
+  --ink:#242A26;
+  --ink-soft:#5B6058;
+  --ink-faint:#6F746B;       /* 2026-10 contrast check: darkened from the
+                                 first pass's #8B9088 (3.23:1 on --surface,
+                                 below AA for normal text) to 4.75:1 */
+
+  /* ---- Brand / primary accent (Owner's role-accent; buttons; links) ---- */
+  --amber:#D96724;           /* burnt orange */
+  --amber-deep:#8C4A1E;      /* hover/pressed shade — 6.75:1 white-on-amber-deep */
+  --amber-tint:#F3E7D6;      /* subtle amber surface */
+
+  /* Admin's nav/role accent — slate blue, distinct from the brand's burnt
+     orange and from --info, never the saturated "dashboard blue" the
+     redesign explicitly moved away from. */
+  --accent-blue:#405E72;
+  --accent-blue-deep:#263B47;
+  --accent-blue-tint:#E7EDF0;
+
+  /* ---- Semantic status (meaning over decoration — spec §7) ---- */
+  --good:#386A55;             /* stable operations / positive */
+  --good-tint:#E5EDE5;
+  --warn:#8A5A1E;             /* approaching thresholds / needs attention */
+  --warn-tint:#F3E7D6;
+  --crit:#9C453C;             /* expired / critical shortage / destructive — see note above */
+  --crit-tint:#F3E4E1;
+  --info:#49677A;             /* informational, non-urgent */
+  --info-tint:#E7EDF0;
+
+  /* Cocoa family — Messages/conversation surfaces, deliberately not
+     orange-accented so a reply doesn't read as an alert. */
   --cocoa:#6F4E2F;
   --cocoa-deep:#3E2A18;
   --cocoa-tint:#E7DCC5;
   --cocoa-bg:#F6EFE4;
   --cocoa-faint:#A3886A;
-  --radius:10px;
-  --radius-sm:6px;
-  /* Strengthened alongside --bg/--line above -- was 4%/3% alpha, invisible
-     against the old near-white canvas. Still a soft, refined lift (not a
-     hard drop shadow), just one a card edge actually shows at a glance. */
-  --shadow:0 1px 3px rgba(31,28,23,0.08), 0 2px 14px rgba(31,28,23,0.06);
+
+  /* ---- Dark surfaces (sidebar/topbar, hero overlays, premium panels) ---- */
+  --nav-bg:#171C20;           /* deep charcoal */
+  --nav-bg-deep:#0E1114;
+  --nav-line:rgba(255,255,255,0.08);
+  --surface-premium-dark:#27382F; /* muted forest green — premium dark surface */
+
+  /* ---- Shape / elevation ---- */
+  --radius:12px;
+  --radius-sm:8px;
+  --radius-lg:16px;
+  --shadow:0 1px 2px rgba(23,28,22,0.05), 0 4px 16px rgba(23,28,22,0.06);
+  --shadow-sm:0 1px 2px rgba(23,28,22,0.05);
+
   --font-display:'Fraunces', serif;
   --font-body:'Inter', sans-serif;
   --font-mono:'JetBrains Mono', monospace;

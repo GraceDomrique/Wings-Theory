@@ -29,7 +29,8 @@ def _future_iso(days: int) -> str:
     return (timeutil.business_today() + dt.timedelta(days=days)).isoformat()
 
 from wt import (                                                    # noqa: E402
-    auth, db, instructions, owner_provisioning, purchasing, refills, timeutil, units, unli,
+    auth, db, instructions, owner_provisioning, purchasing, refills, sessions, timeutil, units,
+    unli,
 )
 from wt.cache import TTLCache                                       # noqa: E402
 from wt.anomaly import consumption_model_details                    # noqa: E402
@@ -99,11 +100,22 @@ def manager_token(conn: sqlite3.Connection, username: str = "manager") -> str:
     account's own password_changed_at claim, exactly as auth.issue_token
     already requires) reaches the same capability-layer coverage without
     going through the now-blocked login endpoint.
+
+    Also registers the matching auth_session row api.principal() now
+    requires (see wt/sessions.py) -- without this, every call site that
+    reactivates the account first (TestPagePermissions) would 401 on "session
+    has ended" before ever reaching the page-permission/capability layer
+    those tests exist to exercise, same as a real login's token would if
+    nothing had ever recorded its session.
     """
     row = conn.execute(
         "SELECT role, password_changed_at FROM app_user WHERE username=?", (username,)
     ).fetchone()
-    return auth.issue_token(username, row["role"], row["password_changed_at"])
+    token = auth.issue_token(username, row["role"], row["password_changed_at"])
+    issued = auth.decode_token(token)
+    with db.write_tx(conn):
+        sessions.create(conn, issued["jti"], username, row["role"], issued["exp"])
+    return token
 
 
 def fresh_db() -> tuple[sqlite3.Connection, str]:
@@ -4343,6 +4355,254 @@ class TestPasswordSecurity(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["failed_login_count"], 0)
         self.assertIsNone(row["locked_until"])
+
+
+class TestAuthSessionLifecycle(unittest.TestCase):
+    """2026-10 fix: 'Sign out' used to be a client-side localStorage.
+    removeItem() only -- the bearer token itself stayed valid server-side
+    for the rest of its 12-hour TTL, so a captured/replayed token kept
+    working after logout, and landing.html's "Signed in as X — Continue"
+    resume card kept offering a session that had, in every way that
+    mattered to the person looking at the screen, already ended.
+
+    This class proves the actual session lifecycle end to end: explicit
+    logout revokes THIS token server-side (wt/sessions.py) so it is refused
+    on its very next use, by any client, including a direct API request
+    with no browser involved at all; unauthenticated and under-privileged
+    requests still get the right status code (401 vs 403) on both sides of
+    that change; and a password change/reset still revokes every OTHER
+    session for the account, not just the one it was issued through."""
+
+    @classmethod
+    def setUpClass(cls):
+        fd, cls.path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            os.unlink(cls.path)
+        except FileNotFoundError:
+            pass
+        os.environ["WT_DB"] = cls.path
+        os.environ["WT_ENV"] = "test"
+        db.close_conn()
+        from wt import seed
+        seed.run(fresh=True)
+        db.get_conn().execute("UPDATE app_user SET must_change_password = 0")
+        db.get_conn().commit()
+        from fastapi.testclient import TestClient
+        from wt.api import app
+        cls.client = TestClient(app)
+        cls.conn = db.get_conn()
+
+        # The seeded username 'owner' is actually role=admin (historical
+        # naming, predates the real 'owner' role — see
+        # TestComboPublishEndToEnd's own comment on this exact confusion).
+        # A genuine owner-ROLE account is only created through
+        # owner_provisioning.provision_first_owner.
+        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        cls.conn.commit()
+        cls._owner_role_password = provisioned["temporary_password"]
+
+    @classmethod
+    def tearDownClass(cls):
+        db.close_conn()
+        os.environ.pop("WT_DB", None)
+        os.environ.pop("WT_ENV", None)
+        scrub(cls.path)
+
+    def _login(self, username, password="wingstheory"):
+        if username == "biz_owner" and password == "wingstheory":
+            password = self._owner_role_password
+        r = self.client.post("/auth/login", json={"username": username, "password": password})
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["token"]
+
+    def _h(self, token):
+        return {"Authorization": f"Bearer {token}"}
+
+    # ------------------------------------------------------------------
+    # explicit logout actually ends the session server-side
+    # ------------------------------------------------------------------
+    def test_logout_revokes_the_token_for_any_later_request(self):
+        """The test named in the brief as 'Logout -> old token must be
+        rejected', proved directly against the API with no browser or
+        localStorage involved at all -- exactly the gap this fix closes."""
+        token = self._login("cashier1")
+        ok = self.client.get("/pos/menu", headers=self._h(token))
+        self.assertEqual(ok.status_code, 200, ok.text)
+
+        out = self.client.post("/auth/logout", headers=self._h(token))
+        self.assertEqual(out.status_code, 200, out.text)
+
+        replayed = self.client.get("/pos/menu", headers=self._h(token))
+        self.assertEqual(replayed.status_code, 401, replayed.text)
+        self.assertIn("session has ended", replayed.json()["message"])
+
+    def test_logout_then_continue_does_not_restore_access(self):
+        """'Logout -> Continue must not restore access' and 'Logout -> Back
+        button must not restore protected access': both ultimately reduce to
+        the same server-side fact once the client-side resume affordance
+        (landing.html's "Signed in as X — Continue" card, or a bfcache-
+        restored protected page) is set aside — the token that resume or
+        that cached page would use to act is already dead. A protected
+        write endpoint, not just a read, closes the gap completely: even
+        bypassing the UI and POSTing directly with the "resumed" token must
+        fail."""
+        token = self._login("cashier1")
+        self.client.post("/auth/logout", headers=self._h(token))
+
+        menu = self.client.get("/pos/menu", headers=self._h(token))
+        self.assertEqual(menu.status_code, 401)
+
+        order = self.client.post(
+            "/pos/orders", headers=self._h(token),
+            json={"lines": [{"menu_item_pk": 1, "qty": 1}]},
+        )
+        self.assertEqual(order.status_code, 401, order.text)
+
+    def test_logging_out_of_one_tab_does_not_end_another_login(self):
+        """Multiple tabs/devices signed into the same account independently:
+        each /auth/login issues its own session (its own jti), so signing
+        out of one does not yank the rug out from under a second, still-
+        active tab — logout is scoped to the one token it was called with,
+        not every session the account holds (that broader "everywhere" case
+        is what a password change/reset does instead, proved below)."""
+        tab_a = self._login("cashier1")
+        tab_b = self._login("cashier1")
+        self.assertNotEqual(tab_a, tab_b)
+
+        self.client.post("/auth/logout", headers=self._h(tab_a))
+
+        a_again = self.client.get("/pos/menu", headers=self._h(tab_a))
+        self.assertEqual(a_again.status_code, 401)
+        b_still_fine = self.client.get("/pos/menu", headers=self._h(tab_b))
+        self.assertEqual(b_still_fine.status_code, 200, b_still_fine.text)
+
+    def test_logout_is_idempotent_not_a_500(self):
+        token = self._login("cashier1")
+        first = self.client.post("/auth/logout", headers=self._h(token))
+        self.assertEqual(first.status_code, 200)
+        second = self.client.post("/auth/logout", headers=self._h(token))
+        self.assertEqual(second.status_code, 401)
+
+    def test_logout_requires_a_valid_token_not_open_to_the_world(self):
+        r = self.client.post("/auth/logout")
+        self.assertEqual(r.status_code, 401)
+
+    # ------------------------------------------------------------------
+    # password rotation revokes every OTHER live session for the account
+    # ------------------------------------------------------------------
+    def test_password_change_revokes_every_other_session_not_just_its_own_token(self):
+        h, s = auth.hash_password("wingstheory")
+        self.conn.execute(
+            "INSERT INTO app_user (username, display_name, role, password_hash, "
+            "password_salt, password_changed_at, must_change_password) "
+            "VALUES ('rotate_sessions_user','Rotate Sessions','cashier',?,?,"
+            "datetime('now'),0)",
+            (h, s),
+        )
+        self.conn.commit()
+        phone = self._login("rotate_sessions_user")
+        laptop = self._login("rotate_sessions_user")
+
+        r = self.client.post(
+            "/auth/change_password", headers=self._h(phone),
+            json={"current_password": "wingstheory", "new_password": "a-rotated-password-1",
+                  "confirm_new_password": "a-rotated-password-1"},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+        # the session that made the change gets a fresh token in the
+        # response and is expected to keep working on it -- /pos/menu, not
+        # a manager/admin/owner-only route, since this account is 'cashier'
+        # (same capability this whole test is agnostic to: it's about
+        # session revocation, not RBAC).
+        fresh = self.client.get("/pos/menu", headers=self._h(r.json()["token"]))
+        self.assertEqual(fresh.status_code, 200, fresh.text)
+        # its own OLD token (pre-change) is dead
+        old_self = self.client.get("/pos/menu", headers=self._h(phone))
+        self.assertEqual(old_self.status_code, 401)
+        # the OTHER device's session, never used to change anything, is
+        # dead too -- a password rotation must end every session, not just
+        # replace the one it was called through
+        other_device = self.client.get("/pos/menu", headers=self._h(laptop))
+        self.assertEqual(other_device.status_code, 401)
+
+    def test_admin_reset_revokes_the_targets_existing_sessions(self):
+        # A dedicated account, not the shared seeded 'cashier1' -- this test
+        # permanently changes the account's password (that's the entire
+        # point of an admin reset), and every other test in this class that
+        # logs into 'cashier1' with its seeded password would break if it
+        # ran afterward (unittest executes test_* methods in alphabetical
+        # order, not file order).
+        h, s = auth.hash_password("wingstheory")
+        self.conn.execute(
+            "INSERT INTO app_user (username, display_name, role, password_hash, "
+            "password_salt, password_changed_at, must_change_password) "
+            "VALUES ('resettest_cashier','Reset Test Cashier','cashier',?,?,"
+            "datetime('now'),0)",
+            (h, s),
+        )
+        self.conn.commit()
+        target = self._login("resettest_cashier")
+        still_good = self.client.get("/pos/menu", headers=self._h(target))
+        self.assertEqual(still_good.status_code, 200)
+
+        owner = self._login("owner")
+        reset = self.client.post(
+            "/console/users/resettest_cashier/reset_password", headers=self._h(owner),
+        )
+        self.assertEqual(reset.status_code, 200, reset.text)
+
+        dead = self.client.get("/pos/menu", headers=self._h(target))
+        self.assertEqual(dead.status_code, 401, dead.text)
+
+    # ------------------------------------------------------------------
+    # unauthenticated / under-privileged requests, server-side RBAC
+    # ------------------------------------------------------------------
+    def test_unauthenticated_request_to_a_protected_endpoint_is_401(self):
+        r = self.client.get("/console/ingredients")
+        self.assertEqual(r.status_code, 401)
+        r = self.client.post("/pos/orders", json={"lines": []})
+        self.assertEqual(r.status_code, 401)
+
+    def test_cashier_cannot_reach_an_admin_only_endpoint(self):
+        """Cashier -> Admin endpoint must return 403. inventory.write
+        (creating an ingredient) is admin-only -- auth.CAPABILITIES, not
+        anything the frontend nav hides -- so a cashier token reaching it
+        directly, bypassing the POS UI entirely, must still be refused."""
+        token = self._login("cashier1")
+        r = self.client.post(
+            "/console/ingredients", headers=self._h(token),
+            json={"name": "Cashier Should Not Create This", "base_unit": "g",
+                  "unit_cost": 1.0, "pack_size": 1, "pack_cost": 1.0,
+                  "reorder_point": 1, "reorder_qty": 1},
+        )
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_kitchen_cannot_reach_an_owner_only_endpoint(self):
+        """Kitchen -> Owner endpoint must return 403.
+        dashboard.owner_intelligence is owner-only (auth.CAPABILITIES) --
+        the console nav never shows this screen to a kitchen account, but
+        that is UI convenience only; the server-side capability check is
+        the real boundary being proved here."""
+        token = self._login("kitchen1")
+        r = self.client.get("/console/dashboard/owner-overview", headers=self._h(token))
+        self.assertEqual(r.status_code, 403, r.text)
+
+    def test_valid_authorized_users_retain_their_intended_permissions(self):
+        """None of the above narrows what a legitimately authorized account
+        can still do -- a live cashier session reaches its own POS routes,
+        and a live owner session reaches its own owner-only route."""
+        cashier = self._login("cashier1")
+        menu = self.client.get("/pos/menu", headers=self._h(cashier))
+        self.assertEqual(menu.status_code, 200, menu.text)
+
+        owner = self._login("biz_owner")
+        overview = self.client.get(
+            "/console/dashboard/owner-overview", headers=self._h(owner)
+        )
+        self.assertEqual(overview.status_code, 200, overview.text)
 
 
 class TestForecasting(Base):
@@ -17593,6 +17853,7 @@ def main() -> int:
             TestSeedImport, TestXlsxProphetIngest, TestVerificationWorkflow, TestConsoleAPI,
             TestAdminAuditLog, TestRBAC, TestPagePermissions,
             TestLoginAudit, TestMLResultCaching, TestDashboardSummary, TestPasswordSecurity,
+            TestAuthSessionLifecycle,
             TestForecasting, TestProphetGrowthSelection, TestEffectiveNow,
             TestStoreDemandForecast, TestSeriesForecastability,
             TestIngredientDepletionForecast,

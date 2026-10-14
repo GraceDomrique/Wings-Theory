@@ -1,7 +1,9 @@
-import { h } from '../../lib/dom.js';
+import { h, mount } from '../../lib/dom.js';
 import { Modal } from '../../components/ui/Modal.js';
-import { money, stamp } from '../../lib/format.js';
+import { money, stamp, qty } from '../../lib/format.js';
 import { getOrder } from '../../lib/api/orders.js';
+import { listMovements, LEDGER_REASON } from '../../lib/api/inventory.js';
+import { Pill } from '../../components/ui/Pill.js';
 
 /**
  * Shared "open an order's real detail" action — used by Order History's own
@@ -65,6 +67,13 @@ export async function openOrderDetail(orderId) {
         h('div', { class: 't-xs', style: { fontWeight: '600' } }, s.label),
         h('div', { class: 't-xs t-faint mono' }, stamp(s.iso))))));
 
+  // "Ingredients Used" — real stock-ledger entries for this order, not a
+  // recomputation from the recipe. KDS-commit is what actually deducts stock
+  // (reservation.commit_order -> deplete_fefo), so a punched-but-not-yet-
+  // committed order has nothing here yet, which this says plainly rather
+  // than guessing what WOULD be deducted.
+  const ingredientsHost = h('div');
+
   Modal({ title: `Order ${o.orderNo || `#${o.id}`}`, desc: stamp(o.createdAt), wide: true, onClose: () => {} },
     ribbon,
     statStrip,
@@ -72,5 +81,30 @@ export async function openOrderDetail(orderId) {
     receipt,
     h('div', { class: 't-xs t-faint', style: { margin: '16px 0 10px' } }, 'Timeline'),
     timeline,
-    o.voidReason ? h('div', { class: 'callout callout-crit', style: { marginTop: '14px' } }, h('p', {}, 'Void reason: ', o.voidReason)) : null);
+    o.voidReason ? h('div', { class: 'callout callout-crit', style: { marginTop: '14px' } }, h('p', {}, 'Void reason: ', o.voidReason)) : null,
+    h('div', { class: 't-xs t-faint', style: { margin: '16px 0 6px' } }, 'Ingredients used'),
+    ingredientsHost);
+
+  if (!o.committedAt) {
+    mount(ingredientsHost, h('p', { class: 't-xs t-faint' }, 'Not committed at KDS yet — stock has not been deducted for this order.'));
+    return;
+  }
+  try {
+    const { entries } = await listMovements({ orderNo: o.orderNo, limit: 100 });
+    if (entries.length === 0) {
+      mount(ingredientsHost, h('p', { class: 't-xs t-faint' }, 'No ledger entries found for this order.'));
+      return;
+    }
+    mount(ingredientsHost, h('div', { class: 'order-receipt' },
+      ...entries.map((e) => {
+        const info = LEDGER_REASON[e.reason] || { label: e.reason, severity: 'flat' };
+        return h('div', { class: 'order-receipt-line' },
+          h('span', { class: 'order-receipt-name' },
+            e.ingredientName, ' ', Pill(info.severity, info.label)),
+          h('span', { class: 'order-receipt-amount mono' },
+            e.changeQty != null ? qty(Math.abs(e.changeQty), e.baseUnit) : '—'));
+      })));
+  } catch (e) {
+    mount(ingredientsHost, h('p', { class: 't-xs t-crit' }, `Could not load ledger entries: ${e.message || e}`));
+  }
 }

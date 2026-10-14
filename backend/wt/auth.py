@@ -309,14 +309,26 @@ def issue_token(username: str, role: str, password_changed_at: str, ttl: int = T
     against app_user's current column value and rejects a mismatch. Without
     this, changing or resetting a password would leave every token already
     issued for that account valid until its own 12-hour expiry, which
-    defeats the point of an emergency reset."""
+    defeats the point of an emergency reset.
+
+    'jti' is a fresh random id for THIS token, independent of anything else
+    in the payload. It exists so a single session can be individually
+    revoked (see wt/sessions.py and api.py's POST /auth/logout) without
+    touching any other token the same account holds -- the 'pwd' claim
+    above already invalidates *every* token on a password change, but there
+    was no equivalent for "just this one, right now, because the user
+    signed out." Callers that need the session recorded (api.py's login()
+    and change_password()) decode the returned token straight back with
+    decode_token() to read this claim and the 'exp' above -- issue_token
+    itself never touches the database, consistent with every other
+    function in this module."""
     if role not in ROLES:
         raise WTError(f"unknown role {role!r}")
     header = {"alg": ALGO, "typ": "JWT"}
     now = int(time.time())
     payload = {
         "sub": username, "role": role, "iat": now, "exp": now + ttl,
-        "pwd": password_changed_at,
+        "pwd": password_changed_at, "jti": secrets.token_hex(16),
     }
     signing_input = f"{_b64(json.dumps(header).encode())}.{_b64(json.dumps(payload).encode())}"
     sig = hmac.new(_secret(), signing_input.encode(), hashlib.sha256).digest()

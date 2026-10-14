@@ -42,7 +42,7 @@ export function Modal({ title, desc, wide = false, onClose }, ...children) {
     },
   },
   h('div', { class: 'card-head' },
-    h('div', {}, titleEl, descEl),
+    h('div', { style: { flex: '1', minWidth: '0' } }, titleEl, descEl),
     closeBtn),
   ...children);
 

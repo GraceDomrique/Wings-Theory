@@ -35,26 +35,28 @@ export async function render(ctx) {
         ' (', ageFromNow(d.freshness.latestOrderAt), ').'))
     : null;
 
-  // Layout (2026-10, matched to the reference design): Store Status beside
-  // Today's Sales up top; Do Now, Next 7 Days and Inventory Pulse in one
-  // three-up row; Today's Deliveries, Quick Actions, Order Activity and
-  // Recent Orders in one four-up row (Recent Orders widest, since it has
-  // the most to show); Unusual Usage, Unusual Stock Difference and
-  // Activity Log in the final three-up row.
+  // Layout (2026-10-14 reorder — content/components unchanged, only which
+  // row each card sits in): Store Status beside Today's Sales up top; Do Now
+  // beside Quick Actions right below it, so the two things an admin acts on
+  // first are visible without scrolling on a normal desktop viewport; then
+  // Inventory Pulse / Today's Deliveries / Order Activity; then Recent
+  // Orders beside Next 7 Days; Unusual Usage, Unusual Stock Difference and
+  // Activity Log stay last — read-only review, not something acted on first.
   return h('div', { class: 'admin-today' },
     stale,
     h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '14px' } },
       storeStatusBanner(d, ctx),
       todaysSalesCard(d)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
       doNowCard(d, ctx),
-      next7DaysCard(d),
-      inventoryPulseCard(d, ctx)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '0.85fr 0.85fr 0.85fr 1.5fr', gap: '14px', marginTop: '14px' } },
+      quickActionsCard(d, ctx)),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
+      inventoryPulseCard(d, ctx),
       deliveriesCard(d, ctx),
-      quickActionsCard(d, ctx),
-      orderActivityCard(d),
-      recentOrdersCard(d)),
+      orderActivityCard(d)),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1.4fr 1fr', gap: '14px', marginTop: '14px' } },
+      recentOrdersCard(d),
+      next7DaysCard(d)),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
       unusualUsageCard(d, ctx),
       unusualStockDifferenceCard(d, ctx),
@@ -84,7 +86,7 @@ function storeStatusBanner(d, ctx) {
     Pill(sev, ok ? 'Store Status' : 'Needs attention'),
     h('div', { style: { fontSize: '26px', fontWeight: '700', margin: '8px 0 16px', fontFamily: 'var(--font-display)' } },
       ok ? 'All systems running' : `${s.needAttention} item${s.needAttention === 1 ? '' : 's'} need attention`),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px' } },
+    h('div', { class: 'grid store-status-stats', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px' } },
       heroStat(s.needAttention, 'Need Attention', s.needAttention ? 'crit' : 'good', STAT_ICON.attention, () => ctx.navigate('expiry')),
       heroStat(s.deliveriesToday, 'Deliveries Today', 'info', STAT_ICON.truck, () => ctx.navigate('receiving')),
       heroStat(s.runningLow, 'Running Low', s.runningLow ? 'warn' : 'good', STAT_ICON.box, () => ctx.navigate('whattobuy')),

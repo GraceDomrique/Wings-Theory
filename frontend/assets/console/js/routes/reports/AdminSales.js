@@ -6,7 +6,7 @@ import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading } from '../../components/ui/Feedback.js';
 import { BarChart } from '../../components/charts/BarChart.js';
-import { palette, destroyAllCharts } from '../../components/charts/base.js';
+import { palette, destroyAllCharts, destroyChart } from '../../components/charts/base.js';
 import { money, count, stamp } from '../../lib/format.js';
 import { getAdminSales } from '../../lib/api/sales.js';
 import { openOrderDetail } from './orderDetailModal.js';
@@ -57,7 +57,7 @@ export async function render(ctx) {
         trendCard(d),
         salesMixCard(d)),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
-        whatsSellingCard(d),
+        whatsSellingCard(d, ctx2),
         orderActivityCard(d),
         busyTimesCard(d)),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
@@ -73,7 +73,7 @@ export async function render(ctx) {
       Button({ variant: state.trendMetric === 'orders' ? 'primary' : 'ghost', size: 'sm', onClick: () => { state.trendMetric = 'orders'; paint(); } }, 'Orders'));
     const chartHost = h('div');
     function paint() {
-      destroyAllCharts();
+      destroyChart(chartHost.firstChild);
       const series = d.compactSalesTrend.current;
       mount(chartHost, BarChart({
         labels: series.map((p) => String(p.period).slice(5)),
@@ -125,10 +125,13 @@ function salesMixCard(d) {
           h('div', { style: { height: '100%', width: `${c.sharePct}%`, background: 'var(--amber)' } })))));
 }
 
-function whatsSellingCard(d) {
+function whatsSellingCard(d, ctx) {
   const rows = d.whatsSelling || [];
   return Card({},
-    CardHeader({ title: "What's Selling" }),
+    CardHeader({
+      title: "What's Selling",
+      right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('bestsellers') }, 'View all →'),
+    }),
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'Nothing sold yet', tight: true })
       : h('div', { class: 'scrollpane' }, ...rows.map((r) => h('div', { class: 'mini-row' },

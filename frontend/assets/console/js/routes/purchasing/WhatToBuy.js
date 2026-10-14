@@ -1,5 +1,7 @@
-import { h, mount } from '../../lib/dom.js';
-import { Card } from '../../components/ui/Card.js';
+import { h, mount, icon } from '../../lib/dom.js';
+import { Card, CardHeader } from '../../components/ui/Card.js';
+import { Table } from '../../components/ui/Table.js';
+import { Drawer } from '../../components/ui/Drawer.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError } from '../../components/ui/Modal.js';
@@ -11,6 +13,7 @@ import { severityFromDepletionStatus } from '../../lib/severity.js';
 import { getReplenishment } from '../../lib/api/intelligence.js';
 import { createPurchaseOrder } from '../../lib/api/purchaseOrders.js';
 import { session } from '../../lib/api/client.js';
+import { ICONS } from '../../lib/icons.js';
 
 /**
  * Purchasing > What to Buy (Owner's sidebar label: "Purchase Needs") — spec
@@ -78,62 +81,86 @@ export async function render(ctx) {
       });
   }
 
+  /** 2026-10-15 redesign: a full Card per ingredient (8 inline fields + two
+   * paragraphs + a footer) repeated down the page used to be the whole list
+   * — with dozens of ingredients that was "unnecessarily long repetitive
+   * recommendation cards." Now a compact per-supplier table (Ingredient /
+   * Status / Usable stock / Cover / Recommended buy), row click opens the
+   * same supporting-calculation detail in a drawer instead of showing it
+   * inline on every row. No figure here changed — same getReplenishment()
+   * response, same backend-computed recommendation. */
   function supplierGroup({ supplier, items, urgentCount }) {
-    return h('div', { style: { marginBottom: '22px' } },
-      h('div', {
-        style: {
-          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-          gap: '10px', margin: '0 0 8px',
-        },
-      },
-      h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-        h('span', { class: 'eyebrow' }, supplier),
-        urgentCount > 0 ? Pill('flat', `${urgentCount} to buy`) : null),
-      urgentCount > 1 && isOwner
-        ? Button({
-          variant: 'default', size: 'sm',
-          onClick: () => openGroupDraftModal(supplier, items.filter(needsBuying)),
-        }, `Draft purchase order (${urgentCount} items)`)
-        : null),
-      ...items.map(recommendationCard));
+    return Card({ style: { marginBottom: '14px' } },
+      CardHeader({
+        title: supplier,
+        desc: urgentCount > 0 ? `${urgentCount} ingredient${urgentCount === 1 ? '' : 's'} need buying` : 'Nothing urgent from this supplier',
+        right: urgentCount > 1 && isOwner
+          ? Button({
+            size: 'sm',
+            onClick: () => openGroupDraftModal(supplier, items.filter(needsBuying)),
+          }, `Draft PO (${urgentCount} items)`)
+          : null,
+      }),
+      Table({
+        columns: [
+          { key: 'name', label: 'Ingredient', render: (r) => r.name },
+          { key: 'status', label: 'Status', render: (r) => statusPill(r) },
+          { key: 'usable', label: 'Usable stock', render: (r) => h('span', { class: 'mono t-sm' }, qty(r.onHand, r.baseUnit)) },
+          { key: 'cover', label: 'Cover', render: (r) => h('span', { class: 'mono t-sm' }, days(r.daysLeft)) },
+          {
+            key: 'buy',
+            label: 'Recommended buy',
+            render: (r) => (needsBuying(r)
+              ? h('span', { class: 't-sm t-strong' }, r.suggestedOrderQty !== null
+                ? `~${asText.num(r.suggestedOrderQty, '', 2)} ${r.suggestedOrderUnit || r.baseUnit}`
+                : nodata('not enough history'))
+              : h('span', { class: 't-xs t-faint' }, '—')),
+          },
+        ],
+        rows: items,
+        onRowClick: (r) => openDetailDrawer(r),
+      }));
   }
 
-  function recommendationCard(r) {
+  /** The supporting calculation — everything that used to sit inline on
+   * every card (usage rate, lead time, safety stock, pack size, minimum
+   * order, incoming orders, the reason text) now lives here, one ingredient
+   * at a time, reached by clicking its row. */
+  function openDetailDrawer(r) {
     const buying = needsBuying(r);
-    return Card({ style: { marginBottom: '14px' } },
-      h('div', { class: 'card-head' },
-        h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } },
-          h('span', { class: 'card-title' }, r.name),
-          statusPill(r)),
-        buying && isOwner
-          ? Button({ variant: 'primary', size: 'sm', onClick: () => openDraftModal(r) }, 'Draft purchase order')
-          : (buying && isAdmin ? Pill('flat', 'Owner drafts this') : null)),
-      h('div', { style: { display: 'flex', gap: '22px', flexWrap: 'wrap', margin: '6px 0 10px' } },
-        field('Estimated on hand', qty(r.onHand, r.baseUnit)),
-        field('Current usage rate', r.usedPerDay === null ? nodata('not measured') : `~${asText.num(r.usedPerDay, '', 2)} ${r.baseUnit}/day`),
-        field('Estimated stock cover', days(r.daysLeft)),
-        field('Supplier lead time', r.leadTimeDays === null ? nodata('not set') : `${r.leadTimeDays} day${r.leadTimeDays === 1 ? '' : 's'}`),
-        r.safetyStockBase !== null ? field('Safety stock', qty(r.safetyStockBase, r.baseUnit)) : null,
-        r.packSize ? field('Pack size', qty(r.packSize, r.baseUnit), ` per ${r.purchaseUnit || 'pack'}`) : null,
-        r.minimumOrderQty ? field('Minimum order', `${asText.num(r.minimumOrderQty, '', 2)} ${r.suggestedOrderUnit || r.purchaseUnit || 'pack'}`) : null,
-        r.incomingOrderedBase > 0 ? field('Incoming confirmed orders', qty(r.incomingOrderedBase, r.baseUnit)) : null),
-      h('div', { class: 't-sm t-soft' }, reasonText(r)),
-      h('div', { class: 't-xs t-faint' }, 'Figures are estimates derived from recipes and recorded sales — physical '
-        + 'stock can differ due to spills, over-portioning, or spoilage.'),
+    const drawer = Drawer({ title: r.name, desc: 'Purchase recommendation', onClose: () => {} },
+      h('div', { style: { marginBottom: '14px' } }, statusPill(r)),
+      h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '14px' } },
+        drawerField('Usable stock', qty(r.onHand, r.baseUnit)),
+        drawerField('Estimated stock cover', days(r.daysLeft)),
+        drawerField('Current usage rate', r.usedPerDay === null ? nodata('not measured') : `~${asText.num(r.usedPerDay, '', 2)} ${r.baseUnit}/day`),
+        drawerField('Supplier lead time', r.leadTimeDays === null ? nodata('not set') : `${r.leadTimeDays} day${r.leadTimeDays === 1 ? '' : 's'}`),
+        r.safetyStockBase !== null ? drawerField('Safety stock', qty(r.safetyStockBase, r.baseUnit)) : null,
+        r.packSize ? drawerField('Pack size', qty(r.packSize, r.baseUnit), ` per ${r.purchaseUnit || 'pack'}`) : null,
+        r.minimumOrderQty ? drawerField('Minimum order', `${asText.num(r.minimumOrderQty, '', 2)} ${r.suggestedOrderUnit || r.purchaseUnit || 'pack'}`) : null,
+        r.incomingOrderedBase > 0 ? drawerField('Incoming confirmed orders', qty(r.incomingOrderedBase, r.baseUnit)) : null),
+      h('div', { class: 't-sm t-soft', style: { marginBottom: '8px' } }, reasonText(r)),
+      h('div', { class: 't-xs t-faint', style: { marginBottom: '16px' } },
+        'Figures are estimates derived from recipes and recorded sales — physical stock can differ due to spills, over-portioning, or spoilage.'),
       buying
-        ? h('div', {
-          style: {
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--line)',
-          },
-        },
-        h('div', {},
+        ? h('div', { class: 'card card-sunk' },
           h('div', { class: 'eyebrow' }, 'Recommended'),
-          h('div', { style: { fontWeight: '600' } },
+          h('div', { style: { fontWeight: '600', marginBottom: '12px' } },
             r.suggestedOrderQty !== null
               ? `Buy ~${asText.num(r.suggestedOrderQty, '', 2)} ${r.suggestedOrderUnit || r.baseUnit}`
-              : 'Not enough history yet to suggest a quantity')))
+              : 'Not enough history yet to suggest a quantity'),
+          isOwner
+            ? Button({ variant: 'primary', size: 'sm', onClick: () => { drawer.close(); openDraftModal(r); } }, 'Draft purchase order')
+            : h('div', { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+              icon(ICONS.clipboardList, 14), h('span', { class: 't-xs t-soft' }, 'Owner drafts this from their own Purchase Orders view.')))
         : null);
+    return drawer;
+  }
+
+  function drawerField(label, ...value) {
+    return h('div', { class: 'card card-sunk', style: { padding: '10px 12px' } },
+      h('div', { class: 't-xs t-faint' }, label),
+      h('div', { class: 't-strong', style: { marginTop: '3px' } }, ...value));
   }
 
   function reasonText(r) {
@@ -159,10 +186,6 @@ export async function render(ctx) {
             : r.risk === 'idle' ? 'no usage data'
               : 'healthy';
     return Pill(sev, label);
-  }
-
-  function field(label, ...value) {
-    return h('span', { class: 't-sm' }, h('span', { class: 't-soft' }, `${label} `), h('strong', {}, ...value));
   }
 
   function openDraftModal(r) {

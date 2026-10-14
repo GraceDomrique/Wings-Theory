@@ -147,7 +147,9 @@ export async function render(ctx) {
     mount(detailHost, Card({},
       CardHeader({
         title: ins.title,
-        desc: `From ${ins.createdBy} · ${ins.assignedTo ? `assigned to ${ins.assignedTo}` : 'unassigned'}${ins.dueDate ? ` · due ${date(ins.dueDate)}` : ''}`,
+        // date() returns a DOM node, not a string — interpolating it
+        // directly used to print the literal "[object Text]".
+        desc: `From ${ins.createdBy} · ${ins.assignedTo ? `assigned to ${ins.assignedTo}` : 'unassigned'}${ins.dueDate ? ` · due ${date(ins.dueDate).textContent}` : ''}`,
         right: h('div', { style: { display: 'flex', gap: '6px' } }, Pill(prioSev, prioLabel), Pill(statusSev, statusLabel)),
       }),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '18px' } },
@@ -275,10 +277,16 @@ export async function render(ctx) {
 
   draw();
 
+  // Desktop: list and detail side by side — selecting a row doesn't push the
+  // detail panel below the fold the way a stacked layout did. Tablet and
+  // narrower fall back to a single stacked column automatically (the
+  // console-wide `.grid{grid-template-columns:1fr !important}` rule at
+  // max-width:860px already does this for every grid in the console, not
+  // just this one), matching "task list, then a full-width detail panel".
   return h('div', {},
     h('div', { style: { display: 'flex', justifyContent: 'flex-end', marginBottom: '12px' } },
       isOwner ? Button({ variant: 'primary', onClick: openNewInstructionModal }, '+ New instruction') : null),
     h('div', { style: { marginBottom: '12px' } }, tabbarHost),
-    h('div', { style: { marginBottom: '14px' } }, listHost),
-    detailHost);
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1.2fr 1fr', alignItems: 'start' } },
+      listHost, detailHost));
 }

@@ -26,32 +26,34 @@
  * PAGE_COPY pair — see the bottom of this file.
  */
 
+import { ICONS } from '../lib/icons.js';
+
 const G = (v) => v; // no-op marker for readability where an svg path is long
 
 export const ADMIN_TREE = [
   {
     id: 'today',
     label: 'Today',
-    icon: G('<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>'),
+    icon: ICONS.layoutDashboard,
   },
+  // 2026-10-14 rebuild: Inventory collapsed from a 7-item accordion into one
+  // primary nav item that opens the consolidated workspace (OnHand.js)
+  // directly — the old children (Receiving/Expiry/Physical Stock Count/
+  // Losses & Variance/Unlimited Wings/Movements) are no longer their own
+  // sidebar entries, but their routes, components and endpoints are
+  // untouched: they're reached as contextual deep links FROM the Inventory
+  // workspace (Quick Actions, "Needs attention" rows, "View full history"),
+  // and remain valid direct-URL targets — see ADMIN_EXTRA_ROUTE_IDS below,
+  // the same pattern OWNER_EXTRA_ROUTE_IDS already established.
   {
-    id: 'grp-inventory',
+    id: 'onhand',
     label: 'Inventory',
-    icon: G('<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>'),
-    children: [
-      { id: 'onhand', label: 'On Hand' },
-      { id: 'receiving', label: 'Receiving' },
-      { id: 'expiry', label: 'Expiry' },
-      { id: 'stockcounts', label: 'Physical Stock Count' },
-      { id: 'losses', label: 'Losses & Variance' },
-      { id: 'unli', label: 'Unlimited Wings' },
-      { id: 'movements', label: 'Movements' },
-    ],
+    icon: ICONS.package,
   },
   {
     id: 'grp-menu',
     label: 'Menu & Recipes',
-    icon: G('<path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/>'),
+    icon: ICONS.bookOpen,
     children: [
       { id: 'menu', label: 'Menu' },
       { id: 'recipes', label: 'Recipes & Costing' },
@@ -61,34 +63,32 @@ export const ADMIN_TREE = [
   {
     id: 'grp-purchasing',
     label: 'Purchasing',
-    icon: G('<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><circle cx="9" cy="22" r="1"/><circle cx="16" cy="22" r="1"/>'),
+    icon: ICONS.shoppingCart,
     children: [
       { id: 'forecasts', label: 'Demand Forecasts' },
       { id: 'whattobuy', label: 'What to Buy' },
       { id: 'purchasing', label: 'Purchase' },
     ],
   },
+  // 2026-10-15: consolidated from four children to three (Overview/Orders/
+  // Reports) — Best Sellers is no longer its own sidebar entry; the same
+  // page (route id unchanged) is now reached from Overview's "What's
+  // Selling" card and from the new Reports center's Best Sellers section,
+  // and stays a valid direct-URL target via ADMIN_EXTRA_ROUTE_IDS below.
   {
     id: 'grp-sales',
-    label: 'Sales & History',
-    icon: G('<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>'),
+    label: 'Sales & Orders',
+    icon: ICONS.chartCombined,
     children: [
-      { id: 'salesoverview', label: 'Sales Overview' },
-      { id: 'orderhistory', label: 'Order History' },
-      { id: 'bestsellers', label: 'Best Sellers' },
-      // Not in the spec's literal Admin tree, but valuation and the
-      // printable Attention Needed list (spec section 27's "Business
-      // Reports") pre-existed here and have no other home on Admin's side
-      // — dropping them would violate "preserve current functionality"
-      // (spec section 45). Owner reaches the identical page under Reports
-      // & History.
-      { id: 'reports', label: 'Business Reports' },
+      { id: 'salesoverview', label: 'Overview' },
+      { id: 'orderhistory', label: 'Orders' },
+      { id: 'reports', label: 'Reports' },
     ],
   },
   {
     id: 'grp-admin',
-    label: 'Administration',
-    icon: G('<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 00.34 1.87l.06.06a2 2 0 11-2.83 2.83l-.06-.06a1.7 1.7 0 00-1.87-.34 1.7 1.7 0 00-1.04 1.56V21a2 2 0 01-4 0v-.09A1.7 1.7 0 009 19.35a1.7 1.7 0 00-1.87.34l-.06.06a2 2 0 11-2.83-2.83l.06-.06A1.7 1.7 0 004.65 15a1.7 1.7 0 00-1.56-1.04H3a2 2 0 010-4h.09A1.7 1.7 0 004.65 9a1.7 1.7 0 00-.34-1.87l-.06-.06a2 2 0 112.83-2.83l.06.06A1.7 1.7 0 009 4.65a1.7 1.7 0 001.04-1.56V3a2 2 0 014 0v.09A1.7 1.7 0 0015 4.65a1.7 1.7 0 001.87-.34l.06-.06a2 2 0 112.83 2.83l-.06.06A1.7 1.7 0 0019.35 9a1.7 1.7 0 001.56 1.04H21a2 2 0 010 4h-.09A1.7 1.7 0 0019.4 15z"/>'),
+    label: 'Management',
+    icon: ICONS.settings2,
     children: [
       { id: 'verify', label: 'Setup & Verification', badge: 'verification' },
       { id: 'users', label: 'Users & Access' },
@@ -98,7 +98,7 @@ export const ADMIN_TREE = [
   {
     id: 'instructions',
     label: 'Instructions',
-    icon: G('<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>'),
+    icon: ICONS.clipboardList,
     badge: 'instructions',
   },
 ];
@@ -115,23 +115,23 @@ export const OWNER_TREE = [
   {
     id: 'today',
     label: 'Overview',
-    icon: G('<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>'),
+    icon: ICONS.layoutDashboard,
   },
   {
     id: 'salesoverview',
     label: 'Sales & Performance',
-    icon: G('<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>'),
+    icon: ICONS.chartCombined,
   },
   {
     id: 'stockreplenishment',
     label: 'Stock & Replenishment',
-    icon: G('<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>'),
+    icon: ICONS.package,
     badge: 'stockreplenishment',
   },
   {
     id: 'purchasing',
     label: 'Purchase Orders',
-    icon: G('<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><circle cx="9" cy="22" r="1"/><circle cx="16" cy="22" r="1"/>'),
+    icon: ICONS.shoppingCart,
   },
   {
     id: 'costslosses',
@@ -141,13 +141,13 @@ export const OWNER_TREE = [
   {
     id: 'instructions',
     label: 'Instructions',
-    icon: G('<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>'),
+    icon: ICONS.clipboardList,
     badge: 'instructions',
   },
   {
     id: 'reportshistory',
     label: 'Reports & History',
-    icon: G('<path d="M4 19V5a2 2 0 012-2h9l5 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M9 13h6M9 17h6M9 9h2"/>'),
+    icon: ICONS.fileChart,
   },
 ];
 
@@ -165,6 +165,29 @@ const OWNER_EXTRA_ROUTE_IDS = [
   'reports', 'historicalrecords', 'downloads', 'audit',
 ];
 
+/** Admin's equivalent of OWNER_EXTRA_ROUTE_IDS: the six ex-children of the
+ * old Inventory accordion. Not in ADMIN_TREE (so Sidebar.js never renders
+ * them as their own entries) but still valid direct-URL / deep-link targets
+ * — reached from Inventory's Quick Actions and "Needs attention" rows. */
+const ADMIN_EXTRA_ROUTE_IDS = [
+  'receiving', 'expiry', 'stockcounts', 'losses', 'unli', 'movements', 'bestsellers',
+];
+
+/** Display label for a route id that isn't a leaf in either tree anymore
+ * (an *_EXTRA_ROUTE_IDS id) — breadcrumbFor's last resort before falling
+ * back to the bare id. Movements is relabeled "Stock Activity" here (the
+ * route id and the underlying append-only ledger are unchanged — display
+ * name only, per the terminology pass). */
+const EXTRA_LABELS = {
+  receiving: { group: 'Inventory', label: 'Receiving' },
+  expiry: { group: 'Inventory', label: 'Expiry' },
+  stockcounts: { group: 'Inventory', label: 'Physical Stock Count' },
+  losses: { group: 'Inventory', label: 'Stock Differences' },
+  unli: { group: 'Inventory', label: 'Unlimited Wings' },
+  movements: { group: 'Inventory', label: 'Stock Activity' },
+  bestsellers: { group: 'Sales & Orders', label: 'Best Sellers' },
+};
+
 export function treeForRole(role) {
   return role === 'owner' ? OWNER_TREE : ADMIN_TREE;
 }
@@ -178,23 +201,32 @@ function leafIds(tree) {
  * direct hash visit (typed URL, bookmark, reload) that bypasses the
  * sidebar entirely. A route reachable from only one role's tree (e.g.
  * 'onhand', admin-only) is guarded accordingly; one present in both (e.g.
- * 'expiry') is open to both. Owner additionally reaches OWNER_EXTRA_ROUTE_IDS
- * — pages folded into one of the seven primary pages but still valid
+ * 'expiry') is open to both. Each role additionally reaches its own
+ * *_EXTRA_ROUTE_IDS — pages folded into a primary workspace but still valid
  * navigation targets, not shown in the sidebar. */
 export function routeRoles(id) {
+  // Account Settings is rendered outside both trees (Sidebar.js pins it at
+  // the bottom, separately) but every signed-in account — Admin or Owner —
+  // reaches the same page to manage their own login.
+  if (id === 'settings') return ['admin', 'owner'];
   const roles = [];
-  if (leafIds(ADMIN_TREE).includes(id)) roles.push('admin');
+  if (leafIds(ADMIN_TREE).includes(id) || ADMIN_EXTRA_ROUTE_IDS.includes(id)) roles.push('admin');
   if (leafIds(OWNER_TREE).includes(id) || OWNER_EXTRA_ROUTE_IDS.includes(id)) roles.push('owner');
   return roles;
 }
 
-export const ROUTE_IDS = [...new Set([...leafIds(ADMIN_TREE), ...leafIds(OWNER_TREE), ...OWNER_EXTRA_ROUTE_IDS])];
+export const ROUTE_IDS = [...new Set([
+  ...leafIds(ADMIN_TREE), ...leafIds(OWNER_TREE),
+  ...ADMIN_EXTRA_ROUTE_IDS, ...OWNER_EXTRA_ROUTE_IDS,
+  'settings',
+])];
 
 /** {groupLabel, leafLabel} for the breadcrumb and topbar title, resolved
  * against the CURRENT role's tree (the same id can carry a different label
  * — or a different parent group entirely — depending on who's looking). A
  * standalone link (Today/Instructions) has no group, so groupLabel is null. */
 export function breadcrumbFor(role, id) {
+  if (id === 'settings') return { groupLabel: null, leafLabel: 'Account Settings' };
   const tree = treeForRole(role);
   for (const node of tree) {
     if (node.id === id) return { groupLabel: null, leafLabel: node.label };
@@ -215,13 +247,17 @@ export function breadcrumbFor(role, id) {
       if (child) return { groupLabel: node.label, leafLabel: child.label };
     }
   }
+  // Last resort: one of the *_EXTRA_ROUTE_IDS ids (an ex-sidebar-child,
+  // reached only as a deep link now) — labelled and grouped, rather than
+  // falling through to the bare route id.
+  if (EXTRA_LABELS[id]) return { groupLabel: EXTRA_LABELS[id].group, leafLabel: EXTRA_LABELS[id].label };
   return { groupLabel: null, leafLabel: id };
 }
 
 /** Topbar subtitle per route id — one sentence, why this page exists. */
 export const PAGE_SUB = {
   today: 'Everything that needs your attention right now — nothing you have to go looking for.',
-  onhand: 'Every ingredient, how much is on hand, and how long it will last.',
+  onhand: 'What you have, what needs attention, and what to do about it — one workspace.',
   receiving: 'Record a delivery and see what has recently come in.',
   expiry: 'Oldest stock first, so it gets used before it turns.',
   stockcounts: 'Compare what the system expects on hand against a physical count.',
@@ -249,4 +285,5 @@ export const PAGE_SUB = {
   verify: 'Setup numbers that still need a real, confirmed value.',
   users: 'Who has access, and what they can do.',
   audit: 'Who changed what, and when.',
+  settings: 'Your account — who you are signed in as, and your password.',
 };

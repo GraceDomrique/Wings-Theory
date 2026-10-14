@@ -36,7 +36,7 @@ This is the production launcher. It:
 - Sets `WT_ENV=production` and `WT_DB` to the full path of `backend\wings_theory.db` (the real production database — no dev/demo database is ever used by this script).
 - Loads the persistent signing secret from `backend\.secret` (generating it only if it doesn't already exist).
 - Starts the backend with `python -m uvicorn wt.api:app --host 0.0.0.0 --port 8000` — bound to all network interfaces on **port 8000**, intentionally, so tablets on the shop network can reach it.
-- Serves the frontend (POS/KDS/console) directly from `backend\static\` — there is no separate frontend build or server to start.
+- Serves the frontend (POS/KDS/console) directly from the top-level `frontend\` folder — there is no separate frontend build or server to start.
 - Prints the console/POS/kitchen-display URLs using the PC's current LAN IP, and keeps watching for the IP changing (e.g. hotspot reassignment), reprinting the new address if it does.
 
 Leave this PowerShell window open — the server runs in it and stops if it's closed.

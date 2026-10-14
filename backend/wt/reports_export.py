@@ -359,11 +359,20 @@ def write_pdf(
     headers: list[str],
     groups: list[tuple[str | None, list[list[Any]]]],
     notice: str | None = None,
+    col_widths: list[float] | None = None,
+    wrap_last_col: bool = False,
 ) -> bytes:
     """groups: [(group_label_or_None, rows), ...] -- one table per group
     when grouping by supplier, or a single (None, rows) entry otherwise.
     Table pagination across pages is handled automatically by Platypus
-    (SimpleDocTemplate splits a long Table flowable across page breaks)."""
+    (SimpleDocTemplate splits a long Table flowable across page breaks).
+
+    col_widths, when given, must sum to <= the usable page width (10in on
+    landscape letter with the 0.5in margins below) -- used by the short,
+    few-column purchasing report so its columns read like a real document
+    instead of auto-sizing to the widest cell. wrap_last_col lets that same
+    report's free-text "Why" column word-wrap inside its fixed width rather
+    than overflowing the page."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(letter),
@@ -396,12 +405,17 @@ def write_pdf(
                 continue
             if label:
                 story.append(Paragraph(label, _H2_STYLE))
-            table_data = [headers] + [[_cell(v) for v in row] for row in rows]
-            tbl = RLTable(table_data, repeatRows=1)
+            last_idx = len(headers) - 1
+            table_data = [headers] + [
+                [(Paragraph(_cell(v), _BODY_STYLE) if (wrap_last_col and ci == last_idx) else _cell(v))
+                 for ci, v in enumerate(row)]
+                for row in rows
+            ]
+            tbl = RLTable(table_data, repeatRows=1, colWidths=col_widths)
             tbl.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f3ead9")),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+                ("FONTSIZE", (0, 0), (-1, -1), 8.5 if col_widths else 7.5),
                 ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#d8cdb8")),
                 ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fbf8f2")]),
@@ -432,6 +446,25 @@ PURCHASING_HEADERS = [
 ]
 PURCHASING_NUMERIC_COLS = {3, 5, 6, 7, 8, 9, 11, 12}  # 0-indexed into the row above
 
+# The PDF is a printed document someone acts on at a glance (and possibly
+# hands to a supplier), not a data dump -- it gets its own short column set
+# and rounded, human-sized numbers. CSV/XLSX keep every raw field above at
+# full precision for whoever wants to work the numbers in a spreadsheet.
+_PRIORITY_LABEL = {
+    "out": "Out of stock", "critical": "Urgent", "at_risk": "Low stock",
+}
+
+PURCHASING_PDF_HEADERS = ["Ingredient", "Currently in Stock", "Suggested Purchase Qty", "Priority", "Why"]
+PURCHASING_PDF_COST_HEADERS = ["Ingredient", "Currently in Stock", "Suggested Purchase Qty", "Est. Cost", "Priority", "Why"]
+
+
+def _round_qty(v: float | None) -> str:
+    if v is None:
+        return "not available"
+    # Whole numbers read as whole numbers; anything else gets one decimal --
+    # never the raw 3-4 decimal places the forecast math itself works in.
+    return f"{v:,.0f}" if float(v).is_integer() else f"{v:,.1f}"
+
 
 def _purchasing_row_values(r: dict, include_costs: bool) -> list[Any]:
     return [
@@ -443,6 +476,19 @@ def _purchasing_row_values(r: dict, include_costs: bool) -> list[Any]:
         (r["estimated_purchase_cost"] if include_costs else None),
         r["priority"], r["reason"],
     ]
+
+
+def _purchasing_pdf_row_values(r: dict, include_costs: bool) -> list[Any]:
+    unit = r["purchase_unit"] or r["base_unit"]
+    qty = f"{_round_qty(r['suggested_purchase_qty'])} {unit}" if r["suggested_purchase_qty"] is not None else "not available"
+    stock = f"{_round_qty(r['current_usable_stock'])} {r['base_unit']}"
+    priority = _PRIORITY_LABEL.get(r["priority"], r["priority"])
+    row = [r["ingredient"], stock, qty]
+    if include_costs:
+        row.append(_money(r["estimated_purchase_cost"]))
+    row.append(priority)
+    row.append(r["reason"] or "—")
+    return row
 
 
 def generate_purchasing_report(
@@ -473,18 +519,19 @@ def generate_purchasing_report(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
-    # pdf
+    # pdf — short, rounded, supplier-grouped: what to buy and why, not the
+    # full forecast-engine data dump CSV/XLSX hand to a spreadsheet.
     if group_by_supplier:
         by_supplier: dict[str, list[dict]] = {}
         for r in rows:
             by_supplier.setdefault(r["supplier"], []).append(r)
         groups = [
             (f"Supplier: {supplier} ({len(items)} item{'s' if len(items) != 1 else ''})",
-             [_purchasing_row_values(r, include_costs) for r in items])
+             [_purchasing_pdf_row_values(r, include_costs) for r in items])
             for supplier, items in sorted(by_supplier.items(), key=lambda kv: kv[0])
         ]
     else:
-        groups = [(None, [_purchasing_row_values(r, include_costs) for r in rows])]
+        groups = [(None, [_purchasing_pdf_row_values(r, include_costs) for r in rows])]
 
     cost_line = "Estimated total purchase cost: not available (no cost data on the recommended items)"
     if summary["estimated_total_purchase_cost"] is not None:
@@ -501,13 +548,22 @@ def generate_purchasing_report(
     if include_costs:
         summary_lines.append(cost_line)
 
+    # Usable width on landscape letter with 0.5in margins is 10in. Ingredient
+    # and Why get the most room; the short numeric/priority columns stay
+    # narrow so the table reads like a document, not a spreadsheet dump.
+    if include_costs:
+        widths = [2.0 * inch, 1.3 * inch, 1.5 * inch, 1.0 * inch, 1.1 * inch, 3.1 * inch]
+    else:
+        widths = [2.2 * inch, 1.5 * inch, 1.7 * inch, 1.2 * inch, 3.4 * inch]
+
     content = write_pdf(
         report_name="Purchasing Recommendation Report",
         scope_line=f"Scope: {scope_label}" + (" · Grouped by supplier" if group_by_supplier else ""),
         summary_lines=summary_lines,
-        headers=PURCHASING_HEADERS if include_costs else PURCHASING_HEADERS[:11] + PURCHASING_HEADERS[13:],
-        groups=[(label, [row if include_costs else row[:11] + row[13:] for row in group_rows])
-                for label, group_rows in groups],
+        headers=PURCHASING_PDF_COST_HEADERS if include_costs else PURCHASING_PDF_HEADERS,
+        groups=groups,
+        col_widths=widths,
+        wrap_last_col=True,
     )
     return content, _filename("purchasing-list", "pdf"), "application/pdf"
 

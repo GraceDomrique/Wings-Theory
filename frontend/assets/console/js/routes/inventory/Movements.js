@@ -31,8 +31,17 @@ const PAGE_SIZE = 200;
 export async function render(ctx) {
   const ingredients = await listIngredients({ limit: 500, withRunway: false });
 
+  // 2026-10-14: default view is Grouped by Order — kitchen deductions read
+  // as "what an order used," not as a flat row-per-ingredient ledger dump.
+  // "All Stock Activity" is the original flat, pair-aware table, completely
+  // unchanged below. Every filter (ingredient/reason/order/date) applies to
+  // both — this is one dataset shown two ways, not two separate features.
+  let viewMode = 'grouped'; // 'grouped' | 'all'
   let reasonFilter = '';
   let ingredientPk = ctx.selection.ingredient ? ctx.selection.ingredient.pk : null;
+  let orderIdFilter = '';
+  let dateFrom = '';
+  let dateTo = '';
   let offset = 0;
   let total = 0;
   let rows = [];
@@ -51,24 +60,174 @@ export async function render(ctx) {
     value: String(i.pk), selected: i.pk === ingredientPk ? 'selected' : null,
   }, i.name)));
 
+  const orderIdInput = h('input', {
+    type: 'text', placeholder: 'e.g. 34595 or WT-34595',
+    onChange: (e) => { orderIdFilter = e.target.value.trim(); offset = 0; draw(); },
+  });
+  const dateFromInput = h('input', {
+    type: 'date', onChange: (e) => { dateFrom = e.target.value; offset = 0; draw(); },
+  });
+  const dateToInput = h('input', {
+    type: 'date', onChange: (e) => { dateTo = e.target.value; offset = 0; draw(); },
+  });
+
+  const modeToggle = h('div', { style: { display: 'flex', gap: '6px' } });
+  function drawModeToggle() {
+    mount(modeToggle,
+      h('button', {
+        class: `btn btn-sm${viewMode === 'grouped' ? ' btn-primary' : ''}`,
+        onClick: () => { if (viewMode !== 'grouped') { viewMode = 'grouped'; draw(); } },
+      }, 'Grouped by Order'),
+      h('button', {
+        class: `btn btn-sm${viewMode === 'all' ? ' btn-primary' : ''}`,
+        onClick: () => { if (viewMode !== 'all') { viewMode = 'all'; draw(); } },
+      }, 'All Stock Activity'));
+  }
+
   const host = h('div');
   const download = Button({ size: 'sm', onClick: () => exportCsv(rows) }, '↓ Download');
 
   async function draw() {
-    mount(host, Loading('Loading movements…'));
-    const out = await listMovements({ ingredientPk, reason: reasonFilter, limit: PAGE_SIZE, offset });
+    drawModeToggle();
+    mount(host, Loading('Loading stock activity…'));
+    const out = await listMovements({
+      ingredientPk,
+      reason: reasonFilter,
+      orderNo: orderIdFilter || undefined,
+      dateFrom: dateFrom || undefined,
+      dateTo: dateTo || undefined,
+      limit: PAGE_SIZE,
+      offset,
+    });
     rows = pairRows(out.entries);
     total = out.total;
 
+    if (viewMode === 'grouped') {
+      drawGrouped(out.entries);
+      return;
+    }
+    drawAll();
+  }
+
+  /** Order-grouped view: kitchen deductions (ref_type='order') collected
+   * under one card per order, newest first. Every non-order entry —
+   * receiving, wastage, counts, corrections, Unlimited Wings — still shows,
+   * in its own "Other Stock Activity" section below, never hidden just
+   * because it has no order to sit under. */
+  function drawGrouped(entries) {
+    const byOrder = new Map();
+    const other = [];
+    for (const m of entries) {
+      if (m.refType === 'order' && m.refId != null) {
+        if (!byOrder.has(m.refId)) byOrder.set(m.refId, []);
+        byOrder.get(m.refId).push(m);
+      } else {
+        other.push(m);
+      }
+    }
+    const groups = [...byOrder.entries()]
+      .map(([refId, lines]) => ({
+        refId,
+        lines,
+        latest: lines.reduce((max, m) => (m.timestamp > max ? m.timestamp : max), lines[0].timestamp),
+      }))
+      .sort((a, b) => (a.latest < b.latest ? 1 : -1));
+
+    mount(host,
+      h('div', { class: 't-xs t-faint', style: { marginBottom: '10px' } },
+        `${total} ledger record${total === 1 ? '' : 's'} match this filter — grouped into ${groups.length} order${groups.length === 1 ? '' : 's'} and ${other.length} other entr${other.length === 1 ? 'y' : 'ies'} on this page`),
+      groups.length === 0
+        ? null
+        : h('div', {}, ...groups.map(orderGroupCard)),
+      Card({ style: { marginTop: groups.length ? '14px' : '0' } },
+        CardHeader({
+          title: 'Other Stock Activity',
+          desc: 'Receiving, wastage, physical counts, corrections and anything else not tied to a specific order',
+        }),
+        other.length === 0
+          ? EmptyState({ icon: '✓', title: 'Nothing else on this page', tight: true })
+          : h('div', {}, ...other.map(otherActivityRow))),
+      pager());
+  }
+
+  function orderGroupCard(group) {
+    let open = false;
+    const body = h('div', { style: { display: 'none', marginTop: '8px' } });
+    const chevron = h('span', { class: 't-xs t-faint' }, '▸');
+
+    function drawBody() {
+      body.style.display = open ? '' : 'none';
+      chevron.textContent = open ? '▾' : '▸';
+      if (!open) return;
+      mount(body, Table({
+        columns: [
+          { key: 'ingredient', label: 'Ingredient', render: (m) => m.ingredientName },
+          {
+            key: 'change',
+            label: 'Quantity',
+            render: (m) => h('span', { class: m.changeQty > 0 ? 't-good' : 't-crit' }, delta(m.changeQty, m.baseUnit)),
+          },
+          { key: 'when', label: 'Time', render: (m) => h('span', { class: 'mono t-xs' }, stamp(m.timestamp)) },
+          { key: 'reason', label: 'Event', render: (m) => Pill((LEDGER_REASON[m.reason] || { severity: 'flat' }).severity, (LEDGER_REASON[m.reason] || { label: m.reason }).label) },
+          { key: 'ref', label: 'Ledger ref', render: (m) => h('span', { class: 'mono t-xs t-faint' }, `#${m.id}`) },
+        ],
+        rows: group.lines,
+      }));
+    }
+
+    const used = group.lines.filter((m) => m.changeQty < 0).length;
+    const returned = group.lines.filter((m) => m.changeQty > 0).length;
+
+    return Card({ style: { marginBottom: '8px', cursor: 'pointer' } },
+      h('div', {
+        style: { display: 'flex', alignItems: 'center', gap: '10px' },
+        onClick: () => { open = !open; drawBody(); },
+      },
+      chevron,
+      h('div', { style: { flex: '1' } },
+        h('div', { class: 't-sm t-strong' }, `Order #${group.refId}`),
+        h('div', { class: 'sub' }, stamp(group.latest))),
+      h('div', { style: { display: 'flex', gap: '6px' } },
+        used ? Pill('flat', `${used} used`) : null,
+        returned ? Pill('warn', `${returned} returned`) : null)),
+      body);
+  }
+
+  /** A non-order entry — receiving, wastage, a physical count, Unlimited
+   * Wings, etc. Same reason labelling as the flat "All" table, just one row
+   * per line rather than a full table (these aren't grouped by anything). */
+  function otherActivityRow(m) {
+    const meta = LEDGER_REASON[m.reason] || { label: m.reason, severity: 'flat' };
+    return h('div', { class: 'mini-row' },
+      h('span', {},
+        Pill(meta.severity, meta.label), ' ', m.ingredientName,
+        h('div', { class: 'sub' }, stamp(m.timestamp), m.refType ? ` · ${REF_LABEL[m.refType] || m.refType} #${m.refId ?? '—'}` : '')),
+      h('span', { class: `mono t-xs ${m.changeQty > 0 ? 't-good' : m.changeQty < 0 ? 't-crit' : ''}` }, delta(m.changeQty, m.baseUnit)));
+  }
+
+  function pager() {
+    const page = Math.floor(offset / PAGE_SIZE) + 1;
+    const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    return h('div', {
+      style: {
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        marginTop: '14px', paddingTop: '12px', borderTop: '1px solid var(--line)',
+      },
+    },
+    h('span', { class: 't-xs t-faint' }, `Page ${page} of ${pages}`),
+    h('div', { style: { display: 'flex', gap: '8px' } },
+      Button({ size: 'sm', disabled: offset <= 0, onClick: () => { offset = Math.max(0, offset - PAGE_SIZE); draw(); } }, 'Previous'),
+      Button({ size: 'sm', disabled: offset + PAGE_SIZE >= total, onClick: () => { offset += PAGE_SIZE; draw(); } }, 'Next')));
+  }
+
+  /** The original flat, pair-aware ledger table — unchanged. */
+  function drawAll() {
     // Filtering by one reason can only ever return one half of a pair — the
     // other half is a different reason by definition. Say so, rather than
     // letting a filtered view quietly present a correction as a bare loss.
     // Pagination carries the same caveat: a pair can straddle a page boundary
     // exactly as it can straddle a reason filter — the note covers both.
     const splitsPairs = ['void_credit', 'wastage', 'spoilage', 'sale_commit'].includes(reasonFilter);
-
-    const page = Math.floor(offset / PAGE_SIZE) + 1;
-    const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
     mount(host, Card({},
       CardHeader({
@@ -115,24 +274,19 @@ export async function render(ctx) {
           description: 'Every sale, delivery, waste entry and count correction lands here. Widen the filter to see more.',
         }),
       }),
-      h('div', {
-        style: {
-          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-          marginTop: '14px', paddingTop: '12px', borderTop: '1px solid var(--line)',
-        },
-      },
-      h('span', { class: 't-xs t-faint' }, `Page ${page} of ${pages}`),
-      h('div', { style: { display: 'flex', gap: '8px' } },
-        Button({ size: 'sm', disabled: offset <= 0, onClick: () => { offset = Math.max(0, offset - PAGE_SIZE); draw(); } }, 'Previous'),
-        Button({ size: 'sm', disabled: offset + PAGE_SIZE >= total, onClick: () => { offset += PAGE_SIZE; draw(); } }, 'Next')))));
+      pager()));
   }
 
   await draw();
 
   return h('div', {},
-    h('div', { style: { display: 'flex', gap: '12px', marginBottom: '14px', flexWrap: 'wrap' } },
-      h('label', { class: 'field', style: { minWidth: '220px' } }, 'Ingredient', ingredientPicker),
-      h('label', { class: 'field', style: { minWidth: '200px' } }, 'Reason', reasonPicker)),
+    h('div', { style: { marginBottom: '12px' } }, modeToggle),
+    h('div', { style: { display: 'flex', gap: '12px', marginBottom: '14px', flexWrap: 'wrap', alignItems: 'flex-end' } },
+      h('label', { class: 'field', style: { minWidth: '200px' } }, 'Ingredient', ingredientPicker),
+      h('label', { class: 'field', style: { minWidth: '180px' } }, 'Reason', reasonPicker),
+      h('label', { class: 'field', style: { minWidth: '120px' } }, 'Order #', orderIdInput),
+      h('label', { class: 'field' }, 'From', dateFromInput),
+      h('label', { class: 'field' }, 'To', dateToInput)),
     host);
 }
 

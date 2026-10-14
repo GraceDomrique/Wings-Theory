@@ -8,7 +8,9 @@ import { Modal, ModalError } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading, toast } from '../../components/ui/Feedback.js';
 import { money, qty, pct, count, nodata } from '../../lib/format.js';
-import { listRecipes, getRecipe, listMenuItems, createRecipe } from '../../lib/api/menu.js';
+import {
+  listRecipes, getRecipe, listMenuItems, createRecipe, editRecipe,
+} from '../../lib/api/menu.js';
 import { listIngredients } from '../../lib/api/inventory.js';
 
 /**
@@ -89,9 +91,15 @@ export async function render(ctx) {
               money(price).textContent)
             : null),
         desc: 'Cost per serving vs. menu price',
-        right: menuItem
-          ? (menuItem.sellable ? Pill('good', 'available') : Pill('crit', 'unavailable'))
-          : Pill('flat', 'not on the menu'),
+        right: [
+          Button({
+            size: 'sm',
+            onClick: () => openEditRecipeModal(d.recipe, d.lines, () => reload(selected.pk)),
+          }, 'Edit recipe'),
+          menuItem
+            ? (menuItem.sellable ? Pill('good', 'available') : Pill('crit', 'unavailable'))
+            : Pill('flat', 'not on the menu'),
+        ],
       }),
 
       h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3,1fr)', marginBottom: '14px' } },
@@ -184,6 +192,84 @@ export async function render(ctx) {
 }
 
 /**
+ * A searchable ingredient field — replaces a plain <select> for a list that
+ * can run past 100 items. Text input shows the current selection; typing
+ * filters a dropdown of matches; picking one or clicking away closes it.
+ * Same "type to filter, click a row" pattern already proven in
+ * Verification.js's ingredient-mapping modal, pulled out here so the recipe
+ * line-row builder isn't a second copy of it.
+ *
+ * @returns {{el:Node, getPk:()=>number|null}}
+ */
+function ingredientSearchField(ingredientOptions, initialPk) {
+  let selectedPk = initialPk ?? null;
+  const initial = ingredientOptions.find((i) => i.pk === initialPk);
+  const input = h('input', { type: 'text', placeholder: 'Search ingredient…', value: initial ? initial.name : '', autocomplete: 'off' });
+  const menu = h('div', {
+    style: {
+      position: 'absolute', zIndex: '20', top: '100%', left: '0', right: '0',
+      maxHeight: '220px', overflowY: 'auto', background: 'var(--surface)', border: '1px solid var(--line)',
+      borderRadius: 'var(--radius-sm)', boxShadow: 'var(--shadow)', display: 'none', marginTop: '2px',
+    },
+  });
+  const wrap = h('div', { style: { position: 'relative' } }, input, menu);
+
+  function drawMenu(query) {
+    const q = (query || '').trim().toLowerCase();
+    const rows = (q ? ingredientOptions.filter((i) => i.name.toLowerCase().includes(q)) : ingredientOptions).slice(0, 50);
+    if (rows.length === 0) {
+      mount(menu, h('div', { class: 't-xs t-faint', style: { padding: '8px 12px' } }, 'No match'));
+    } else {
+      mount(menu, ...rows.map((i) => h('div', {
+        class: 'row-click', style: { padding: '7px 12px', fontSize: '12.5px' },
+        onMousedown: (e) => {
+          e.preventDefault();
+          selectedPk = i.pk;
+          input.value = i.name;
+          menu.style.display = 'none';
+        },
+      }, i.name)));
+    }
+    menu.style.display = '';
+  }
+
+  input.addEventListener('focus', () => drawMenu(input.value));
+  input.addEventListener('input', () => { selectedPk = null; drawMenu(input.value); });
+  input.addEventListener('blur', () => { menu.style.display = 'none'; });
+
+  return { el: wrap, getPk: () => selectedPk };
+}
+
+/**
+ * One ingredient line row — shared by Add recipe and Edit recipe, which
+ * used to each carry their own near-identical copy of this. `initial`, when
+ * given, pre-fills from an existing recipe line (Edit); omitted, it's a
+ * blank row (Add, or "+ Add ingredient line" in either modal).
+ */
+function buildLineRow(ingredientOptions, lineRows, linesHost, initial) {
+  const ingField = ingredientSearchField(ingredientOptions, initial ? initial.ingredientId : null);
+  const labelInput = h('input', { type: 'text', placeholder: 'label (defaults to ingredient name)', value: initial ? initial.label : '' });
+  const qtyInput = h('input', {
+    type: 'number', inputmode: 'decimal', min: '0.01', step: '0.01', placeholder: 'qty', class: 'no-spinner',
+    value: initial && initial.amount != null ? String(initial.amount) : '',
+  });
+  const removeBtn = h('button', { class: 'icon-btn', title: 'Remove line' }, '✕');
+  const num = h('span', { class: 'recipe-line-num' }, String(lineRows.length + 1));
+  const row = h('div', { class: 'recipe-line-row' },
+    num, ingField.el, labelInput, qtyInput, removeBtn);
+  removeBtn.addEventListener('click', () => {
+    row.remove();
+    lineRows.splice(lineRows.indexOf(entry), 1);
+    lineRows.forEach((r, i) => { r.num.textContent = String(i + 1); });
+  });
+  const entry = {
+    row, labelInput, qtyInput, num, getIngredientPk: ingField.getPk,
+  };
+  lineRows.push(entry);
+  linesHost.appendChild(row);
+}
+
+/**
  * POST /console/recipes — a menu recipe or a sub-recipe, with its lines, in
  * one call. Every ingredient_pk sent is a real FK the backend validates; an
  * unresolved ingredient belongs in the Ingredient Queue (Verification tab),
@@ -203,44 +289,18 @@ function openAddRecipeModal(onCreated) {
   const submit = Button({ variant: 'primary' }, 'Create recipe');
   const lineRows = [];
 
-  function addLineRow() {
-    const ingSelect = h('select', {},
-      h('option', { value: '' }, 'Select ingredient…'),
-      ...ingredientOptions.map((i) => h('option', { value: String(i.pk) }, i.name)));
-    const labelInput = h('input', { type: 'text', placeholder: 'label (defaults to ingredient name)' });
-    // No native spinner: the recipe app has no use for clicking +/- 0.01 a
-    // hundred times to type a real quantity like "250" — a plain decimal
-    // field is both simpler to build and faster to use.
-    const qtyInput = h('input', { type: 'number', min: '0.01', step: '0.01', placeholder: 'qty', class: 'no-spinner' });
-    const removeBtn = h('button', { class: 'icon-btn', title: 'Remove line' }, '✕');
-    const num = h('span', { class: 'recipe-line-num' }, String(lineRows.length + 1));
-    const row = h('div', { class: 'recipe-line-row' },
-      num, ingSelect, labelInput, qtyInput, removeBtn);
-    removeBtn.addEventListener('click', () => {
-      row.remove();
-      lineRows.splice(lineRows.indexOf(entry), 1);
-      renumberRows();
-    });
-    const entry = { row, ingSelect, labelInput, qtyInput, num };
-    lineRows.push(entry);
-    linesHost.appendChild(row);
-  }
-
-  function renumberRows() {
-    lineRows.forEach((r, i) => { r.num.textContent = String(i + 1); });
-  }
-
-  const addLineBtn = Button({ size: 'sm', onClick: addLineRow }, '+ Add ingredient line');
+  const addLineBtn = Button({ size: 'sm', onClick: () => buildLineRow(ingredientOptions, lineRows, linesHost) }, '+ Add ingredient line');
 
   submit.addEventListener('click', async () => {
     err.textContent = ''; err.style.display = 'none';
     if (!nameInput.value.trim()) { err.textContent = 'Enter a recipe name.'; err.style.display = ''; return; }
     const lines = [];
     for (const r of lineRows) {
-      if (!r.ingSelect.value) continue;
+      const pk = r.getIngredientPk();
+      if (!pk) continue;
       const qtyBase = Number(r.qtyInput.value);
       if (!(qtyBase > 0)) { err.textContent = 'Every line needs a quantity greater than zero.'; err.style.display = ''; return; }
-      const ing = ingredientOptions.find((i) => i.pk === Number(r.ingSelect.value));
+      const ing = ingredientOptions.find((i) => i.pk === pk);
       lines.push({
         ingredientPk: ing.pk,
         displayLabel: r.labelInput.value.trim() || ing.name,
@@ -290,6 +350,88 @@ function openAddRecipeModal(onCreated) {
 
   listIngredients({ limit: 500, withRunway: false }).then((list) => {
     ingredientOptions = list;
-    addLineRow();
+    buildLineRow(ingredientOptions, lineRows, linesHost);
+  });
+}
+
+/**
+ * PATCH /console/recipes/{pk} — edit an existing recipe's name, yield and
+ * full ingredient line set. Same line-row editor as Add recipe, pre-filled
+ * from the recipe's current lines. Replacing the whole line set (rather
+ * than diffing adds/removes/changes) matches exactly what the backend
+ * endpoint does — see its own docstring for why that's safe against an
+ * order already reserved against the old lines.
+ */
+function openEditRecipeModal(recipe, currentLines, onSaved) {
+  let ingredientOptions = [];
+  const nameInput = h('input', { type: 'text', value: recipe.name });
+  const yieldQtyInput = h('input', { type: 'number', min: '0.01', step: '0.01', value: String(recipe.yieldQty ?? 1), class: 'no-spinner' });
+  const yieldUnitInput = h('input', { type: 'text', value: recipe.yieldUnit || 'serving' });
+  const linesHost = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px' } });
+  const err = ModalError();
+  const submit = Button({ variant: 'primary' }, 'Save changes');
+  const lineRows = [];
+
+  const addLineBtn = Button({ size: 'sm', onClick: () => buildLineRow(ingredientOptions, lineRows, linesHost) }, '+ Add ingredient line');
+
+  submit.addEventListener('click', async () => {
+    err.textContent = ''; err.style.display = 'none';
+    if (!nameInput.value.trim()) { err.textContent = 'Enter a recipe name.'; err.style.display = ''; return; }
+    const lines = [];
+    for (const r of lineRows) {
+      const pk = r.getIngredientPk();
+      if (!pk) continue;
+      const qtyBase = Number(r.qtyInput.value);
+      if (!(qtyBase > 0)) { err.textContent = 'Every line needs a quantity greater than zero.'; err.style.display = ''; return; }
+      const ing = ingredientOptions.find((i) => i.pk === pk);
+      lines.push({
+        ingredientPk: ing.pk,
+        displayLabel: r.labelInput.value.trim() || ing.name,
+        qtyBase,
+      });
+    }
+    if (lines.length === 0) { err.textContent = 'Add at least one ingredient line.'; err.style.display = ''; return; }
+
+    submit.disabled = true;
+    try {
+      const r = await editRecipe(recipe.pk, {
+        name: nameInput.value.trim(),
+        yieldQty: Number(yieldQtyInput.value) || 1,
+        yieldUnit: yieldUnitInput.value.trim() || 'serving',
+        lines,
+      });
+      modal.close();
+      const problems = r.problems || [];
+      toast(problems.length
+        ? `Recipe updated, but has ${problems.length} problem(s) to resolve.`
+        : 'Recipe updated — future orders use the new lines; orders already reserved are unaffected.', problems.length ? 'warn' : 'good');
+      onSaved();
+    } catch (e) {
+      err.textContent = e.message; err.style.display = ''; submit.disabled = false;
+    }
+  });
+
+  const modal = Modal({
+    title: `Edit — ${recipe.name}`,
+    desc: 'Changes apply to orders reserved from now on. Orders already punched keep the quantities they were reserved with.',
+    wide: true,
+    onClose: () => {},
+  },
+  h('label', { class: 'field', style: { marginBottom: '10px', display: 'block' } }, 'Name', nameInput),
+  h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '10px' } },
+    h('label', { class: 'field' }, 'Yields', yieldQtyInput),
+    h('label', { class: 'field' }, 'Yield unit', yieldUnitInput)),
+  h('div', { class: 'eyebrow', style: { marginTop: '6px' } }, 'Ingredient lines'),
+  h('div', { class: 'recipe-line-row recipe-line-head' },
+    h('span', {}), h('span', {}, 'Ingredient'), h('span', {}, 'Label (optional)'), h('span', {}, 'Qty'), h('span', {})),
+  linesHost,
+  h('div', { style: { margin: '8px 0 14px' } }, addLineBtn),
+  err,
+  submit);
+
+  listIngredients({ limit: 500, withRunway: false }).then((list) => {
+    ingredientOptions = list;
+    if (currentLines.length === 0) buildLineRow(ingredientOptions, lineRows, linesHost);
+    else for (const l of currentLines) buildLineRow(ingredientOptions, lineRows, linesHost, l);
   });
 }

@@ -69,6 +69,7 @@ export function Topbar({ title, sub, onSearch, onSignOut }) {
     el.querySelector('.search').style.visibility = visible ? '' : 'hidden';
     if (!visible) input.value = '';
   };
+  el.setSearchPlaceholder = (text) => { input.placeholder = text || 'Search…'; };
   el.onRefresh = (fn) => refresh.addEventListener('click', fn);
   return el;
 }

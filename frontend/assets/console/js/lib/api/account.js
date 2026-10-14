@@ -72,4 +72,14 @@ export async function createUser({ username, displayName, role }) {
   return { username: out.username, role: out.role, temporaryPassword: out.temporary_password };
 }
 
+/**
+ * Admin-only rename of an account's display name (never the username used
+ * to sign in). Same capability as resetPassword/createUser above.
+ */
+export function updateDisplayName(username, displayName) {
+  return api.patch(`/console/users/${encodeURIComponent(username)}/display_name`, {
+    display_name: displayName,
+  });
+}
+
 export { MIN_PASSWORD_LENGTH };

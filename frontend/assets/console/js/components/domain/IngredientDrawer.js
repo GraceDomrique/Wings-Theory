@@ -1,8 +1,8 @@
-import { h, mount } from '../../lib/dom.js';
-import { Modal, ModalError } from '../ui/Modal.js';
+import { h, mount, icon } from '../../lib/dom.js';
+import { Drawer } from '../ui/Drawer.js';
+import { ModalError } from '../ui/Modal.js';
 import { Button } from '../ui/Button.js';
 import { Pill } from '../ui/Pill.js';
-import { Tabbar } from '../ui/Tabbar.js';
 import { toast } from '../ui/Feedback.js';
 import {
   money, qty, date, stamp, delta, str,
@@ -11,6 +11,7 @@ import {
   getIngredient, countStock, wasteStock, useStock, updateIngredient, receive,
 } from '../../lib/api/inventory.js';
 import { severityFromDays } from '../../lib/severity.js';
+import { ICONS } from '../../lib/icons.js';
 
 /**
  * The ingredient workflow hub — restored from the old console's
@@ -33,15 +34,26 @@ import { severityFromDays } from '../../lib/severity.js';
  *        batch's own quantity and reason='spoilage' already entered, instead
  *        of making the owner re-find the ingredient and re-type a number
  *        the expiry card already showed them.
+ *
+ * 2026-10-14 redesign: the five actions (Receive/Count/Waste/Use/Edit) used
+ * to sit behind an always-equal-weight Tabbar, which put "Manual use" — an
+ * occasional exception for operational supplies — on exactly the same
+ * footing as Receive. They're now four primary action TILES (Receive/Count
+ * Stock/Record Waste/Edit Details) plus a "More actions" disclosure holding
+ * Manual use, matching how often each one is actually reached for. A write
+ * keeps the drawer open and refreshes it in place (load() below) rather than
+ * closing — the point of a drawer over a modal is staying oriented on the
+ * same ingredient through a multi-step correction.
  */
 export function openIngredientDrawer({
   pk, onChanged, initialAction = null, prefill = null,
 }) {
   let detail = null;
   let activeAction = initialAction; // 'receive' | 'count' | 'waste' | 'use' | 'edit' | null
+  let moreOpen = false;
   const body = h('div');
 
-  const modal = Modal({ title: 'Loading…', wide: true, onClose: () => {} }, body);
+  const modal = Drawer({ title: 'Loading…', onClose: () => {} }, body);
   mount(body, h('div', { class: 'load-note' }, 'Loading ingredient…'));
 
   load();
@@ -64,51 +76,96 @@ export function openIngredientDrawer({
   function buildBody() {
     const ing = detail.ingredient;
     const hasExpiredStock = (ing.expiredBaseQty || 0) > 0.001;
+    const usable = ing.usableBaseQty ?? ing.onHandBaseQty ?? 0;
+    const outOfStock = usable <= 0.0001;
+
+    // "Available to use" leads — it's the number that answers "can I cook
+    // with this right now", which Recorded quantity alone cannot (it can be
+    // positive while every batch behind it is expired). Recorded quantity is
+    // still shown, just secondary.
+    const headline = h('div', { style: { marginBottom: '14px' } },
+      h('div', { class: 't-xs t-faint' }, 'Available to use'),
+      h('div', {
+        class: 't-strong', style: { fontSize: '28px', marginTop: '2px', color: outOfStock ? 'var(--crit)' : undefined },
+      }, qty(ing.usableBaseQty, ing.baseUnit)),
+      hasExpiredStock
+        ? h('div', { class: 't-xs t-crit', style: { marginTop: '2px' } },
+          `${qty(ing.expiredBaseQty, ing.baseUnit).textContent} expired — not counted above`)
+        : null);
 
     const summary = h('div', {
-      class: 'grid', style: { gridTemplateColumns: `repeat(${hasExpiredStock ? 5 : 4},1fr)`, gap: '10px', marginBottom: '14px' },
+      class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '10px', marginBottom: '14px' },
     },
-    summaryTile('On hand', str(ing.onHandDisplay, 'not counted')),
-    // Only shown when some of what's on hand is already expired — for
-    // everything else, "On hand" already IS the usable figure, and a second
-    // identical tile would just be noise.
-    hasExpiredStock
-      ? summaryTile('Usable', qty(ing.usableBaseQty, ing.baseUnit),
-        h('div', { class: 't-xs t-crit', style: { marginTop: '2px' } },
-          `${qty(ing.expiredBaseQty, ing.baseUnit).textContent} expired`))
-      : null,
+    summaryTile('Recorded stock', str(ing.onHandDisplay, 'not counted')),
     summaryTile('Cost / unit', money(ing.costPerUnit)),
-    summaryTile('Confidence',
-      ing.confidence === 'confirmed' ? Pill('good', 'confirmed') : Pill('warn', 'unverified')),
-    summaryTile('Sellable?',
-      ing.isDeductable ? Pill('good', 'deductable') : Pill('crit', ing.blockReason || 'blocked')));
+    summaryTile('Details',
+      ing.confidence === 'confirmed' ? Pill('good', 'verified') : Pill('warn', 'needs confirming')),
+    // Fixed 2026-10 audit finding: this used to read "deductable" purely off
+    // recipe-mapping configuration, so a fully-expired ingredient (correctly
+    // configured, zero usable stock) still showed a calm green "deductable"
+    // pill — implying it could be sold when it could not.
+    summaryTile('Recipe deduction',
+      !ing.isDeductable ? Pill('crit', ing.blockReason || 'blocked')
+        : outOfStock ? Pill('crit', 'no usable stock')
+          : Pill('good', 'enabled')));
+
+    const expiredBanner = hasExpiredStock
+      ? h('div', { class: 'callout callout-crit', style: { marginBottom: '14px' } },
+        h('p', {},
+          h('strong', {}, 'Expired batches need checking. '),
+          'Review them under Stock Batches below and record disposal — expired stock is never removed automatically.'))
+      : null;
+
+    const actionTiles = h('div', {
+      class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '10px', marginBottom: '10px' },
+    },
+    actionTile('receive', ICONS.packagePlus, 'Receive'),
+    actionTile('count', ICONS.clipboardCheck, 'Count Stock'),
+    actionTile('waste', ICONS.trash2, 'Record Waste'),
+    actionTile('edit', ICONS.layers, 'Edit Details'));
+
+    const moreToggle = h('button', {
+      class: 'btn btn-ghost btn-sm',
+      style: { marginBottom: '10px' },
+      onClick: () => { moreOpen = !moreOpen; draw(); },
+    }, moreOpen ? '− Fewer actions' : '+ More actions');
 
     const actionPane = h('div', { style: { marginBottom: '16px' } });
-
-    const actions = Tabbar({
-      items: [
-        { id: 'receive', label: 'Receive' },
-        { id: 'count', label: 'Stock count' },
-        { id: 'waste', label: 'Wastage' },
-        { id: 'use', label: 'Manual use' },
-        { id: 'edit', label: 'Edit details' },
-      ],
-      activeId: activeAction || '__none__',
-      onChange: (id) => { activeAction = id; drawActionPane(actionPane); },
-    });
-
     drawActionPane(actionPane);
+
+    const moreActions = moreOpen
+      ? h('div', { style: { marginBottom: '16px' } },
+        h('div', { class: 'eyebrow' }, 'More actions'),
+        h('button', {
+          class: `btn btn-sm${activeAction === 'use' ? ' btn-primary' : ''}`,
+          onClick: () => { activeAction = activeAction === 'use' ? null : 'use'; drawActionPane(actionPane); },
+        }, icon(ICONS.utensils, 16), ' Record other usage'),
+        activeAction === 'use' ? usePane() : null)
+      : null;
 
     const recent = h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px' } },
       recentBatches(), recentMovements());
 
-    return h('div', {}, summary, actions, actionPane, recent);
+    return h('div', {}, headline, summary, expiredBanner, actionTiles, moreToggle, actionPane, moreActions, recent);
+  }
+
+  function actionTile(id, iconPaths, label) {
+    const active = activeAction === id;
+    return h('button', {
+      class: `quick-action action-tile${active ? ' active' : ''}`,
+      style: { flexDirection: 'column', textAlign: 'center', justifyContent: 'center', gap: '6px' },
+      onClick: () => { activeAction = activeAction === id ? null : id; draw(); },
+    }, h('span', { class: 'kpi-icon kpi-icon-flat' }, icon(iconPaths, 17)), h('span', {}, label));
   }
 
   function drawActionPane(host) {
-    if (!activeAction) { mount(host, h('div')); return; }
-    const panes = { receive: receivePane, count: countPane, waste: wastePane, use: usePane, edit: editPane };
-    mount(host, panes[activeAction]());
+    if (!activeAction || activeAction === 'use') { mount(host, h('div')); return; }
+    const panes = { receive: receivePane, count: countPane, waste: wastePane, edit: editPane };
+    const back = h('button', {
+      class: 'btn btn-ghost btn-sm', style: { marginBottom: '8px' },
+      onClick: () => { activeAction = null; draw(); },
+    }, icon(ICONS.close, 13), ' Back to overview');
+    mount(host, back, panes[activeAction]());
   }
 
   function summaryTile(label, value, ...extra) {
@@ -121,7 +178,7 @@ export function openIngredientDrawer({
   function recentBatches() {
     const rows = (detail.batches || []).slice(0, 5);
     return h('div', {},
-      h('div', { class: 'eyebrow' }, 'Open FEFO batches'),
+      h('div', { class: 'eyebrow' }, 'Stock Batches'),
       rows.length === 0
         ? h('div', { class: 't-sm t-faint' }, 'No open batches.')
         : rows.map((b) => h('div', { class: 'mini-row' },
@@ -132,12 +189,19 @@ export function openIngredientDrawer({
   function recentMovements() {
     const rows = (detail.movements || []).slice(0, 5);
     return h('div', {},
-      h('div', { class: 'eyebrow' }, 'Recent ledger activity'),
+      h('div', { class: 'eyebrow' }, 'Recent Activity'),
       rows.length === 0
-        ? h('div', { class: 't-sm t-faint' }, 'No movements yet.')
+        ? h('div', { class: 't-sm t-faint' }, 'No activity yet.')
         : rows.map((m) => h('div', { class: 'mini-row' },
           h('span', {}, str(m.reason, 'movement').textContent, h('div', { class: 'sub' }, stamp(m.timestamp).textContent)),
-          h('span', { class: `mono t-xs ${m.changeQty > 0 ? 't-good' : 't-crit'}` }, delta(m.changeQty, m.baseUnit)))));
+          h('span', { class: `mono t-xs ${m.changeQty > 0 ? 't-good' : 't-crit'}` }, delta(m.changeQty, m.baseUnit)))),
+      detail.movements && detail.movements.length > 0
+        ? h('button', {
+          class: 'btn btn-ghost btn-sm',
+          style: { marginTop: '6px' },
+          onClick: () => { modal.close(); window.location.hash = '#/movements'; },
+        }, 'View full history →')
+        : null);
   }
 
   // ---- Receive ----
@@ -215,7 +279,7 @@ export function openIngredientDrawer({
       value: pf.note || undefined,
     });
     const err = ModalError();
-    const submit = Button({ variant: 'primary', size: 'sm' }, 'Log wastage');
+    const submit = Button({ variant: 'primary', size: 'sm' }, 'Record waste');
     submit.addEventListener('click', () => runWrite({
       err, submit,
       validate: () => (Number(qtyInput.value) > 0 ? null : 'Enter how much was lost.'),
@@ -223,7 +287,7 @@ export function openIngredientDrawer({
         qtyBase: Number(qtyInput.value), reason: reasonSelect.value, note: noteInput.value.trim() || null,
         source: pf.source || 'manual_writeoff',
       }),
-      successMsg: () => `${reasonSelect.value === 'spoilage' ? 'Spoilage' : 'Wastage'} logged for ${ing.name}.`,
+      successMsg: () => `${reasonSelect.value === 'spoilage' ? 'Expired stock discarded' : 'Waste recorded'} for ${ing.name}.`,
     }));
     return actionForm(
       `Amount lost, in ${ing.baseUnit}`, qtyInput,

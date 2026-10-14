@@ -64,6 +64,27 @@ export const session = {
   },
 };
 
+/**
+ * Explicit sign-out. Clears local state immediately — the UI must never
+ * wait on the network to show the login screen again — then revokes the
+ * session server-side in the background (wt/sessions.py, POST
+ * /auth/logout) so the bearer token this tab was using stops working too,
+ * including a captured copy replayed directly against the API. Best-effort:
+ * an offline/unreachable server, or a token that was already dead (the
+ * automatic session.end() a 401 triggers in request() below has already
+ * cleared it by the time this runs), must never throw past this function.
+ */
+export function logout() {
+  const token = session.token;
+  session.end();
+  if (token) {
+    fetch('/auth/logout', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+}
+
 // Frontend mirror of the backend's role split (wt/auth.py CAPABILITIES,
 // 2026-09 revision): admin holds every write capability, manager is
 // read/monitoring-only. This is UI convenience ONLY — hiding/disabling a

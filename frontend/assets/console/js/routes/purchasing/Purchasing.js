@@ -215,7 +215,10 @@ export async function render(ctx) {
     mount(detailHost, Card({},
       CardHeader({
         title: `PO-${po.id}`,
-        desc: `Supplier: ${po.supplier || '—'} · Created ${stamp(po.createdAt)} by ${po.createdBy || '—'}`,
+        // stamp() returns a DOM node, not a string — interpolating it
+        // directly into the template literal below used to print the
+        // literal "[object Text]" (2026-10 rendering bug fix).
+        desc: `Supplier: ${po.supplier || '—'} · Created ${stamp(po.createdAt).textContent} by ${po.createdBy || '—'}`,
         right: Pill(sev, label),
       }),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '18px' } },
@@ -240,7 +243,7 @@ export async function render(ctx) {
               ? Button({ size: 'sm', variant: 'primary', onClick: () => openReceiveModal(po) }, 'Receive delivery')
               : null,
             canCancel ? Button({ size: 'sm', variant: 'ghost', onClick: () => doCancel(po) }, 'Cancel order') : null,
-            po.expectedDeliveryDate ? h('div', { class: 't-xs t-faint', style: { marginTop: '6px' } }, `Expected delivery: ${date(po.expectedDeliveryDate)}`) : null)))));
+            po.expectedDeliveryDate ? h('div', { class: 't-xs t-faint', style: { marginTop: '6px' } }, 'Expected delivery: ', date(po.expectedDeliveryDate)) : null)))));
   }
 
   draw();

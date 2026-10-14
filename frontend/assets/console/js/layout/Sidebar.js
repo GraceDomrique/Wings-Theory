@@ -1,6 +1,7 @@
 import { h, icon } from '../lib/dom.js';
 import { treeForRole } from './nav.js';
 import { session } from '../lib/api/client.js';
+import { ICONS } from '../lib/icons.js';
 
 const EXPANDED_KEY = 'wt_console_nav_expanded';
 const COLLAPSED_KEY = 'wt_console_nav_collapsed';
@@ -144,16 +145,16 @@ export function Sidebar({ activeId, onNavigate }) {
     onClick: () => setCollapsed(!collapsed),
   }, collapseToggle, collapseLabel);
 
-  // Reference screenshots: lower-sidebar wing photograph, blended into the
-  // dark sidebar via a gradient (pure CSS, see .sidebar-photo in app.css) --
-  // landing-hero.jpg is the same top-down wings shot already used on the
-  // public landing page, so this introduces no new asset.
-  const photo = h('div', {
-    class: 'sidebar-photo',
-    style: { backgroundImage: "url('/img/landing-hero.jpg')" },
-  }, h('div', { class: 'sidebar-photo-tag' },
-    h('div', { class: 'sidebar-photo-wordmark' }, 'Wings Theory'),
-    'GOOD FOOD', h('span', { class: 'sub' }, 'Better days')));
+  // Account Settings — pinned below the main tree for every role (not a
+  // leaf of either ADMIN_TREE/OWNER_TREE; see nav.js's routeRoles('settings')
+  // special case), same place "Collapse" already lives, so it reads as
+  // account-level rather than one more operational destination.
+  const settingsBtn = h('button', {
+    class: 'nav-item nav-item-top' + ('settings' === activeId ? ' active' : ''),
+    title: 'Account Settings',
+    onClick: () => onNavigate('settings'),
+  }, icon(ICONS.userRound), h('span', { class: 'nav-item-label' }, 'Account Settings'));
+  leafButtons.set('settings', settingsBtn);
 
   const el = h('aside', { class: 'sidebar' },
     h('div', { class: 'brand' },
@@ -162,7 +163,7 @@ export function Sidebar({ activeId, onNavigate }) {
         h('div', { class: 't1' }, 'Wings Theory'),
         h('div', { class: 't2' }, 'Operations Console'))),
     h('nav', { class: 'nav-tree' }, ...nodes),
-    photo,
+    h('div', { class: 'nav-foot' }, settingsBtn),
     collapseBtn);
 
   /** Called on every route change. A leaf outside the currently-collapsed

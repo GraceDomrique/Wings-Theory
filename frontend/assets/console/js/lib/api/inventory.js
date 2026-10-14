@@ -188,9 +188,11 @@ function toMovement(r, ingredient) {
  * The append-only ledger. Read-only by contract: there is no update or delete
  * function in this module, and there must never be one (spec section 6 point 2).
  */
-export async function listMovements({ ingredientPk, reason, limit = 200, offset = 0 } = {}) {
+export async function listMovements({
+  ingredientPk, reason, orderNo, dateFrom, dateTo, limit = 200, offset = 0,
+} = {}) {
   const out = await api.get('/console/ledger', {
-    ingredient_id: ingredientPk, reason, limit, offset,
+    ingredient_id: ingredientPk, reason, order_no: orderNo, date_from: dateFrom, date_to: dateTo, limit, offset,
   });
   return { entries: (out.entries || []).map((r) => toMovement(r, null)), total: out.total || 0 };
 }

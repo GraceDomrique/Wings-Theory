@@ -116,6 +116,29 @@ export function createRecipe({ name, kind, producesIngredientPk, yieldQty, yield
 }
 
 /**
+ * PATCH /console/recipes/{pk} — full edit of an existing recipe's name,
+ * yield and ingredient lines (admin-only, recipe.write). `kind` and which
+ * ingredient a sub-recipe produces are not editable here — see the
+ * endpoint's own docstring for why. Safe against orders already in
+ * flight: reserve_order() snapshots quantities at POS-punch time, so this
+ * can only affect orders reserved after it commits.
+ */
+export function editRecipe(pk, { name, yieldQty, yieldUnit, lines }) {
+  return api.patch(`/console/recipes/${pk}`, {
+    name,
+    yield_qty: yieldQty || 1,
+    yield_unit: yieldUnit || 'serving',
+    lines: (lines || []).map((l) => ({
+      ingredient_pk: l.ingredientPk,
+      display_label: l.displayLabel,
+      qty_base: l.qtyBase,
+      is_optional: !!l.isOptional,
+      note: l.note || null,
+    })),
+  });
+}
+
+/**
  * PATCH /console/menu-items/{pk}/price — the only console-writable field on
  * a menu item. The POS reads this same `menu_item.price` column on its next
  * menu load, so a change here reaches the till without any separate sync

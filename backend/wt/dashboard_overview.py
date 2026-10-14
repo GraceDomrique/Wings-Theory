@@ -186,11 +186,20 @@ def admin_today(conn, *, now: _dt.datetime, summary: dict, forecast: dict | None
             ],
         },
         "todaysDeliveries": deliveries,
+        # 2026-10-14 fix: "Create Purchase Order" was offered to Admin here,
+        # but purchase_order.create is owner-only (wt/auth.py) — clicking it
+        # sent Admin to What to Buy with a label promising an action they
+        # were never allowed to take. Relabeled to what Admin actually does
+        # there (review the recommendations, purchase_order.read is granted
+        # to both roles); the route is unchanged. "Record Waste" pointed at
+        # Losses & Variance, a read-only anomaly review page with no waste
+        # action on it at all — repointed to Inventory (onhand), where
+        # "Record Waste" is a real Quick Action that opens the waste form.
         "quickActions": [
             {"key": "receive", "label": "Receive Delivery", "route": "receiving"},
-            {"key": "waste", "label": "Record Waste", "route": "losses"},
+            {"key": "waste", "label": "Record Waste", "route": "onhand"},
             {"key": "stockcount", "label": "Start Stock Count", "route": "stockcounts"},
-            {"key": "createpo", "label": "Create Purchase Order", "route": "whattobuy"},
+            {"key": "createpo", "label": "Review Purchase Needs", "route": "whattobuy"},
         ],
         "orderActivity": activity,
         "recentOrders": recent,

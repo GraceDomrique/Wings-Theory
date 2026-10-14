@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 from . import (
     audit, auth, business_overview as business_overview_mod, db, instructions, permissions,
-    purchasing, refills, timeutil, unli, user_permissions, verification,
+    purchasing, refills, sessions, timeutil, unli, user_permissions, verification,
 )
 from . import dashboard_overview as dashboard_overview_mod
 from . import sales_overview as sales_overview_mod
@@ -274,6 +274,14 @@ def principal(
         raise AuthenticationError("account no longer active — please sign in again")
     if payload.get("pwd") != row["password_changed_at"]:
         raise AuthenticationError("session invalidated by a password change — please sign in again")
+    # This session's own jti must still be live -- revoked by an explicit
+    # POST /auth/logout (wt/sessions.revoke), or never recorded at all (a
+    # token minted before this check existed). Checked after the two
+    # identity checks above, not before: a deactivated/password-rotated
+    # account should still read as exactly that, not as a generic "session
+    # has ended" that erases the more specific reason. See wt/sessions.py.
+    if not sessions.is_active(c, payload.get("jti")):
+        raise AuthenticationError("session has ended — please sign in again")
     # Stapled onto the decoded payload, not looked up again by needs() below,
     # so the must_change_password gate costs zero extra queries — this SELECT
     # already runs on every request.
@@ -400,6 +408,8 @@ def login(body: Login, c: sqlite3.Connection = Depends(conn)):
             audit.log_login(c, body.username, row["role"] if row else None, success=False,
                              reason="invalid_credentials" if row else "unknown_user")
         raise HTTPException(401, "invalid credentials")
+    token = auth.issue_token(row["username"], row["role"], row["password_changed_at"])
+    issued = auth.decode_token(token)
     with db.write_tx(c):
         if row["failed_login_count"] or row["locked_until"]:
             c.execute(
@@ -407,8 +417,12 @@ def login(body: Login, c: sqlite3.Connection = Depends(conn)):
                 (row["id"],),
             )
         audit.log_login(c, row["username"], row["role"], success=True)
+        # Recorded so this specific session can be individually revoked by
+        # POST /auth/logout, independent of every other token/tab/device
+        # this account is signed in from -- see wt/sessions.py.
+        sessions.create(c, issued["jti"], row["username"], row["role"], issued["exp"])
     return {
-        "token": auth.issue_token(row["username"], row["role"], row["password_changed_at"]),
+        "token": token,
         "role": row["role"],
         "display_name": row["display_name"],
         # Data only -- nothing blocks this login or any later request on it.
@@ -417,6 +431,24 @@ def login(body: Login, c: sqlite3.Connection = Depends(conn)):
         # carry the shared placeholder password.
         "must_change_password": bool(row["must_change_password"]),
     }
+
+
+@app.post("/auth/logout", tags=["auth"])
+def logout(c: sqlite3.Connection = Depends(conn), p: dict = Depends(principal)):
+    """Explicit sign-out. Revokes THIS session server-side (wt/sessions.py)
+    so the bearer token that was just used to call this endpoint is refused
+    on every request from here on, including a direct API call replaying a
+    captured copy of it -- not merely "no longer offered" by whichever
+    browser tab called this.
+
+    Bare Depends(principal), not needs(_must_change_password gate included):
+    an account mid-forced-password-change must still be able to sign itself
+    out. Idempotent -- logging out twice with the same (already-revoked)
+    token simply 401s on the second call via principal() itself, same as
+    any other dead session would."""
+    with db.write_tx(c):
+        sessions.revoke(c, p["jti"])
+    return {"ok": True}
 
 
 class ChangePasswordIn(BaseModel):
@@ -458,7 +490,17 @@ def change_password(
     new_changed_at = c.execute(
         "SELECT password_changed_at FROM app_user WHERE id=?", (row["id"],)
     ).fetchone()["password_changed_at"]
-    return {"ok": True, "token": auth.issue_token(row["username"], row["role"], new_changed_at)}
+    token = auth.issue_token(row["username"], row["role"], new_changed_at)
+    issued = auth.decode_token(token)
+    with db.write_tx(c):
+        # The 'pwd' claim already makes every pre-existing token unusable
+        # (api.principal() rejects a mismatch) -- this just keeps the
+        # session table itself an accurate picture of what's actually live,
+        # and revokes the one this very request authenticated with too,
+        # replacing it with the fresh session below.
+        sessions.revoke_all_for_user(c, row["username"])
+        sessions.create(c, issued["jti"], row["username"], row["role"], issued["exp"])
+    return {"ok": True, "token": token}
 
 
 @app.post("/console/users/{username}/reset_password", tags=["console"])
@@ -489,6 +531,13 @@ def reset_password(
             "failed_login_count=0, locked_until=NULL WHERE id=?",
             (h, s, row["id"]),
         )
+        # Same reasoning as change_password()'s own revoke_all_for_user: the
+        # 'pwd' claim already invalidates every token this account is
+        # holding, this just keeps the session table in sync with that --
+        # an admin-triggered reset is exactly the moment every other active
+        # session for the account should visibly end, not just silently
+        # stop working on its next request.
+        sessions.revoke_all_for_user(c, username)
         audit.log(c, "user", username, "password_reset", p["sub"])
     return {
         "ok": True,
@@ -582,6 +631,30 @@ def create_user(
         "temporary_password": temp_password,
         "note": "Shown once. Give this to the user directly — it is not stored or logged anywhere.",
     }
+
+
+class UpdateDisplayNameIn(BaseModel):
+    display_name: str = Field(min_length=1, max_length=128)
+
+
+@app.patch("/console/users/{username}/display_name", tags=["console"])
+def update_display_name(
+    username: str, body: UpdateDisplayNameIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("user.manage")),
+):
+    """Admin-only rename of an account's display name (the label shown in
+    the console UI — never the username used to sign in). Same capability
+    as every other account-management action."""
+    row = c.execute("SELECT * FROM app_user WHERE username=?", (username,)).fetchone()
+    if not row:
+        raise NotFoundError(f"user '{username}' not found")
+    with db.write_tx(c):
+        c.execute(
+            "UPDATE app_user SET display_name=? WHERE id=?",
+            (body.display_name, row["id"]),
+        )
+        audit.log(c, "user", username, "display_name_change", p["sub"], previous_value=row["display_name"], new_value=body.display_name)
+    return {"ok": True, "username": username, "display_name": body.display_name}
 
 
 @app.get("/console/users/{username}/capabilities", tags=["console"])
@@ -2110,6 +2183,65 @@ def create_recipe(
     return {"id": pk, "problems": problems}
 
 
+class RecipeEditIn(BaseModel):
+    """Full editing of an existing recipe (2026-10-15) — name, yield and the
+    complete ingredient line set. `kind`/`produces_ingredient_pk` are
+    deliberately NOT editable here: changing what a sub-recipe produces, or
+    converting a menu recipe into one, is an identity change with its own
+    FK/uniqueness implications (ux_recipe_produces), not a line edit."""
+    name: str
+    yield_qty: float = Field(gt=0)
+    yield_unit: str
+    lines: list[RecipeLineIn] = []
+
+
+@app.patch("/console/recipes/{pk}", tags=["console"])
+def edit_recipe(
+    pk: int, body: RecipeEditIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("recipe.write")),
+):
+    """Replace an existing recipe's name/yield/ingredient lines wholesale.
+
+    Safe against an order already in flight: reserve_order() snapshots each
+    ingredient's needed qty_base into the `reservation` table at POS-punch
+    time (wt/reservation.py) and commit_order() deducts from that snapshot,
+    never re-reading recipe_line — so an edit made here can only affect
+    orders reserved AFTER this commits. No separate recipe-versioning
+    mechanism is needed; the existing reserve/commit split already is one.
+
+    Historical stock_ledger entries and completed orders are untouched —
+    this never writes to either table. Lines are replaced (DELETE + INSERT
+    in one transaction) rather than diffed, the same "describe the whole
+    current state" shape create_recipe already uses, so there is exactly one
+    code path that turns a line list into recipe_line rows."""
+    with db.write_tx(c):
+        before = c.execute("SELECT * FROM recipe WHERE id=?", (pk,)).fetchone()
+        if not before:
+            raise HTTPException(404, "recipe not found")
+        c.execute(
+            "UPDATE recipe SET name=?, yield_qty=?, yield_unit=?, updated_at=datetime('now') WHERE id=?",
+            (body.name, body.yield_qty, body.yield_unit, pk),
+        )
+        before_line_count = c.execute(
+            "SELECT COUNT(*) AS n FROM recipe_line WHERE recipe_id=?", (pk,)
+        ).fetchone()["n"]
+        c.execute("DELETE FROM recipe_line WHERE recipe_id=?", (pk,))
+        for order, ln in enumerate(body.lines):
+            c.execute(
+                "INSERT INTO recipe_line (recipe_id, ingredient_id, display_label, "
+                "qty_base, qty_status, is_optional, sort_order, note) "
+                "VALUES (?,?,?,?, 'verified', ?,?,?)",
+                (pk, ln.ingredient_pk, ln.display_label, ln.qty_base,
+                 int(ln.is_optional), order, ln.note),
+            )
+        audit.log(c, "recipe", pk, "edit", p["sub"],
+                   field="name/yield/lines",
+                   previous_value=f"{before['name']} ({before_line_count} line(s))",
+                   new_value=f"{body.name} ({len(body.lines)} line(s))")
+    problems = validate_recipe(c, pk)
+    return {"id": pk, "problems": problems}
+
+
 class MenuPriceIn(BaseModel):
     price: float = Field(gt=0)
 
@@ -2296,13 +2428,38 @@ def readiness(
 def list_ledger(
     ingredient_id: int | None = None,
     reason: str | None = None,
+    order_no: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     limit: int = Query(200, le=1000),
     offset: int = 0,
     c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("inventory.read")),
 ):
     """The append-only stock ledger — every movement, in base units, with the
     balance it produced. This is the audit trail every number on the
-    dashboard is ultimately reconciled against."""
+    dashboard is ultimately reconciled against.
+
+    order_no/date_from/date_to (2026-10-14, additive) support the console's
+    order-grouped Stock Activity view and its filters. order_no matches
+    ref_type='order' AND ref_id LIKE the given text — ref_id for an order
+    deduction is whichever order-number code was current when
+    reservation.commit_order's _ledger() call wrote that line, not the
+    internal integer order id.
+
+    2026-10-15 fix: an order-numbering migration later rewrote
+    customer_order.order_no to a new scheme for every order that existed at
+    the time, moving its old code to customer_order.legacy_order_no — but a
+    ledger line is immutable history (never retroactively rewritten, by
+    design), so a pre-migration order's ledger lines still carry whichever
+    code was current *then*, i.e. its legacy_order_no, not its current
+    order_no. Searching by today's order_no alone therefore matched almost
+    nothing — every committed order in the live dataset predates the
+    renumbering. This resolves the given order_no (or legacy_order_no, so a
+    search by either still works) to the order it names, then matches ref_id
+    against BOTH of that order's codes. No ledger row is touched; only the
+    lookup is widened. A order_no with no matching order row (e.g. a bare
+    numeric-tail search) falls back to the original LIKE-the-raw-text
+    behavior unchanged."""
     sql = """
         SELECT l.*, i.name AS ingredient_name, i.base_unit
           FROM stock_ledger l JOIN ingredient i ON i.id = l.ingredient_id
@@ -2315,12 +2472,22 @@ def list_ledger(
     if reason:
         sql += " AND l.reason = ?"
         params.append(reason)
+    order_no_candidates = _order_no_ref_candidates(c, order_no) if order_no else None
+    if order_no_candidates:
+        sql += " AND l.ref_type = 'order' AND (" + " OR ".join(["l.ref_id LIKE ?"] * len(order_no_candidates)) + ")"
+        params += [f"%{v}%" for v in order_no_candidates]
+    if date_from:
+        sql += " AND date(l.created_at) >= date(?)"
+        params.append(date_from)
+    if date_to:
+        sql += " AND date(l.created_at) <= date(?)"
+        params.append(date_to)
     sql += " ORDER BY l.id DESC LIMIT ? OFFSET ?"
     params += [limit, offset]
     # Same WHERE conditions as the row query above (minus LIMIT/OFFSET) --
-    # a `reason` filter must narrow the page-count total exactly as it
-    # narrows the rows themselves, or "Page X of Y" undercounts the pages
-    # whenever a reason filter is active.
+    # a filter must narrow the page-count total exactly as it narrows the
+    # rows themselves, or "Page X of Y" undercounts the pages whenever a
+    # filter is active.
     count_sql = "SELECT COUNT(*) AS n FROM stock_ledger WHERE 1=1"
     count_params: list[Any] = []
     if ingredient_id:
@@ -2329,8 +2496,31 @@ def list_ledger(
     if reason:
         count_sql += " AND reason = ?"
         count_params.append(reason)
+    if order_no_candidates:
+        count_sql += " AND ref_type = 'order' AND (" + " OR ".join(["ref_id LIKE ?"] * len(order_no_candidates)) + ")"
+        count_params += [f"%{v}%" for v in order_no_candidates]
+    if date_from:
+        count_sql += " AND date(created_at) >= date(?)"
+        count_params.append(date_from)
+    if date_to:
+        count_sql += " AND date(created_at) <= date(?)"
+        count_params.append(date_to)
     total = c.execute(count_sql, count_params).fetchone()["n"]
     return {"entries": rows(c.execute(sql, params)), "total": total}
+
+
+def _order_no_ref_candidates(c: sqlite3.Connection, order_no: str) -> list[str]:
+    """Every code a ledger line for this order could have been written
+    under — see list_ledger's docstring. Falls back to the raw search text
+    when it doesn't name a real order, preserving the original
+    numeric-tail-search behavior."""
+    row = c.execute(
+        "SELECT order_no, legacy_order_no FROM customer_order WHERE order_no = ? OR legacy_order_no = ?",
+        (order_no, order_no),
+    ).fetchone()
+    if not row:
+        return [order_no]
+    return [v for v in (row["order_no"], row["legacy_order_no"]) if v]
 
 
 @app.get("/console/expiry", tags=["console"])

@@ -74,7 +74,8 @@ export function AppShell({ routes, onSignOut }) {
     const { groupLabel, leafLabel } = breadcrumbFor(role, id);
     topbar.setCopy(leafLabel, PAGE_SUB[id] || '');
     topbar.setBreadcrumb(groupLabel);
-    topbar.setSearchVisible(id === 'onhand');
+    topbar.setSearchVisible(id === 'onhand' || id === 'menu');
+    topbar.setSearchPlaceholder(id === 'menu' ? 'Search menu items…' : 'Search ingredients…');
     sidebar.setActive(id);
     mount(content, Loading());
 

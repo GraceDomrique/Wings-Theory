@@ -7,6 +7,7 @@
       content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
     />
     <title>Wings Theory — Kitchen</title>
+    <script src="/assets/bfcache-guard.js"></script>
     <!-- Self-hosted webfonts. These pages referenced var(--font-sans)/
          --font-display but never actually loaded a font file, so POS, KDS and the
          landing page silently rendered in whatever the device had while the
@@ -1289,9 +1290,22 @@
       }
       function doLogout() {
         if (POLL) clearInterval(POLL);
+        // Best-effort: revoke this session server-side (wt/sessions.py) so
+        // the token itself stops working immediately, not just the copy
+        // sitting in this tab's localStorage. Failure (offline, already
+        // expired) is swallowed — signing out of a dead/unreachable
+        // session must still succeed locally.
+        const outgoing = TOKEN;
+        if (outgoing) {
+          fetch(API + "/auth/logout", {
+            method: "POST",
+            headers: { Authorization: "Bearer " + outgoing },
+          }).catch(() => {});
+        }
         localStorage.removeItem(NS + "token");
         localStorage.removeItem(NS + "role");
         localStorage.removeItem(NS + "name");
+        TOKEN = null;
         location.reload();
       }
       $("#logoutBtn").onclick = doLogout;

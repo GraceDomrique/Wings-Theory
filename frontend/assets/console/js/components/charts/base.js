@@ -20,6 +20,24 @@ export function destroyAllCharts() {
   live.clear();
 }
 
+/**
+ * Destroy just the one chart instance living in `node` (a chartBox() div),
+ * if any — for a partial in-place repaint (e.g. a chart's own metric
+ * toggle) that must not touch sibling charts still mounted elsewhere on the
+ * same page. Calling destroyAllCharts() from such a toggle tore down every
+ * other chart's Chart.js instance while leaving its canvas mounted, which
+ * both blanked those sibling charts and left Chart.js's own animator
+ * ticking a canvas with no backing instance (surfaced as a
+ * "this._fn is not a function" crash inside chart.umd.min.js).
+ */
+export function destroyChart(node) {
+  const instance = node && node._chartInstance;
+  if (!instance) return;
+  try { instance.destroy(); } catch { /* already gone */ }
+  live.delete(instance);
+  node._chartInstance = null;
+}
+
 function token(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
@@ -79,6 +97,7 @@ export function chartBox(height, config) {
     applyDefaults();
     const instance = new Chart(canvas.getContext('2d'), config());
     live.add(instance);
+    box._chartInstance = instance;
   });
 
   return box;

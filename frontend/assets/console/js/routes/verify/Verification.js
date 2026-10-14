@@ -2,12 +2,14 @@ import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { RailCard } from '../../components/ui/RailCard.js';
 import { Stat } from '../../components/ui/Stat.js';
+import { Table } from '../../components/ui/Table.js';
+import { Pill } from '../../components/ui/Pill.js';
 import { Tabbar } from '../../components/ui/Tabbar.js';
 import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
-import { VerificationItemCard } from '../../components/domain/VerificationItem.js';
+import { verificationRowCells, openVerificationDrawer } from '../../components/domain/VerificationItem.js';
 import { count } from '../../lib/format.js';
 import { getQueue } from '../../lib/api/verification.js';
 import { listUnmapped, resolveMap, resolveDismiss } from '../../lib/api/queue.js';
@@ -52,6 +54,12 @@ export async function render(ctx) {
         Stat({ value: count(unmapped.count), label: 'Ingredient Queue — blocks menu items' })));
   }
 
+  /** 2026-10-14 redesign: a compact table (Record/Current estimate/Reason/
+   * Review), each row opening the focused review drawer — not one full-width
+   * Card per item repeating the same question/button row down the page. The
+   * underlying resolve flow (confirm/change/keep, all additive — nothing
+   * here rewrites verification_event's own history) is unchanged, just
+   * moved into VerificationItem.js's drawer. */
   function drawList() {
     if (active === 'unmapped') { drawUnmapped(); return; }
     const priority = Number(active);
@@ -70,29 +78,41 @@ export async function render(ctx) {
       return;
     }
 
+    function onResolved(resolved) {
+      // Resolved items leave the queue locally so the table does not jump
+      // under the reader's cursor while they work down it.
+      queue.items = queue.items.filter((i) => i.id !== resolved.id);
+      queue.byPriority[resolved.priority] = Math.max(0, (queue.byPriority[resolved.priority] || 1) - 1);
+      queue.count = Math.max(0, queue.count - 1);
+      drawKpis();
+      drawList();
+      ctx.refreshBadges();
+    }
+
     const visible = items.slice(0, shown);
     mount(listHost,
-      h('div', { class: 't-sm t-soft', style: { marginBottom: '4px' } },
-        `Showing ${visible.length} of ${items.length}. Each decision is recorded with who made it and when.`),
-      ...visible.map((item) => VerificationItemCard({
-        item,
-        onResolved: (resolved) => {
-          // Resolved items leave the queue locally so the list does not jump
-          // under the reader's cursor while they work down it.
-          queue.items = queue.items.filter((i) => i.id !== resolved.id);
-          queue.byPriority[resolved.priority] = Math.max(0, (queue.byPriority[resolved.priority] || 1) - 1);
-          queue.count = Math.max(0, queue.count - 1);
-          drawKpis();
-          drawList();
-          ctx.refreshBadges();
-        },
-      })),
-      visible.length < items.length
-        ? h('div', { style: { marginTop: '14px', textAlign: 'center' } },
-          Button({
-            onClick: () => { shown += PAGE_SIZE; drawList(); },
-          }, `Show ${Math.min(PAGE_SIZE, items.length - visible.length)} more`))
-        : null);
+      Card({},
+        CardHeader({
+          title: `Priority ${priority}`,
+          desc: `${items.length} record${items.length === 1 ? '' : 's'} need review — each decision is recorded with who made it and when`,
+        }),
+        Table({
+          columns: [
+            { key: 'record', label: 'Record', render: (i) => verificationRowCells(i).record },
+            { key: 'current', label: 'Current estimate', render: (i) => verificationRowCells(i).current },
+            { key: 'reason', label: 'Reason', render: (i) => verificationRowCells(i).reason },
+            { key: 'status', label: 'Status', render: (i) => verificationRowCells(i).status },
+            { key: 'review', label: '', render: () => h('span', { class: 't-xs t-faint' }, 'Review →') },
+          ],
+          rows: visible,
+          onRowClick: (item) => openVerificationDrawer({ item, onResolved }),
+        }),
+        visible.length < items.length
+          ? h('div', { style: { marginTop: '14px', textAlign: 'center' } },
+            Button({
+              onClick: () => { shown += PAGE_SIZE; drawList(); },
+            }, `Show ${Math.min(PAGE_SIZE, items.length - visible.length)} more`))
+          : null));
   }
 
   function drawUnmapped() {
@@ -104,22 +124,39 @@ export async function render(ctx) {
       })));
       return;
     }
-    mount(listHost, ...unmapped.items.map((item) => Card({ style: { marginTop: '10px' } },
+    mount(listHost, Card({},
       CardHeader({
-        title: item.sourceIngredientLabel,
-        desc: h('div', { class: 'card-desc' },
-          `From “${item.sourceRecipeName}” · ${item.reasonLabel}`,
-          item.sourceQtyText ? ` · read as "${item.sourceQtyText}"` : ''),
-        right: [
-          Button({ size: 'sm', onClick: () => dismissLine(item) }, 'Dismiss'),
-          Button({ variant: 'primary', size: 'sm', onClick: () => openMapModal(item) }, 'Map to ingredient'),
-        ],
+        title: 'Ingredient Queue',
+        desc: `${unmapped.items.length} recipe line${unmapped.items.length === 1 ? '' : 's'} could not be matched to a real ingredient on import`,
       }),
-      item.blocksMenuItems > 0
-        ? h('div', { class: 'callout callout-crit', style: { marginBottom: '0' } },
-          h('p', {}, h('strong', {}, `Blocks ${item.blocksMenuItems} menu item${item.blocksMenuItems === 1 ? '' : 's'} from being sellable. `),
-            'Mapping this line to a real ingredient is what makes those items available on the POS again.'))
-        : h('div', { class: 't-xs t-faint' }, 'Not currently attached to a live menu item.'))));
+      Table({
+        columns: [
+          {
+            key: 'line',
+            label: 'Recipe line',
+            render: (item) => h('div', {},
+              h('div', { class: 't-sm t-strong' }, item.sourceIngredientLabel),
+              h('div', { class: 'sub' },
+                `From “${item.sourceRecipeName}” · ${item.reasonLabel}`,
+                item.sourceQtyText ? ` · read as "${item.sourceQtyText}"` : '')),
+          },
+          {
+            key: 'impact',
+            label: 'Impact',
+            render: (item) => (item.blocksMenuItems > 0
+              ? Pill('crit', `blocks ${item.blocksMenuItems} menu item${item.blocksMenuItems === 1 ? '' : 's'}`)
+              : h('span', { class: 't-xs t-faint' }, 'not on a live menu item')),
+          },
+          {
+            key: 'actions',
+            label: '',
+            render: (item) => h('div', { style: { display: 'flex', gap: '6px', justifyContent: 'flex-end' } },
+              Button({ size: 'sm', onClick: () => dismissLine(item) }, 'Dismiss'),
+              Button({ variant: 'primary', size: 'sm', onClick: () => openMapModal(item) }, 'Map')),
+          },
+        ],
+        rows: unmapped.items,
+      })));
   }
 
   function dismissLine(item) {

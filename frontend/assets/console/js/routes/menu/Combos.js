@@ -6,6 +6,7 @@ import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading, toast } from '../../components/ui/Feedback.js';
+import { FileUpload } from '../../components/ui/FileUpload.js';
 import { money, pct, nodata } from '../../lib/format.js';
 import { getCombinations } from '../../lib/api/reports.js';
 import { listMenuItems } from '../../lib/api/menu.js';
@@ -253,38 +254,21 @@ export async function render(ctx) {
 
     const rowsHost = h('div', {});
     const previewHost = h('div', { style: { marginTop: '12px' } });
-    const imagePreview = h('div', {
-      style: {
-        width: '96px', height: '96px', borderRadius: '8px', background: 'var(--surface-2, #f1ece3)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden', flexShrink: '0',
+    // Real backend upload (uploadComboImage -> POST /console/combos/image)
+    // unchanged — FileUpload only replaces the raw <input type=file> UI
+    // around it. asDataUrl:true because uploadComboImage's own contract is
+    // "takes a base64 data URL", not a raw File.
+    const imageUpload = FileUpload({
+      currentUrl: state.imagePath,
+      maxSizeMB: 5,
+      asDataUrl: true,
+      onSelect: async (dataUrl) => {
+        state.imagePath = await uploadComboImage(dataUrl);
+        imageUpload.setImage(state.imagePath);
+        runPreview();
       },
-    }, state.imagePath ? h('img', { src: state.imagePath, style: { width: '100%', height: '100%', objectFit: 'cover' } }) : '🖼');
-    const fileInput = h('input', { type: 'file', accept: 'image/png,image/jpeg,image/webp' });
-    const imageStatus = h('div', { class: 't-xs t-soft', style: { marginTop: '4px' } }, state.imagePath ? 'Image set.' : 'No image yet.');
-
-    fileInput.addEventListener('change', async () => {
-      const file = fileInput.files[0];
-      if (!file) return;
-      if (file.size > 5 * 1024 * 1024) { imageStatus.textContent = 'Image is too large (max 5 MB).'; return; }
-      imageStatus.textContent = 'Uploading…';
-      try {
-        const base64 = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result);
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
-        });
-        state.imagePath = await uploadComboImage(base64);
-        mount(imagePreview, h('img', { src: state.imagePath, style: { width: '100%', height: '100%', objectFit: 'cover' } }));
-        imageStatus.textContent = 'Image uploaded.';
-      } catch (e) { imageStatus.textContent = e.message; }
+      onRemove: () => { state.imagePath = null; runPreview(); },
     });
-
-    function removeImage() {
-      state.imagePath = null;
-      mount(imagePreview, '🖼');
-      imageStatus.textContent = 'No image yet.';
-    }
 
     function itemOptions(selectedId) {
       return pickable.map((i) => h('option', {
@@ -460,13 +444,8 @@ export async function render(ctx) {
         h('div', { class: 'eyebrow', style: { marginTop: '18px' } }, 'Items in this combo'),
         rowsHost,
 
-        h('div', { class: 'eyebrow', style: { marginTop: '18px' } }, 'Image'),
-        h('div', { style: { display: 'flex', gap: '12px', alignItems: 'flex-start' } },
-          imagePreview,
-          h('div', {},
-            h('div', {}, fileInput),
-            imageStatus,
-            state.imagePath ? Button({ size: 'sm', variant: 'ghost', onClick: removeImage }, 'Remove image') : null)),
+        h('div', { class: 'eyebrow', style: { marginTop: '18px' } }, 'Combo Image'),
+        imageUpload,
 
         pricingRules),
       h('div', { class: 'combo-builder-col combo-builder-preview' },

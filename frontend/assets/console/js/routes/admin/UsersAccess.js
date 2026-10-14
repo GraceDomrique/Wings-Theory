@@ -8,7 +8,7 @@ import { toast } from '../../components/ui/Feedback.js';
 import { ageFromNow } from '../../lib/format.js';
 import { session } from '../../lib/api/client.js';
 import {
-  listUsers, createUser, resetPassword, changePassword, MIN_PASSWORD_LENGTH,
+  listUsers, createUser, resetPassword, updateDisplayName,
 } from '../../lib/api/account.js';
 import { getCapabilityMatrix, getUserCapabilities, setUserCapability } from '../../lib/api/permissions.js';
 
@@ -78,6 +78,23 @@ function groupFor(capability) {
   return hit ? hit[1] : 'Other';
 }
 
+// Capability suffix -> plain-English verb, for the summary a non-technical
+// manager reads first. A suffix not listed here falls back to itself,
+// title-cased — so a new capability is never silently dropped from the
+// summary, it just reads a little more literally until this map catches up.
+const ACTION_LABELS = {
+  read: 'View', write: 'Edit', create: 'Create', delete: 'Delete',
+  approve: 'Approve', void: 'Void', receive: 'Receive', count: 'Count',
+  waste: 'Record waste for', reset: 'Reset', export: 'Export', override: 'Override',
+};
+
+function humanCapability(capability) {
+  const [prefix, ...rest] = capability.split('.');
+  const suffix = rest.join('.');
+  const verb = ACTION_LABELS[suffix] || (suffix.charAt(0).toUpperCase() + suffix.slice(1).replace(/_/g, ' '));
+  return `${verb} ${groupFor(capability).toLowerCase()}`;
+}
+
 function initials(name) {
   return (name || '?').trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
 }
@@ -99,6 +116,7 @@ export async function render(ctx) {
       : locked ? Pill('crit', 'locked')
         : Pill('good', 'active');
     const resetBtn = Button({ size: 'sm', onClick: () => openResetModal(u.username) }, 'Reset password');
+    const renameBtn = Button({ size: 'sm', variant: 'ghost', onClick: () => openRenameModal(u.username, u.displayName) }, 'Rename');
 
     return Card({ style: { display: 'flex', gap: '14px', alignItems: 'flex-start' } },
       h('div', {
@@ -117,7 +135,7 @@ export async function render(ctx) {
           ' · last signed in ', ageFromNow(u.lastLoginAt, 'never'),
           locked ? ` · locked until ${u.lockedUntil}` : '',
           u.mustChangePassword ? ' · must change password' : ''),
-        h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px' } }, resetBtn)));
+        h('div', { style: { marginTop: '10px', display: 'flex', gap: '8px' } }, resetBtn, renameBtn)));
   }
 
   function drawUsers(list) {
@@ -146,6 +164,32 @@ export async function render(ctx) {
       desc: 'Generates a one-time temporary password, shown once, right here. Also clears any login lockout on this account.',
       onClose: () => {},
     }, err, submit, resultHost);
+  }
+
+  function openRenameModal(username, currentDisplayName) {
+    const nameInput = h('input', { type: 'text', value: currentDisplayName || '' });
+    const err = ModalError();
+    const submit = Button({ variant: 'primary' }, 'Save');
+    submit.addEventListener('click', async () => {
+      err.textContent = ''; err.style.display = 'none';
+      const displayName = nameInput.value.trim();
+      if (!displayName) { err.textContent = 'Enter a display name.'; err.style.display = ''; return; }
+      submit.disabled = true;
+      try {
+        await updateDisplayName(username, displayName);
+        toast(`${username}'s display name updated.`, 'good');
+        modal.close();
+        const fresh = await listUsers().catch(() => null);
+        if (fresh) drawUsers(fresh);
+      } catch (e) { err.textContent = e.message; err.style.display = ''; } finally { submit.disabled = false; }
+    });
+    const modal = Modal({
+      title: `Rename — ${username}`,
+      desc: 'Changes only the display name shown in the console — never the username used to sign in.',
+      onClose: () => {},
+    },
+      h('label', { class: 'field' }, 'Display name', nameInput),
+      err, submit);
   }
 
   function openAddUserModal() {
@@ -186,44 +230,72 @@ export async function render(ctx) {
       err, submit, resultHost);
   }
 
-  function myPasswordCard() {
-    const current = h('input', { type: 'password', autocomplete: 'current-password' });
-    const next = h('input', { type: 'password', autocomplete: 'new-password' });
-    const confirm = h('input', { type: 'password', autocomplete: 'new-password' });
-    const err = h('div', { class: 'login-err', style: { display: 'none' } });
-    const submit = Button({ variant: 'primary', size: 'sm' }, 'Change password');
-    submit.addEventListener('click', async () => {
-      err.style.display = 'none';
-      if (!current.value) { err.textContent = 'Enter your current password.'; err.style.display = ''; return; }
-      if (next.value.length < MIN_PASSWORD_LENGTH) {
-        err.textContent = `New password must be at least ${MIN_PASSWORD_LENGTH} characters.`; err.style.display = ''; return;
-      }
-      if (next.value !== confirm.value) { err.textContent = 'New password and confirmation do not match.'; err.style.display = ''; return; }
-      submit.disabled = true;
-      try {
-        await changePassword({ currentPassword: current.value, newPassword: next.value, confirmNewPassword: confirm.value });
-        current.value = ''; next.value = ''; confirm.value = '';
-        toast('Password changed. Every other signed-in device has been logged out.', 'good');
-      } catch (e) {
-        err.textContent = e.message; err.style.display = '';
-      } finally { submit.disabled = false; }
-    });
-    return Card({},
-      CardHeader({ title: 'Change my password', desc: `At least ${MIN_PASSWORD_LENGTH} characters, not the shared default` }),
-      h('label', { class: 'field', style: { marginBottom: '10px', display: 'block' } }, 'Current password', current),
-      h('label', { class: 'field', style: { marginBottom: '10px', display: 'block' } }, 'New password', next),
-      h('label', { class: 'field', style: { marginBottom: '10px', display: 'block' } }, 'Confirm new password', confirm),
-      err, submit);
-  }
+  // Self-service "change my own password" moved to Account Settings
+  // (routes/account/Settings.js, 2026-10-14) — reached from every role's
+  // sidebar now, not buried in an admin-only page. This page keeps only
+  // administrator-controlled account management (reset someone ELSE's
+  // password, create an account, edit capabilities).
 
   // --- "Who can do what": grouped, collapsible, filterable — and, once
   // admin picks an account in the "Checking permissions for" selector,
   // editable for that one account right here, in place of the read-only
   // role columns. No separate modal: this list IS the editor.
   const matrixHost = h('div');
+  const summaryHost = h('div');
   let filterQuery = '';
   let editingUsername = ''; // '' = reference mode (role columns, read-only)
   let editingCapabilities = null; // this account's getUserCapabilities() rows, while editing
+
+  /**
+   * Plain-English capability summary (2026-10-15) — sits above the raw
+   * capability-ID matrix, which moved into a collapsed "Advanced
+   * Permissions" section below it. Reference mode summarizes each role by
+   * area ("full" = every capability in that group is allowed, "partial" =
+   * some are); editing mode summarizes one account's overrides against its
+   * role default, since that's the only thing that differs per-account.
+   */
+  function drawSummary() {
+    if (editingUsername) {
+      const overrides = editingCapabilities.filter((r) => r.override !== null);
+      if (overrides.length === 0) {
+        mount(summaryHost, h('div', { class: 't-sm t-faint' },
+          `${editingUsername} follows the ${(() => { const u = (users || []).find((x) => x.username === editingUsername); return u ? u.role : 'role'; })()} default for every capability — no individual overrides.`));
+        return;
+      }
+      const granted = overrides.filter((r) => r.override === true);
+      const revoked = overrides.filter((r) => r.override === false);
+      mount(summaryHost, h('div', { class: 'grid', style: { gap: '4px' } },
+        granted.length ? h('div', { class: 't-sm' },
+          h('span', { class: 't-good t-strong' }, `+${granted.length} granted `),
+          'beyond the role default: ', granted.map((r) => humanCapability(r.capability)).join(', ')) : null,
+        revoked.length ? h('div', { class: 't-sm' },
+          h('span', { class: 't-crit t-strong' }, `−${revoked.length} revoked `),
+          'from the role default: ', revoked.map((r) => humanCapability(r.capability)).join(', ')) : null));
+      return;
+    }
+    // Reference mode: one line per role, grouped by area, "full" vs "partial".
+    const byGroupAll = new Map();
+    for (const row of capabilities) {
+      const g = groupFor(row.capability);
+      if (!byGroupAll.has(g)) byGroupAll.set(g, []);
+      byGroupAll.get(g).push(row);
+    }
+    mount(summaryHost, h('div', { class: 'grid', style: { gap: '8px' } },
+      ...roles.map((role) => {
+        const full = []; const partial = [];
+        for (const [g, rows] of byGroupAll) {
+          const allowedCount = rows.filter((r) => r[role]).length;
+          if (allowedCount === 0) continue;
+          if (allowedCount === rows.length) full.push(g); else partial.push(`${g} (${allowedCount}/${rows.length})`);
+        }
+        return h('div', { class: 't-sm' },
+          h('strong', {}, role.charAt(0).toUpperCase() + role.slice(1)), ' — ',
+          full.length ? `full access to ${full.join(', ')}` : null,
+          full.length && partial.length ? '; ' : null,
+          partial.length ? `partial access to ${partial.join(', ')}` : null,
+          !full.length && !partial.length ? 'no access configured' : null);
+      })));
+  }
 
   function tick(allowed) {
     return allowed ? h('span', { class: 't-good t-strong' }, '✓') : h('span', { class: 't-faint' }, '—');
@@ -236,6 +308,7 @@ export async function render(ctx) {
       editingCapabilities = out.capabilities;
       const fresh = out.capabilities.find((r) => r.capability === row.capability);
       resetLink.style.display = fresh.override === null ? 'none' : '';
+      drawSummary();
     } catch (e) {
       checkbox.checked = !checkbox.checked;
       toast(e.message, 'bad');
@@ -275,6 +348,7 @@ export async function render(ctx) {
                   const after = out.capabilities.find((x) => x.capability === r.capability);
                   checkbox.checked = after.effective;
                   resetLink.style.display = 'none';
+                  drawSummary();
                 } catch (e2) { toast(e2.message, 'bad'); } finally { checkbox.disabled = false; }
               },
             }, 'Reset to role default');
@@ -301,7 +375,7 @@ export async function render(ctx) {
 
   async function setEditingUser(username) {
     editingUsername = username;
-    if (!username) { editingCapabilities = null; drawMatrix(); return; }
+    if (!username) { editingCapabilities = null; drawMatrix(); drawSummary(); return; }
     mount(matrixHost, h('div', { class: 't-sm t-faint' }, 'Loading…'));
     try {
       const data = await getUserCapabilities(username);
@@ -312,15 +386,20 @@ export async function render(ctx) {
       userSelect.value = '';
     }
     drawMatrix();
+    drawSummary();
   }
 
   const filterInput = h('input', { type: 'text', placeholder: 'Filter capabilities…', onInput: (e) => { filterQuery = e.target.value; drawMatrix(); } });
+  const advancedDetails = h('details', { style: { marginTop: '14px', borderTop: '1px solid var(--line)', paddingTop: '10px' } },
+    h('summary', { style: { cursor: 'pointer', fontWeight: '600', fontSize: '12.5px' } }, 'Advanced Permissions — raw capability IDs and overrides'),
+    matrixHost);
   const userSelect = h('select', {
-    onChange: (e) => setEditingUser(e.target.value),
+    onChange: (e) => { setEditingUser(e.target.value); if (e.target.value) advancedDetails.open = true; },
   },
     h('option', { value: '' }, 'All roles (reference)'),
     ...(users || []).map((u) => h('option', { value: u.username }, `${u.displayName || u.username} (${u.role})`)));
   drawMatrix();
+  drawSummary();
 
   return h('div', {},
     isAdmin
@@ -333,7 +412,6 @@ export async function render(ctx) {
           }),
           usersHost))
       : null,
-    isAdmin ? h('div', { style: { marginBottom: '14px' } }, myPasswordCard()) : null,
     Card({},
       CardHeader({
         title: 'Who can do what',
@@ -344,7 +422,8 @@ export async function render(ctx) {
           isAdmin ? h('label', { class: 'field' }, h('div', { class: 't-xs t-faint' }, 'Checking permissions for'), userSelect) : null,
           h('label', { class: 'field' }, h('div', { class: 't-xs t-faint', style: { visibility: 'hidden' } }, '.'), filterInput)),
       }),
-      matrixHost,
+      summaryHost,
+      advancedDetails,
       h('div', { class: 't-xs t-faint', style: { marginTop: '10px' } },
         `Signed in as ${(session.user || {}).displayName || 'unknown'} · role: ${(session.user || {}).role || 'unknown'}`)));
 }
