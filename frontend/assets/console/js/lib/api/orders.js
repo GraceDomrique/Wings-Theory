@@ -38,14 +38,28 @@ export async function getOrder(id) {
   };
 }
 
-export async function listOrders({ status = 'all', limit = 200, allTime = false, startDate = null, endDate = null } = {}) {
-  const params = { status, limit };
+/**
+ * offset/q (2026-10-15, additive): real server-side pagination and search.
+ * Previously this always asked for up to 5000 rows and filtered client-side
+ * — fine for a short date window, but with `allTime: true` on a dataset of
+ * 33k+ orders, "most recent 5000" put over a year of real history
+ * permanently out of reach with no way to page further back, and a search
+ * only ever matched the one page already sitting in the browser. `q`
+ * matches server-side across the full date-filtered range; `offset` pages
+ * through it without ever loading more than one page into memory.
+ */
+export async function listOrders({
+  status = 'all', limit = 200, offset = 0, q = null, allTime = false, startDate = null, endDate = null,
+} = {}) {
+  const params = { status, limit, offset };
+  if (q && q.trim()) params.q = q.trim();
   if (allTime) params.all_time = true;
   if (startDate) params.start_date = startDate;
   if (endDate) params.end_date = endDate;
   const out = await api.get('/pos/orders', params);
   return {
     totalCount: out.total_count ?? null,
+    offset: out.offset ?? 0,
     orders: (out.orders || []).map((o) => ({
       id: o.id,
       orderNo: o.order_no,

@@ -1484,6 +1484,8 @@ def set_order_leftover_charge(
 def list_orders(
     status: Literal["open", "all"] = "open",
     limit: int = Query(100, ge=1, le=5000),
+    offset: int = Query(0, ge=0, description="2026-10-15, additive — real server-side pagination for the console's Order History page, which has 33k+ rows in this dataset and cannot load them all into the browser"),
+    q: str | None = Query(default=None, description="2026-10-15, additive — server-side search across order_no, table_label and item names, so a search can reach every order in the matched date range, not just the one page already loaded client-side"),
     start_date: str | None = Query(default=None, description="Manila business date YYYY-MM-DD, inclusive — overrides the default 3-month window"),
     end_date: str | None = Query(default=None, description="Manila business date YYYY-MM-DD, inclusive; defaults to today when start_date is given"),
     all_time: bool = Query(default=False, description="every order ever recorded — no lower date bound"),
@@ -1508,7 +1510,45 @@ def list_orders(
     The console's order-history page is read-heavy BI, not a till screen, so
     it passes start_date/end_date or all_time=true to see the full ledger;
     plain status=all with none of those keeps the till's original 3-month
-    default so that caller's behavior is unchanged."""
+    default so that caller's behavior is unchanged.
+
+    offset/q (2026-10-15): the console previously asked for up to 5000 rows
+    in one shot and filtered client-side — fine for a 90-day window, but with
+    `all_time=true` and 33k+ orders on record, "most recent 5000" silently
+    put over a year of history permanently out of reach (no way to page
+    further back, and search only ever searched the rows already loaded).
+    offset makes real pagination possible; q matches server-side across the
+    full date-filtered range, not just one page. total_count below now
+    always reflects the SAME where-clause as the row query (it previously
+    ignored start_date/end_date/all_time entirely, which understated how
+    complete a date-scoped page actually was)."""
+    where = []
+    params: list = []
+    if status == "open":
+        where.append("o.status IN ('punched','in_progress','ready')")
+    elif all_time:
+        pass
+    elif start_date:
+        where.append("o.created_at >= ?")
+        params.append(timeutil.utc_bound_for_manila_date(start_date))
+        if end_date:
+            where.append("o.created_at < ?")
+            params.append(timeutil.utc_bound_for_manila_date(
+                (_date.fromisoformat(end_date) + _timedelta(days=1)).isoformat()
+            ))
+    else:
+        where.append("o.created_at >= ?")
+        params.append(timeutil.utc_bound_n_manila_months_ago(3))
+    if q and q.strip():
+        where.append(
+            "(o.order_no LIKE ? OR o.table_label LIKE ? OR EXISTS ("
+            "  SELECT 1 FROM order_line ol2 JOIN menu_item m2 ON m2.id = ol2.menu_item_id"
+            "  WHERE ol2.order_id = o.id AND m2.name LIKE ?))"
+        )
+        needle = f"%{q.strip()}%"
+        params += [needle, needle, needle]
+    where_sql = ("WHERE " + " AND ".join(where) + " ") if where else ""
+
     sql = ("SELECT o.id, o.order_no, o.status, o.table_label, o.head_count, o.created_at, "
            "o.committed_at, o.served_at, o.voided_at, o.subtotal, o.discount_type, "
            "o.discount_amount, o.service_charge, o.total, "
@@ -1518,35 +1558,17 @@ def list_orders(
            "   JOIN menu_item m ON m.id = ol.menu_item_id WHERE ol.order_id = o.id) AS item_names "
            "FROM customer_order o "
            "LEFT JOIN (SELECT order_id, SUM(amount) AS addon_total FROM order_charge "
-           "           GROUP BY order_id) ch ON ch.order_id = o.id ")
-    params: list = []
-    if status == "open":
-        sql += "WHERE o.status IN ('punched','in_progress','ready') "
-    elif all_time:
-        sql += "WHERE 1=1 "
-    elif start_date:
-        sql += "WHERE o.created_at >= ? "
-        params.append(timeutil.utc_bound_for_manila_date(start_date))
-        if end_date:
-            sql += "AND o.created_at < ? "
-            params.append(timeutil.utc_bound_for_manila_date(
-                (_date.fromisoformat(end_date) + _timedelta(days=1)).isoformat()
-            ))
-    else:
-        sql += "WHERE o.created_at >= ? "
-        params.append(timeutil.utc_bound_n_manila_months_ago(3))
-    sql += "ORDER BY o.created_at DESC LIMIT ?"
-    params.append(limit)
-    orders = rows(c.execute(sql, params))
+           "           GROUP BY order_id) ch ON ch.order_id = o.id "
+           + where_sql + "ORDER BY o.created_at DESC LIMIT ? OFFSET ?")
+    orders = rows(c.execute(sql, params + [limit, offset]))
     for o in orders:
         o["line_count"] = c.execute(
             "SELECT COUNT(*) AS n FROM order_line WHERE order_id=?", (o["id"],)
         ).fetchone()["n"]
     total_count = c.execute(
-        "SELECT COUNT(*) AS n FROM customer_order o WHERE "
-        + ("o.status IN ('punched','in_progress','ready')" if status == "open" else "1=1")
+        "SELECT COUNT(*) AS n FROM customer_order o " + where_sql, params
     ).fetchone()["n"]
-    return {"orders": orders, "total_count": total_count}
+    return {"orders": orders, "total_count": total_count, "offset": offset}
 
 
 @app.get("/pos/orders/{order_pk}", tags=["pos"])
