@@ -231,6 +231,33 @@ async function stockLossView(isAdmin) {
         listHost)));
 }
 
+/**
+ * 2026-10-15 fix: variance_ratio (backend/wt/reservation.py) divides the
+ * absolute count variance by expected consumption with no floor beyond
+ * "not literally zero" (EPS = 1e-6) — an ingredient with a real absolute
+ * discrepancy but near-zero expected consumption this window produces a
+ * mathematically correct but practically meaningless percentage (confirmed
+ * live: ratios over 1000%, e.g. 213,565%, when consumedBase was a tiny
+ * fraction relative to the ingredient's real throughput). This is NOT a
+ * unit-conversion bug — consumed_base and count_variance_base are both
+ * already in the same base unit (see reservation.py's own column names)
+ * — it's a denominator-too-small problem, so the fix is presentational,
+ * not a backend recalculation: the raw ratio/flag threshold (10%, backend-
+ * owned) is untouched, only what this column PRINTS changes.
+ *
+ * "Reliable" is judged against receivedBase for the SAME ingredient, SAME
+ * window — an independent real-activity measure already in this row,
+ * rather than an arbitrary fixed number (meaningless across grams vs.
+ * pieces vs. litres). If this ingredient received real stock but
+ * "expected consumption" is under 1% of that, the denominator clearly
+ * isn't representative of real throughput.
+ */
+function varianceDenominatorReliable(i) {
+  if (!(i.consumedBase > 0)) return false;
+  if (i.receivedBase > 0 && i.consumedBase < i.receivedBase * 0.01) return false;
+  return true;
+}
+
 async function varianceView() {
   const report = await getIngredientVariance(VARIANCE_LOOKBACK_DAYS);
   const items = report.items || [];
@@ -269,9 +296,16 @@ async function varianceView() {
         },
         {
           key: 'ratio', label: '% of expected',
-          render: (i) => i.hasCountData
-            ? h('span', { class: 'mono t-sm' }, pct(i.varianceRatio === null ? null : i.varianceRatio * 100, 'n/a', 0))
-            : h('span', { class: 't-xs t-faint' }, '—'),
+          render: (i) => {
+            if (!i.hasCountData) return h('span', { class: 't-xs t-faint' }, '—');
+            if (!varianceDenominatorReliable(i)) {
+              return h('span', {
+                class: 't-xs t-faint',
+                title: `Expected consumption this window (${qty(i.consumedBase, i.baseUnit, 'none').textContent}) is too small relative to this ingredient's real activity for a percentage to be meaningful — see the absolute count variance instead.`,
+              }, 'not meaningful');
+            }
+            return h('span', { class: 'mono t-sm' }, pct(i.varianceRatio === null ? null : i.varianceRatio * 100, 'n/a', 0));
+          },
         },
         {
           key: 'status', label: 'Status',
