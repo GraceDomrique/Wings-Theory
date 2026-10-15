@@ -94,6 +94,31 @@ class PasswordChangeRequiredError(WTError):
     http_status = 403
 
 
+class RegistryUnavailableError(WTError):
+    """The ml_model_registry / ml_training_run / ml_approved_synthetic_batch
+    schema is not present yet (migration 0050 hasn't run against this
+    database) or a related ML table is missing. Distinct from an ordinary
+    "nothing trained yet" result: callers must report ML as not-yet-
+    initialized and fall back to live serving, never crash and never treat
+    this the same as database corruption. Raised only when the query fails
+    because the table itself is absent -- never for a query that ran fine
+    and simply found no row."""
+    code = "model_registry_unavailable"
+    http_status = 503
+
+
+class DatabaseIntegrityError(WTError):
+    """A SQLite operation on an ML registry table failed in a way that
+    indicates a damaged database file (malformed schema, corrupt index,
+    "file is not a database") rather than an ordinary missing table or
+    empty result. Must never be caught by a blanket `except Exception` and
+    treated as "nothing trained yet" -- it has to surface loudly so an
+    operator stops and runs recovery instead of continuing to read from or
+    write to a damaged file."""
+    code = "database_integrity_error"
+    http_status = 500
+
+
 class AuthenticationError(WTError):
     """The caller could not be identified at all — no token, expired token,
     malformed token, bad signature.

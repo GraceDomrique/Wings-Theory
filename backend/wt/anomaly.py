@@ -55,7 +55,7 @@ from sklearn.ensemble import IsolationForest
 from . import audit, model_registry, timeutil
 from . import ml_artifacts_io as artifacts
 from .db import write_tx
-from .errors import InvalidStateError, NotFoundError
+from .errors import InvalidStateError, NotFoundError, RegistryUnavailableError
 
 REVIEW_STATUSES = ("flagged", "under_review", "confirmed_anomaly", "false_positive", "resolved")
 
@@ -336,7 +336,12 @@ def _provenance_branches(conn: sqlite3.Connection, user_col: str, batch_col: str
     re-import might leave behind); MIXED returns both predicates "live" so
     a caller ORs them -- never an unfiltered 'all rows'."""
     real = f"({user_col} IS NULL OR {user_col} IN (SELECT username FROM app_user))"
-    approved = model_registry.approved_batch_ids(conn)
+    try:
+        approved = model_registry.approved_batch_ids(conn)
+    except RegistryUnavailableError:
+        # Migration 0050 hasn't run yet -- no batches can be approved, same
+        # as an ordinary empty ml_approved_synthetic_batch table.
+        approved = []
     if approved:
         placeholders = ",".join("?" * len(approved))
         simulated = f"({user_col} = ? AND {batch_col} IN ({placeholders}))"
@@ -387,7 +392,10 @@ def _score_with_isolation_forest(
     layer (large_fraction / variance-MAD) keeps answering, and the ML
     verdict is reported absent rather than fabricated."""
     if use_artifact:
-        path = model_registry.active_artifact_path(conn, model_key)
+        try:
+            path = model_registry.active_artifact_path(conn, model_key)
+        except RegistryUnavailableError:
+            path = None
         if path:
             try:
                 payload = artifacts.load_joblib(path)

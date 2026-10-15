@@ -28,6 +28,7 @@ import sqlite3
 from . import anomaly, audit, depletion, model_registry
 from . import ml_artifacts_io as artifacts
 from .db import write_tx
+from .errors import InvalidStateError, NotFoundError, RegistryUnavailableError
 from .ml_training import FPGROWTH_SCHEMA_VERSION, ISO_SCHEMA_VERSION, PROPHET_SCHEMA_VERSION
 
 _EXPECTED_FEATURE_NAMES = {
@@ -61,9 +62,21 @@ def _validate_payload(model_key: str, payload: dict) -> tuple[bool, str]:
 
 
 def validate_artifacts_on_startup(conn: sqlite3.Connection) -> dict:
+    """DatabaseIntegrityError (a damaged ml_model_registry/ml_training_run
+    file, as opposed to a merely-missing or merely-empty one) is
+    deliberately NOT caught here -- it must propagate out of the FastAPI
+    startup hook and stop the process, not be folded into a per-model
+    'degraded' report the operator could miss."""
     report: dict[str, dict] = {}
     for model_key in model_registry.MODEL_KEYS:
-        active = model_registry.active_run(conn, model_key)
+        try:
+            active = model_registry.active_run(conn, model_key)
+        except RegistryUnavailableError as exc:
+            report[model_key] = {
+                "status": "registry_unavailable",
+                "detail": f"{exc.message}; serving falls back live until migrations run",
+            }
+            continue
         if active is None:
             report[model_key] = {"status": "no_active_run", "detail": "nothing trained yet; serving falls back live"}
             continue
@@ -93,8 +106,13 @@ def validate_artifacts_on_startup(conn: sqlite3.Connection) -> dict:
                 ok2, reason2 = _validate_payload(model_key, payload2)
             except Exception as exc:  # noqa: BLE001
                 payload2, ok2, reason2 = None, False, f"artifact_load_failed: {exc}"
-        except Exception as exc:  # noqa: BLE001 -- no prior run to roll back to, or rollback itself failed
+        except (NotFoundError, InvalidStateError) as exc:
+            # No active run, or no prior (superseded) run to fall back to --
+            # an ordinary "nothing else to serve" outcome, not a failure.
             ok2, reason2, payload2 = False, str(exc), None
+        # DatabaseIntegrityError propagates: a database that went from
+        # readable (active_run succeeded above) to corrupt mid-request is
+        # not a "no fallback available" case to paper over.
 
         if ok2:
             report[model_key] = {

@@ -23,10 +23,62 @@ anything in this module directly — see ml_training.retrain_model().
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from contextlib import contextmanager
 
 from .db import write_tx
-from .errors import InvalidStateError, NotFoundError, ValidationError
+from .errors import (
+    DatabaseIntegrityError,
+    InvalidStateError,
+    NotFoundError,
+    RegistryUnavailableError,
+    ValidationError,
+)
+
+_REGISTRY_TABLES = ("ml_model_registry", "ml_training_run", "ml_approved_synthetic_batch")
+_MISSING_TABLE_RE = re.compile(r"no such table:\s*(\S+)")
+# sqlite3.IntegrityError/ProgrammingError/DataError/NotSupportedError/InternalError
+# are all subclasses of DatabaseError -- they signal a constraint violation or a
+# programming bug (bad SQL, wrong bind count), not a missing table or a damaged
+# file, and must never be reclassified or hidden here.
+_PROGRAMMING_OR_CONSTRAINT_ERRORS = (
+    sqlite3.IntegrityError, sqlite3.ProgrammingError, sqlite3.DataError,
+    sqlite3.NotSupportedError, sqlite3.InternalError,
+)
+
+
+@contextmanager
+def _registry_errors():
+    """Classify a raw sqlite failure from a registry/training-run query
+    instead of letting it crash the caller.
+
+    - "no such table: ml_*" (migration 0050 hasn't run yet) -> RegistryUnavailableError,
+      a condition serving code is expected to catch and fall back on.
+    - any other OperationalError/DatabaseError (malformed schema, "file is
+      not a database", disk I/O corruption) -> DatabaseIntegrityError, which
+      must propagate uncaught so corruption is never mistaken for "ML not
+      initialized yet".
+    - constraint violations and programming bugs (IntegrityError,
+      ProgrammingError, ...) are re-raised unchanged -- never hidden here.
+    """
+    try:
+        yield
+    except _PROGRAMMING_OR_CONSTRAINT_ERRORS:
+        raise
+    except (sqlite3.OperationalError, sqlite3.DatabaseError) as exc:
+        message = str(exc)
+        match = _MISSING_TABLE_RE.search(message)
+        if match and match.group(1) in _REGISTRY_TABLES:
+            raise RegistryUnavailableError(
+                f"ML registry table '{match.group(1)}' does not exist yet -- "
+                "run database migrations before serving ML-backed endpoints.",
+                missing_table=match.group(1),
+            ) from exc
+        raise DatabaseIntegrityError(
+            f"ML registry query failed, possibly due to database corruption: {message}"
+        ) from exc
+
 
 MODES = ("SIMULATED", "MIXED", "REAL")
 MODEL_KEYS = (
@@ -46,9 +98,10 @@ def next_mode(current: str) -> str:
 
 
 def _registry_row(conn: sqlite3.Connection, model_key: str) -> sqlite3.Row:
-    row = conn.execute(
-        "SELECT * FROM ml_model_registry WHERE model_key=?", (model_key,)
-    ).fetchone()
+    with _registry_errors():
+        row = conn.execute(
+            "SELECT * FROM ml_model_registry WHERE model_key=?", (model_key,)
+        ).fetchone()
     if not row:
         raise NotFoundError(f"unknown model_key '{model_key}'")
     return row
@@ -69,19 +122,21 @@ def _hydrate(row: sqlite3.Row) -> dict:
 
 
 def _run_row(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM ml_training_run WHERE id=?", (run_id,)).fetchone()
+    with _registry_errors():
+        row = conn.execute("SELECT * FROM ml_training_run WHERE id=?", (run_id,)).fetchone()
     if not row:
         raise NotFoundError(f"training run {run_id} not found")
     return row
 
 
 def active_run(conn: sqlite3.Connection, model_key: str) -> dict | None:
-    row = conn.execute(
-        "SELECT r.* FROM ml_training_run r "
-        "JOIN ml_model_registry m ON m.active_training_run_id = r.id "
-        "WHERE m.model_key=?",
-        (model_key,),
-    ).fetchone()
+    with _registry_errors():
+        row = conn.execute(
+            "SELECT r.* FROM ml_training_run r "
+            "JOIN ml_model_registry m ON m.active_training_run_id = r.id "
+            "WHERE m.model_key=?",
+            (model_key,),
+        ).fetchone()
     return _hydrate(row) if row else None
 
 
@@ -91,16 +146,19 @@ def active_artifact_path(conn: sqlite3.Connection, model_key: str) -> str | None
 
 
 def training_history(conn: sqlite3.Connection, model_key: str, limit: int = 20) -> list[dict]:
-    rows = conn.execute(
-        "SELECT * FROM ml_training_run WHERE model_key=? ORDER BY trained_at DESC, id DESC LIMIT ?",
-        (model_key, limit),
-    ).fetchall()
+    with _registry_errors():
+        rows = conn.execute(
+            "SELECT * FROM ml_training_run WHERE model_key=? ORDER BY trained_at DESC, id DESC LIMIT ?",
+            (model_key, limit),
+        ).fetchall()
     return [_hydrate(r) for r in rows]
 
 
 def list_models(conn: sqlite3.Connection) -> list[dict]:
     out = []
-    for row in conn.execute("SELECT * FROM ml_model_registry ORDER BY model_key"):
+    with _registry_errors():
+        rows = conn.execute("SELECT * FROM ml_model_registry ORDER BY model_key").fetchall()
+    for row in rows:
         out.append({
             "model_key": row["model_key"],
             "display_name": row["display_name"],
@@ -214,4 +272,5 @@ def rollback(conn: sqlite3.Connection, model_key: str, *, triggered_by: str, rea
 
 
 def approved_batch_ids(conn: sqlite3.Connection) -> list[str]:
-    return [r["batch_id"] for r in conn.execute("SELECT batch_id FROM ml_approved_synthetic_batch")]
+    with _registry_errors():
+        return [r["batch_id"] for r in conn.execute("SELECT batch_id FROM ml_approved_synthetic_batch")]
