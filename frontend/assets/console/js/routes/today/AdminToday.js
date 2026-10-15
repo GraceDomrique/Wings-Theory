@@ -1,4 +1,4 @@
-import { h, icon } from '../../lib/dom.js';
+import { h, icon, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { RailCard } from '../../components/ui/RailCard.js';
 import { Stat } from '../../components/ui/Stat.js';
@@ -28,39 +28,64 @@ import { openOrderDetail } from '../reports/orderDetailModal.js';
  */
 export async function render(ctx) {
   const d = await getAdminToday();
-  const stale = d.freshness && d.freshness.latestOrderAt
-    ? h('div', { class: 'callout', style: { marginBottom: '14px' } },
-      h('p', { class: 't-xs t-faint' },
-        'Figures below reflect orders up to ', stamp(d.freshness.latestOrderAt),
-        ' (', ageFromNow(d.freshness.latestOrderAt), ').'))
-    : null;
 
-  // Layout (2026-10-14 reorder — content/components unchanged, only which
-  // row each card sits in): Store Status beside Today's Sales up top; Do Now
-  // beside Quick Actions right below it, so the two things an admin acts on
-  // first are visible without scrolling on a normal desktop viewport; then
-  // Inventory Pulse / Today's Deliveries / Order Activity; then Recent
-  // Orders beside Next 7 Days; Unusual Usage, Unusual Stock Difference and
-  // Activity Log stay last — read-only review, not something acted on first.
+  // 2026-10-15 rebuild (spec: "Premium Operations Command Center" — a real
+  // restructure, not a card-grid reshuffle):
+  //   1. Hero — Today's Sales/Orders/Active Orders/Restaurant Status
+  //      together in one banner (previously Today's Sales sat in its own
+  //      separate card beside the hero; the hero's own 4 stats were
+  //      inventory-attention counts, not the operational headline numbers
+  //      the spec asks the hero itself to carry). Last-updated now lives in
+  //      the hero instead of a separate callout above it.
+  //   2. Immediate Priorities — Do Now beside Quick Actions (unchanged: this
+  //      pairing was already correct).
+  //   3. Upcoming Demand & Inventory — Next 7 Days, Inventory Health
+  //      (the old Inventory Pulse card, relabeled — same data, same
+  //      backend), Upcoming Deliveries. The four attention counts that used
+  //      to live in the hero (Need Attention/Deliveries/Running Low/Stock
+  //      Healthy) moved into Inventory Health, where they belong with the
+  //      rest of the inventory-attention picture.
+  //   4. Supporting Operations — Recent Orders, Urgent Owner Instructions
+  //      (new — d.instructionsPreview was already fetched by
+  //      getAdminToday() but never rendered anywhere on this page), Order
+  //      Activity, Unusual Usage, Stock Differences, Recent Activity — all
+  //      behind one progressive-disclosure toggle, collapsed by default, so
+  //      none of it pushes the three operational rows above below the fold.
+  const supportingHost = h('div');
+  const toggleHost = h('div', { style: { marginTop: '18px', textAlign: 'center' } });
+  let supportingOpen = false;
+  const supportingCount = (d.recentOrders || []).length + (d.instructionsPreview?.openInstructions || 0)
+    + (d.unusualUsage || []).length + (d.unusualStockDifference || []).length;
+
+  function drawSupporting() {
+    mount(toggleHost, Button({
+      variant: 'ghost', onClick: () => { supportingOpen = !supportingOpen; drawSupporting(); },
+    }, supportingOpen ? '▲ Hide supporting details' : `▾ Show supporting details (${supportingCount})`));
+    mount(supportingHost, supportingOpen
+      ? h('div', {},
+        h('div', { class: 'grid', style: { gridTemplateColumns: '1.4fr 1fr', gap: '14px' } },
+          recentOrdersCard(d),
+          instructionsCard(d, ctx)),
+        h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
+          orderActivityCard(d),
+          unusualUsageCard(d, ctx),
+          unusualStockDifferenceCard(d, ctx)),
+        h('div', { style: { marginTop: '14px' } }, activityLogCard(d)))
+      : null);
+  }
+  drawSupporting();
+
   return h('div', { class: 'admin-today' },
-    stale,
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '14px' } },
-      storeStatusBanner(d, ctx),
-      todaysSalesCard(d)),
+    heroBanner(d, ctx),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
       doNowCard(d, ctx),
       quickActionsCard(d, ctx)),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
+      next7DaysCard(d, ctx),
       inventoryPulseCard(d, ctx),
-      deliveriesCard(d, ctx),
-      orderActivityCard(d)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1.4fr 1fr', gap: '14px', marginTop: '14px' } },
-      recentOrdersCard(d),
-      next7DaysCard(d)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
-      unusualUsageCard(d, ctx),
-      unusualStockDifferenceCard(d, ctx),
-      activityLogCard(d)));
+      deliveriesCard(d, ctx)),
+    toggleHost,
+    h('div', { style: { marginTop: '14px' } }, supportingHost));
 }
 
 // Dark, moody studio shot (2026-10) -- deliberately NOT the brighter,
@@ -78,25 +103,41 @@ const STAT_ICON = {
   check: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>',
 };
 
-function storeStatusBanner(d, ctx) {
+// 2026-10-15: the hero's own headline stats are now the operational
+// numbers the spec asks for (Sales/Orders/Active Orders/Restaurant
+// Status) — the inventory-attention counts that used to sit here moved to
+// Inventory Health (inventoryPulseCard) below, where they belong with the
+// rest of the stock-attention picture rather than competing with the
+// day's actual sales performance for the same four hero slots.
+function heroBanner(d, ctx) {
   const s = d.storeStatus;
+  const t = d.todaySales;
+  const a = d.orderActivity;
   const ok = s.operational;
   const sev = ok ? 'good' : 'crit';
+  const freshness = d.freshness && d.freshness.latestOrderAt
+    ? h('div', { class: 't-xs', style: { color: '#D8D1C2', marginTop: '4px' } },
+      'Updated as of ', stamp(d.freshness.latestOrderAt), ' (', ageFromNow(d.freshness.latestOrderAt), ')')
+    : null;
   return Card({ className: 'store-status-banner photo-hero', style: { backgroundImage: STORE_STATUS_PHOTO } },
     Pill(sev, ok ? 'Store Status' : 'Needs attention'),
-    h('div', { style: { fontSize: '26px', fontWeight: '700', margin: '8px 0 16px', fontFamily: 'var(--font-display)' } },
+    h('div', { style: { fontSize: '26px', fontWeight: '700', margin: '8px 0 2px', fontFamily: 'var(--font-display)' } },
       ok ? 'All systems running' : `${s.needAttention} item${s.needAttention === 1 ? '' : 's'} need attention`),
-    h('div', { class: 'grid store-status-stats', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px' } },
-      heroStat(s.needAttention, 'Need Attention', s.needAttention ? 'crit' : 'good', STAT_ICON.attention, () => ctx.navigate('expiry')),
-      heroStat(s.deliveriesToday, 'Deliveries Today', 'info', STAT_ICON.truck, () => ctx.navigate('receiving')),
-      heroStat(s.runningLow, 'Running Low', s.runningLow ? 'warn' : 'good', STAT_ICON.box, () => ctx.navigate('whattobuy')),
-      heroStat(s.stockHealthy, 'Stock Healthy', 'good', STAT_ICON.check, () => ctx.navigate('onhand'))));
+    freshness,
+    h('div', { class: 'grid store-status-stats', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px', marginTop: '16px' } },
+      heroStat(money(t.revenue, '₱0').textContent, "Today's Sales", 'good', STAT_ICON.check),
+      heroStat(count(t.orders).textContent, 'Orders Today', 'info', STAT_ICON.box, () => ctx.navigate('orderhistory')),
+      heroStat(count(a.preparing).textContent, 'Active Orders', a.preparing ? 'warn' : 'good', STAT_ICON.truck),
+      heroStat(ok ? 'Open' : 'Attention', 'Restaurant Status', sev, STAT_ICON.attention)));
 }
 
-// Dark icon-badge tile for storeStatusBanner's row, sitting on the hero
-// photo -- distinct from pillStat() below (an opaque white card used
-// elsewhere on this page, off the photo) since the two need opposite
-// contrast treatments.
+// Dark icon-badge tile for heroBanner's row, sitting on the hero photo --
+// distinct from pillStat() below (an opaque white card used elsewhere on
+// this page, off the photo) since the two need opposite contrast treatments.
+// `value` arrives pre-formatted (a plain string/number already rendered by
+// the caller via money()/count()/etc, or a bare status word) — this stays a
+// dumb display tile rather than re-guessing how to format each of the hero's
+// now-mixed stat types (currency, a count, a one-word status).
 function heroStat(value, label, severity, iconPath, onClick) {
   return h('div', {
     class: `stat-tile stat-tile-${severity}`,
@@ -105,7 +146,7 @@ function heroStat(value, label, severity, iconPath, onClick) {
   },
     h('span', { class: `kpi-icon kpi-icon-${severity}` }, icon(iconPath, 15)),
     h('div', {},
-      h('div', { class: 'stat-tile-value' }, count(value)),
+      h('div', { class: 'stat-tile-value' }, value),
       h('div', { class: 'stat-tile-label' }, label)));
 }
 
@@ -119,29 +160,10 @@ function pillStat(value, label, severity, onClick) {
     h('div', { class: 't-xs t-faint' }, label));
 }
 
-function deltaPill(value) {
-  if (value === null || value === undefined) return Pill('flat', 'n/a');
-  if (value > 0.05) return Pill('good', h('span', {}, '▲ ', value.toFixed(1), '%'));
-  if (value < -0.05) return Pill('warn', h('span', {}, '▼ ', Math.abs(value).toFixed(1), '%'));
-  return Pill('flat', '≈ flat');
-}
-
-function todaysSalesCard(d) {
-  const t = d.todaySales;
-  return Card({ className: 'card-flex' },
-    CardHeader({ title: "Today's Sales", desc: t.comparisonLabel }),
-    h('div', { style: { fontSize: '30px', fontWeight: '700', margin: '4px 0 2px' } }, money(t.revenue, '₱0')),
-    h('div', { style: { marginBottom: '14px' } }, deltaPill(t.deltas.revenue_pct)),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: '14px' } },
-      Stat({ value: count(t.orders), label: 'Orders' }),
-      Stat({ value: count(t.items), label: 'Items Sold' }),
-      Stat({ value: t.avgOrder === null ? null : money(t.avgOrder), label: 'Avg. Order' })));
-}
-
 function inventoryPulseCard(d, ctx) {
   const p = d.inventoryPulse;
   return Card({ className: 'card-flex' },
-    CardHeader({ title: 'Inventory Pulse', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('onhand') }, 'View Inventory →') }),
+    CardHeader({ title: 'Inventory Health', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('onhand') }, 'View Inventory →') }),
     h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px', marginBottom: '12px' } },
       pillStat(p.purchaseNeeded, 'Purchase Needed', p.purchaseNeeded ? 'crit' : 'good', () => ctx.navigate('whattobuy')),
       pillStat(p.runningLow, 'Running Low', p.runningLow ? 'warn' : 'good', () => ctx.navigate('whattobuy')),
@@ -173,16 +195,19 @@ function doNowCard(d, ctx) {
         h('span', { class: `t-xs t-strong ${SEV_TEXT_CLASS[a.severity] || 't-soft'}`, style: { textAlign: 'right', flexShrink: 0, maxWidth: '48%' } }, a.detail)))));
 }
 
-function next7DaysCard(d) {
+// 2026-10-15: "direct action to inspect detailed forecasts" (spec B) — a
+// link to the full Demand Forecasts workspace, which fits real per-menu-item
+// Prophet/baseline charts and history this compact card has no room for.
+function next7DaysCard(d, ctx) {
   const f = d.next7Days;
   if (!f.available) {
     return Card({ className: 'card-flex' },
-      CardHeader({ title: 'Next 7 Days' }),
+      CardHeader({ title: 'Next 7 Days', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('forecasts') }, 'Details →') }),
       EmptyState({ icon: '▤', title: 'Not enough order history yet', description: f.note, tight: true }));
   }
   const colors = f.days.map((x) => ({ Normal: palette.info, Moderate: palette.warn, High: palette.crit, Busiest: palette.crit }[x.level] || palette.info));
   return Card({ className: 'card-flex' },
-    CardHeader({ title: 'Next 7 Days', desc: 'Expected demand' }),
+    CardHeader({ title: 'Next 7 Days', desc: 'Expected demand', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('forecasts') }, 'Details →') }),
     BarChart({ labels: f.days.map((x) => x.weekday), data: f.days.map((x) => x.qty), colors, height: 110 }),
     f.note ? h('div', { class: 't-xs', style: { marginTop: '8px' } }, Pill('info', 'Forecast'), ' ', f.note) : null);
 }
@@ -237,6 +262,28 @@ function orderActivityCard(d) {
       Stat({ value: count(a.completed), label: 'Completed' }),
       Stat({ value: count(a.preparing), label: 'In Progress' }),
       Stat({ value: count(a.voided), label: 'Voided' })));
+}
+
+// 2026-10-15: new — d.instructionsPreview was already part of
+// getAdminToday()'s response (wt/dashboard_overview.py) but nothing on this
+// page ever rendered it. Read-only here (the same role-correct rule as
+// everywhere else: only Owner creates/the normal Instructions workflow
+// handles state changes); this is a visibility fix, not a new write path.
+function instructionsCard(d, ctx) {
+  const p = d.instructionsPreview || { openInstructions: 0, items: [] };
+  const items = p.items || [];
+  return Card({ className: 'card-flex' },
+    CardHeader({
+      title: 'Urgent Owner Instructions',
+      right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('instructions') }, 'View all →'),
+    }),
+    items.length === 0
+      ? EmptyState({ icon: '✓', title: p.openInstructions ? `${p.openInstructions} open, none urgent` : 'Nothing open', tight: true })
+      : h('div', { class: 'scrollpane' }, ...items.map((it) => h('div', {
+        class: 'mini-row', style: { cursor: 'pointer' }, onClick: () => ctx.navigate('instructions'),
+      },
+      h('span', {}, it.title),
+      Pill(it.priority === 'urgent' || it.priority === 'high' ? 'crit' : 'warn', it.status)))));
 }
 
 function recentOrdersCard(d) {
