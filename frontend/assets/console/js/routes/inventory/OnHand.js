@@ -139,13 +139,23 @@ export async function render(ctx) {
    * (that's what the filtered table below is for). Clicking one filters the
    * table and scrolls it into view, so the number and the rows it describes
    * are never two different places to reconcile. */
+  // 2026-10-15 redesign (spec 6): grouped into the three categories asked
+  // for — Expired Stock, Low/Out of Stock, Expiring Soon — each ONE row per
+  // category (never one row per affected ingredient, so a day with 30
+  // low-stock ingredients is one grouped alert, not 30 repetitive
+  // warnings). Out-of-stock is called out in the Low/Out row's own text
+  // when distinguishable (real data, i.risk === 'out', not invented) rather
+  // than a fourth row — the spec's own grouping is Low/Out combined.
   function drawAttention() {
     const expiredCount = expiry.buckets.expired.length;
-    const lowCount = lowStockIngredients().length;
+    const soonCount = expiry.buckets.soon.length;
+    const low = lowStockIngredients();
+    const outCount = low.filter((i) => i.risk === 'out').length;
+    const lowCount = low.length;
 
-    if (expiredCount === 0 && lowCount === 0) {
+    if (expiredCount === 0 && soonCount === 0 && lowCount === 0) {
       mount(attentionHost, h('div', { class: 'attn-card', style: { height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center' } },
-        EmptyState({ icon: '✓', title: 'Nothing needs attention', description: 'No expired batches or low-stock ingredients right now.', tight: true })));
+        EmptyState({ icon: '✓', title: 'Nothing needs attention', description: 'No expired batches, low stock, or ingredients expiring soon right now.', tight: true })));
       return;
     }
 
@@ -154,7 +164,7 @@ export async function render(ctx) {
       rows.push(attentionSummaryRow({
         iconPaths: ICONS.alertTriangle,
         severity: 'crit',
-        title: 'Expired ingredients',
+        title: 'Expired stock',
         sub: `${expiredCount} batch${expiredCount === 1 ? '' : 'es'} need checking`,
         onClick: () => { activeFilter = 'expiring'; drawFilters(); drawTable(lastQuery); scrollToTable(); },
       }));
@@ -162,10 +172,21 @@ export async function render(ctx) {
     if (lowCount > 0) {
       rows.push(attentionSummaryRow({
         iconPaths: ICONS.packageMinus,
-        severity: 'warn',
-        title: 'Low stock',
-        sub: `${lowCount} ingredient${lowCount === 1 ? '' : 's'} need reviewing`,
+        severity: outCount > 0 ? 'crit' : 'warn',
+        title: 'Low / out of stock',
+        sub: outCount > 0
+          ? `${outCount} out of stock, ${lowCount} total need reviewing`
+          : `${lowCount} ingredient${lowCount === 1 ? '' : 's'} need reviewing`,
         onClick: () => { activeFilter = 'low'; drawFilters(); drawTable(lastQuery); scrollToTable(); },
+      }));
+    }
+    if (soonCount > 0) {
+      rows.push(attentionSummaryRow({
+        iconPaths: ICONS.calendarClock,
+        severity: 'warn',
+        title: 'Expiring soon',
+        sub: `${soonCount} batch${soonCount === 1 ? '' : 'es'} within the review window`,
+        onClick: () => { activeFilter = 'expiring'; drawFilters(); drawTable(lastQuery); scrollToTable(); },
       }));
     }
 
