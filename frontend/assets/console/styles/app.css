@@ -978,6 +978,27 @@ canvas{max-width:100%;}
 .account-security-panel{padding:22px 20px;}
 .account-security-field{display:block; margin-bottom:14px;}
 
+/* ============ OPERATIONS INTELLIGENCE (2026-10-15, Admin Today) ===========
+   ============================================================================ */
+.intel-section{padding:16px 18px;}
+.intel-tile{
+  display:flex; flex-direction:column; gap:3px; text-align:left; width:100%;
+  padding:12px 14px; border-radius:var(--radius-sm); border:1px solid transparent;
+  font-family:inherit; transition:background .12s ease, transform .06s ease;
+}
+.intel-tile-crit{background:var(--crit-tint);}
+.intel-tile-warn{background:var(--warn-tint);}
+.intel-tile-good{background:var(--good-tint);}
+.intel-tile-info{background:var(--info-tint);}
+.intel-tile:hover{border-color:rgba(0,0,0,.08); transform:translateY(-1px);}
+.intel-tile:focus-visible{outline:2px solid var(--amber); outline-offset:2px;}
+.intel-tile-arrow{color:var(--ink-faint); opacity:0; transition:opacity .12s ease;}
+.intel-tile:hover .intel-tile-arrow{opacity:1;}
+.intel-tile-value{font-family:var(--font-display); font-size:22px; font-weight:700; color:var(--ink); margin-top:4px;}
+.intel-tile-title{font-size:12px; font-weight:700; color:var(--ink);}
+.intel-tile-desc{font-size:10.5px; color:var(--ink-soft);}
+.intel-tile-window{font-size:9.5px; color:var(--ink-faint); margin-top:2px;}
+
 /* ============ STOCK & USAGE REVIEWS (2026-10-15 unified Review Center) ====
    ============================================================================ */
 .review-queue-row{

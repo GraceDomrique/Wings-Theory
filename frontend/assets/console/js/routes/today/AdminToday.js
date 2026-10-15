@@ -8,9 +8,13 @@ import { EmptyState } from '../../components/ui/EmptyState.js';
 import { BarChart } from '../../components/charts/BarChart.js';
 import { palette } from '../../components/charts/base.js';
 import { money, count, pct, stamp, ageFromNow } from '../../lib/format.js';
-import { severityFromAnomaly } from '../../lib/severity.js';
 import { getAdminToday } from '../../lib/api/dashboard.js';
+import { getAnomalies, getIngredientVariance, getFlavorAnomalyEvents } from '../../lib/api/intelligence.js';
+import { ICONS } from '../../lib/icons.js';
 import { openOrderDetail } from '../reports/orderDetailModal.js';
+
+const INTEL_ANOMALY_LOOKBACK_DAYS = 90;
+const INTEL_VARIANCE_LOOKBACK_DAYS = 30;
 
 /**
  * Admin Today — the reference-design operational landing screen (2026-10).
@@ -27,7 +31,19 @@ import { openOrderDetail } from '../reports/orderDetailModal.js';
  * inventing a fourth bucket to match a generic reference layout.
  */
 export async function render(ctx) {
-  const d = await getAdminToday();
+  // Operations Intelligence (spec: "one consolidated intelligence area with
+  // distinct signals for forecasting, stock discrepancies, ingredient
+  // usage, and unlimited-wings activity") needs real counts, not the
+  // top-4-only previews getAdminToday() already carries in d.unusualUsage/
+  // d.unusualStockDifference — fetched alongside it, same real endpoints
+  // the Stock & Usage Reviews center reads, never a second calculation.
+  const [d, { stockLoss, consumption_anomalies: streamAnomalies }, varianceReport, flavorEvents] = await Promise.all([
+    getAdminToday(),
+    getAnomalies(INTEL_ANOMALY_LOOKBACK_DAYS),
+    getIngredientVariance(INTEL_VARIANCE_LOOKBACK_DAYS),
+    getFlavorAnomalyEvents(INTEL_ANOMALY_LOOKBACK_DAYS),
+  ]);
+  const varianceFlagged = (varianceReport.items || []).filter((i) => i.flagged);
 
   // 2026-10-15 rebuild (spec: "Premium Operations Command Center" — a real
   // restructure, not a card-grid reshuffle):
@@ -54,8 +70,7 @@ export async function render(ctx) {
   const supportingHost = h('div');
   const toggleHost = h('div', { style: { marginTop: '18px', textAlign: 'center' } });
   let supportingOpen = false;
-  const supportingCount = (d.recentOrders || []).length + (d.instructionsPreview?.openInstructions || 0)
-    + (d.unusualUsage || []).length + (d.unusualStockDifference || []).length;
+  const supportingCount = (d.recentOrders || []).length + (d.instructionsPreview?.openInstructions || 0);
 
   function drawSupporting() {
     mount(toggleHost, Button({
@@ -66,10 +81,7 @@ export async function render(ctx) {
         h('div', { class: 'grid', style: { gridTemplateColumns: '1.4fr 1fr', gap: '14px' } },
           recentOrdersCard(d),
           instructionsCard(d, ctx)),
-        h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
-          orderActivityCard(d),
-          unusualUsageCard(d, ctx),
-          unusualStockDifferenceCard(d, ctx)),
+        h('div', { style: { marginTop: '14px' } }, orderActivityCard(d)),
         h('div', { style: { marginTop: '14px' } }, activityLogCard(d)))
       : null);
   }
@@ -80,12 +92,111 @@ export async function render(ctx) {
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
       doNowCard(d, ctx),
       quickActionsCard(d, ctx)),
+    h('div', { style: { marginTop: '14px' } },
+      operationsIntelligenceSection(ctx, { stockLoss, streamAnomalies, varianceFlagged, flavorEvents })),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
       next7DaysCard(d, ctx),
       inventoryPulseCard(d, ctx),
       deliveriesCard(d, ctx)),
     toggleHost,
     h('div', { style: { marginTop: '14px' } }, supportingHost));
+}
+
+// ---------------------------------------------------------------------
+// Operations Intelligence (spec 1-2) — one consolidated summary of the
+// five separate analytical functions (stock-loss, usage variance, two
+// independent Unlimited Wings streams, demand forecasting), placed right
+// after Immediate Priorities, not buried at the bottom. Every count below
+// is real (fetched alongside d above, the same endpoints Stock & Usage
+// Reviews reads) — never a fabricated confidence score, never today's
+// total standing in for the real analysis window. Each tile and the
+// Priority Reviews list route to the Stock & Usage Reviews workspace
+// ('losses') or Demand Forecasts ('forecasts') — the actual record, not a
+// duplicate of it rendered a third time on this page.
+// ---------------------------------------------------------------------
+const INTEL_TILE_ICON = {
+  stockLoss: ICONS.trash,
+  variance: ICONS.packageMinus,
+  unli: ICONS.utensils,
+  demand: ICONS.chartLine,
+};
+
+function intelTile({
+  iconKey, title, value, window: win, desc, severity, onClick,
+}) {
+  return h('button', { class: `intel-tile intel-tile-${severity}`, onClick },
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' } },
+      h('span', { class: `kpi-icon kpi-icon-${severity}` }, icon(INTEL_TILE_ICON[iconKey], 16)),
+      h('span', { class: 'intel-tile-arrow' }, icon(ICONS.arrowUpRight, 13))),
+    h('div', { class: 'intel-tile-value' }, value),
+    h('div', { class: 'intel-tile-title' }, title),
+    h('div', { class: 'intel-tile-desc' }, desc),
+    h('div', { class: 'intel-tile-window' }, win));
+}
+
+function operationsIntelligenceSection(ctx, { stockLoss, streamAnomalies, varianceFlagged, flavorEvents }) {
+  const stockLossOpen = stockLoss.filter((a) => !a.reviewStatus).length;
+  const unliCount = streamAnomalies.length + flavorEvents.length;
+
+  const priorityFindings = [
+    ...stockLoss.filter((a) => !a.reviewStatus).map((a) => ({
+      title: a.ingredientName, type: 'Stock loss', explanation: a.flaggedBecause,
+      date: a.timestamp, impact: delta_(a.amount, a.baseUnit), status: 'needs_review',
+      sortKey: a.priority === 'review_soon' ? 2 : 1,
+    })),
+    ...varianceFlagged.map((i) => ({
+      title: i.name, type: 'Usage variance', explanation: `Count variance against expected consumption`,
+      date: null, impact: `${i.countVarianceBase > 0 ? '+' : ''}${i.countVarianceBase} ${i.baseUnit}`, status: 'flagged',
+      sortKey: 1,
+    })),
+  ].sort((a, b) => b.sortKey - a.sortKey).slice(0, 3);
+
+  return h('div', { class: 'card intel-section' },
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '2px' } },
+      h('div', {},
+        h('div', { class: 'eyebrow' }, 'Operations Intelligence'),
+        h('div', { class: 'card-title', style: { fontSize: '16px' } }, 'What needs a closer look')),
+      icon(ICONS.chartLine, 18)),
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2, 1fr)', gap: '10px', margin: '14px 0' } },
+      intelTile({
+        iconKey: 'stockLoss', title: 'Stock loss flags', value: count(stockLoss.length),
+        window: `${INTEL_ANOMALY_LOOKBACK_DAYS}d window`, desc: 'Unusual stock adjustments and waste events',
+        severity: stockLossOpen > 0 ? 'crit' : 'good', onClick: () => ctx.navigate('losses'),
+      }),
+      intelTile({
+        iconKey: 'variance', title: 'Consumption differences', value: count(varianceFlagged.length),
+        window: `${INTEL_VARIANCE_LOOKBACK_DAYS}d window`, desc: 'Ingredients needing reconciliation',
+        severity: varianceFlagged.length > 0 ? 'warn' : 'good', onClick: () => ctx.navigate('losses'),
+      }),
+      intelTile({
+        iconKey: 'unli', title: 'Unlimited Wings', value: unliCount > 0 ? count(unliCount) : '—',
+        window: `${INTEL_ANOMALY_LOOKBACK_DAYS}d window`, desc: 'Unusual daily usage or flavor patterns',
+        severity: unliCount > 0 ? 'warn' : 'good', onClick: () => ctx.navigate('losses'),
+      }),
+      intelTile({
+        iconKey: 'demand', title: 'Demand Outlook', value: '7 days',
+        window: 'Rolling forecast', desc: 'Expected demand and replenishment risks',
+        severity: 'info', onClick: () => ctx.navigate('forecasts'),
+      })),
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', margin: '18px 0 8px' } },
+      h('div', { class: 't-sm t-strong' }, 'Priority Reviews'),
+      Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('losses') }, 'Open review queue →')),
+    priorityFindings.length === 0
+      ? EmptyState({ icon: '✓', title: 'Nothing needs review right now', tight: true })
+      : h('div', {}, ...priorityFindings.map((f) => h('div', { class: 'mini-row' },
+        h('span', {},
+          h('div', { class: 't-sm t-strong' }, f.title),
+          h('div', { class: 'sub' }, `${f.type} — ${f.explanation || 'see details'}`)),
+        Button({ size: 'sm', variant: 'ghost', onClick: () => ctx.navigate('losses') }, 'Review')))));
+}
+
+/** delta() from lib/format.js returns a Node; this file needs the plain
+ * string form inline above, same discipline as pesoStr() elsewhere in the
+ * console (interpolating a Node into a template literal stringifies it to
+ * "[object Text]"). */
+function delta_(value, unit) {
+  if (value === null || value === undefined) return '—';
+  return `${value > 0 ? '+' : ''}${value} ${unit || ''}`.trim();
 }
 
 // Dark, moody studio shot (2026-10) -- deliberately NOT the brighter,
@@ -324,31 +435,12 @@ function recentOrdersCard(d) {
           h('td', {}, Pill(o.status === 'served' ? 'good' : o.status === 'void' ? 'crit' : 'info', o.status)))))));
 }
 
-function unusualUsageCard(d, ctx) {
-  const rows = d.unusualUsage || [];
-  return Card({ className: 'card-flex' },
-    CardHeader({ title: 'Unusual Usage', desc: 'Consumption anomaly detection', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('losses') }, 'View all →') }),
-    rows.length === 0
-      ? EmptyState({ icon: '✓', title: 'Nothing unusual detected', tight: true })
-      : h('div', { class: 'scrollpane' }, ...rows.map((r) => h('div', { class: 'mini-row' },
-        h('span', {},
-          h('div', {}, r.label || r.ingredient_name, ' — ', r.service_date || ''),
-          h('div', { class: 'sub' }, r.why)),
-        Pill(severityFromAnomaly(r.severity), `${r.variance_pct > 0 ? '+' : ''}${(r.variance_pct ?? 0).toFixed(0)}%`)))));
-}
-
-function unusualStockDifferenceCard(d, ctx) {
-  const rows = d.unusualStockDifference || [];
-  return Card({ className: 'card-flex' },
-    CardHeader({ title: 'Unusual Stock Difference', desc: 'Stock-loss anomaly detection', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('losses') }, 'View all →') }),
-    rows.length === 0
-      ? EmptyState({ icon: '✓', title: 'Nothing unusual detected', tight: true })
-      : h('div', { class: 'scrollpane' }, ...rows.map((r) => h('div', { class: 'mini-row' },
-        h('span', {},
-          h('div', {}, r.ingredient_name),
-          h('div', { class: 'sub' }, r.why)),
-        Pill(severityFromAnomaly(r.severity), `${r.delta_base > 0 ? '+' : ''}${r.delta_base} ${r.base_unit}`)))));
-}
+// 2026-10-15: unusualUsageCard/unusualStockDifferenceCard (the old
+// top-4-preview cards reading d.unusualUsage/d.unusualStockDifference)
+// removed — operationsIntelligenceSection + its Priority Reviews list above
+// now cover the same stock-loss/consumption-anomaly findings, prominently
+// placed instead of buried in the collapsed supporting tier. Keeping both
+// would show the same findings twice on one page.
 
 // 2026-10-15 fix (spec 7): startup_validation_failed on ml_model_registry
 // carried its raw Python exception text straight into this feed — local

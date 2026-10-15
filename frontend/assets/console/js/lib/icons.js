@@ -56,6 +56,7 @@ export const ICONS = {
   // brand spec asks for) — deliberately one continuous stroke, no
   // gradients, no feather detail, so it still reads cleanly at 24px.
   brandMark: '<path d="M3 7l4.2 11 3.3-7.5L13.8 18l4.2-11"/><path d="M17.3 9.5L21 7"/>',
+  arrowUpRight: '<path d="M7 17 17 7"/><path d="M7 7h10v10"/>',
 };
 
 /** Convenience: `iconName('package', 20)` → an <svg> node, via lib/dom.js's icon(). */
