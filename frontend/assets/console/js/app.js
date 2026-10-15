@@ -14,7 +14,7 @@ import * as losses from './routes/losses/Losses.js';
 import * as unli from './routes/intelligence/Reconciliation.js';
 import * as movements from './routes/inventory/Movements.js';
 
-import * as menu from './routes/menu/MenuAvailability.js';
+import * as menu from './routes/menu/MenuStudio.js';
 import * as recipes from './routes/menu/Recipes.js';
 import * as combos from './routes/menu/Combos.js';
 

@@ -50,15 +50,18 @@ export const ADMIN_TREE = [
     label: 'Inventory',
     icon: ICONS.package,
   },
+  // 2026-10-15 rebuild: collapsed from a 3-child accordion (Menu / Recipes &
+  // Costing / Combos) into one primary nav item that opens Menu Studio — the
+  // single integrated product-editor workspace (MenuStudio.js) — directly.
+  // 'recipes' and 'combos' are no longer their own sidebar entries, but
+  // their routes/components/endpoints are untouched and stay reachable as
+  // deep links from within Menu Studio (its "Edit recipe"/"Open workspace →"
+  // actions) and as direct-URL targets — see ADMIN_EXTRA_ROUTE_IDS below,
+  // same pattern 'onhand' already established for Inventory.
   {
-    id: 'grp-menu',
+    id: 'menu',
     label: 'Menu & Recipes',
     icon: ICONS.bookOpen,
-    children: [
-      { id: 'menu', label: 'Menu' },
-      { id: 'recipes', label: 'Recipes & Costing' },
-      { id: 'combos', label: 'Combos' },
-    ],
   },
   {
     id: 'grp-purchasing',
@@ -171,6 +174,7 @@ const OWNER_EXTRA_ROUTE_IDS = [
  * — reached from Inventory's Quick Actions and "Needs attention" rows. */
 const ADMIN_EXTRA_ROUTE_IDS = [
   'receiving', 'expiry', 'stockcounts', 'losses', 'unli', 'movements', 'bestsellers',
+  'recipes', 'combos',
 ];
 
 /** Display label for a route id that isn't a leaf in either tree anymore
@@ -186,6 +190,8 @@ const EXTRA_LABELS = {
   unli: { group: 'Inventory', label: 'Unlimited Wings' },
   movements: { group: 'Inventory', label: 'Stock Activity' },
   bestsellers: { group: 'Sales & Orders', label: 'Best Sellers' },
+  recipes: { group: 'Menu & Recipes', label: 'Recipes & Costing' },
+  combos: { group: 'Menu & Recipes', label: 'Combos' },
 };
 
 export function treeForRole(role) {

@@ -66,7 +66,17 @@ export async function render(ctx) {
     mount(detailHost, Loading('Loading recipe…'));
     const d = await getRecipe(selected.pk);
     const cost = d.cost || {};
-    const menuItem = priceByRecipe.get(d.recipe.id) || null;
+    // 2026-10-15 fix: was `priceByRecipe.get(d.recipe.id)` — d.recipe.id is
+    // the string business code ("REC-0038") getRecipe() maps from the
+    // recipe's own recipe_id field, but priceByRecipe (built from
+    // listMenuItems()) is keyed by m.recipeId, the NUMERIC row id
+    // /pos/menu's recipe_id field actually holds. Those are two different
+    // values that happen to share a JSON key name across two endpoints —
+    // every lookup here silently missed, so this panel never showed a menu
+    // item's real price or availability next to its recipe, for any recipe,
+    // ever (found while building Menu Studio, which depends on the same
+    // linkage actually working). d.recipe.pk is the numeric id that matches.
+    const menuItem = priceByRecipe.get(d.recipe.pk) || null;
     const price = menuItem ? menuItem.price : null;
 
     const complete = !!cost.complete;
@@ -276,7 +286,7 @@ function buildLineRow(ingredientOptions, lineRows, linesHost, initial) {
  * not typed here as free text — that is exactly the distinction that keeps
  * a recipe's cost and deduction path trustworthy.
  */
-function openAddRecipeModal(onCreated) {
+export function openAddRecipeModal(onCreated) {
   let ingredientOptions = [];
   const nameInput = h('input', { type: 'text', placeholder: 'e.g. Chicken Salpicao' });
   const kindSelect = h('select', {},
@@ -362,7 +372,7 @@ function openAddRecipeModal(onCreated) {
  * endpoint does — see its own docstring for why that's safe against an
  * order already reserved against the old lines.
  */
-function openEditRecipeModal(recipe, currentLines, onSaved) {
+export function openEditRecipeModal(recipe, currentLines, onSaved) {
   let ingredientOptions = [];
   const nameInput = h('input', { type: 'text', value: recipe.name });
   const yieldQtyInput = h('input', { type: 'number', min: '0.01', step: '0.01', value: String(recipe.yieldQty ?? 1), class: 'no-spinner' });

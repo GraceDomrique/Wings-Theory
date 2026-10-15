@@ -892,6 +892,50 @@ canvas{max-width:100%;}
    no longer references it. */
 .login-err{color:var(--crit); font-size:11.5px; margin-top:10px;}
 
+/* ============ MENU STUDIO (2026-10-15 integrated Menu & Recipes workspace)
+   ============================================================================
+   Left/center/right three-column product editor — see MenuStudio.js's own
+   docstring for why this replaces the old Menu/Recipes/Combos three-page
+   split. */
+.menu-health-strip{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 14px;
+  background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-sm);
+  margin-bottom:14px; font-size:12.5px; color:var(--ink-soft);
+}
+.mhs-item{display:inline-flex; align-items:center; gap:5px;}
+.mhs-item b{color:var(--ink); font-weight:700;}
+.mhs-good{color:var(--good);}
+.mhs-crit{color:var(--crit);}
+.mhs-dot{width:3px; height:3px; border-radius:50%; background:var(--line);}
+
+.studio-layout{display:grid; grid-template-columns:25% 1fr 25%; gap:14px; align-items:start;}
+.studio-col{min-width:0;}
+
+.studio-list-cat{
+  font-size:10.5px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+  color:var(--ink-faint); padding:8px 8px 4px;
+}
+.studio-list-row{
+  display:flex; align-items:center; gap:8px; width:100%; text-align:left; padding:8px;
+  border-radius:var(--radius-sm); border:none; background:none; font-family:inherit; cursor:pointer;
+  transition:background .12s ease;
+}
+.studio-list-row:hover{background:var(--surface-sunk);}
+.studio-list-row.is-active{background:var(--amber-tint);}
+.studio-dot{width:7px; height:7px; border-radius:50%; flex-shrink:0;}
+.studio-dot-good{background:var(--good);}
+.studio-dot-crit{background:var(--crit);}
+.studio-dot-flat{background:var(--ink-faint);}
+
+.studio-price-row{display:flex; align-items:center; gap:10px; margin:4px 0 10px; flex-wrap:wrap;}
+
+.action-chip.is-active{background:var(--amber-tint); border-color:var(--amber); color:var(--amber-deep);}
+
+@media (max-width:1180px){
+  .studio-layout{grid-template-columns:1fr;}
+  .studio-col-left .scrollpane{max-height:320px;}
+}
+
 /* ============ PRINT (Reports > Attention Needed > Print / Save as PDF) ====
    No server-side PDF generation in this codebase (2026-08 audit) -- this is
    the browser's own print-to-PDF instead, so the on-screen preview and the
