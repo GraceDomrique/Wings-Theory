@@ -27,23 +27,29 @@ Safety properties (all verified by scripts/verify_demo_seed.py):
     recommendations through the real, unmodified mining code, per the
     user's explicit request.
 
-Usage (from backend/):
-    python scripts/seed_recent_demo_orders.py
+Usage (from backend/), with WT_ENV/WT_DB set the same way the app itself
+requires everywhere else:
+    WT_ENV=development WT_DB=dev/wings_theory_dev.db python scripts/seed_recent_demo_orders.py
+
+Goes through wt.db.get_conn()/db_path() rather than a bare
+sqlite3.connect(BACKEND_DIR / "wings_theory.db") -- a hardcoded path to the
+PRODUCTION file meant this script could never safely target a dev/demo
+database, and offered no WT_ENV/WT_DB mismatch protection if accidentally
+run with the wrong cwd. Same fix as reset_prod_passwords.py; see that
+script's docstring for the full reasoning.
 """
 from __future__ import annotations
 
 import datetime as _dt
 import random
-import sqlite3
 import sys
 from pathlib import Path
 
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BACKEND_DIR))
 
-from wt import associations, combo_pricing  # noqa: E402
+from wt import associations, combo_pricing, db  # noqa: E402
 
-DB_PATH = BACKEND_DIR / "wings_theory.db"
 SEED = 20260921  # fixed -> idempotent regeneration
 START_DATE = _dt.date(2026, 9, 21)
 END_DATE = _dt.date(2026, 10, 13)
@@ -253,10 +259,9 @@ def discover_and_draft_combos(conn: sqlite3.Connection, max_drafts: int = 8) -> 
 
 
 def main() -> None:
-    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA busy_timeout = 10000")
+    target = db.db_path()  # fails closed if WT_ENV/WT_DB are unset or mismatched
+    print(f"targeting {target} (WT_ENV={db.environment()})")
+    conn = db.connect(target)
     try:
         seed_report = seed(conn)
         combo_report = discover_and_draft_combos(conn)

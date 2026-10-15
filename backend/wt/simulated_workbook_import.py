@@ -377,20 +377,35 @@ def _replay_ledger(conn, wastage_rows: list[dict], count_rows: list[dict],
     return out
 
 
-def insert_ledger_row(conn, lr: dict, user_id: str | None) -> int:
+def insert_ledger_row(conn, lr: dict, user_id: str | None, batch_id: str | None = None) -> int:
     """Shared by run() (user_id=USER_ID, excluded from production training)
     and wt/demo_validation.py's isolated workbook-ground-truth harness
     (user_id=None, so the SAME real detect_anomalies() sees it as eligible
     inside that harness's own throwaway database) -- one INSERT, not two
-    copies that could drift apart."""
+    copies that could drift apart.
+
+    batch_id populates stock_ledger.source_batch_id (migration 0050) the
+    same way insert_reconciliation_row already does for
+    unli_flavor_reconciliation -- without it, a SIMULATED/MIXED-mode
+    provenance query (wt/anomaly.py's _provenance_branches, which matches
+    on source_batch_id IN ml_approved_synthetic_batch) can never find these
+    rows no matter how many are approved, since the column stays NULL.
+    Production's one pre-existing batch got this via a one-time migration
+    0050 UPDATE,
+    which only ever covered that specific historical batch_id -- any batch
+    produced by a later run() call needs it written here, at insert time,
+    to be eligible for SIMULATED-mode training at all. user_id=None callers
+    (wt/demo_validation.py's harness) still pass batch_id=None by default,
+    unchanged: that harness evaluates with mode='REAL' precisely because its
+    rows carry user_id=None (real/NULL provenance), not a batch."""
     cur = conn.execute(
         "INSERT INTO stock_ledger "
         "(ingredient_id, delta_base, balance_after_base, reason, wastage_reason, "
-        " ref_type, ref_id, user_id, note, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        " ref_type, ref_id, user_id, note, created_at, source_batch_id) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
         (lr["ingredient_id"], lr["delta_base"], lr["balance_after_base"], lr["reason"],
          lr["wastage_reason"], lr["ref_type"], lr["ref_id"], user_id, lr["note"],
-         lr["created_at"]),
+         lr["created_at"], batch_id),
     )
     return cur.lastrowid
 
@@ -671,7 +686,7 @@ def run(conn=None, dry_run: bool = False, verbose: bool = True,
             if lr["ref_id"] in existing:
                 duplicates["wastage" if lr["ref_type"] == "sim_wastage" else "counts"] += 1
                 continue
-            insert_ledger_row(conn, lr, USER_ID)
+            insert_ledger_row(conn, lr, USER_ID, batch_id=batch_id)
             if lr["ref_type"] == "sim_wastage":
                 inserted["wastage"] += 1
             else:
