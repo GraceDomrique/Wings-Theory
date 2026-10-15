@@ -355,6 +355,14 @@ input[type=number]{-moz-appearance:textfield;}
   background:linear-gradient(180deg, rgba(14,13,10,0.1) 0%, rgba(14,13,10,0.35) 40%, rgba(14,13,10,0.88) 100%);
 }
 .photo-hero > *{position:relative; z-index:1;}
+/* .photo-hero is a flex column with no align-items set, which defaults to
+   stretch -- its first child, the status Pill, is a direct flex item and
+   was stretching to the hero's full width (a plain inline-flex chip
+   everywhere else in the app, turned into a giant full-width bar only
+   here). Pills and buttons stay their own content width; the stat-tile
+   grid row below them is the one child that's SUPPOSED to span full width,
+   and keeps doing so since grid rows aren't flex items of this rule. */
+.photo-hero > .pill{align-self:flex-start;}
 .photo-hero .card-head{align-items:center;}
 .photo-hero .card-title{color:#fff; font-size:16.5px;}
 .photo-hero .card-desc{color:#D8D1C2;}
