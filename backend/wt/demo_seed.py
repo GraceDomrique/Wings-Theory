@@ -164,11 +164,20 @@ def _new_order(conn: sqlite3.Connection, table_label: str, head_count: int) -> t
     # still-surviving row already holds once enough new rows fill the gap.
     # Identical to the COUNT(*) result whenever the table has never had a
     # row removed (id and row count march together from an empty table).
+    #
+    # created_by=USER_ID ('demo_seed') tags every order this module writes --
+    # this was previously left NULL, which is indistinguishable from a real
+    # POS order (the live order-creation path also leaves it NULL) under
+    # every existing is_demo=0 "real" query. wt/forecasting.py's
+    # _order_provenance_clause() is what now reads this column to tell
+    # SIMULATED-mode Prophet training apart from real demand history;
+    # without this tag, that mode could never find anything to train on no
+    # matter how much history this module generated.
     n = conn.execute("SELECT COALESCE(MAX(id), 0) AS n FROM customer_order").fetchone()["n"]
     order_no = f"WT-{n + 1001}"
     cur = conn.execute(
-        "INSERT INTO customer_order (order_no, table_label, head_count) VALUES (?,?,?)",
-        (order_no, table_label, head_count),
+        "INSERT INTO customer_order (order_no, table_label, head_count, created_by) VALUES (?,?,?,?)",
+        (order_no, table_label, head_count, USER_ID),
     )
     return cur.lastrowid, order_no
 

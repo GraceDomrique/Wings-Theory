@@ -25,8 +25,13 @@ Two different questions:
         hard-failing the page.
 
 Both report "insufficient data" out loud rather than guessing when there
-isn't enough real history yet — no synthetic data is ever mixed into either
-path, Prophet included.
+isn't enough real history yet — no synthetic data is ever mixed into
+either path, Prophet included, UNLESS a caller explicitly asks for
+mode="SIMULATED" (see _order_provenance_clause below) -- the one
+capstone-training exception, for a restaurant too new to have enough real
+history yet. Every live/default caller still gets mode="REAL" exactly as
+before this existed; only wt/ml_training.py's explicit SIMULATED-mode
+training path ever passes anything else.
 """
 from __future__ import annotations
 
@@ -42,6 +47,44 @@ from .errors import NotFoundError
 MIN_DEMAND_SAMPLE_DAYS = 7      # distinct days with at least one sale before a forecast is offered
 MIN_SEASONALITY_WEEKS = 2       # weeks of history before a weekday factor is trusted
 RESIDUAL_SIGMA = 2.5            # how far off its own fit a day must be to be called an outlier
+
+# The one sentinel wt/demo_seed.py stamps on customer_order.created_by for
+# every order it generates (see that module's docstring: a year of
+# realistic, weekday/weekend/trend/mood-varied synthetic history, run
+# through the real reserve_order/commit_order pipeline against an isolated
+# dev database, never production). Mirrors how wt/anomaly.py already
+# distinguishes real vs. simulated stock_ledger rows by user_id -- same
+# idea, applied to customer_order/order_line so Prophet/baseline training
+# can tell "real" and "simulated" demand history apart without a schema
+# change (customer_order.created_by already exists for exactly this kind
+# of provenance tagging).
+SIMULATED_ORDER_USER_ID = "demo_seed"
+DEMAND_MODES = ("REAL", "SIMULATED")
+
+
+def _order_provenance_clause(order_alias: str, mode: str = "REAL") -> str:
+    """SQL fragment (no bind params needed -- the one sentinel is a fixed
+    literal) selecting which customer_order rows a demand query may read,
+    by provenance:
+
+      REAL       created_by is NULL (the normal POS path never sets it) or
+                 a real app_user account -- today's exact, unchanged
+                 behavior for every existing caller.
+      SIMULATED  created_by = the demo_seed sentinel -- ONLY rows
+                 wt/demo_seed.py generated, never real orders, never the
+                 separate is_demo=1 recent-dashboard-demo dataset (a
+                 different, shorter, differently-purposed synthetic set;
+                 see scripts/seed_recent_demo_orders.py's own docstring).
+
+    is_demo=0 is still required by every caller of this clause regardless
+    of mode -- SIMULATED here means "demo_seed's own realistic long-range
+    history", not "also pull in the is_demo=1 dashboard dataset too"."""
+    if mode not in DEMAND_MODES:
+        raise ValueError(f"unknown demand mode {mode!r}")
+    if mode == "SIMULATED":
+        return f"{order_alias}.created_by = '{SIMULATED_ORDER_USER_ID}'"
+    return (f"({order_alias}.created_by IS NULL OR {order_alias}.created_by "
+            f"IN (SELECT username FROM app_user))")
 
 # 2026-09 accuracy-optimization audit: Prophet's own default growth='linear'
 # fits a trend component from whatever history a series has -- on this
@@ -346,7 +389,7 @@ def effective_now(conn: sqlite3.Connection, *, now: _dt.datetime | None = None) 
 
 
 def _daily_series(conn: sqlite3.Connection, menu_item_pk: int, lookback_days: int,
-                  now: _dt.datetime | None = None):
+                  now: _dt.datetime | None = None, mode: str = "REAL"):
     """Real daily sold-qty rows plus the same series zero-filled across every
     calendar day in the window — shared by both forecasting methods below so
     they can't disagree about what "the last N days" contains.
@@ -376,6 +419,7 @@ def _daily_series(conn: sqlite3.Connection, menu_item_pk: int, lookback_days: in
     could have known" principle the rest of this audit applies."""
     bd = timeutil.sql_business_date("o.created_at")
     upper = " AND o.created_at < ?" if now is not None else ""
+    prov = _order_provenance_clause("o", mode)
     params = [menu_item_pk, timeutil.utc_bound_n_manila_days_ago(lookback_days, now)]
     if now is not None:
         params.append(timeutil.utc_upper_bound_sql(now))
@@ -384,7 +428,7 @@ def _daily_series(conn: sqlite3.Connection, menu_item_pk: int, lookback_days: in
         SELECT {bd} AS d, SUM(ol.qty) AS qty
           FROM order_line ol JOIN customer_order o ON o.id = ol.order_id
          WHERE ol.menu_item_id = ? AND o.status != 'void' AND o.is_demo = 0
-           AND o.created_at >= ?{upper}
+           AND {prov} AND o.created_at >= ?{upper}
          GROUP BY {bd}
         """,
         params,
@@ -1150,7 +1194,7 @@ def _backtest_item(item_id: int, item_name: str, rows: list[dict], series: list[
 
 
 def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
-                          now: _dt.datetime | None = None) -> dict:
+                          now: _dt.datetime | None = None, mode: str = "REAL") -> dict:
     """A real chronological rolling backtest across multiple menu items,
     scoring Prophet against three simple baselines on data none of them saw
     while fitting -- not a single 83/7 split on one representative item.
@@ -1198,7 +1242,7 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
     LOOKBACK_FOR_BACKTEST = 365
     candidates = []
     for it in items:
-        rows, series = _daily_series(conn, it["id"], LOOKBACK_FOR_BACKTEST, now=anchor)
+        rows, series = _daily_series(conn, it["id"], LOOKBACK_FOR_BACKTEST, now=anchor, mode=mode)
         candidates.append((it, rows, series))
     candidates.sort(key=lambda c: len(c[1]), reverse=True)
 
@@ -1216,13 +1260,14 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
     for it, rows, series in candidates[ROLLING_MAX_ITEMS:]:
         excluded.append({"item_id": it["id"], "item_name": it["name"],
                          "reason": f"not among the {ROLLING_MAX_ITEMS} items with the most "
-                                   f"real sales history (has {len(rows)} sale-days)"})
+                                   f"{mode.lower()} sales history (has {len(rows)} sale-days)"})
 
     scored_items = [r for r in per_item_results if not r["insufficient_history"]]
     if not scored_items:
         return {
             "available": False,
-            "reason": "not enough real sales history yet for a rolling backtest on any item",
+            "mode": mode,
+            "reason": f"not enough {mode.lower()} sales history yet for a rolling backtest on any item",
             "method_version": EVAL_METHOD_VERSION,
             "items": per_item_results,
         }
@@ -1289,9 +1334,10 @@ def evaluate_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
 
     return {
         "available": True,
+        "mode": mode,
         "method_version": EVAL_METHOD_VERSION,
         "methodology": ("Chronological expanding-window rolling backtest, never a random split. "
-                        f"Up to {ROLLING_MAX_ITEMS} items with the most real sales history, up to "
+                        f"Up to {ROLLING_MAX_ITEMS} items with the most {mode.lower()} sales history, up to "
                         f"{ROLLING_MAX_FOLDS} most-recent folds each, {horizon_days}-day forecast "
                         f"horizon per fold, minimum {ROLLING_MIN_TRAIN_DAYS}-day initial training "
                         "window. Every fold scored for naive-previous-period, trailing-moving-"
@@ -1337,7 +1383,7 @@ STORE_LOOKBACK_FOR_BACKTEST = 365  # matches evaluate_demand_model's per-item lo
 
 
 def _store_daily_series(conn: sqlite3.Connection, lookback_days: int,
-                        now: _dt.datetime | None = None
+                        now: _dt.datetime | None = None, mode: str = "REAL"
                         ) -> dict[str, tuple[list[dict], list[dict]]]:
     """Store-wide daily {orders, items sold, gross sales}, aggregated across
     every menu item rather than one at a time -- the same real
@@ -1362,6 +1408,7 @@ def _store_daily_series(conn: sqlite3.Connection, lookback_days: int,
     # `now` this far), closed on the same principle.
     bd = timeutil.sql_business_date("o.created_at")
     upper = " AND o.created_at < ?" if now is not None else ""
+    prov = _order_provenance_clause("o", mode)
     params = [timeutil.utc_bound_n_manila_days_ago(lookback_days, now)]
     if now is not None:
         params.append(timeutil.utc_upper_bound_sql(now))
@@ -1372,7 +1419,7 @@ def _store_daily_series(conn: sqlite3.Connection, lookback_days: int,
                COALESCE(SUM(ol.qty * ol.unit_price), 0) AS sales
           FROM customer_order o
           JOIN order_line ol ON ol.order_id = o.id
-         WHERE o.status != 'void' AND o.is_demo = 0 AND o.created_at >= ?{upper}
+         WHERE o.status != 'void' AND o.is_demo = 0 AND {prov} AND o.created_at >= ?{upper}
          GROUP BY d
         """,
         params,
@@ -1472,7 +1519,7 @@ def _backtest_store_metric(metric: str, rows: list[dict], series: list[dict],
 
 
 def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
-                                now: _dt.datetime | None = None) -> dict:
+                                now: _dt.datetime | None = None, mode: str = "REAL") -> dict:
     """The same chronological rolling-backtest methodology as
     evaluate_demand_model(), applied to the store's own aggregate daily
     series (orders taken, items sold, gross sales) instead of one menu item
@@ -1489,7 +1536,7 @@ def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
     scoring lower WAPE on the store's own aggregate series IS the selection.
     """
     anchor = effective_now(conn, now=now)
-    per_metric = _store_daily_series(conn, STORE_LOOKBACK_FOR_BACKTEST, now=anchor)
+    per_metric = _store_daily_series(conn, STORE_LOOKBACK_FOR_BACKTEST, now=anchor, mode=mode)
     results = {
         metric: _backtest_store_metric(metric, rows, series, horizon_days,
                                        ROLLING_MIN_TRAIN_DAYS, ROLLING_MAX_FOLDS)
@@ -1499,7 +1546,8 @@ def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
     if not scored:
         return {
             "available": False,
-            "reason": "not enough real store-level history yet for a rolling backtest",
+            "mode": mode,
+            "reason": f"not enough {mode.lower()} store-level history yet for a rolling backtest",
             "method_version": EVAL_METHOD_VERSION,
             "metrics": results,
         }
@@ -1520,6 +1568,7 @@ def evaluate_store_demand_model(conn: sqlite3.Connection, horizon_days: int = 7,
 
     return {
         "available": True,
+        "mode": mode,
         "method_version": EVAL_METHOD_VERSION,
         "methodology": ("Chronological expanding-window rolling backtest -- identical methodology "
                         "to the menu-item backtest above, applied to the store's own aggregate daily "

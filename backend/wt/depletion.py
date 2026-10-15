@@ -586,7 +586,7 @@ GROWTH_SELECTION_LOOKBACK_DAYS = 365
 
 
 def refresh_prophet_baselines(conn: sqlite3.Connection, horizon_days: int = HORIZON_DAYS,
-                              lookback_days: int = LOOKBACK_DAYS) -> dict:
+                              lookback_days: int = LOOKBACK_DAYS, mode: str = "REAL") -> dict:
     """Fit Prophet for every POS-visible menu item and cache the result for
     build_demand() to consult when demand_model='prophet'.
 
@@ -646,7 +646,7 @@ def refresh_prophet_baselines(conn: sqlite3.Connection, horizon_days: int = HORI
     hybrid_unavailable = 0
     hybrid_method_counts: dict[str, int] = {}
     for it in items:
-        rows, series = forecasting._daily_series(conn, it["id"], lookback_days, now=anchor)
+        rows, series = forecasting._daily_series(conn, it["id"], lookback_days, now=anchor, mode=mode)
         key = (scope, it["id"], lookback_days, horizon_days)
         if len(rows) < forecasting.MIN_DEMAND_SAMPLE_DAYS:
             result = None
@@ -656,7 +656,7 @@ def refresh_prophet_baselines(conn: sqlite3.Connection, horizon_days: int = HORI
                 _hybrid_store[key] = (time.monotonic(), None)
         else:
             growth_rows, growth_series = forecasting._daily_series(
-                conn, it["id"], GROWTH_SELECTION_LOOKBACK_DAYS, now=anchor)
+                conn, it["id"], GROWTH_SELECTION_LOOKBACK_DAYS, now=anchor, mode=mode)
             selection = forecasting.select_prophet_growth(
                 growth_rows, growth_series, horizon=horizon_days)
             series_key = f"menu_item:{it['id']}"
@@ -735,7 +735,7 @@ def refresh_prophet_baselines(conn: sqlite3.Connection, horizon_days: int = HORI
     store_growth_flat = store_growth_linear = store_growth_fallback = 0
     for metric in forecasting.STORE_METRICS:
         growth_rows, growth_series = forecasting._store_daily_series(
-            conn, GROWTH_SELECTION_LOOKBACK_DAYS, now=anchor)[metric]
+            conn, GROWTH_SELECTION_LOOKBACK_DAYS, now=anchor, mode=mode)[metric]
         selection = forecasting.select_prophet_growth(
             growth_rows, growth_series, horizon=horizon_days)
         series_key = f"store:{metric}"
@@ -756,6 +756,7 @@ def refresh_prophet_baselines(conn: sqlite3.Connection, horizon_days: int = HORI
             store_growth_flat += 1
 
     return {
+        "mode": mode,
         "itemsConsidered": len(items), "fitted": fitted,
         "insufficientData": insufficient, "fitFailed": failed,
         "horizonDays": horizon_days, "lookbackDays": lookback_days,
@@ -821,7 +822,7 @@ def _save_refresh_status(conn: sqlite3.Connection, status: dict) -> None:
 
 def run_prophet_refresh_job(conn: sqlite3.Connection, *, triggered_by: str,
                             horizon_days: int = HORIZON_DAYS,
-                            lookback_days: int = LOOKBACK_DAYS) -> dict:
+                            lookback_days: int = LOOKBACK_DAYS, mode: str = "REAL") -> dict:
     """The one path both the background scheduler and the manual admin
     endpoint call to actually run refresh_prophet_baselines() -- guards
     against two refreshes overlapping (Prophet fitting a realistic menu
@@ -839,7 +840,7 @@ def run_prophet_refresh_job(conn: sqlite3.Connection, *, triggered_by: str,
         _refresh_running = True
     started_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
     try:
-        summary = refresh_prophet_baselines(conn, horizon_days, lookback_days)
+        summary = refresh_prophet_baselines(conn, horizon_days, lookback_days, mode=mode)
         # Merged, not nested: every existing caller of this endpoint reads
         # fields like body["fitted"] straight off the top level (this used
         # to BE refresh_prophet_baselines()'s own return value) -- the new

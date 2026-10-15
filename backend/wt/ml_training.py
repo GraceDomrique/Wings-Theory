@@ -195,15 +195,25 @@ def train_flavor_consumption_model(
     )
 
 
-def train_demand_prophet(conn: sqlite3.Connection, *, triggered_by: str) -> dict:
+def train_demand_prophet(conn: sqlite3.Connection, *, triggered_by: str, mode: str | None = None) -> dict:
     """Wraps the existing, already-working refresh_prophet_baselines()/
     run_prophet_refresh_job() (depletion.py) with the registry/artifact/
     rollback machinery those never had: snapshots the live stores first,
     lets the refresh run exactly as it always has, then only keeps the new
     fit if the STORE-LEVEL fleet WAPE did not regress beyond
     PROPHET_WAPE_REGRESSION_TOLERANCE against the last ACTIVE run's own
-    recorded figure -- otherwise restores the snapshot (the previous,
-    still-good forecast keeps serving) and records the attempt as 'failed'.
+    recorded figure for the SAME mode -- otherwise restores the snapshot
+    (the previous, still-good forecast keeps serving) and records the
+    attempt as 'failed'.
+
+    mode (SIMULATED/MIXED/REAL, same ladder as the IsolationForest models --
+    see model_registry.MODES) decides which customer_order rows are
+    eligible, via forecasting._order_provenance_clause(): REAL reads real
+    orders only (today's exact default, unchanged for every existing
+    caller); SIMULATED reads ONLY wt/demo_seed.py's sentinel-tagged rows, a
+    capstone/pre-launch path for a restaurant with too little real history
+    yet to fit anything. Mirrors how wt/anomaly.py's IsolationForest passes
+    already take an explicit mode rather than only ever reading real data.
 
     Reports two genuinely different numbers, never conflated into one:
       store_level_prophet_wape  mean WAPE across the 3 store-aggregate
@@ -219,26 +229,37 @@ def train_demand_prophet(conn: sqlite3.Connection, *, triggered_by: str) -> dict
                                 recorded: ~50% item-level vs ~10% store-
                                 level), so reporting only one of them next
                                 to the other's historical context would be
-                                misleading."""
+                                misleading.
+
+    Both numbers, and every other metric below, land in metrics["simulated_
+    metrics"] when mode='SIMULATED' and metrics["real_metrics"] when
+    mode='REAL' -- NEVER both at once, so a dashboard reader can never
+    mistake a synthetic-fixture result for a real-world accuracy claim (the
+    exact rule this module's own docstring states for every other model)."""
     model_key = "demand_prophet"
-    mode = model_registry.get_mode(conn, model_key)
+    mode = mode or model_registry.get_mode(conn, model_key)
+    metrics_bucket = "simulated_metrics" if mode == "SIMULATED" else "real_metrics"
     dataset_version = _fingerprint(conn, "customer_order")
     snapshot = depletion.snapshot_prophet_stores()
     prior_run = model_registry.active_run(conn, model_key)
     prior_store_wape = prior_item_wape = None
-    if prior_run and prior_run["metrics"].get("real_metrics"):
-        prior_real = prior_run["metrics"]["real_metrics"]
-        prior_store_wape = prior_real.get("store_level_prophet_wape")
-        prior_item_wape = prior_real.get("item_level_prophet_wape")
+    # Only compare against a prior run trained under the SAME mode -- a
+    # SIMULATED run's WAPE regressing against a REAL run's (or vice versa)
+    # would compare two different datasets, not two fits of the same one.
+    if prior_run and prior_run["mode"] == mode and prior_run["metrics"].get(metrics_bucket):
+        prior_bucket = prior_run["metrics"][metrics_bucket]
+        prior_store_wape = prior_bucket.get("store_level_prophet_wape")
+        prior_item_wape = prior_bucket.get("item_level_prophet_wape")
 
     def _artifact_from(store_snapshot: tuple[dict, dict]) -> str:
         return artifacts.dump_joblib(
             {"prophet_store": store_snapshot[0], "hybrid_store": store_snapshot[1],
-             "schema_version": PROPHET_SCHEMA_VERSION, "feature_names": None, "model_key": model_key},
+             "schema_version": PROPHET_SCHEMA_VERSION, "feature_names": None, "model_key": model_key,
+             "mode": mode},
             model_key, artifacts.new_run_token(),
         )
 
-    summary = depletion.run_prophet_refresh_job(conn, triggered_by=triggered_by)
+    summary = depletion.run_prophet_refresh_job(conn, triggered_by=triggered_by, mode=mode)
     if not summary.get("lastRunOk", False):
         depletion.restore_prophet_stores(snapshot)
         metrics = {"simulated_metrics": None, "real_metrics": None,
@@ -251,7 +272,7 @@ def train_demand_prophet(conn: sqlite3.Connection, *, triggered_by: str) -> dict
             ok=False, reason="refresh_failed",
         )
 
-    store_eval = forecasting.evaluate_store_demand_model(conn)
+    store_eval = forecasting.evaluate_store_demand_model(conn, mode=mode)
     store_wapes = []
     if store_eval.get("available"):
         for r in store_eval["metrics"].values():
@@ -262,14 +283,19 @@ def train_demand_prophet(conn: sqlite3.Connection, *, triggered_by: str) -> dict
                 store_wapes.append(m["wape"])
     new_store_wape = round(statistics.mean(store_wapes), 4) if store_wapes else None
 
-    item_eval = forecasting.evaluate_demand_model(conn)
+    item_eval = forecasting.evaluate_demand_model(conn, mode=mode)
     new_item_wape = (item_eval["fleet_summary"]["prophet"]["mean_wape"]
                      if item_eval.get("available") else None)
 
-    real_count = summary.get("fitted", 0)
+    fitted_count = summary.get("fitted", 0)
+    real_count = fitted_count if mode == "REAL" else 0
+    synthetic_count = fitted_count if mode == "SIMULATED" else 0
     metrics = {
         "simulated_metrics": None,
-        "real_metrics": {
+        "real_metrics": None,
+        metrics_bucket: {
+            "mode": mode,
+            "fitted_series_count": fitted_count,
             "store_level_prophet_wape": new_store_wape, "prior_store_level_prophet_wape": prior_store_wape,
             "item_level_prophet_wape": new_item_wape, "prior_item_level_prophet_wape": prior_item_wape,
             "items_backtested": item_eval.get("items_evaluated") if item_eval.get("available") else None,
@@ -289,15 +315,30 @@ def train_demand_prophet(conn: sqlite3.Connection, *, triggered_by: str) -> dict
         path = _artifact_from(snapshot)
         return _finish(
             conn, model_key=model_key, mode=mode, dataset_version=dataset_version,
-            real_count=real_count, synthetic_count=0, schema_version=PROPHET_SCHEMA_VERSION,
+            real_count=real_count, synthetic_count=synthetic_count, schema_version=PROPHET_SCHEMA_VERSION,
             metrics=metrics, artifact_path=path, triggered_by=triggered_by,
             ok=False, reason=f"store_level_wape_regressed_{prior_store_wape}_to_{new_store_wape}",
+        )
+
+    # fitted_count == 0 means Prophet fit NOTHING -- every item/metric was
+    # insufficient_history. Accepting that as an 'active' run would let a
+    # zero-fitted registry entry be read as "Prophet is trained" (exactly
+    # what the capstone brief forbids); record it as a failed attempt
+    # instead so the registry/UI can tell "trained" apart from "ran, fit
+    # nothing" at a glance, without needing to parse refresh_summary.
+    if fitted_count == 0:
+        path = _artifact_from(snapshot)
+        return _finish(
+            conn, model_key=model_key, mode=mode, dataset_version=dataset_version,
+            real_count=real_count, synthetic_count=synthetic_count, schema_version=PROPHET_SCHEMA_VERSION,
+            metrics=metrics, artifact_path=path, triggered_by=triggered_by,
+            ok=False, reason=f"zero_series_fitted_insufficient_{mode.lower()}_history",
         )
 
     path = _artifact_from(depletion.snapshot_prophet_stores())
     return _finish(
         conn, model_key=model_key, mode=mode, dataset_version=dataset_version,
-        real_count=real_count, synthetic_count=0, schema_version=PROPHET_SCHEMA_VERSION,
+        real_count=real_count, synthetic_count=synthetic_count, schema_version=PROPHET_SCHEMA_VERSION,
         metrics=metrics, artifact_path=path, triggered_by=triggered_by, ok=True, reason="ok",
     )
 

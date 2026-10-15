@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from wt import anomaly, db, ml_scheduler, ml_startup, ml_training  # noqa: E402
+from wt import anomaly, db, forecasting, ml_scheduler, ml_startup, ml_training  # noqa: E402
 from wt import ml_artifacts_io as artifacts  # noqa: E402
 from wt import model_registry as mr  # noqa: E402
 from wt.db import write_tx  # noqa: E402
@@ -230,6 +230,70 @@ class TestProvenanceClause(_MLTestBase):
         # the way the other tests in this class assume.
         with self.assertRaises(TypeError):
             self._insert_ledger_row(delta=-1, balance_after=1, user_id="owner", ref_id="X")
+
+
+class TestDemandProvenanceClause(_MLTestBase):
+    """wt/forecasting.py's _order_provenance_clause() / mode-aware
+    _daily_series() -- the SIMULATED-mode Prophet training path added so a
+    too-new-to-have-real-history restaurant can still train/evaluate
+    Prophet on wt/demo_seed.py's realistic synthetic history (tagged
+    customer_order.created_by='demo_seed') without ever counting it as
+    real demand. Same provenance-by-sentinel idea as TestProvenanceClause
+    above, applied to customer_order instead of stock_ledger."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.menu_item_id, cls.menu_item_price = cls.conn.execute(
+            "SELECT id, price FROM menu_item WHERE pos_visible=1 AND is_unli=0 LIMIT 1"
+        ).fetchone()
+
+    def _insert_order(self, *, order_no, created_by, created_at, qty=3) -> None:
+        with write_tx(self.conn):
+            cur = self.conn.execute(
+                "INSERT INTO customer_order (order_no, table_label, head_count, status, "
+                " created_by, created_at) VALUES (?, 'T-TEST', 2, 'served', ?, ?)",
+                (order_no, created_by, created_at),
+            )
+            self.conn.execute(
+                "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,?,?)",
+                (cur.lastrowid, self.menu_item_id, qty, self.menu_item_price),
+            )
+
+    def test_real_mode_excludes_demo_seed_rows(self):
+        # A narrow 2-day lookback anchored tightly on this test's own dates
+        # -- these tests share one class-level connection/menu_item, so a
+        # wide window would also pick up another test method's rows on a
+        # different calendar date.
+        self._insert_order(order_no="PROV-REAL-1", created_by=None, created_at="2026-01-05 12:00:00")
+        self._insert_order(order_no="PROV-REAL-2", created_by="demo_seed", created_at="2026-01-05 13:00:00")
+        rows, _ = forecasting._daily_series(self.conn, self.menu_item_id, 2,
+                                            now=_dt.datetime(2026, 1, 6, tzinfo=_dt.timezone.utc), mode="REAL")
+        self.assertEqual(sum(r["qty"] for r in rows), 3)
+
+    def test_simulated_mode_sees_only_demo_seed_rows(self):
+        self._insert_order(order_no="PROV-SIM-1", created_by=None, created_at="2026-02-07 12:00:00")
+        self._insert_order(order_no="PROV-SIM-2", created_by="demo_seed", created_at="2026-02-07 13:00:00", qty=5)
+        rows, _ = forecasting._daily_series(self.conn, self.menu_item_id, 2,
+                                            now=_dt.datetime(2026, 2, 8, tzinfo=_dt.timezone.utc), mode="SIMULATED")
+        self.assertEqual(sum(r["qty"] for r in rows), 5)
+
+    def test_a_different_sentinel_is_neither_real_nor_simulated(self):
+        # scripts/seed_recent_demo_orders.py's own sentinel
+        # ('demo_seed_recent_orders') must stay invisible to BOTH modes --
+        # it is a separate, differently-purposed synthetic dataset
+        # (dashboard/FP-Growth demo data), never Prophet training data.
+        self._insert_order(order_no="PROV-OTHER-1", created_by="demo_seed_recent_orders",
+                           created_at="2026-03-09 12:00:00")
+        now = _dt.datetime(2026, 3, 10, tzinfo=_dt.timezone.utc)
+        real_rows, _ = forecasting._daily_series(self.conn, self.menu_item_id, 2, now=now, mode="REAL")
+        sim_rows, _ = forecasting._daily_series(self.conn, self.menu_item_id, 2, now=now, mode="SIMULATED")
+        self.assertEqual(sum(r["qty"] for r in real_rows), 0)
+        self.assertEqual(sum(r["qty"] for r in sim_rows), 0)
+
+    def test_unknown_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            forecasting._order_provenance_clause("o", "NOT_A_MODE")
 
 
 class TestPassBDerivedViewDoubleCounting(_MLTestBase):
