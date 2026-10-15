@@ -1,16 +1,13 @@
-import { h, mount } from '../../lib/dom.js';
-import { Card, CardHeader } from '../../components/ui/Card.js';
+import { h, mount, icon } from '../../lib/dom.js';
+import { Card } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
-import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
-import { Tabbar } from '../../components/ui/Tabbar.js';
 import { toast } from '../../components/ui/Feedback.js';
-import { BarChart } from '../../components/charts/BarChart.js';
-import { palette, destroyAllCharts } from '../../components/charts/base.js';
 import { count, delta, qty, pct, stamp, humanise, nodata } from '../../lib/format.js';
+import { ICONS } from '../../lib/icons.js';
 import {
   getAnomalies, getIngredientVariance, reviewAnomaly, getFlavorAnomalyEvents,
 } from '../../lib/api/intelligence.js';
@@ -21,50 +18,30 @@ const ANOMALY_LOOKBACK_DAYS = 90;
 const VARIANCE_LOOKBACK_DAYS = 30;
 
 /**
- * Losses & Stock Issues — merges the old Intelligence > Anomaly Detection
- * and Intelligence > Ingredient Variance tabs (2026-09-30 UX/IA redesign):
- * both answer the same business question ("did something go wrong with
- * this ingredient's stock, worth a look") from two different data sources
- * (Isolation Forest flags vs. expected-vs-counted), so they read as one
- * task, not two unrelated "uses ML" screens.
+ * Stock & Usage Reviews — 2026-10-15 rebuild (spec: "Review Center").
+ * Replaces the old three-full-width-tab layout (Stock Loss / Consumption
+ * Variance / Unlimited Wings) with one unified review queue + contextual
+ * inspector. This is a PRESENTATION change: the same four data sources
+ * below (stock-loss Isolation Forest, ingredient variance reconciliation,
+ * Unlimited Wings service-day Isolation Forest, Unlimited Wings
+ * flavor-level Isolation Forest) are fetched exactly as before, through
+ * the same adapters, and are NEVER merged into one score or one meaning of
+ * "anomaly" — every finding keeps its own `detector` identity, shown on
+ * every row and in the inspector, per the explicit instruction that these
+ * are different statistical methods answering different questions.
  *
- * Copy discipline carried over unchanged from the old AnomalyDetection.js
- * (spec section 6 point 5): these are informational flags, never
- * accusations. The confirm/false-positive actions added here are new --
- * `POST /console/anomalies/{id}/review` existed server-side with no UI
- * caller at all until now, which is also why validation_metrics() had zero
- * confirmed labels to score against (see the ML validation notes).
+ * Only stock-loss anomalies have a real backend review action
+ * (POST /console/anomalies/{id}/review) — variance, stream and flavor
+ * findings are calculation/detection-only views with no invented actions
+ * for ones the backend doesn't support (spec: "Do not invent review
+ * actions for a calculation-only view").
  */
-export async function render(ctx) {
-  const isAdmin = (session.user || {}).role === 'admin';
-  const active = ['loss', 'variance', 'consumption'].includes(ctx.tab) ? ctx.tab : 'loss';
-  const body = h('div');
-
-  const shell = h('div', {},
-    Tabbar({
-      items: [
-        { id: 'loss', label: 'Stock loss' },
-        { id: 'variance', label: 'Consumption variance' },
-        { id: 'consumption', label: 'Unlimited Wings consumption' },
-      ],
-      activeId: active,
-      onChange: (id) => {
-        destroyAllCharts();
-        history.replaceState(null, '', `#/losses/${id}`);
-        draw(id);
-      },
-    }),
-    body);
-
-  async function draw(id) {
-    mount(body, id === 'loss' ? await stockLossView(isAdmin)
-      : id === 'variance' ? await varianceView()
-      : await consumptionAnomalyView());
-  }
-
-  await draw(active);
-  return shell;
-}
+const DETECTORS = {
+  stock_loss: { label: 'Stock Loss', icon: ICONS.trash, color: 'crit' },
+  variance: { label: 'Usage Variance', icon: ICONS.packageMinus, color: 'warn' },
+  unli_stream: { label: 'Unlimited Wings', icon: ICONS.utensils, color: 'info' },
+  unli_flavor: { label: 'Unlimited Wings (Flavor)', icon: ICONS.utensils, color: 'info' },
+};
 
 const CATEGORY_LABEL = {
   wastage: 'Wastage',
@@ -72,96 +49,174 @@ const CATEGORY_LABEL = {
   count_adjustment: 'Count adjustment',
 };
 
-async function stockLossView(isAdmin) {
-  let { stockLoss } = await getAnomalies(ANOMALY_LOOKBACK_DAYS);
-  const listHost = h('div');
+/**
+ * 2026-10-15 fix (same root cause documented in varianceDenominatorReliable
+ * below): variance_ratio divides by expected consumption with no floor
+ * beyond "not literally zero" — a tiny-but-real denominator next to a real
+ * absolute discrepancy produces a mathematically correct but practically
+ * meaningless percentage (confirmed live: ratios past 1000%+). This is NOT
+ * a unit-conversion bug (consumed_base/count_variance_base are already the
+ * same base unit server-side) — purely presentational; the backend's own
+ * ratio, flag threshold and which rows get flagged are untouched.
+ */
+function varianceDenominatorReliable(i) {
+  if (!(i.consumedBase > 0)) return false;
+  if (i.receivedBase > 0 && i.consumedBase < i.receivedBase * 0.01) return false;
+  return true;
+}
 
-  const ingredientsInvolved = new Set(stockLoss.map((a) => a.ingredientName)).size;
-  const byIngredient = new Map();
-  for (const a of stockLoss) byIngredient.set(a.ingredientName, (byIngredient.get(a.ingredientName) || 0) + 1);
-  const clusters = [...byIngredient.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8);
+export async function render(ctx) {
+  const isAdmin = (session.user || {}).role === 'admin';
 
-  // Category/priority/review filters -- so a manager can jump straight to
-  // "spoilage, review soon, not yet reviewed" instead of scanning the full
-  // flagged list every time. Filtering never changes the stats/chart above,
-  // which stay computed against the full unfiltered window.
-  const categoriesPresent = [...new Set(stockLoss.map((a) => a.category).filter(Boolean))];
-  let categoryFilter = '';
-  let priorityFilter = '';
-  let reviewFilter = '';
+  // 2026-10-15: getModelDetails() is NOT in this Promise.all — the old
+  // per-tab code only ever called it lazily, when the Unlimited Wings tab
+  // was actually opened, so a slow /console/model-details response never
+  // blocked the page. Fetching it eagerly here (needed for the Model/data
+  // status tile) made that latency block the ENTIRE queue from rendering
+  // at all — found live while verifying this page (stuck on "Loading..."
+  // past 10s). It now loads separately and fills in its own tile once it
+  // resolves; the queue itself never waits on it.
+  let models = null;
+  const modelStatusHost = h('div');
+  getModelDetails().then((m) => { models = m; drawModelStatus(); }).catch(() => { drawModelStatus(); });
 
-  function filteredRows() {
-    return stockLoss.filter((a) => (!categoryFilter || a.category === categoryFilter)
-      && (!priorityFilter || a.priority === priorityFilter)
-      && (!reviewFilter || (reviewFilter === 'unreviewed' ? !a.reviewStatus : a.reviewStatus === reviewFilter)));
+  const [{ stockLoss, consumption_anomalies: streamAnomalies }, varianceReport, flavorEvents] = await Promise.all([
+    getAnomalies(ANOMALY_LOOKBACK_DAYS),
+    getIngredientVariance(VARIANCE_LOOKBACK_DAYS),
+    getFlavorAnomalyEvents(ANOMALY_LOOKBACK_DAYS),
+  ]);
+  const varianceItems = (varianceReport.items || []).filter((i) => i.flagged);
+
+  // ---------------------------------------------------------------------
+  // Normalize all four sources into one queue. Each finding keeps a
+  // `detector` tag (never collapsed into a shared "anomaly score") plus
+  // its own evidence shape in `raw`, read back out by the inspector below
+  // per detector type.
+  // ---------------------------------------------------------------------
+  const findings = [
+    ...stockLoss.map((a) => ({
+      key: `stock_loss_${a.id}`,
+      detector: 'stock_loss',
+      title: a.ingredientName,
+      date: a.timestamp,
+      severity: a.severity,
+      status: a.reviewStatus === 'confirmed_anomaly' ? 'confirmed'
+        : a.reviewStatus === 'false_positive' ? 'false_positive' : 'needs_review',
+      summary: a.flaggedBecause,
+      raw: a,
+    })),
+    ...varianceItems.map((i) => ({
+      key: `variance_${i.ingredient_id}`,
+      detector: 'variance',
+      title: i.name,
+      date: null,
+      severity: 'warn',
+      status: 'calculation_only',
+      summary: `Count variance ${delta(i.countVarianceBase, i.baseUnit).textContent} against expected consumption`,
+      raw: i,
+    })),
+    ...streamAnomalies.map((a, idx) => ({
+      key: `unli_stream_${a.service_date}_${idx}`,
+      detector: 'unli_stream',
+      title: a.label || a.ingredient_name || 'Unlimited Wings',
+      date: a.service_date,
+      severity: 'warn',
+      status: 'needs_review',
+      summary: a.why,
+      raw: a,
+    })),
+    ...flavorEvents.map((e, idx) => ({
+      key: `unli_flavor_${e.serviceDate}_${idx}`,
+      detector: 'unli_flavor',
+      title: e.primaryFlavors.join(', ') || 'Flavor shift',
+      date: e.serviceDate,
+      severity: 'warn',
+      status: 'needs_review',
+      summary: e.why,
+      raw: e,
+    })),
+  ];
+
+  const openCount = findings.filter((f) => f.status === 'needs_review' || f.status === 'calculation_only').length;
+  const completedCount = findings.filter((f) => f.status === 'confirmed' || f.status === 'false_positive').length;
+  const followUpCount = findings.filter((f) => f.status === 'confirmed').length;
+
+  let categoryFilter = 'all';
+  let query = '';
+  let selectedKey = findings[0] ? findings[0].key : null;
+
+  const queueHost = h('div');
+  const inspectorHost = h('div');
+  const filterStripHost = h('div', { class: 'action-strip' });
+
+  function visibleFindings() {
+    const q = query.trim().toLowerCase();
+    return findings.filter((f) => (categoryFilter === 'all' || f.detector === categoryFilter
+      || (categoryFilter === 'unlimited' && (f.detector === 'unli_stream' || f.detector === 'unli_flavor')))
+      && (!q || f.title.toLowerCase().includes(q) || (f.summary || '').toLowerCase().includes(q)));
   }
 
-  const categoryPicker = h('select', {
-    onChange: (e) => { categoryFilter = e.target.value; drawList(); },
-  },
-  h('option', { value: '' }, 'All categories'),
-  ...categoriesPresent.map((c) => h('option', { value: c }, CATEGORY_LABEL[c] || humanise(c))));
+  const FILTER_CHIPS = [
+    ['all', 'All Findings'],
+    ['stock_loss', 'Stock Loss'],
+    ['variance', 'Usage'],
+    ['unlimited', 'Unlimited Wings'],
+  ];
 
-  const priorityPicker = h('select', {
-    onChange: (e) => { priorityFilter = e.target.value; drawList(); },
-  },
-  h('option', { value: '' }, 'All priorities'),
-  h('option', { value: 'review_soon' }, 'Review soon'),
-  h('option', { value: 'worth_a_look' }, 'Worth a look'));
+  function drawFilterStrip() {
+    mount(filterStripHost, ...FILTER_CHIPS.map(([id, label]) => h('button', {
+      class: `action-chip${categoryFilter === id ? ' is-active' : ''}`,
+      onClick: () => { categoryFilter = id; drawFilterStrip(); drawQueue(); },
+    }, label)));
+  }
 
-  const reviewPicker = h('select', {
-    onChange: (e) => { reviewFilter = e.target.value; drawList(); },
-  },
-  h('option', { value: '' }, 'All statuses'),
-  h('option', { value: 'unreviewed' }, 'Not yet reviewed'),
-  h('option', { value: 'confirmed_anomaly' }, 'Confirmed'),
-  h('option', { value: 'false_positive' }, 'False positive'));
+  function statusPill(f) {
+    if (f.status === 'confirmed') return Pill('crit', 'confirmed');
+    if (f.status === 'false_positive') return Pill('flat', 'false positive');
+    if (f.status === 'calculation_only') return Pill('warn', 'flagged');
+    return Pill('warn', 'needs review');
+  }
 
-  function drawList() {
-    const rows = filteredRows();
-    mount(listHost, Table({
-      columns: [
-        { key: 'ingredient', label: 'Ingredient', render: (a) => a.ingredientName },
-        { key: 'when', label: 'When', render: (a) => h('span', { class: 'mono t-xs' }, stamp(a.timestamp)) },
-        { key: 'amount', label: 'Amount', render: (a) => h('span', { class: 't-crit mono t-sm' }, delta(a.amount, a.baseUnit)) },
-        {
-          key: 'category', label: 'Category',
-          render: (a) => a.category ? Pill('flat', CATEGORY_LABEL[a.category] || humanise(a.category)) : null,
-        },
-        {
-          key: 'why', label: 'Why flagged',
-          render: (a) => h('div', {},
-            h('span', { class: 't-sm t-soft' }, a.flaggedBecause),
-            a.reasonCode ? h('div', { class: 't-xs t-faint' }, humanise(a.reasonCode)) : null,
-            a.reviewStatus
-              ? h('div', { class: 't-xs', style: { marginTop: '2px' } },
-                Pill(a.reviewStatus === 'confirmed_anomaly' ? 'crit' : a.reviewStatus === 'false_positive' ? 'flat' : 'info',
-                  a.reviewStatus === 'confirmed_anomaly' ? 'confirmed'
-                    : a.reviewStatus === 'false_positive' ? 'false positive' : humanise(a.reviewStatus)))
-              : null),
-        },
-        {
-          key: 'priority', label: 'Priority',
-          render: (a) => Pill(a.severity, a.priority === 'review_soon' ? 'review soon' : 'worth a look'),
-        },
-        !isAdmin ? null : {
-          key: 'review', label: 'Review',
-          render: (a) => a.reviewStatus
-            ? null
-            : h('div', { style: { display: 'flex', gap: '6px' } },
-              Button({ size: 'sm', onClick: () => doReview(a, 'confirmed_anomaly') }, 'Confirm'),
-              Button({ size: 'sm', onClick: () => doReview(a, 'false_positive') }, 'False positive')),
-        },
-      ].filter(Boolean),
-      rows,
-      empty: EmptyState({
+  function select(key) {
+    selectedKey = key;
+    drawQueue();
+    drawInspector();
+  }
+
+  function drawQueue() {
+    const visible = visibleFindings();
+    if (visible.length === 0) {
+      mount(queueHost, EmptyState({
         icon: '✓',
-        title: stockLoss.length ? 'No flags match this filter' : 'Nothing flagged for review',
-        description: stockLoss.length
-          ? 'Widen or clear the filters above to see the rest of the flagged list.'
-          : 'Waste and stock-count entries are all within each ingredient’s normal range for this window.',
-      }),
-    }));
+        title: findings.length ? 'Nothing matches this filter' : 'Nothing flagged for review',
+        description: findings.length
+          ? 'Widen or clear the filter above to see the rest of the queue.'
+          : `Stock loss, usage variance and Unlimited Wings are all within normal range for their analysis windows.`,
+        tight: true,
+      }));
+      return;
+    }
+    mount(queueHost, h('div', { class: 'scrollpane', style: { maxHeight: '620px' } },
+      ...visible.map((f) => {
+        const det = DETECTORS[f.detector];
+        const isSel = f.key === selectedKey;
+        return h('button', {
+          class: `review-queue-row${isSel ? ' is-active' : ''}`,
+          onClick: () => select(f.key),
+        },
+        h('span', { class: `kpi-icon kpi-icon-${det.color}`, style: { width: '30px', height: '30px', flexShrink: '0' } }, icon(det.icon, 14)),
+        h('span', { style: { flex: '1', minWidth: '0' } },
+          h('div', { class: 't-xs t-faint' }, det.label, f.date ? ` · ${f.date.length > 10 ? stamp(f.date).textContent : f.date}` : ''),
+          h('div', { class: 't-sm t-strong' }, f.title),
+          h('div', { class: 'sub' }, f.summary)),
+        statusPill(f));
+      })));
+  }
+
+  function fieldRow(label, ...value) {
+    return h('div', { class: 'card card-sunk', style: { padding: '9px 11px' } },
+      h('div', { class: 't-xs t-faint' }, label),
+      h('div', { class: 't-strong', style: { marginTop: '2px', fontSize: '13px' } }, ...value));
   }
 
   function doReview(a, status) {
@@ -174,14 +229,14 @@ async function stockLossView(isAdmin) {
         await reviewAnomaly(a.id, status, noteInput.value.trim() || null);
         modal.close();
         a.reviewStatus = status;
+        const f = findings.find((x) => x.detector === 'stock_loss' && x.raw === a);
+        if (f) f.status = status === 'confirmed_anomaly' ? 'confirmed' : 'false_positive';
         toast(status === 'confirmed_anomaly' ? 'Marked as a confirmed anomaly.' : 'Marked as a false positive.', 'good');
-        drawList();
+        drawQueue();
+        drawInspector();
       } catch (e) { err.textContent = e.message; err.style.display = ''; } finally { submit.disabled = false; }
     });
     const modal = Modal({
-      // stamp() returns a Node (lib/format.js), not a string -- Modal's
-      // title accepts either, but only if handed one directly, never
-      // string-interpolated (that stringifies a Node to "[object Text]").
       title: h('span', {}, a.ingredientName, ' — ', stamp(a.timestamp)),
       desc: a.flaggedBecause,
       onClose: () => {},
@@ -191,276 +246,131 @@ async function stockLossView(isAdmin) {
     h('div', { style: { marginTop: '14px', display: 'flex', justifyContent: 'flex-end' } }, submit));
   }
 
-  drawList();
-
-  return h('div', {},
-    h('div', { class: 'callout callout-info', style: { marginBottom: '14px' } },
-      h('p', {}, h('strong', {}, 'What this is. '),
-        'Every time waste is logged or a physical stock count doesn’t match what the system expected, it’s checked against that ingredient’s own normal pattern. Anything unusually large shows up below — a flag worth a look, not proof anything went wrong.')),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3,1fr)', marginBottom: '14px' } },
-      Card({}, Stat({ value: count(stockLoss.length), label: 'Flagged stock losses' })),
-      Card({}, Stat({ value: count(ingredientsInvolved), label: 'Ingredients involved' })),
-      Card({}, Stat({ value: `${ANOMALY_LOOKBACK_DAYS}d`, label: 'Lookback window' }))),
-
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1.3fr' } },
-      Card({},
-        h('div', { class: 'card-title', style: { marginBottom: '10px' } }, 'Where losses cluster'),
-        BarChart({
-          labels: clusters.map(([name]) => name),
-          data: clusters.map(([, n]) => n),
-          color: palette.crit,
-          height: 180,
-          empty: {
-            icon: '✓',
-            title: 'No losses flagged in this window',
-            description: `Nothing in the last ${ANOMALY_LOOKBACK_DAYS} days stood out against each ingredient's own usual pattern.`,
-            tight: true,
-          },
-        })),
-      Card({},
-        CardHeader({
-          title: 'Flagged, for review',
-          desc: isAdmin
-            ? 'Waste and count entries larger than usual for that ingredient — confirm or mark false positive so this model can be scored against real outcomes'
-            : 'Waste and count entries larger than usual for that ingredient — a flag to look into, not a finding',
-        }),
-        h('div', { style: { display: 'flex', gap: '10px', marginBottom: '12px', flexWrap: 'wrap' } },
-          h('label', { class: 'field', style: { minWidth: '160px' } }, 'Category', categoryPicker),
-          h('label', { class: 'field', style: { minWidth: '160px' } }, 'Priority', priorityPicker),
-          h('label', { class: 'field', style: { minWidth: '160px' } }, 'Review status', reviewPicker)),
-        listHost)));
-}
-
-/**
- * 2026-10-15 fix: variance_ratio (backend/wt/reservation.py) divides the
- * absolute count variance by expected consumption with no floor beyond
- * "not literally zero" (EPS = 1e-6) — an ingredient with a real absolute
- * discrepancy but near-zero expected consumption this window produces a
- * mathematically correct but practically meaningless percentage (confirmed
- * live: ratios over 1000%, e.g. 213,565%, when consumedBase was a tiny
- * fraction relative to the ingredient's real throughput). This is NOT a
- * unit-conversion bug — consumed_base and count_variance_base are both
- * already in the same base unit (see reservation.py's own column names)
- * — it's a denominator-too-small problem, so the fix is presentational,
- * not a backend recalculation: the raw ratio/flag threshold (10%, backend-
- * owned) is untouched, only what this column PRINTS changes.
- *
- * "Reliable" is judged against receivedBase for the SAME ingredient, SAME
- * window — an independent real-activity measure already in this row,
- * rather than an arbitrary fixed number (meaningless across grams vs.
- * pieces vs. litres). If this ingredient received real stock but
- * "expected consumption" is under 1% of that, the denominator clearly
- * isn't representative of real throughput.
- */
-function varianceDenominatorReliable(i) {
-  if (!(i.consumedBase > 0)) return false;
-  if (i.receivedBase > 0 && i.consumedBase < i.receivedBase * 0.01) return false;
-  return true;
-}
-
-async function varianceView() {
-  const report = await getIngredientVariance(VARIANCE_LOOKBACK_DAYS);
-  const items = report.items || [];
-  const flagged = items.filter((i) => i.flagged);
-  const counted = items.filter((i) => i.hasCountData);
-  const listHost = h('div');
-
-  // Same "categorize so it's fast to find" filter as the Stock loss tab,
-  // over this table's own three-way status instead of the anomaly reason.
-  let statusFilter = '';
-  function statusOf(i) { return !i.hasCountData ? 'no_count' : i.flagged ? 'review_needed' : 'within_range'; }
-  function filteredItems() {
-    return statusFilter ? items.filter((i) => statusOf(i) === statusFilter) : items;
+  function inspectorHeader(f) {
+    const det = DETECTORS[f.detector];
+    return h('div', { style: { marginBottom: '14px' } },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' } },
+        h('span', { class: `kpi-icon kpi-icon-${det.color}`, style: { width: '26px', height: '26px' } }, icon(det.icon, 13)),
+        h('span', { class: 't-xs t-faint', style: { fontWeight: '700', letterSpacing: '.03em', textTransform: 'uppercase' } }, det.label)),
+      h('div', { class: 'card-title', style: { fontSize: '17px' } }, f.title));
   }
 
-  const statusPicker = h('select', {
-    onChange: (e) => { statusFilter = e.target.value; drawList(); },
-  },
-  h('option', { value: '' }, 'All statuses'),
-  h('option', { value: 'review_needed' }, 'Review needed'),
-  h('option', { value: 'within_range' }, 'Within range'),
-  h('option', { value: 'no_count' }, 'No count data'));
-
-  function drawList() {
-    const rows = filteredItems();
-    mount(listHost, Table({
-      columns: [
-        { key: 'ingredient', label: 'Ingredient', render: (i) => i.name },
-        { key: 'consumed', label: 'Expected consumption', render: (i) => h('span', { class: 'mono t-sm' }, qty(i.consumedBase, i.baseUnit, 'none')) },
-        { key: 'received', label: 'Received', render: (i) => h('span', { class: 'mono t-sm' }, qty(i.receivedBase, i.baseUnit, 'none')) },
-        {
-          key: 'variance', label: 'Count variance',
-          render: (i) => i.hasCountData
-            ? h('span', { class: `mono t-sm ${i.flagged ? 't-crit' : ''}` }, delta(i.countVarianceBase, i.baseUnit))
-            : h('span', { class: 't-xs t-faint' }, nodata('no count in window')),
-        },
-        {
-          key: 'ratio', label: '% of expected',
-          render: (i) => {
-            if (!i.hasCountData) return h('span', { class: 't-xs t-faint' }, '—');
-            if (!varianceDenominatorReliable(i)) {
-              return h('span', {
-                class: 't-xs t-faint',
-                title: `Expected consumption this window (${qty(i.consumedBase, i.baseUnit, 'none').textContent}) is too small relative to this ingredient's real activity for a percentage to be meaningful — see the absolute count variance instead.`,
-              }, 'not meaningful');
-            }
-            return h('span', { class: 'mono t-sm' }, pct(i.varianceRatio === null ? null : i.varianceRatio * 100, 'n/a', 0));
-          },
-        },
-        {
-          key: 'status', label: 'Status',
-          render: (i) => !i.hasCountData ? Pill('flat', 'no count data') : i.flagged ? Pill('warn', 'review needed') : Pill('good', 'within range'),
-        },
-      ],
-      rows,
-      empty: EmptyState({
-        icon: '✓',
-        title: items.length ? 'No ingredients match this filter' : 'No ingredient activity in this window',
-        description: items.length
-          ? 'Widen or clear the status filter above to see the rest of the list.'
-          : `Nothing moved through receiving, recipes, wastage or a physical count in the last ${VARIANCE_LOOKBACK_DAYS} days.`,
-      }),
-    }));
+  function drawStockLossInspector(f) {
+    const a = f.raw;
+    mount(inspectorHost, Card({},
+      inspectorHeader(f),
+      h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '14px' } },
+        fieldRow('Event date', stamp(a.timestamp)),
+        fieldRow('Amount', delta(a.amount, a.baseUnit)),
+        a.category ? fieldRow('Category', CATEGORY_LABEL[a.category] || humanise(a.category)) : null,
+        fieldRow('Priority', a.priority === 'review_soon' ? 'Review soon' : 'Worth a look'),
+        fieldRow('Detection method', 'Isolation Forest (stock-loss model)'),
+        fieldRow('Analysis window', `${ANOMALY_LOOKBACK_DAYS} days`)),
+      h('div', { class: 't-sm t-soft', style: { marginBottom: '14px' } }, a.flaggedBecause),
+      a.reasonCode ? h('div', { class: 't-xs t-faint', style: { marginBottom: '14px' } }, 'Ledger reason: ', humanise(a.reasonCode)) : null,
+      statusPill(f),
+      isAdmin && f.status === 'needs_review'
+        ? h('div', { style: { display: 'flex', gap: '8px', marginTop: '14px' } },
+          Button({ onClick: () => doReview(a, 'confirmed_anomaly') }, 'Confirm'),
+          Button({ variant: 'ghost', onClick: () => doReview(a, 'false_positive') }, 'False positive'))
+        : f.status !== 'needs_review'
+          ? h('div', { class: 't-xs t-faint', style: { marginTop: '10px' } }, 'Already reviewed — this is the recorded decision, not a live recommendation.')
+          : h('div', { class: 't-xs t-faint', style: { marginTop: '10px' } }, 'Admin reviews stock-loss flags from this panel.')));
   }
 
-  drawList();
+  function drawVarianceInspector(f) {
+    const i = f.raw;
+    const reliable = varianceDenominatorReliable(i);
+    mount(inspectorHost, Card({},
+      inspectorHeader(f),
+      h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '14px' } },
+        fieldRow('Expected consumption', qty(i.consumedBase, i.baseUnit, 'none')),
+        fieldRow('Received', qty(i.receivedBase, i.baseUnit, 'none')),
+        fieldRow('Absolute count variance', delta(i.countVarianceBase, i.baseUnit)),
+        fieldRow('% of expected', reliable
+          ? pct(i.varianceRatio === null ? null : i.varianceRatio * 100, 'n/a', 0)
+          : h('span', { title: 'Expected consumption is too small relative to this ingredient\'s real activity for a percentage to be meaningful.' }, nodata('not meaningful'))),
+        fieldRow('Method', 'Expected-vs-counted reconciliation (not a trained model)'),
+        fieldRow('Analysis window', `${varianceReport.days ?? VARIANCE_LOOKBACK_DAYS} days`)),
+      h('div', { class: 'callout callout-info', style: { marginBottom: '0' } },
+        h('p', {}, h('strong', {}, 'Calculation-only. '),
+          'This compares recipe + waste-log consumption against the last physical count — there is no backend review/confirm action for this view. Investigate via a new Stock Count or the ingredient\'s own Stock Activity history.'))));
+  }
 
-  return h('div', {},
-    h('div', { class: 'callout callout-info', style: { marginBottom: '14px' } },
-      h('p', {}, h('strong', {}, 'What this is. '),
-        'For each ingredient, this compares what the recipes + waste log say should have been used against what a physical count actually found. A big gap ("review needed") is worth checking — it could be a missed count, an unrecorded waste, or a real loss.')),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: '14px' } },
-      Card({}, Stat({ value: count(items.length), label: 'Ingredients with activity' })),
-      Card({}, Stat({ value: count(counted.length), label: 'Physically counted' })),
-      Card({}, Stat({ value: count(flagged.length), label: 'Flagged for review' })),
-      Card({}, Stat({ value: `${report.days ?? VARIANCE_LOOKBACK_DAYS}d`, label: 'Window' }))),
+  function drawUnliStreamInspector(f) {
+    const a = f.raw;
+    const details = models && models.anomaly_detection;
+    mount(inspectorHost, Card({},
+      inspectorHeader(f),
+      h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '14px' } },
+        fieldRow('Service date', a.service_date),
+        fieldRow('Covers', count(a.heads)),
+        fieldRow('Variance vs. provisional', pct(a.variance_pct, 'n/a', 1)),
+        fieldRow('Method', a.method === 'isolation_forest' ? 'Isolation Forest' : humanise(a.method)),
+        fieldRow('Analysis window', `${ANOMALY_LOOKBACK_DAYS} days`),
+        fieldRow('Model status', details ? (details.trained_this_call ? 'Trained' : 'Dormant — insufficient real data') : 'Unknown')),
+      h('div', { class: 't-sm t-soft', style: { marginBottom: '0' } }, a.why),
+      h('div', { class: 't-xs t-faint', style: { marginTop: '10px' } },
+        'Informational only — a normal fixed-portion refill never appears here; only a whole reconciled service-day whose measured total looked unusual.')));
+  }
 
-    Card({},
-      CardHeader({
-        title: 'Expected vs. measured, per ingredient',
-        desc: 'Recipe and wastage consumption from the ledger, against what the last physical count in this window found — a variance is context for a manager to review, not a finding of cause',
-      }),
-      h('div', { style: { display: 'flex', gap: '10px', marginBottom: '12px', flexWrap: 'wrap' } },
-        h('label', { class: 'field', style: { minWidth: '160px' } }, 'Status', statusPicker)),
-      listHost));
+  function drawUnliFlavorInspector(f) {
+    const e = f.raw;
+    const details = models && models.flavor_anomaly_detection;
+    mount(inspectorHost, Card({},
+      inspectorHeader(f),
+      h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '8px', marginBottom: '14px' } },
+        fieldRow('Service date', e.serviceDate),
+        fieldRow('Flags that day', count(e.totalFlagged)),
+        fieldRow('Primary flavor(s)', e.primaryFlavors.join(', ') || '—'),
+        fieldRow('Secondary (likely compositional)', e.secondaryFlavors.join(', ') || '—'),
+        fieldRow('Method', 'Isolation Forest (flavor-level model)'),
+        fieldRow('Model status', details ? (details.trained_this_call ? 'Trained' : 'Dormant — insufficient real data') : 'Unknown')),
+      h('div', { class: 't-sm t-soft' }, e.why)));
+  }
+
+  function drawInspector() {
+    const f = findings.find((x) => x.key === selectedKey);
+    if (!f) {
+      mount(inspectorHost, Card({ className: 'kpi-neutral', style: { minHeight: '220px', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+        EmptyState({ icon: icon(ICONS.clipboardList, 26), title: 'Select a finding', description: 'Choose a record on the left to see its full evidence and review options.', tight: true })));
+      return;
+    }
+    if (f.detector === 'stock_loss') return drawStockLossInspector(f);
+    if (f.detector === 'variance') return drawVarianceInspector(f);
+    if (f.detector === 'unli_stream') return drawUnliStreamInspector(f);
+    return drawUnliFlavorInspector(f);
+  }
+
+  function drawModelStatus() {
+    mount(modelStatusHost, models
+      ? h('div', { class: 't-xs', style: { marginTop: '4px' } },
+        modelStatusLine('Stock loss', models.anomaly_detection),
+        modelStatusLine('Unli service-day', models.anomaly_detection),
+        modelStatusLine('Unli flavor', models.flavor_anomaly_detection))
+      : h('div', { class: 't-xs t-faint', style: { marginTop: '4px' } }, 'Loading…'));
+  }
+
+  drawModelStatus();
+  drawFilterStrip();
+  drawQueue();
+  drawInspector();
+  ctx.setSearchHandler((q) => { query = q; drawQueue(); });
+
+  return h('div', { class: 'review-center' },
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '10px', marginBottom: '14px' } },
+      Card({ className: 'kpi-neutral' }, Stat({ value: count(openCount), label: 'Open Reviews' })),
+      Card({ className: 'kpi-neutral' }, Stat({ value: count(completedCount), label: 'Completed Reviews' })),
+      Card({ className: 'kpi-neutral' }, Stat({ value: count(followUpCount), label: 'Needs Follow-up' })),
+      Card({ className: 'kpi-neutral' }, h('div', { class: 't-xs t-faint' }, 'Model / data status'), modelStatusHost)),
+    h('div', { class: 'eyebrow', style: { marginBottom: '8px' } }, 'Review queue'),
+    filterStripHost,
+    h('div', { class: 'studio-layout', style: { gridTemplateColumns: '1.5fr 1fr', marginTop: '10px' } },
+      h('div', { class: 'studio-col' }, Card({ style: { padding: '8px' } }, queueHost)),
+      h('div', { class: 'studio-col' }, inspectorHost)));
 }
 
-/**
- * 2026-10 fix: the backend has returned consumption_anomalies (stream-level,
- * reconciled Unlimited Wings service-days) and flavor-level anomaly events
- * since they were built, but nothing in the console rendered either — this
- * tab is that missing UI. Two separate sections, never merged into one list
- * (wt/anomaly.py's own module docstring: the stock-loss pass above, this
- * stream-level pass, and the flavor-level pass answer three different
- * questions and must never blend). Each section shows its own model's
- * dormant/trained state honestly (from GET /console/model-details) instead
- * of letting an empty list read as "nothing wrong" when the real reason is
- * "no real reconciled data exists yet to train on" — see the 2026-10-05
- * forensic audit finding that unli_reconciliation currently has zero real
- * rows in this deployment.
- *
- * A routine, fixed 3-pieces-per-head refill is never flagged here: both
- * passes operate on reconciled SERVICE-DAYS (unli.record_reconciliation()
- * output), not individual refill rounds — there is no granularity at which
- * a normal refill could even appear as a row to flag.
- */
-async function consumptionAnomalyView() {
-  const [{ consumption_anomalies: streamAnomalies }, flavorEvents, models] = await Promise.all([
-    getAnomalies(ANOMALY_LOOKBACK_DAYS),
-    getFlavorAnomalyEvents(ANOMALY_LOOKBACK_DAYS),
-    getModelDetails().catch(() => null),
-  ]);
-
-  const streamDetails = models && models.anomaly_detection;
-  const flavorDetails = models && models.flavor_anomaly_detection;
-
-  return h('div', {},
-    h('div', { class: 'callout callout-info', style: { marginBottom: '14px' } },
-      h('p', {}, h('strong', {}, 'What this is. '),
-        'Each day’s unlimited-wings weigh-in is compared against that stream’s own usual pattern. A normal 3-piece refill round never shows up here — only a whole reconciled day whose total measured consumption looked unusually high or low.')),
-    Card({},
-      CardHeader({
-        title: 'Unlimited Wings Consumption Anomaly Detection',
-        desc: 'Reconciled service-days whose measured consumption looked unusual against this stream\'s own history — informational only, never an accusation, and never raised by an ordinary fixed-portion refill',
-      }),
-      consumptionModelStatus(streamDetails),
-      streamAnomalies.length === 0
-        ? EmptyState({
-          icon: '✓',
-          title: (streamDetails && streamDetails.trained_this_call)
-            ? 'Nothing flagged for review'
-            : 'Nothing to show yet',
-          description: (streamDetails && streamDetails.trained_this_call)
-            ? `Reconciled days in the last ${ANOMALY_LOOKBACK_DAYS} days are all within this stream's normal pattern.`
-            : 'This model has not trained on enough real reconciled service-days yet — see the status above.',
-        })
-        : Table({
-          columns: [
-            { key: 'date', label: 'Service date', render: (a) => h('span', { class: 'mono t-xs' }, a.service_date) },
-            { key: 'stream', label: 'Stream', render: (a) => a.label || a.ingredient_name },
-            { key: 'heads', label: 'Covers', render: (a) => h('span', { class: 'mono t-sm' }, count(a.heads)) },
-            {
-              key: 'variance', label: 'Variance vs. provisional',
-              render: (a) => h('span', { class: 'mono t-sm t-crit' }, pct(a.variance_pct, 'n/a', 1)),
-            },
-            { key: 'why', label: 'Why flagged', render: (a) => h('span', { class: 't-sm t-soft' }, a.why) },
-            {
-              key: 'method', label: 'Method',
-              render: (a) => Pill('flat', a.method === 'isolation_forest' ? 'isolation forest' : humanise(a.method)),
-            },
-          ],
-          rows: streamAnomalies,
-          empty: EmptyState({ icon: '✓', title: 'Nothing flagged', description: '' }),
-        })),
-
-    Card({ style: { marginTop: '14px' } },
-      CardHeader({
-        title: 'Flavor-Level Consumption Anomaly Detection',
-        desc: 'The same reconciled-consumption question, one dimension finer — per-flavour share of a stream\'s wings on a given day, grouped into one event per date so a compositional shift reads as a single alert',
-      }),
-      consumptionModelStatus(flavorDetails),
-      flavorEvents.length === 0
-        ? EmptyState({
-          icon: '✓',
-          title: (flavorDetails && flavorDetails.trained_this_call)
-            ? 'Nothing flagged for review'
-            : 'Nothing to show yet',
-          description: (flavorDetails && flavorDetails.trained_this_call)
-            ? `Reconciled flavour-days in the last ${ANOMALY_LOOKBACK_DAYS} days are all within normal range.`
-            : 'This model has not trained on enough real reconciled flavour-days yet — see the status above.',
-        })
-        : Table({
-          columns: [
-            { key: 'date', label: 'Service date', render: (e) => h('span', { class: 'mono t-xs' }, e.serviceDate) },
-            {
-              key: 'primary', label: 'Primary flavour(s)',
-              render: (e) => e.primaryFlavors.map((f) => Pill('warn', f)),
-            },
-            {
-              key: 'secondary', label: 'Secondary (likely compositional)',
-              render: (e) => e.secondaryFlavors.length
-                ? h('span', { class: 't-xs t-soft' }, e.secondaryFlavors.join(', '))
-                : h('span', { class: 't-xs t-faint' }, '—'),
-            },
-            { key: 'count', label: 'Flags that day', render: (e) => count(e.totalFlagged) },
-            { key: 'why', label: 'Why', render: (e) => h('span', { class: 't-sm t-soft' }, e.why) },
-          ],
-          rows: flavorEvents,
-          empty: EmptyState({ icon: '✓', title: 'Nothing flagged', description: '' }),
-        })));
-}
-
-/** Honest model-status line shared by both consumption sections above —
- * never fabricates a signal when there isn't enough real data to train on
- * (per the 2026-10-05 forensic audit, this deployment's own
- * unli_reconciliation table currently has zero real, non-synthetic rows). */
-function consumptionModelStatus(details) {
-  if (!details) return null;
-  const trained = !!details.trained_this_call;
-  return h('div', { class: 't-xs t-faint', style: { marginBottom: '10px' } },
-    trained
-      ? `Model trained on ${details.records_evaluated} real reconciled day(s) in this window.`
-      : `Model dormant — ${details.records_evaluated} real reconciled day(s) in this window `
-        + `(needs ${details.min_reconciled_days}+ to train). Synthetic/simulated rows are excluded `
-        + 'from training and flagging, never presented as real evidence.');
+function modelStatusLine(label, details) {
+  if (!details) return h('div', {}, label, ': ', nodata('unknown'));
+  return h('div', {}, label, ': ', details.trained_this_call ? h('span', { class: 't-good' }, 'trained') : h('span', { class: 't-warn' }, 'dormant'));
 }

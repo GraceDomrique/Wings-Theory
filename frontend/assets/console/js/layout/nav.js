@@ -273,7 +273,7 @@ export const PAGE_SUB = {
   receiving: 'Record a delivery and see what has recently come in.',
   expiry: 'Oldest stock first, so it gets used before it turns.',
   stockcounts: 'Compare what the system expects on hand against a physical count.',
-  losses: 'Stock loss, consumption variance and Unlimited Wings findings — one review queue, three separate detectors.',
+  losses: 'Investigate unusual inventory and consumption activity — stock loss, usage variance, and Unlimited Wings, each its own detector. A flag to look into, never an accusation.',
   unli: 'Weigh-ins, sign-off, and the portion rate they’re measured against.',
   unlisummary: 'How Unlimited Wings consumption has tracked against the estimate.',
   movements: 'Every stock change, in order — received, used, wasted, counted, corrected.',

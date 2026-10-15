@@ -978,6 +978,16 @@ canvas{max-width:100%;}
 .account-security-panel{padding:22px 20px;}
 .account-security-field{display:block; margin-bottom:14px;}
 
+/* ============ STOCK & USAGE REVIEWS (2026-10-15 unified Review Center) ====
+   ============================================================================ */
+.review-queue-row{
+  display:flex; align-items:center; gap:10px; width:100%; text-align:left; padding:10px;
+  border-radius:var(--radius-sm); border:none; background:none; font-family:inherit; cursor:pointer;
+  transition:background .12s ease; margin-bottom:4px;
+}
+.review-queue-row:hover{background:var(--surface-sunk);}
+.review-queue-row.is-active{background:var(--amber-tint);}
+
 /* ============ MENU STUDIO (2026-10-15 integrated Menu & Recipes workspace)
    ============================================================================
    Left/center/right three-column product editor — see MenuStudio.js's own
