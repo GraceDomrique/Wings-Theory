@@ -253,21 +253,23 @@ export async function render(ctx) {
   const completedCount = all.filter((po) => po.status === 'received').length;
   const cancelledCount = all.filter((po) => po.status === 'cancelled').length;
 
+  // 2026-10-15 recompose: the title/action line and the 4 stat tiles used to
+  // be two separate full-width rows (title row, then a 4-up tile row below
+  // it) — the same "stacked equal rows" shape fixed on Inventory and Menu.
+  // The title+action block now pairs beside a compact 2x2 tile grid instead,
+  // so the page's own "what you do here" and "what's the current count"
+  // read as one composed header instead of two.
   return h('div', {},
-    // Was crammed into the same row as the 4 stat tiles (flex:1 grid plus a
-    // button squeezed beside it) -- its own header line now, so the action
-    // reads as "the thing you do on this page" rather than a fifth,
-    // oddly-shaped tile.
-    h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' } },
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1.1fr 1fr', gap: '18px', marginBottom: '18px', alignItems: 'center' } },
       h('div', {},
-        h('div', { class: 'eyebrow', style: { marginBottom: '2px' } }, 'Purchase orders'),
-        h('div', { class: 't-sm t-faint' }, 'Draft, in progress, completed and cancelled, all in one place.')),
-      isOwner ? Button({ variant: 'primary', onClick: () => ctx.navigate('stockreplenishment') }, '+ Create Purchase Order') : null),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', marginBottom: '18px' } },
-      StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(draftCount), label: 'Draft' }),
-      StatTile({ iconPath: ICON.cart, severity: inProgressCount > 0 ? 'warn' : 'good', value: count(inProgressCount), label: 'In Progress' }),
-      StatTile({ iconPath: ICON.cart, severity: 'good', value: count(completedCount), label: 'Completed' }),
-      StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(cancelledCount), label: 'Cancelled' })),
+        h('div', { class: 'eyebrow', style: { marginBottom: '4px' } }, 'Purchase orders'),
+        h('div', { class: 't-sm t-faint', style: { marginBottom: '14px' } }, 'Draft, in progress, completed and cancelled, all in one place.'),
+        isOwner ? Button({ variant: 'primary', onClick: () => ctx.navigate('stockreplenishment') }, '+ Create Purchase Order') : null),
+      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2,1fr)', gap: '10px' } },
+        StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(draftCount), label: 'Draft' }),
+        StatTile({ iconPath: ICON.cart, severity: inProgressCount > 0 ? 'warn' : 'good', value: count(inProgressCount), label: 'In Progress' }),
+        StatTile({ iconPath: ICON.cart, severity: 'good', value: count(completedCount), label: 'Completed' }),
+        StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(cancelledCount), label: 'Cancelled' }))),
     tabbarHost,
     h('div', { style: { marginTop: '14px', marginBottom: '14px' } }, listHost),
     detailHost);
