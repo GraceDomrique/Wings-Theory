@@ -17,17 +17,22 @@ import { openOrderDetail } from './orderDetailModal.js';
  * record the till itself reads — this is a second reader, never a second
  * calculation, and nothing here can change a completed order.
  *
- * Range picker added so this console page can actually reach more than the
- * till's own 3-month/200-row default (list_orders' docstring always claimed
- * the console route was exempt from that cap — it wasn't wired up until
- * now). Backend limit tops out at 5000 rows per request; when the range
- * holds more than that, the header says so rather than silently truncating.
+ * Range picker lets this console page reach more than the till's own
+ * 3-month/200-row default. Search and paging are both server-side
+ * (2026-10-15) — on a dataset of 33k+ orders, loading up to 5000 rows and
+ * filtering them in the browser put over a year of real history out of
+ * reach under "All time" (the most recent 5000 only reached back a few
+ * months) with no way to page further, and a search only ever matched
+ * whatever page happened to already be loaded. Each page now holds at most
+ * PAGE_SIZE rows; Previous/Next move the server-side offset, and typing in
+ * Search re-queries the server instead of filtering what's in memory.
  */
 const RANGE_OPTIONS = [
   { value: '90', label: 'Last 90 days' },
   { value: '365', label: 'Last 12 months' },
   { value: 'all', label: 'All time' },
 ];
+const PAGE_SIZE = 100;
 
 export async function render(ctx) {
   const shell = h('div');
@@ -38,27 +43,31 @@ export async function render(ctx) {
   let range = '365';
   let query = '';
   let statusFilter = '';
+  let offset = 0;
+  let searchDebounce = null;
 
   async function load() {
-    const opts = { status: 'all', limit: 5000 };
+    const opts = { status: 'all', limit: PAGE_SIZE, offset };
     if (range === 'all') opts.allTime = true;
     else {
       const d = new Date();
       d.setDate(d.getDate() - Number(range));
       opts.startDate = d.toISOString().slice(0, 10);
     }
+    if (query.trim()) opts.q = query.trim();
     const out = await listOrders(opts);
     orders = out.orders;
     totalCount = out.totalCount;
   }
 
   function matches(o) {
+    // Status is the one filter still applied client-side: it's cheap (one
+    // page, max PAGE_SIZE rows) and keeping it local avoids a round-trip on
+    // every click of the status dropdown. Search and date range are both
+    // server-side now — see load() — since those need to reach rows this
+    // page never fetched.
     if (statusFilter && o.status !== statusFilter) return false;
-    if (!query) return true;
-    const q = query.toLowerCase();
-    return String(o.orderNo || '').toLowerCase().includes(q)
-      || (o.tableLabel || '').toLowerCase().includes(q)
-      || (o.itemNames || '').toLowerCase().includes(q);
+    return true;
   }
 
   function statusPill(o) {
@@ -100,7 +109,21 @@ export async function render(ctx) {
       }));
     }
 
-    const searchInput = h('input', { type: 'text', placeholder: 'Order #, table, or item…', onInput: (e) => { query = e.target.value; draw(); } });
+    const searchInput = h('input', {
+      type: 'text', placeholder: 'Order #, table, or item…', value: query,
+      // Debounced server-side search (2026-10-15): every keystroke used to
+      // just re-filter the page already in memory; now it re-queries the
+      // backend, which is the only way to reach an order outside the
+      // current page of 100. Debounced so typing doesn't fire a request per
+      // keystroke, and reset to offset 0 — a search result page numbered
+      // from wherever Previous/Next last left off would be confusing.
+      onInput: (e) => {
+        query = e.target.value;
+        offset = 0;
+        clearTimeout(searchDebounce);
+        searchDebounce = setTimeout(async () => { await refresh(); }, 350);
+      },
+    });
     const statusPicker = h('select', { onChange: (e) => { statusFilter = e.target.value; draw(); } },
       h('option', { value: '' }, 'All statuses'),
       h('option', { value: 'served' }, 'Served'),
@@ -108,24 +131,39 @@ export async function render(ctx) {
       h('option', { value: 'in_progress' }, 'In progress'),
       h('option', { value: 'punched' }, 'Punched'));
     const rangePicker = h('select', {
-      onChange: async (e) => { range = e.target.value; await refresh(); },
+      onChange: async (e) => { range = e.target.value; offset = 0; await refresh(); },
     }, ...RANGE_OPTIONS.map((o) => h('option', { value: o.value, selected: o.value === range ? 'selected' : undefined }, o.label)));
 
-    const truncated = totalCount != null && totalCount > orders.length;
+    const pageStart = totalCount === 0 ? 0 : offset + 1;
+    const pageEnd = offset + orders.length;
+    const prevBtn = Button({
+      size: 'sm', variant: 'ghost', disabled: offset === 0,
+      onClick: async () => { offset = Math.max(0, offset - PAGE_SIZE); await refresh(); },
+    }, '← Previous');
+    const nextBtn = Button({
+      size: 'sm', variant: 'ghost', disabled: totalCount == null || pageEnd >= totalCount,
+      onClick: async () => { offset += PAGE_SIZE; await refresh(); },
+    }, 'Next →');
+    const pager = h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginTop: '12px', justifyContent: 'flex-end' } },
+      h('span', { class: 't-xs t-faint' },
+        totalCount ? `Showing ${pageStart.toLocaleString()}–${pageEnd.toLocaleString()} of ${totalCount.toLocaleString()}` : ''),
+      prevBtn, nextBtn);
+
     draw();
 
     mount(shell, Card({},
       CardHeader({
-        title: `Order history (${orders.length}${truncated ? ` of ${totalCount}` : ''})`,
-        desc: truncated
-          ? `Showing the most recent ${orders.length.toLocaleString()} of ${totalCount.toLocaleString()} orders in this range — narrow the range or widen it in smaller steps to see the rest.`
-          : 'Voided orders included and clearly marked',
+        title: `Order history${totalCount != null ? ` (${totalCount.toLocaleString()})` : ''}`,
+        desc: query.trim()
+          ? `Searching every order in this range for "${query.trim()}" — not just this page`
+          : 'Voided orders included and clearly marked · search and paging both reach the full range on the server',
         right: h('label', { class: 'field' }, rangePicker),
       }),
       h('div', { style: { display: 'flex', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' } },
         h('label', { class: 'field', style: { minWidth: '220px' } }, 'Search', searchInput),
         h('label', { class: 'field', style: { minWidth: '160px' } }, 'Status', statusPicker)),
-      host));
+      host,
+      pager));
   }
 
   async function refresh() {
