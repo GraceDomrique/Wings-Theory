@@ -156,12 +156,20 @@ export function Sidebar({ activeId, onNavigate }) {
   }, icon(ICONS.userRound), h('span', { class: 'nav-item-label' }, 'Account Settings'));
   leafButtons.set('settings', settingsBtn);
 
+  // 2026-10-15 brand redesign: one WT wing monogram (ICONS.brandMark) for
+  // both roles — a generic orange square with a plain letter "W" replaced
+  // with an original mark, per role-accent color (see app.css's
+  // --brand-accent, scoped to this component only — not the console's
+  // existing --role-accent nav-highlight system). This is the console
+  // shell's own chrome; the official Wings Theory restaurant logo
+  // (/img/logo.png, used on the sign-in screen) is untouched.
+  const subtitle = role === 'owner' ? 'Owner Intelligence' : 'Operations Console';
   const el = h('aside', { class: 'sidebar' },
     h('div', { class: 'brand' },
-      h('div', { class: 'brand-mark' }, 'W'),
+      h('div', { class: 'brand-mark' }, icon(ICONS.brandMark, 20)),
       h('div', { class: 'brand-text' },
         h('div', { class: 't1' }, 'Wings Theory'),
-        h('div', { class: 't2' }, 'Operations Console'))),
+        h('div', { class: 't2' }, subtitle))),
     h('nav', { class: 'nav-tree' }, ...nodes),
     h('div', { class: 'nav-foot' }, settingsBtn),
     collapseBtn);

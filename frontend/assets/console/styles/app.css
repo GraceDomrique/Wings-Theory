@@ -63,13 +63,25 @@ body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
   background:var(--nav-bg); color:#EDE7D9; display:flex; flex-direction:column;
   padding:18px 12px; border-right:1px solid var(--nav-bg-deep); overflow-y:auto;
 }
+/* Brand mark accent (2026-10-15) — deliberately its OWN variable, not
+   --role-accent: --role-accent already carries a documented, intentional
+   split (slate blue for Admin's active-nav state, distinct from the brand's
+   burnt orange) that the console's working nav highlighting depends on.
+   The brand identity spec asks for a DIFFERENT split (burnt orange for
+   Admin, muted champagne for Owner) scoped to the logo mark itself, so it
+   gets its own token rather than overloading --role-accent and breaking
+   the nav-highlight distinction it already carries. */
+:root{--brand-accent:var(--amber);}
+body.role-owner{--brand-accent:#C4A477;}
+
 .brand{display:flex; align-items:center; gap:10px; padding:6px 8px 18px; border-bottom:1px solid rgba(255,255,255,0.08); margin-bottom:14px;}
 .brand-mark{
-  width:34px; height:34px; border-radius:8px; background:linear-gradient(155deg,var(--amber),var(--amber-deep));
-  display:flex; align-items:center; justify-content:center; font-family:var(--font-display); font-weight:700; font-size:16px; color:var(--ink); flex-shrink:0;
+  width:34px; height:34px; border-radius:8px; background:var(--brand-accent);
+  display:flex; align-items:center; justify-content:center; color:var(--nav-bg); flex-shrink:0;
 }
+.brand-mark svg{width:20px; height:20px;}
 .brand-text .t1{font-family:var(--font-display); font-weight:700; font-size:15.5px; letter-spacing:.2px; color:#fff;}
-.brand-text .t2{font-size:10px; letter-spacing:1.4px; text-transform:uppercase; color:#9C9385; margin-top:1px;}
+.brand-text .t2{font-size:10px; letter-spacing:1.4px; text-transform:uppercase; color:var(--brand-accent); margin-top:1px;}
 
 /* flex:1 so the nav list (not the sidebar's own overflow) absorbs leftover
    vertical space -- otherwise .sidebar-photo and .sidebar-foot below it

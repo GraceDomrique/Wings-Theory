@@ -50,6 +50,12 @@ export const ICONS = {
   close: '<path d="M18 6 6 18"/><path d="m6 6 12 12"/>',
   imagePlus: '<path d="M10.3 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v9.3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/><path d="M16 19h6"/><path d="M19 16v6"/>',
   trash: '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  // Brand mark (2026-10-15) — an original WT monogram, not a Lucide icon or
+  // emoji. Three angular peaks read simultaneously as a "W" silhouette and
+  // as a row of raised wingtips (the geometric "subtle wing symbol" the
+  // brand spec asks for) — deliberately one continuous stroke, no
+  // gradients, no feather detail, so it still reads cleanly at 24px.
+  brandMark: '<path d="M3 7l4.2 11 3.3-7.5L13.8 18l4.2-11"/><path d="M17.3 9.5L21 7"/>',
 };
 
 /** Convenience: `iconName('package', 20)` → an <svg> node, via lib/dom.js's icon(). */
