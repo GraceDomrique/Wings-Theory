@@ -124,8 +124,9 @@ import statistics
 import threading
 import time
 
-from . import forecasting, reservation, timeutil
+from . import forecasting, model_registry, reservation, timeutil
 from .db import write_tx
+from .errors import RegistryUnavailableError
 
 # 2026-10-08: same structural real-vs-synthetic test as wt/anomaly.py's
 # _REAL_USER_CLAUSE (see that module's SYNTHETIC_SEED_USER_IDS comment for
@@ -494,7 +495,8 @@ class DemandSeries:
 
     __slots__ = ("key", "name", "baseline", "factors", "sigma", "today_actual",
                  "today_remaining", "pace", "pace_adjustment", "momentum",
-                 "trading_days", "seasonality", "daily", "sigma_daily", "demand_source")
+                 "trading_days", "seasonality", "daily", "sigma_daily", "demand_source",
+                 "model_mode", "model_run_id")
 
     def __init__(self, key, name, points, today, share_by_now, horizon_days):
         self.key = key
@@ -551,6 +553,13 @@ class DemandSeries:
         # going", which a periodically-refreshed day-ahead model cannot
         # itself know.
         self.demand_source = "ewma"
+        # Set only when build_demand() substitutes a fresh cached Prophet/
+        # hybrid fit for this series (see build_demand()'s own comment) --
+        # None here (the EWMA/day-of-week nowcast model, always available,
+        # never backed by a trained artifact) is itself meaningful: it is
+        # what makes as_dict()'s isFallback true below.
+        self.model_mode = None
+        self.model_run_id = None
 
     @property
     def today_projected_total(self) -> float:
@@ -568,6 +577,21 @@ class DemandSeries:
             "paceAdjustment": round(self.pace_adjustment, 3),
             "momentum": round(self.momentum, 3),
             "demandSource": self.demand_source,
+            # Additive, backward-compatible: every existing field above is
+            # unchanged. "mode" is the demand_prophet registry run's
+            # SIMULATED/MIXED/REAL (None when isFallback -- the EWMA
+            # nowcast is not trained on anything, so it has no mode to
+            # report). "isFallback" is true exactly when demand_source is
+            # the always-available EWMA/day-of-week model rather than a
+            # cached Prophet/hybrid fit, true/false computed the same way
+            # the pre-existing demandSource field already is -- this never
+            # changes which number is actually served, only how it is
+            # labeled.
+            "modelProvenance": {
+                "mode": self.model_mode,
+                "trainingRunId": self.model_run_id,
+                "isFallback": self.model_mode is None,
+            },
         }
 
 
@@ -993,6 +1017,20 @@ def build_demand(conn: sqlite3.Connection, lookback_days: int = LOOKBACK_DAYS,
         "SELECT id, name, category, recipe_id, is_unli, price FROM menu_item WHERE pos_visible = 1"
     ).fetchall()
 
+    # Fetched once per call (never per item) -- this is a registry lookup,
+    # not a refit, and every item sourced from the cache this call shares
+    # the one active demand_prophet run that produced it. None when
+    # demand_model='ewma' doesn't need it, or the registry table isn't
+    # migrated yet (RegistryUnavailableError) -- either way every item's
+    # modelProvenance correctly falls back to isFallback=True rather than
+    # raising.
+    active_prophet_run = None
+    if demand_model in ("prophet", "hybrid"):
+        try:
+            active_prophet_run = model_registry.active_run(conn, "demand_prophet")
+        except RegistryUnavailableError:
+            active_prophet_run = None
+
     series: dict[int, DemandSeries] = {}
     meta: dict[int, sqlite3.Row] = {}
     for it in items:
@@ -1017,6 +1055,9 @@ def build_demand(conn: sqlite3.Connection, lookback_days: int = LOOKBACK_DAYS,
                     # produced.
                     s.sigma_daily[k] = max(0.0, day["high"] - day["low"]) / (2 * 1.2816)
                 s.demand_source = "prophet" if demand_model == "prophet" else pf.get("method_used", "prophet")
+                if active_prophet_run is not None:
+                    s.model_mode = active_prophet_run["mode"]
+                    s.model_run_id = active_prophet_run["id"]
         series[it["id"]] = s
         meta[it["id"]] = it
 
@@ -1034,6 +1075,7 @@ def build_demand(conn: sqlite3.Connection, lookback_days: int = LOOKBACK_DAYS,
         "heads": head_series,
         "horizon_days": horizon_days,
         "lookback_days": lookback_days,
+        "active_prophet_run": active_prophet_run,
     }
 
 
@@ -1790,6 +1832,18 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
             # demand.demandSource in ingredient_detail()'s drivers for the
             # per-item breakdown when an ingredient mixes both.
             "demandSource": "prophet" if prophet_driven[ing_id] else "ewma",
+            # Additive, backward-compatible aggregate of the per-item
+            # modelProvenance above: mode/trainingRunId come from the one
+            # active demand_prophet run (shared by every contributing item
+            # this call ever sourced from the cache), isFallback mirrors
+            # demandSource=='ewma' exactly -- never a second judgment call.
+            "modelProvenance": {
+                "mode": demand["active_prophet_run"]["mode"] if (
+                    prophet_driven[ing_id] and demand["active_prophet_run"]) else None,
+                "trainingRunId": demand["active_prophet_run"]["id"] if (
+                    prophet_driven[ing_id] and demand["active_prophet_run"]) else None,
+                "isFallback": not prophet_driven[ing_id],
+            },
             "daysOfSupply": round(depletion_idx, 2) if depletion_idx is not None else None,
             "depletionDate": depletion_date,
             "depletesWithinHorizon": depletion_idx is not None,
@@ -1855,6 +1909,23 @@ def ingredient_forecast(conn: sqlite3.Connection, horizon_days: int = HORIZON_DA
         "reorderPointsConfigured": sum(1 for r in out if r["reorderPoint"] is not None),
         "demandModel": demand_model,
         "prophetDrivenIngredients": sum(1 for r in out if r["demandSource"] == "prophet"),
+        # Additive: the serving model's own version/provenance, for a
+        # caller that wants it once rather than re-deriving it from every
+        # ingredient row's modelProvenance. None/"unavailable" when
+        # demand_model='ewma' was requested (no model was consulted at
+        # all) or no demand_prophet run has ever been trained -- never
+        # fabricated.
+        "demandModelProvenance": (
+            {
+                "modelKey": "demand_prophet",
+                "mode": demand["active_prophet_run"]["mode"],
+                "trainingRunId": demand["active_prophet_run"]["id"],
+                "trainedAt": demand["active_prophet_run"]["trained_at"],
+                "status": "active",
+            } if demand["active_prophet_run"] else
+            {"modelKey": "demand_prophet", "mode": None, "trainingRunId": None,
+             "trainedAt": None, "status": "unavailable"}
+        ),
         "dates": [(today + _dt.timedelta(days=k)).isoformat() for k in range(n)],
         "ingredients": out,
         "buckets": buckets,
