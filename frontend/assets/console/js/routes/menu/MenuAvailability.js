@@ -1,6 +1,5 @@
 import { h, mount, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
-import { RailCard } from '../../components/ui/RailCard.js';
 import { Stat } from '../../components/ui/Stat.js';
 import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
@@ -169,20 +168,42 @@ export async function render(ctx) {
     h('div', { style: { display: 'flex', gap: '8px', marginBottom: '10px' } }, filterHost),
     tableHost));
 
+  // 2026-10-15 recompose: the three equal KPI tiles and the Menu Problems
+  // card used to each take a full-width row — the same "stacked equal cards"
+  // shape as every other page before this pass (see Inventory's identical
+  // fix). Menu Problems IS this page's "needs attention" panel, so it now
+  // pairs asymmetrically beside a single Menu Health card the same way
+  // Inventory pairs Stock Health beside Needs Attention, instead of sitting
+  // underneath three cards that just repeat its own counts.
   return h('div', {},
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3,1fr)', gap: '10px', marginBottom: '14px' } },
-      RailCard({ severity: 'good', icon: ICONS.checkCircle }, Stat({ value: count(sellable), label: 'Available' })),
-      RailCard({ severity: blocked > 0 ? 'crit' : 'good', icon: ICONS.alertTriangle }, Stat({ value: count(blocked), label: 'Blocked' })),
-      Card({ className: 'kpi-neutral' }, Stat({ value: count(items.length), label: 'Total' }))),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1.3fr 1fr', gap: '14px', alignItems: 'stretch' } },
+      Card({ className: 'kpi-primary', style: { height: '100%' } },
+        h('div', { class: 'eyebrow' }, 'Menu health'),
+        h('div', { class: 'grid', style: { gridTemplateColumns: 'auto 1fr', gap: '18px', alignItems: 'center', margin: '6px 0 2px' } },
+          Stat({ value: count(items.length), label: 'Total menu items' }),
+          h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2,1fr)', gap: '8px' } },
+            menuChip(sellable, 'Sellable now', 'good', ICONS.checkCircle),
+            menuChip(blocked, 'Blocked', blocked > 0 ? 'crit' : 'good', ICONS.alertTriangle)))),
+      Card({ style: { height: '100%' } },
+        CardHeader({
+          title: 'Menu problems',
+          desc: 'Blocked dishes grouped by the one ingredient or setup gap causing it',
+        }),
+        problemsHost)),
 
-    Card({ style: { marginBottom: '14px' } },
-      CardHeader({
-        title: 'Menu problems',
-        desc: 'Blocked dishes grouped by the one ingredient or setup gap causing it · click a row to see which dishes',
-      }),
-      problemsHost),
+    h('div', { style: { marginTop: '14px' } }, tableCard));
+}
 
-    tableCard);
+/** Compact status figure for the Menu Health card — same device as
+ * Inventory's statChip (see OnHand.js), kept local since nothing else on
+ * this page needs it and it isn't yet worth promoting to a shared component
+ * for two call sites. */
+function menuChip(value, label, severity, iconPaths) {
+  return h('div', { class: `rail rail-${severity}`, style: { borderRadius: 'var(--radius-sm)', padding: '8px 10px', display: 'flex', alignItems: 'center', gap: '8px' } },
+    h('span', { class: 'rail-icon', style: { width: '26px', height: '26px' } }, icon(iconPaths, 13)),
+    h('div', {},
+      h('div', { style: { fontSize: '17px', fontWeight: '700', lineHeight: '1.1' } }, count(value)),
+      h('div', { class: 't-xs t-faint' }, label)));
 }
 
 function priceCell(m) {
