@@ -242,11 +242,21 @@ export async function render(ctx) {
   }
 
   function trendCard(d) {
-    const metricBtns = h('div', { style: { display: 'flex', gap: '4px' } },
-      Button({ variant: state.trendMetric === 'revenue' ? 'primary' : 'ghost', size: 'sm', onClick: () => { state.trendMetric = 'revenue'; paint(); } }, 'Sales'),
-      Button({ variant: state.trendMetric === 'orders' ? 'primary' : 'ghost', size: 'sm', onClick: () => { state.trendMetric = 'orders'; paint(); } }, 'Orders'));
+    const metricBtnsHost = h('div', { style: { display: 'flex', gap: '4px' } });
     const chartHost = h('div');
+    // 2026-10-15 bug fix: the Sales/Orders buttons' active/ghost styling was
+    // baked into their class string at the moment trendCard() first built
+    // them — clicking a button swapped the chart's data (paint() did redraw
+    // chartHost correctly) but never touched the buttons' own DOM, so
+    // whichever button was active at page-load stayed visually highlighted
+    // forever, making the toggle look broken (and inconsistent with
+    // whatever the chart was actually showing) until the next full reload
+    // reset everything back to a matching state. Both the buttons and the
+    // chart now redraw together from the same paint() call.
     function paint() {
+      mount(metricBtnsHost,
+        Button({ variant: state.trendMetric === 'revenue' ? 'primary' : 'ghost', size: 'sm', onClick: () => { state.trendMetric = 'revenue'; paint(); } }, 'Sales'),
+        Button({ variant: state.trendMetric === 'orders' ? 'primary' : 'ghost', size: 'sm', onClick: () => { state.trendMetric = 'orders'; paint(); } }, 'Orders'));
       destroyChart(chartHost.firstChild);
       const series = d.compactSalesTrend.current;
       mount(chartHost, BarChart({
@@ -258,7 +268,7 @@ export async function render(ctx) {
     }
     paint();
     return Card({},
-      CardHeader({ title: 'Sales Trend', right: metricBtns }),
+      CardHeader({ title: 'Sales Trend', right: metricBtnsHost }),
       chartHost);
   }
 

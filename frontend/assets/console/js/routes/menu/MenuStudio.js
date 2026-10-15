@@ -67,6 +67,7 @@ export async function render(ctx) {
   const centerHost = h('div');
   const rightHost = h('div');
   const healthHost = h('div');
+  const filterHost = h('div', { class: 'action-strip', style: { marginBottom: '10px' } });
 
   function select(kind, ref) {
     selectedKind = kind;
@@ -153,11 +154,15 @@ export async function render(ctx) {
         : null);
   }
 
+  // 2026-10-15 bug fix: filterHost used to be built once from a single
+  // drawFilters() call, so a chip's onClick only ever redrew the list below
+  // it — the chips' own active-state classes were frozen at whatever they
+  // were on first render and never updated after a click.
   function drawFilters() {
-    return h('div', { class: 'action-strip', style: { marginBottom: '10px' } },
+    mount(filterHost,
       ...[['all', 'All'], ['available', 'Available'], ['blocked', 'Unavailable']].map(([id, label]) => h('button', {
         class: `action-chip${statusFilter === id ? ' is-active' : ''}`,
-        onClick: () => { statusFilter = id; drawList(); },
+        onClick: () => { statusFilter = id; drawFilters(); drawList(); },
       }, label)));
   }
 
@@ -353,12 +358,11 @@ export async function render(ctx) {
   }
 
   drawHealth();
+  drawFilters();
   drawList();
   await drawCenter();
   drawRight();
   ctx.setSearchHandler((q) => { query = q; drawList(); });
-
-  const filterHost = h('div', {}, drawFilters());
 
   return h('div', { class: 'menu-studio' },
     healthHost,

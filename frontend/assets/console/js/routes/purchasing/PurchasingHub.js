@@ -509,16 +509,24 @@ export async function render(ctx) {
     h('div', { style: { marginTop: '14px', display: 'flex', justifyContent: 'flex-end' } }, submit));
   }
 
+  const tabStrip = h('div', { class: 'action-strip', style: { marginBottom: '10px' } });
+  // 2026-10-15 bug fix: tabStrip used to be built once as a static node —
+  // a chip's onClick only ever redrew needsHost, so the chips' own
+  // active-state classes were frozen at whatever they were on first render
+  // and never reflected which one was actually selected after a click.
+  function drawTabStrip() {
+    mount(tabStrip,
+      ...[['attention', `Needs attention (${urgent.length})`], ['all', `All ingredients (${rows.length})`]].map(([id, label]) => h('button', {
+        class: `action-chip${needsTab === id ? ' is-active' : ''}`,
+        onClick: () => { needsTab = id; drawTabStrip(); drawNeeds(); },
+      }, label)));
+  }
+
   drawHealth();
+  drawTabStrip();
   drawNeeds();
   drawPurchaseOrders();
   drawRight();
-
-  const tabStrip = h('div', { class: 'action-strip', style: { marginBottom: '10px' } },
-    ...[['attention', `Needs attention (${urgent.length})`], ['all', `All ingredients (${rows.length})`]].map(([id, label]) => h('button', {
-      class: `action-chip${needsTab === id ? ' is-active' : ''}`,
-      onClick: () => { needsTab = id; drawNeeds(); },
-    }, label)));
 
   // 2026-10-15 fix: the Needs-attention/All-ingredients toggle used to sit
   // INSIDE the left column, above needsHost, while the right column's
