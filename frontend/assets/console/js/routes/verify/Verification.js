@@ -1,6 +1,5 @@
-import { h, mount } from '../../lib/dom.js';
+import { h, mount, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
-import { RailCard } from '../../components/ui/RailCard.js';
 import { Stat } from '../../components/ui/Stat.js';
 import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
@@ -11,6 +10,7 @@ import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
 import { verificationRowCells, openVerificationDrawer } from '../../components/domain/VerificationItem.js';
 import { count } from '../../lib/format.js';
+import { ICONS } from '../../lib/icons.js';
 import { getQueue } from '../../lib/api/verification.js';
 import { listUnmapped, resolveMap, resolveDismiss } from '../../lib/api/queue.js';
 import { listIngredients } from '../../lib/api/inventory.js';
@@ -42,16 +42,43 @@ export async function render(ctx) {
   let active = ['1', '2', '3', 'unmapped'].includes(ctx.tab) ? ctx.tab : '1';
   let shown = PAGE_SIZE;
 
-  const kpis = h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', marginBottom: '14px' } });
+  const kpis = h('div', { style: { marginBottom: '14px' } });
   const listHost = h('div');
 
+  // 2026-10-15 recompose: these same four counts used to be four equal
+  // RailCards in their own full-width row, directly repeating the four tabs
+  // right below them (Priority 1/2/3/Ingredient Queue) — a KPI row that told
+  // an admin nothing the tab labels didn't already say right underneath it.
+  // One compact summary card (headline total pending + four inline chips)
+  // replaces the redundant row; the Tabbar remains the one real filter.
   function drawKpis() {
-    mount(kpis,
-      RailCard({ severity: 'crit' }, Stat({ value: count(queue.byPriority[1] || 0), label: PRIORITY_LABELS[1] })),
-      RailCard({ severity: 'warn' }, Stat({ value: count(queue.byPriority[2] || 0), label: PRIORITY_LABELS[2] })),
-      RailCard({ severity: 'info' }, Stat({ value: count(queue.byPriority[3] || 0), label: PRIORITY_LABELS[3] })),
-      RailCard({ severity: unmapped.count > 0 ? 'crit' : 'good' },
-        Stat({ value: count(unmapped.count), label: 'Ingredient Queue — blocks menu items' })));
+    const p1 = queue.byPriority[1] || 0;
+    const p2 = queue.byPriority[2] || 0;
+    const p3 = queue.byPriority[3] || 0;
+    const total = p1 + p2 + p3 + unmapped.count;
+    mount(kpis, Card({ className: 'kpi-primary' },
+      h('div', { class: 'eyebrow' }, 'Setup & verification'),
+      h('div', { class: 'grid', style: { gridTemplateColumns: 'auto 1fr', gap: '18px', alignItems: 'center', margin: '6px 0 0' } },
+        Stat({ value: count(total), label: 'Pending confirmation' }),
+        h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '8px' } },
+          verifyChip(p1, 'Priority 1', 'crit', ICONS.alertTriangle, PRIORITY_LABELS[1]),
+          verifyChip(p2, 'Priority 2', 'warn', ICONS.clockArrowDown, PRIORITY_LABELS[2]),
+          verifyChip(p3, 'Priority 3', 'info', ICONS.history, PRIORITY_LABELS[3]),
+          verifyChip(unmapped.count, 'Ingredient Queue', unmapped.count > 0 ? 'crit' : 'good', ICONS.packageMinus, 'Recipe lines not yet matched to a real ingredient — blocks menu items')))));
+  }
+
+  /** Same compact-chip device as Inventory's Stock Health / Menu's Menu
+   * Health (see OnHand.js, MenuAvailability.js) — kept local a third time
+   * rather than extracted yet; worth promoting to a shared component if a
+   * fourth page needs it. `title` carries PRIORITY_LABELS' fuller
+   * explanation as a hover tooltip, since the compact chip has no room to
+   * print it the way the old full-width RailCard did. */
+  function verifyChip(value, label, severity, iconPaths, title) {
+    return h('div', { class: `rail rail-${severity}`, title, style: { borderRadius: 'var(--radius-sm)', padding: '8px 10px', display: 'flex', alignItems: 'center', gap: '8px' } },
+      h('span', { class: 'rail-icon', style: { width: '26px', height: '26px' } }, icon(iconPaths, 13)),
+      h('div', {},
+        h('div', { style: { fontSize: '17px', fontWeight: '700', lineHeight: '1.1' } }, count(value)),
+        h('div', { class: 't-xs t-faint' }, label)));
   }
 
   /** 2026-10-14 redesign: a compact table (Record/Current estimate/Reason/
