@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from wt import anomaly, db, forecasting, ml_scheduler, ml_startup, ml_training  # noqa: E402
+from wt import anomaly, associations, db, forecasting, ml_scheduler, ml_startup, ml_training  # noqa: E402
 from wt import ml_artifacts_io as artifacts  # noqa: E402
 from wt import model_registry as mr  # noqa: E402
 from wt.db import write_tx  # noqa: E402
@@ -294,6 +294,76 @@ class TestDemandProvenanceClause(_MLTestBase):
     def test_unknown_mode_is_rejected(self):
         with self.assertRaises(ValueError):
             forecasting._order_provenance_clause("o", "NOT_A_MODE")
+
+
+class TestFpgrowthProvenanceClause(_MLTestBase):
+    """wt/associations.py's _order_provenance_clause()/mode-aware
+    _transactions() -- FP-Growth's own REAL/SIMULATED eligibility split,
+    parallel to TestDemandProvenanceClause above but for the basket miner
+    rather than Prophet. FP-Growth's SIMULATED bucket deliberately spans
+    BOTH known synthetic sentinels (demo_seed AND demo_seed_recent_orders)
+    -- see associations.SIMULATED_ORDER_USER_IDS's own comment for why
+    that differs from Prophet's narrower one-sentinel SIMULATED mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.menu_item_id, cls.menu_item_price = cls.conn.execute(
+            "SELECT id, price FROM menu_item WHERE pos_visible=1 AND is_unli=0 LIMIT 1"
+        ).fetchone()
+
+    def setUp(self):
+        # _transactions() has no historical-`now` override, so every test
+        # method in this class necessarily shares the same "last N days"
+        # window -- wipe customer_order/order_line (both empty at this
+        # point in every other test class; neither seed.run() nor this
+        # class's own fixtures ever need a row to survive between test
+        # methods) before each test so one method's fixture rows can never
+        # bleed into another's raw_order_count assertion.
+        with write_tx(self.conn):
+            self.conn.execute("DELETE FROM order_line")
+            self.conn.execute("DELETE FROM customer_order")
+
+    def _insert_order(self, *, order_no, created_by, created_at, items) -> None:
+        with write_tx(self.conn):
+            cur = self.conn.execute(
+                "INSERT INTO customer_order (order_no, table_label, head_count, status, "
+                " created_by, created_at) VALUES (?, 'T-TEST', 2, 'served', ?, ?)",
+                (order_no, created_by, created_at),
+            )
+            for name in items:
+                self.conn.execute(
+                    "INSERT INTO order_line (order_id, menu_item_id, qty, unit_price) VALUES (?,?,1,?)",
+                    (cur.lastrowid, self.menu_item_id, self.menu_item_price),
+                )
+
+    def test_real_mode_excludes_both_synthetic_sentinels(self):
+        # _transactions() has no historical-`now` override (unlike
+        # forecasting._daily_series()) -- its lookback window is always
+        # relative to the live wall clock, so these fixtures are dated
+        # against datetime.now() rather than a fixed calendar literal.
+        now = _dt.datetime.now(_dt.timezone.utc)
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        self._insert_order(order_no="FPG-REAL-1", created_by=None, created_at=ts, items=["x"])
+        self._insert_order(order_no="FPG-REAL-2", created_by="demo_seed", created_at=ts, items=["x"])
+        self._insert_order(order_no="FPG-REAL-3", created_by="demo_seed_recent_orders",
+                           created_at=ts, items=["x"])
+        baskets, _, raw_count, _ = associations._transactions(self.conn, 1, mode="REAL")
+        self.assertEqual(raw_count, 1)
+
+    def test_simulated_mode_includes_both_synthetic_sentinels_not_real(self):
+        now = _dt.datetime.now(_dt.timezone.utc)
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
+        self._insert_order(order_no="FPG-SIM-1", created_by=None, created_at=ts, items=["x"])
+        self._insert_order(order_no="FPG-SIM-2", created_by="demo_seed", created_at=ts, items=["x"])
+        self._insert_order(order_no="FPG-SIM-3", created_by="demo_seed_recent_orders",
+                           created_at=ts, items=["x"])
+        baskets, _, raw_count, _ = associations._transactions(self.conn, 1, mode="SIMULATED")
+        self.assertEqual(raw_count, 2)
+
+    def test_unknown_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            associations._order_provenance_clause("o", "NOT_A_MODE")
 
 
 class TestPassBDerivedViewDoubleCounting(_MLTestBase):

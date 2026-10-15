@@ -47,6 +47,35 @@ from . import model_registry, timeutil
 from . import ml_artifacts_io as artifacts
 from .errors import RegistryUnavailableError
 
+DEMAND_MODES = ("REAL", "SIMULATED")
+# Both known synthetic customer_order sentinels count as SIMULATED for
+# FP-Growth specifically -- unlike wt/forecasting.py's Prophet-only
+# SIMULATED mode (which deliberately excludes demo_seed_recent_orders: a
+# 23-day dataset too short/differently-shaped to mix into a continuous
+# demand time series), basket mining has no time-series-continuity
+# requirement, and scripts/seed_recent_demo_orders.py's own docstring
+# states its data exists specifically "so ... FP-Growth combo mining"
+# has something to mine. Both sentinels are still never silently combined
+# with real transactions: SIMULATED and REAL remain two disjoint sets, one
+# training run reads exactly one of them.
+SIMULATED_ORDER_USER_IDS = ("demo_seed", "demo_seed_recent_orders")
+
+
+def _order_provenance_clause(order_alias: str, mode: str = "REAL") -> str:
+    """SQL fragment selecting which customer_order rows a basket query may
+    read, by provenance -- same idea, same REAL-clause wording, as
+    wt/forecasting.py's _order_provenance_clause(), applied to FP-Growth's
+    transaction pool instead of Prophet's demand series. No bind params
+    needed: every sentinel here is a fixed literal, never user input."""
+    if mode not in DEMAND_MODES:
+        raise ValueError(f"unknown demand mode {mode!r}")
+    if mode == "SIMULATED":
+        placeholders = ",".join(f"'{u}'" for u in SIMULATED_ORDER_USER_IDS)
+        return f"{order_alias}.created_by IN ({placeholders})"
+    return (f"({order_alias}.created_by IS NULL OR {order_alias}.created_by "
+            f"IN (SELECT username FROM app_user))")
+
+
 MIN_TRANSACTIONS = 30     # real transactions needed before a frequent-itemset pass is trustworthy
 
 # Primary threshold tier.
@@ -134,15 +163,24 @@ def _rows(cur) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
-def _transactions(conn: sqlite3.Connection, lookback_days: int) -> tuple[list[set], list[str], int, dict]:
-    """One basket per REAL completed transaction -- not one per
-    customer_order row (see module docstring for why those differ on this
-    database). A transaction's key is COALESCE(source_order_id, its own
-    row id): two customer_order rows sharing one source_order_id are two
-    halves of a single historical mixed order and are merged into one
-    basket; every other row (every live POS order, and every historical
-    order that was never split) is already exactly one transaction on its
-    own. Void orders are excluded -- they were never a completed sale.
+def _transactions(conn: sqlite3.Connection, lookback_days: int, mode: str = "REAL") -> tuple[list[set], list[str], int, dict]:
+    """One basket per completed transaction of the given provenance `mode`
+    -- not one per customer_order row (see module docstring for why those
+    differ on this database). A transaction's key is
+    COALESCE(source_order_id, its own row id): two customer_order rows
+    sharing one source_order_id are two halves of a single historical
+    mixed order and are merged into one basket; every other row (every
+    live POS order, and every historical order that was never split) is
+    already exactly one transaction on its own. Void orders are excluded
+    -- they were never a completed sale.
+
+    mode (REAL/SIMULATED, see _order_provenance_clause above): REAL is
+    every existing caller's unchanged default (real orders, excluding
+    both known synthetic sentinels); SIMULATED reads ONLY wt/demo_seed.py's
+    and scripts/seed_recent_demo_orders.py's sentinel-tagged rows -- the
+    capstone/pre-launch training path for a restaurant without enough real
+    order history yet. The two provenance groups are never combined in
+    one call: a caller gets exactly one or the other, never both at once.
 
     Returns (basket_list, basket_dates, raw_order_row_count,
     category_by_item_name). basket_dates[i] is basket_list[i]'s own
@@ -169,13 +207,14 @@ def _transactions(conn: sqlite3.Connection, lookback_days: int) -> tuple[list[se
     the live data is excluded by this clause today, but it stays in place
     for whenever a real void is recorded).
     """
+    prov = _order_provenance_clause("o", mode)
     lines = _rows(conn.execute(
-        """
+        f"""
         SELECT o.id AS order_pk, o.source_order_id, o.created_at, m.name, m.category
           FROM order_line ol
           JOIN customer_order o ON o.id = ol.order_id
           JOIN menu_item m ON m.id = ol.menu_item_id
-         WHERE o.status != 'void' AND o.created_at >= ?
+         WHERE o.status != 'void' AND {prov} AND o.created_at >= ?
          ORDER BY o.created_at, o.id
         """,
         (timeutil.utc_bound_n_manila_days_ago(lookback_days),),
@@ -572,7 +611,7 @@ def _evaluate_pair_in_basket_list(item_a: str, item_b: str, basket_list: list[se
     }
 
 
-def expanding_window_validation(conn: sqlite3.Connection, lookback_days: int = 365) -> dict:
+def expanding_window_validation(conn: sqlite3.Connection, lookback_days: int = 365, mode: str = "REAL") -> dict:
     """Runs the three nested EXPANDING_FOLD_DEFS folds over the real
     365-day dataset and reports, for every candidate pair ever identified
     in any fold's training window, its fold-by-fold pair count/support/
@@ -585,11 +624,11 @@ def expanding_window_validation(conn: sqlite3.Connection, lookback_days: int = 3
     whether a pattern that survives one holdout slice also survives being
     checked three different ways.
     """
-    basket_list, basket_dates, _raw_order_count, categories = _transactions(conn, lookback_days)
+    basket_list, basket_dates, _raw_order_count, categories = _transactions(conn, lookback_days, mode=mode)
     transaction_count = len(basket_list)
     if transaction_count < MIN_TRANSACTIONS:
-        return {"available": False,
-               "reason": f"only {transaction_count} real transactions in the window, below "
+        return {"available": False, "mode": mode,
+               "reason": f"only {transaction_count} {mode.lower()} transactions in the window, below "
                          f"MIN_TRANSACTIONS={MIN_TRANSACTIONS}"}
 
     anchor = _dt.date.fromisoformat(basket_dates[0][:10])
@@ -741,7 +780,7 @@ THRESHOLD_CONFIGS = {
 }
 
 
-def threshold_sensitivity(conn: sqlite3.Connection, lookback_days: int = 365) -> dict:
+def threshold_sensitivity(conn: sqlite3.Connection, lookback_days: int = 365, mode: str = "REAL") -> dict:
     """Runs the SAME real transaction data through every configuration in
     THRESHOLD_CONFIGS and reports how many qualifying combinations each one
     finds. Exists to answer, with real numbers rather than a guess: does
@@ -749,10 +788,10 @@ def threshold_sensitivity(conn: sqlite3.Connection, lookback_days: int = 365) ->
     surface anything, or is the transaction data itself simply too sparse
     for co-occurrence mining regardless of threshold? Both are legitimate
     answers; this reports whichever one the data gives."""
-    basket_list, _basket_dates, _raw_order_count, categories = _transactions(conn, lookback_days)
+    basket_list, _basket_dates, _raw_order_count, categories = _transactions(conn, lookback_days, mode=mode)
     transaction_count = len(basket_list)
     if transaction_count < MIN_TRANSACTIONS:
-        return {"insufficient_data": True, "transaction_count": transaction_count,
+        return {"insufficient_data": True, "mode": mode, "transaction_count": transaction_count,
                "required": MIN_TRANSACTIONS, "configs": {}}
 
     item_counts, pair_counts = _item_and_pair_counts(basket_list)
@@ -775,7 +814,7 @@ def threshold_sensitivity(conn: sqlite3.Connection, lookback_days: int = 365) ->
 
 
 def product_combinations(conn: sqlite3.Connection, lookback_days: int = 365, top_n: int = 15,
-                         holdout_validate: bool = True) -> dict:
+                         holdout_validate: bool = True, mode: str = "REAL") -> dict:
     """The operational combo-recommendation surface. lookback_days defaults
     to 365 (2026-10: was 90 -- see MIN_SUPPORT's own comment on why the old
     90-day calibration does not transfer to a longer window as-is).
@@ -792,7 +831,7 @@ def product_combinations(conn: sqlite3.Connection, lookback_days: int = 365, top
     that does not depend on how temporally spread a small test fixture
     happens to be.
     """
-    basket_list, _basket_dates, raw_order_count, categories = _transactions(conn, lookback_days)
+    basket_list, _basket_dates, raw_order_count, categories = _transactions(conn, lookback_days, mode=mode)
     transaction_count = len(basket_list)
     excluded = raw_order_count - transaction_count
 
@@ -808,6 +847,7 @@ def product_combinations(conn: sqlite3.Connection, lookback_days: int = 365, top
 
     shape = {
         "insufficient_data": True,
+        "mode": mode,
         "transaction_count": transaction_count,
         "total_orders_analyzed": raw_order_count,
         "valid_transactions": transaction_count,
@@ -882,6 +922,7 @@ def product_combinations(conn: sqlite3.Connection, lookback_days: int = 365, top
 
     result = {
         "insufficient_data": False,
+        "mode": mode,
         "transaction_count": transaction_count,
         "total_orders_analyzed": raw_order_count,
         "valid_transactions": transaction_count,

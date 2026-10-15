@@ -343,21 +343,39 @@ def train_demand_prophet(conn: sqlite3.Connection, *, triggered_by: str, mode: s
     )
 
 
-def train_fpgrowth_combos(conn: sqlite3.Connection, *, triggered_by: str, lookback_days: int = 365) -> dict:
+def train_fpgrowth_combos(conn: sqlite3.Connection, *, triggered_by: str, lookback_days: int = 365,
+                          mode: str | None = None) -> dict:
     """Mines + holdout-validates exactly as product_combinations() always
-    has (unchanged mining/validation code), then persists the result as a
+    has (unchanged mining/validation code, unchanged support/confidence/
+    lift/min-count/holdout/stability rules), then persists the result as a
     JSON artifact (the mined ruleset already IS a small JSON-serializable
     structure, no sklearn object to pickle) so
     associations.active_combo_recommendations() can serve it without
-    re-mining on every call."""
+    re-mining on every call.
+
+    mode (REAL/SIMULATED -- same ladder as demand_prophet and the
+    IsolationForest models; see associations._order_provenance_clause())
+    decides which customer_order rows are eligible. REAL (the default via
+    model_registry.get_mode) reads real orders only; SIMULATED reads ONLY
+    the two known synthetic sentinels (wt/demo_seed.py's and
+    scripts/seed_recent_demo_orders.py's), never real transactions, and
+    never mixes the two groups into one run. Metrics land in
+    metrics["simulated_metrics"] when mode='SIMULATED' and
+    metrics["real_metrics"] when mode='REAL' -- never both, same rule
+    every other model in this module follows."""
     model_key = "fpgrowth_combos"
-    mode = model_registry.get_mode(conn, model_key)
-    result = associations.product_combinations(conn, lookback_days=lookback_days, holdout_validate=True)
+    mode = mode or model_registry.get_mode(conn, model_key)
+    metrics_bucket = "simulated_metrics" if mode == "SIMULATED" else "real_metrics"
+    result = associations.product_combinations(conn, lookback_days=lookback_days, holdout_validate=True, mode=mode)
     ok = not result.get("insufficient_data", True)
-    real_count = result.get("transaction_count", 0)
+    fitted_count = result.get("transaction_count", 0)
+    real_count = fitted_count if mode == "REAL" else 0
+    synthetic_count = fitted_count if mode == "SIMULATED" else 0
     metrics = {
         "simulated_metrics": None,
-        "real_metrics": {
+        "real_metrics": None,
+        metrics_bucket: {
+            "mode": mode,
             "transaction_count": result.get("transaction_count"),
             "validated_combos": result.get("number_of_final_recommendations"),
             "mining_basis": result.get("mining_basis"),
@@ -366,14 +384,14 @@ def train_fpgrowth_combos(conn: sqlite3.Connection, *, triggered_by: str, lookba
     }
     path = artifacts.dump_json(
         {"result": result, "schema_version": FPGROWTH_SCHEMA_VERSION, "feature_names": None,
-         "model_key": model_key},
+         "model_key": model_key, "mode": mode},
         model_key, artifacts.new_run_token(),
     )
     return _finish(
         conn, model_key=model_key, mode=mode, dataset_version=_fingerprint(conn, "customer_order"),
-        real_count=real_count, synthetic_count=0, schema_version=FPGROWTH_SCHEMA_VERSION,
+        real_count=real_count, synthetic_count=synthetic_count, schema_version=FPGROWTH_SCHEMA_VERSION,
         metrics=metrics, artifact_path=path, triggered_by=triggered_by,
-        ok=ok, reason="ok" if ok else "insufficient_data",
+        ok=ok, reason="ok" if ok else f"insufficient_{mode.lower()}_data",
     )
 
 
