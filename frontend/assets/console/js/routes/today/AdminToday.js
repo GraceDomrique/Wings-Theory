@@ -218,24 +218,46 @@ function next7DaysCard(d, ctx) {
 // discipline as lib/severity.js, just not generalized into that shared file
 // since nothing else in the console needs an action-to-icon mapping.
 const QUICK_ACTION_ICON = {
-  receive: { sev: 'info', path: '<path d="M3 3h2l.4 2M7 13h10l3.6-8H5.4"/><circle cx="9" cy="20" r="1.5"/><circle cx="18" cy="20" r="1.5"/>' },
-  waste: { sev: 'crit', path: '<path d="M3 6h18"/><path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>' },
-  stockcount: { sev: 'good', path: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>' },
-  createpo: { sev: 'warn', path: '<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><path d="M12 10v4M10 12h4"/>' },
+  receive: {
+    sev: 'info', path: '<path d="M3 3h2l.4 2M7 13h10l3.6-8H5.4"/><circle cx="9" cy="20" r="1.5"/><circle cx="18" cy="20" r="1.5"/>',
+    desc: 'Log a delivery into stock',
+  },
+  waste: {
+    sev: 'crit', path: '<path d="M3 6h18"/><path d="M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/>',
+    desc: 'Record spoilage or loss',
+  },
+  stockcount: {
+    sev: 'good', path: '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/>',
+    desc: 'Reconcile a physical count',
+  },
+  createpo: {
+    sev: 'warn', path: '<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><path d="M12 10v4M10 12h4"/>',
+    desc: 'See what needs ordering',
+  },
 };
+const CHEVRON_RIGHT = '<path d="m9 18 6-6-6-6"/>';
 
+// 2026-10-15 redesign (spec 5): a premium operational action-tile instead
+// of a plain icon+label button — icon chip, label, one-line description and
+// a directional chevron, same restrained semantic-tint palette as the rest
+// of the console (no bright colors, no shadows beyond the existing card
+// elevation). Still the same d.quickActions data and the same
+// ctx.navigate(a.route) as before — only the presentation changed.
 function quickActionsCard(d, ctx) {
   return Card({ className: 'card-flex' },
     CardHeader({ title: 'Quick Actions' }),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2, 1fr)', gap: '8px' } },
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2, 1fr)', gap: '10px' } },
       ...d.quickActions.map((a) => {
-        const spec = QUICK_ACTION_ICON[a.key] || { sev: 'flat', path: '<circle cx="12" cy="12" r="9"/>' };
+        const spec = QUICK_ACTION_ICON[a.key] || { sev: 'flat', path: '<circle cx="12" cy="12" r="9"/>', desc: '' };
         return h('button', {
-          class: 'quick-action',
+          class: `quick-action-tile quick-action-tile-${spec.sev}`,
           onClick: () => ctx.navigate(a.route),
         },
-        h('span', { class: `kpi-icon kpi-icon-${spec.sev}` }, icon(spec.path, 15)),
-        h('span', {}, a.label));
+        h('span', { class: `kpi-icon kpi-icon-${spec.sev} quick-action-tile-icon` }, icon(spec.path, 17)),
+        h('span', { class: 'quick-action-tile-body' },
+          h('span', { class: 'quick-action-tile-label' }, a.label),
+          spec.desc ? h('span', { class: 'quick-action-tile-desc' }, spec.desc) : null),
+        h('span', { class: 'quick-action-tile-arrow' }, icon(CHEVRON_RIGHT, 15)));
       })));
 }
 

@@ -735,6 +735,34 @@ select:disabled{cursor:default; opacity:0.6;}
 .quick-action:focus-visible{outline:2px solid var(--amber); outline-offset:1px;}
 .quick-action .kpi-icon{width:32px; height:32px; border-radius:var(--radius-sm); flex-shrink:0;}
 
+/* Premium Action Tile (2026-10-15, spec 5) — Admin Today's Quick Actions
+   only. Distinct from .quick-action above (still used elsewhere, e.g.
+   VerificationItem.js's drawer) by having room for a one-line description
+   and a directional chevron, and a soft per-severity tinted background
+   instead of plain white — so "Record Waste" and "Receive Delivery" read
+   as visually distinct actions, not four identical buttons differing only
+   by icon color. */
+.quick-action-tile{
+  display:flex; align-items:center; gap:10px; padding:12px 12px; border-radius:var(--radius-sm);
+  border:1px solid transparent; width:100%; text-align:left; font-family:inherit;
+  transition:background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.quick-action-tile-crit{background:var(--crit-tint);}
+.quick-action-tile-warn{background:var(--warn-tint);}
+.quick-action-tile-good{background:var(--good-tint);}
+.quick-action-tile-info{background:var(--info-tint);}
+.quick-action-tile-flat{background:var(--surface-sunk);}
+.quick-action-tile:hover{border-color:rgba(0,0,0,.08); transform:translateY(-1px);}
+.quick-action-tile:active{transform:scale(.98) translateY(0);}
+.quick-action-tile:focus-visible{outline:2px solid var(--amber); outline-offset:2px;}
+.quick-action-tile-icon{width:34px; height:34px; border-radius:var(--radius-sm); flex-shrink:0; background:rgba(255,255,255,.55);}
+.quick-action-tile-body{flex:1; min-width:0; display:flex; flex-direction:column; gap:1px;}
+.quick-action-tile-label{font-size:12.5px; font-weight:700; color:var(--ink);}
+.quick-action-tile-desc{font-size:10.5px; color:var(--ink-soft); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.quick-action-tile-arrow{flex-shrink:0; color:var(--ink-faint); transition:transform .12s ease;}
+.quick-action-tile:hover .quick-action-tile-arrow{transform:translateX(2px); color:var(--ink-soft);}
+@media (max-width:420px){.quick-action-tile-desc{display:none;}}
+
 /* Compact Action Strip (2026-10-15) — a second, denser treatment for the
    same "quick action" concept as .quick-action above, used where a page
    already has a strong KPI/attention composition up top and a second row of
