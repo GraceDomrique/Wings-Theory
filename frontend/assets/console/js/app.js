@@ -10,7 +10,7 @@ import * as onhand from './routes/inventory/OnHand.js';
 import * as receiving from './routes/inventory/Receiving.js';
 import * as expiry from './routes/expiry/Expiry.js';
 import * as stockcounts from './routes/inventory/StockCounts.js';
-import * as losses from './routes/losses/Losses.js';
+import * as losses from './routes/losses/StockUsageReviews.js';
 import * as unli from './routes/intelligence/Reconciliation.js';
 import * as movements from './routes/inventory/Movements.js';
 
