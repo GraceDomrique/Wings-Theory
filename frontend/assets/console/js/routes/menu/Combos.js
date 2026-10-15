@@ -128,9 +128,16 @@ export async function render(ctx) {
           { key: 'observed', label: 'Observed together', render: (c) => h('span', { class: 'mono t-sm' }, pct(c.confidence === null ? null : c.confidence * 100, 'n/a', 0)) },
           {
             key: 'action', label: '',
-            render: (c) => c.itemAMenuItemId && c.itemBMenuItemId
-              ? Button({ size: 'sm', onClick: () => openBuilder({ mode: 'from-pair', pair: c }) }, 'View opportunity')
-              : h('span', { class: 't-xs t-faint' }, 'not available'),
+            // Two distinct actions, not one ambiguous one (spec: "An
+            // observed association is not automatically a validated or
+            // publishable combo"). Review Pairing shows the evidence this
+            // row is based on without committing to anything; Create Combo
+            // jumps straight to the builder with both items pre-loaded.
+            render: (c) => (c.itemAMenuItemId && c.itemBMenuItemId
+              ? h('div', { style: { display: 'flex', gap: '6px', justifyContent: 'flex-end' } },
+                Button({ size: 'sm', variant: 'ghost', onClick: () => openReviewPairingModal(c) }, 'Review Pairing'),
+                Button({ size: 'sm', onClick: () => openBuilder({ mode: 'from-pair', pair: c }) }, 'Create Combo'))
+              : h('span', { class: 't-xs t-faint' }, 'not available')),
           },
         ],
         rows: combos.combos,
@@ -143,28 +150,88 @@ export async function render(ctx) {
             combos.combos.map((c) => `${c.itemA} + ${c.itemB}: lift ${c.lift === null ? 'n/a' : c.lift.toFixed(2) + '×'}, support ${c.support === null ? 'n/a' : c.support}`).join(' · ')))));
   }
 
+  /**
+   * Review Pairing — the evidence behind one FP-Growth row, shown before
+   * committing to anything. An observed association is a statistical fact
+   * about order history, not a validated or publishable combo on its own
+   * (spec 4A); this is the "look before you build" step. "Create Combo"
+   * inside it is the exact same action as the row's own Create Combo
+   * button — this modal never saves or publishes anything itself.
+   */
+  function openReviewPairingModal(c) {
+    const confidencePct = c.confidence === null ? null : c.confidence * 100;
+    const modal = Modal({
+      title: 'Review Pairing',
+      desc: `${c.itemA} + ${c.itemB}`,
+      onClose: () => {},
+    },
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '14px' } },
+      h('div', { class: 'card card-sunk', style: { padding: '10px 12px' } },
+        h('div', { class: 't-xs t-faint' }, 'Observed together'),
+        h('div', { class: 't-strong', style: { marginTop: '3px', fontSize: '18px' } }, pct(confidencePct, 'n/a', 0))),
+      h('div', { class: 'card card-sunk', style: { padding: '10px 12px' } },
+        h('div', { class: 't-xs t-faint' }, 'Times seen together'),
+        h('div', { class: 't-strong', style: { marginTop: '3px', fontSize: '18px' } }, c.pairCount ?? nodata('not reported'))),
+      h('div', { class: 'card card-sunk', style: { padding: '10px 12px' } },
+        h('div', { class: 't-xs t-faint' }, 'Lift'),
+        h('div', { class: 't-strong', style: { marginTop: '3px', fontSize: '18px' } }, c.lift === null ? nodata('n/a') : `${c.lift.toFixed(2)}×`)),
+      h('div', { class: 'card card-sunk', style: { padding: '10px 12px' } },
+        h('div', { class: 't-xs t-faint' }, 'Support'),
+        h('div', { class: 't-strong', style: { marginTop: '3px', fontSize: '18px' } }, c.support ?? nodata('n/a')))),
+    h('p', { class: 't-xs t-faint', style: { marginBottom: '14px' } },
+      'This is a statistical pattern from real order history (FP-Growth) — it is not yet a priced, validated, or publishable combo. Creating a combo from it still goes through cost preview, pricing and the normal approval/publish steps below.'),
+    h('div', { style: { display: 'flex', justifyContent: 'flex-end' } },
+      Button({ variant: 'primary', onClick: () => { modal.close(); openBuilder({ mode: 'from-pair', pair: c }); } }, 'Create Combo from this pairing')));
+  }
+
   // -------------------------------------------------------------------
   // 2. Combo ideas (drafts)
   // -------------------------------------------------------------------
+  // 2026-10-15 redesign (spec 4B: "Combo Management"): organized by the
+  // THREE real backend-supported draft statuses (wt/combo_pricing.py's
+  // review endpoint only ever writes 'draft'|'approved'|'rejected' — there
+  // is no separate "pending review" value, since 'draft' already means
+  // exactly that) into labeled sections, each a card grid instead of
+  // repetitive text rows with tiny buttons.
+  const DRAFT_SECTIONS = [
+    { status: 'draft', label: 'Pending Review', empty: 'Nothing waiting on a decision.' },
+    { status: 'approved', label: 'Approved — ready to build', empty: 'Nothing approved yet.' },
+    { status: 'rejected', label: 'Rejected', empty: 'Nothing rejected.' },
+  ];
+
+  function draftCard(d) {
+    return h('div', { class: 'card', style: { padding: '12px' } },
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '8px', marginBottom: '8px' } },
+        h('div', { class: 't-sm', style: { fontWeight: '700' } }, d.name),
+        Pill(d.status === 'approved' ? 'good' : d.status === 'rejected' ? 'flat' : 'warn', d.status)),
+      h('div', { class: 't-xs t-faint', style: { marginBottom: '10px' } },
+        'Proposed price: ', d.chosenPrice !== null ? money(d.chosenPrice).textContent : nodata('not chosen').textContent),
+      !isAdmin ? null
+        : d.status === 'draft'
+          ? h('div', { style: { display: 'flex', gap: '6px' } },
+            Button({ size: 'sm', onClick: () => act(() => reviewDraftCombo(d.id, 'approved')) }, 'Approve'),
+            Button({ size: 'sm', variant: 'ghost', onClick: () => act(() => reviewDraftCombo(d.id, 'rejected')) }, 'Reject'))
+          : d.status === 'approved'
+            ? Button({ size: 'sm', variant: 'primary', style: { width: '100%' }, onClick: () => openBuilder({ mode: 'from-draft', draft: d }) }, 'Build & Publish to POS')
+            : null);
+  }
+
   function draftsCard(drafts) {
+    if (drafts.length === 0) {
+      return Card({ style: { marginTop: '14px' } },
+        CardHeader({ title: 'Combo Management', desc: 'Saved for review — publishing to the POS is a separate, explicit step' }),
+        EmptyState({ icon: '✦', title: 'No combo ideas yet', description: 'Use "Create Combo" on a pairing above to start one.', tight: true }));
+    }
     return Card({ style: { marginTop: '14px' } },
-      CardHeader({ title: 'Combo ideas', desc: 'Saved for review — publishing to the POS is a separate, explicit step' }),
-      drafts.length === 0
-        ? EmptyState({ icon: '✦', title: 'No combo ideas yet', description: 'Open "View opportunity" above to start one.', tight: true })
-        : h('div', {}, ...drafts.map((d) => h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '9px 0', borderBottom: '1px solid var(--line-soft)' } },
-          h('div', {},
-            h('div', { class: 't-sm', style: { fontWeight: '600' } }, d.name),
-            h('div', { class: 't-xs t-soft' }, d.chosenPrice !== null ? money(d.chosenPrice) : nodata('no price chosen'))),
-          h('div', { style: { display: 'flex', gap: '8px', alignItems: 'center' } },
-            Pill(d.status === 'approved' ? 'good' : d.status === 'rejected' ? 'flat' : 'warn', d.status),
-            !isAdmin ? null
-              : d.status === 'draft'
-              ? h('div', { style: { display: 'flex', gap: '6px' } },
-                Button({ size: 'sm', onClick: () => act(() => reviewDraftCombo(d.id, 'approved')) }, 'Approve'),
-                Button({ size: 'sm', onClick: () => act(() => reviewDraftCombo(d.id, 'rejected')) }, 'Reject'))
-              : d.status === 'approved'
-                ? Button({ size: 'sm', variant: 'primary', onClick: () => openBuilder({ mode: 'from-draft', draft: d }) }, 'Build & publish to POS')
-                : null)))));
+      CardHeader({ title: 'Combo Management', desc: 'Saved for review — publishing to the POS is a separate, explicit step' }),
+      ...DRAFT_SECTIONS.map(({ status, label, empty }) => {
+        const inStatus = drafts.filter((d) => d.status === status);
+        if (inStatus.length === 0) return null;
+        return h('div', { style: { marginBottom: '18px' } },
+          h('div', { class: 'eyebrow', style: { marginBottom: '8px' } }, `${label} (${inStatus.length})`),
+          h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '10px' } },
+            ...inStatus.map(draftCard)));
+      }));
   }
 
   // -------------------------------------------------------------------
@@ -417,9 +484,17 @@ export async function render(ctx) {
     primaryBtn.addEventListener('click', () => {
       err.textContent = ''; err.style.display = 'none';
       if (mode === 'edit') { doSave().catch(() => {}); return; }
+      // Spec 4: the confirmation must show the actual combo name, price,
+      // AND included items — not just name and price.
+      const itemsSummary = state.rows
+        .filter((r) => r.menuItemId)
+        .map((r) => {
+          const item = pickable.find((i) => i.pk === r.menuItemId);
+          return `${r.quantity}× ${item ? item.name : `item #${r.menuItemId}`}`;
+        }).join(', ');
       confirmModal({
         title: 'Publish to POS',
-        body: `"${nameInput.value.trim() || state.name}" will immediately appear as a sellable item on the POS at ₱${priceInput.value || '0'}. Continue?`,
+        body: `"${nameInput.value.trim() || state.name}" — ${itemsSummary} — will immediately appear as a sellable item on the POS at ₱${priceInput.value || '0'}. Continue?`,
         confirmLabel: 'Publish',
         onConfirm: doSave,
       });
@@ -428,7 +503,7 @@ export async function render(ctx) {
     const pricingRules = pricingRulesSection(comboConfig || {}, (saved) => { comboConfig = saved; runPreview(); });
 
     const modal = Modal({
-      title: mode === 'edit' ? 'Edit combo' : mode === 'create' ? 'Build a combo' : 'View opportunity',
+      title: mode === 'edit' ? 'Edit combo' : mode === 'create' ? 'Build a combo' : 'Create Combo',
       desc: 'Choose the items, set a price and image, preview it, then publish — it will appear on the POS exactly like any other menu item.',
       wide: true,
       onClose: () => {},
@@ -452,7 +527,8 @@ export async function render(ctx) {
         h('div', { class: 'eyebrow' }, 'Live preview'),
         previewHost)),
     err,
-    h('div', { style: { marginTop: '14px', display: 'flex', justifyContent: 'flex-end', gap: '8px' } },
+    h('div', { class: 'modal-sticky-footer' },
+      Button({ variant: 'ghost', onClick: () => modal.close() }, 'Cancel'),
       saveDraftBtn, primaryBtn));
 
     priceInput.addEventListener('input', () => { if (previewHost.firstChild) runPreview(); });

@@ -238,6 +238,16 @@ body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:
 .combo-builder-preview{border-left:1px solid var(--line-soft); padding-left:22px;}
 @media (max-width:760px){.combo-builder-grid{grid-template-columns:1fr;} .combo-builder-preview{border-left:none; padding-left:0; border-top:1px solid var(--line-soft); padding-top:16px;}}
 
+/* Sticky modal footer (spec: Combo Builder's Save Draft/Cancel/Publish row)
+   — Modal.js's own box is the scrolling element (overflow-y:auto directly
+   on .card), so position:sticky on a direct child pins correctly within
+   it without any extra wrapper. */
+.modal-sticky-footer{
+  position:sticky; bottom:-16px; margin:14px -18px -16px; padding:14px 18px;
+  background:var(--surface); border-top:1px solid var(--line-soft);
+  display:flex; justify-content:flex-end; gap:8px;
+}
+
 .combo-item-row{display:flex; gap:8px; align-items:center; margin-bottom:8px; background:var(--surface-2,#f6f3ec); border:1px solid var(--line-soft); border-radius:8px; padding:6px 8px;}
 .combo-item-row select{flex:1; min-width:0;}
 .combo-item-row input[type=number]{width:56px;}
