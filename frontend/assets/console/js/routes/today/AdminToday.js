@@ -328,31 +328,39 @@ function unusualStockDifferenceCard(d, ctx) {
         Pill(severityFromAnomaly(r.severity), `${r.delta_base > 0 ? '+' : ''}${r.delta_base} ${r.base_unit}`)))));
 }
 
-// 2026-10-15 fix (spec: "do not expose internal stack traces, Windows file
-// paths, artifact filenames, or other diagnostic internals to ordinary
-// operational users"). This feed read `e.note` verbatim, which for a
-// startup_validation_failed audit row is the raw Python exception
-// (artifact_load_failed: [Errno 2] No such file or directory:
-// 'C:\Users\...\ml_artifacts\...json' — an actual screenshot from this
-// console). The audit row itself, and the diagnostic detail, are
-// unchanged server-side; this only decides what an ordinary admin sees in
-// this one feed. The full exception stays reachable to whoever is actually
-// diagnosing it via the server's own logs / the audit record's raw note
-// field — never deleted, just not printed here.
-const MODEL_LABEL = {
+// 2026-10-15 fix (spec 7): startup_validation_failed on ml_model_registry
+// carried its raw Python exception text straight into this feed — local
+// Windows filesystem paths, artifact filenames, [Errno 2] internals — a
+// staff-facing "what happened today" list is not the place for that. The
+// full note is still in the backend's audit_log table untouched (nothing
+// here deletes or rewrites it) and still reaches anyone who reads the raw
+// row directly; this only changes what's PRINTED on this operational feed.
+// There is no dedicated System Health page yet to link to (checked:
+// Losses.js and Forecasting.js each surface their own model's status
+// inline, but nothing aggregates all five) — flagged as a real gap, not
+// silently worked around here.
+const ML_MODEL_LABEL = {
+  stock_loss_isoforest: 'Stock-loss detection',
+  unli_consumption_isoforest: 'Unlimited Wings consumption detection',
+  flavor_consumption_isoforest: 'Unlimited Wings flavor detection',
   demand_prophet: 'Demand forecasting',
-  fpgrowth_combos: 'Combo suggestions',
-  stock_loss: 'Stock-loss detection',
-  unli_consumption: 'Unlimited Wings consumption detection',
-  flavor_consumption: 'Flavor-level consumption detection',
+  fpgrowth_combos: 'Combo association mining',
 };
 
 function safeActivityLine(e) {
-  if (e.action === 'startup_validation_failed') {
-    const label = MODEL_LABEL[e.entity_id] || `"${e.entity_id}"`;
-    return { text: `${label} unavailable — its saved model could not be loaded.`, severity: 'warn' };
+  if (e.entity_type === 'ml_model_registry' && e.action === 'startup_validation_failed') {
+    const label = ML_MODEL_LABEL[e.entity_id] || `Model ${e.entity_id || ''}`;
+    return {
+      text: `${e.action.replace(/_/g, ' ')} ${e.entity_type.replace(/_/g, ' ')}${e.entity_id ? ` #${e.entity_id}` : ''}`,
+      detail: `${label} unavailable — its saved model could not be loaded. Full technical detail in this row's tooltip.`,
+      raw: e.note,
+    };
   }
-  return null;
+  return {
+    text: `${e.action} ${e.entity_type}${e.entity_id ? ` #${e.entity_id}` : ''}`,
+    detail: e.note || null,
+    raw: null,
+  };
 }
 
 function activityLogCard(d) {
@@ -363,13 +371,8 @@ function activityLogCard(d) {
       ? EmptyState({ icon: '✓', title: 'Nothing recorded yet', tight: true })
       : h('div', { class: 'scrollpane' }, ...rows.map((e) => {
         const safe = safeActivityLine(e);
-        if (safe) {
-          return h('div', { class: 'mini-row' },
-            h('span', {}, stamp(e.created_at), ' ', h('span', { class: 't-faint' }, 'system')),
-            h('span', { class: `t-xs t-strong ${SEV_TEXT_CLASS[safe.severity]}` }, safe.text));
-        }
-        return h('div', { class: 'mini-row' },
-          h('span', {}, stamp(e.created_at), ' ', h('span', { class: 't-faint' }, e.user_id || 'system'), ' — ', e.action, ' ', e.entity_type, e.entity_id ? ` #${e.entity_id}` : ''),
-          e.note ? h('span', { class: 't-xs t-faint' }, e.note) : null);
+        return h('div', { class: 'mini-row', title: safe.raw || undefined },
+          h('span', {}, stamp(e.created_at), ' ', h('span', { class: 't-faint' }, e.user_id || 'system'), ' — ', safe.text),
+          safe.detail ? h('span', { class: `t-xs ${safe.raw ? 't-warn' : 't-faint'}` }, safe.detail) : null);
       })));
 }
