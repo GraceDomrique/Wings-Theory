@@ -1,13 +1,15 @@
-import { h, mount } from '../../lib/dom.js';
+import { h, mount, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
+import { Drawer } from '../../components/ui/Drawer.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading } from '../../components/ui/Feedback.js';
 import { BarChart } from '../../components/charts/BarChart.js';
 import { palette, destroyAllCharts, destroyChart } from '../../components/charts/base.js';
 import { money, count, stamp, asText } from '../../lib/format.js';
+import { ICONS } from '../../lib/icons.js';
 import { getAdminSales } from '../../lib/api/sales.js';
 import { getSales, getValuation } from '../../lib/api/reports.js';
 import { openOrderDetail } from './orderDetailModal.js';
@@ -39,10 +41,11 @@ export async function render(ctx) {
   // state and date-window semantics for Today's Operations and Historical
   // Performance") — switching the historical section to This Week or This
   // Month must never make today's own figures disappear or change.
-  const state = { period: 'today', trendMetric: 'revenue', reportPeriod: 'this_month' };
+  const state = {
+    period: 'today', trendMetric: 'revenue', reportPeriod: 'this_month', sellersSort: 'qty',
+  };
   const host = h('div');
   const todayHost = h('div');
-  const reportHost = h('div');
 
   async function drawToday() {
     let t;
@@ -76,80 +79,124 @@ export async function render(ctx) {
       }, o.label)));
   }
 
+  // 2026-10-15 rebuild (spec C: "Reduce scrolling dramatically" — the exact
+  // 5-row composition asked for, not a lighter pass over the old one):
+  //   Row 1 Today's Operations: a compact strip (todayHost, above) instead
+  //     of a big card — handled outside content() since it's independent of
+  //     the historical period.
+  //   Row 2 Historical Performance: summaryCard, unchanged content.
+  //   Row 3 Analytics: Sales Trend (65%) beside Best Sellers (35%) — Best
+  //     Sellers moved here from a buried "Generate Report" section, ranked
+  //     and sortable by qty or revenue, using the SAME d.whatsSelling the
+  //     old 3-up row's small "What's Selling" list read (no new fetch).
+  //   Row 4 Secondary Analytics: Sales Mix beside Busy Times.
+  //   Row 5 Operations: Recent Orders capped at 5 rows (was up to 30) beside
+  //     Sales -> Stock + Operational Exceptions stacked.
+  // Order Activity's own card is gone — "Active Orders" already lives in
+  // the Today's Operations strip, and Completed/Voided duplicated what
+  // Recent Orders' own Status column already shows per row.
   function content(d, ctx2) {
     const host2 = h('div');
     mount(host2,
       h('div', { class: 'eyebrow', style: { margin: '18px 0 10px' } }, 'Historical Performance'),
       summaryCard(d, periodTabs()),
-      h('div', { class: 'grid', style: { gridTemplateColumns: '1.4fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
+      h('div', { class: 'grid', style: { gridTemplateColumns: '1.65fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
         trendCard(d),
-        salesMixCard(d)),
-      h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
-        whatsSellingCard(d, ctx2),
-        orderActivityCard(d),
-        busyTimesCard(d)),
+        bestSellersAnalyticsCard(d)),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
-        salesToStockCard(d, ctx2),
-        exceptionsCard(d)),
-      h('div', { style: { marginTop: '14px' } }, recentOrdersCard(d, ctx2)),
-      h('div', { style: { marginTop: '14px' } }, reportHost));
+        salesMixCard(d),
+        busyTimesCard(d)),
+      h('div', { class: 'grid', style: { gridTemplateColumns: '1.4fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
+        recentOrdersCard(d, ctx2),
+        h('div', {},
+          salesToStockCard(d, ctx2),
+          h('div', { style: { marginTop: '14px' } }, exceptionsCard(d)))));
     return host2;
   }
 
-  // -------------------------------------------------------------------
-  // Generate Report — 2026-10-15 integration (spec: "Connect Reports...
-  // Provide a prominent Generate Report action"). Same two endpoints
-  // Reports.js reads (getSales/getValuation) with the same date-range
-  // semantics and CSV export, folded directly into this page instead of
-  // requiring a separate navigation to see totals or download them. The
-  // full Reports.js page stays reachable ('reports' route) for anyone who
-  // wants it as a dedicated, uncluttered printable view — not removed,
-  // just no longer the only way to generate a report.
-  // -------------------------------------------------------------------
-  async function drawReport() {
-    mount(reportHost, Card({}, Loading('Loading report…')));
-    const opts = state.reportPeriod === 'all_time' ? { all_time: true } : { preset: state.reportPeriod };
-    const [sales, valuation] = await Promise.all([getSales(opts), getValuation()]);
-    const range = sales.allTime ? 'all recorded history' : `${sales.startDate || '—'} to ${sales.endDate || '—'}`;
+  // Row 3's ranked Best Sellers — same compact-bar device as the report
+  // drawer's own list (bestSellersRanked below), reused on real data this
+  // row already had (d.whatsSelling), with a Qty/Revenue sort toggle (spec:
+  // "Support ranking by Quantity Sold or Revenue, with the correct ranking
+  // and bar calculations").
+  function bestSellersAnalyticsCard(d) {
+    const sortBtns = h('div', { style: { display: 'flex', gap: '4px' } },
+      Button({ variant: state.sellersSort !== 'revenue' ? 'primary' : 'ghost', size: 'sm', onClick: () => { state.sellersSort = 'qty'; draw(); } }, 'Qty'),
+      Button({ variant: state.sellersSort === 'revenue' ? 'primary' : 'ghost', size: 'sm', onClick: () => { state.sellersSort = 'revenue'; draw(); } }, 'Revenue'));
+    const items = (d.whatsSelling || []).map((r) => ({ name: r.name, qtySold: r.qty, revenue: r.revenue }))
+      .sort((a, b) => (state.sellersSort === 'revenue' ? b.revenue - a.revenue : b.qtySold - a.qtySold));
+    return Card({},
+      CardHeader({ title: 'Best Sellers', right: sortBtns }),
+      bestSellersRanked(items, 'analytics'));
+  }
 
-    const reportPicker = h('div', { class: 'action-strip' },
-      ...REPORT_PERIODS.map((o) => h('button', {
-        class: `action-chip${state.reportPeriod === o.value ? ' is-active' : ''}`,
-        onClick: () => { state.reportPeriod = o.value; drawReport(); },
-      }, o.label)));
+  // -------------------------------------------------------------------
+  // Generate Report — 2026-10-15 rebuild: now a drawer opened from the top
+  // toolbar (spec D) instead of an always-expanded section at the bottom of
+  // the page, which duplicated the Revenue/Orders/Avg-Order figures Rows 1
+  // and 2 already show. Same two endpoints Reports.js reads (getSales/
+  // getValuation), same CSV export — composition changed, not the data
+  // source. The full Reports.js page stays reachable ("Full report
+  // center") for anyone who wants the dedicated, uncluttered printable
+  // view. Only CSV is a real, backend-generated export today; this drawer
+  // says so rather than offering a PDF/Excel button that doesn't exist.
+  // -------------------------------------------------------------------
+  function openReportDrawer() {
+    const bodyHost = h('div');
+    const drawer = Drawer({
+      title: 'Generate Report',
+      desc: 'Sales summary and best sellers for a chosen period, exported as CSV',
+      onClose: () => {},
+    }, bodyHost);
 
-    mount(reportHost, Card({},
-      CardHeader({
-        title: 'Generate Report',
-        desc: `Covers ${range} · generated ${new Date().toLocaleString()} · voided orders excluded from every total`,
-        right: Button({ size: 'sm', onClick: () => ctx.navigate('reports') }, 'Full report center →'),
-      }),
-      reportPicker,
-      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', margin: '14px 0' } },
-        Stat({ value: money(sales.revenue, '₱0'), label: 'Revenue' }),
-        Stat({ value: count(sales.orders), label: 'Orders' }),
-        Stat({ value: count(sales.covers), label: 'Covers' }),
-        Stat({ value: sales.averageOrder === null ? null : money(sales.averageOrder), label: 'Avg. Order' })),
-      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' } },
-        h('div', { class: 'eyebrow' }, 'Best sellers this period'),
-        h('div', { style: { display: 'flex', gap: '8px' } },
-          Button({ size: 'sm', variant: 'ghost', onClick: () => downloadSalesSummaryCsv(sales) }, '↓ Sales summary CSV'),
-          Button({ size: 'sm', variant: 'ghost', onClick: () => downloadBestSellersCsv(sales) }, '↓ Best sellers CSV'))),
-      bestSellersRanked(sales.byItem || []),
-      valuation.available
-        ? h('div', { class: 't-xs t-faint', style: { marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--line-soft)' } },
-          'Current inventory valuation: ', h('strong', {}, money(valuation.totalValue).textContent), ' · confirmed unit costs only, not tied to the period above')
-        : null));
+    async function drawBody() {
+      mount(bodyHost, Loading('Loading report…'));
+      const opts = state.reportPeriod === 'all_time' ? { all_time: true } : { preset: state.reportPeriod };
+      const [sales, valuation] = await Promise.all([getSales(opts), getValuation()]);
+      const range = sales.allTime ? 'all recorded history' : `${sales.startDate || '—'} to ${sales.endDate || '—'}`;
+
+      const reportPicker = h('div', { class: 'action-strip' },
+        ...REPORT_PERIODS.map((o) => h('button', {
+          class: `action-chip${state.reportPeriod === o.value ? ' is-active' : ''}`,
+          onClick: () => { state.reportPeriod = o.value; drawBody(); },
+        }, o.label)));
+
+      mount(bodyHost,
+        h('div', { class: 't-xs t-faint', style: { marginBottom: '12px' } },
+          `Covers ${range} · generated ${new Date().toLocaleString()} · voided orders excluded from every total · CSV export only — no other format is currently generated by this system`),
+        h('div', { class: 'eyebrow', style: { marginBottom: '6px' } }, 'Date range'),
+        reportPicker,
+        h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2,1fr)', gap: '14px', margin: '16px 0' } },
+          Stat({ value: money(sales.revenue, '₱0'), label: 'Revenue' }),
+          Stat({ value: count(sales.orders), label: 'Orders' }),
+          Stat({ value: count(sales.covers), label: 'Covers' }),
+          Stat({ value: sales.averageOrder === null ? null : money(sales.averageOrder), label: 'Avg. Order' })),
+        h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' } },
+          h('div', { class: 'eyebrow' }, 'Best sellers this period'),
+          h('div', { style: { display: 'flex', gap: '6px' } },
+            Button({ size: 'sm', variant: 'ghost', onClick: () => downloadSalesSummaryCsv(sales) }, '↓ Summary'),
+            Button({ size: 'sm', variant: 'ghost', onClick: () => downloadBestSellersCsv(sales) }, '↓ Sellers'))),
+        bestSellersRanked(sales.byItem || [], 'report', drawBody),
+        valuation.available
+          ? h('div', { class: 't-xs t-faint', style: { marginTop: '14px', paddingTop: '12px', borderTop: '1px solid var(--line-soft)' } },
+            'Current inventory valuation (now, not historical for the period above): ',
+            h('strong', {}, money(valuation.totalValue).textContent), ' · confirmed unit costs only')
+          : null,
+        h('div', { style: { marginTop: '16px' } },
+          Button({ variant: 'ghost', style: { width: '100%' }, onClick: () => { drawer.close(); ctx.navigate('reports'); } }, 'Open full report center →')));
+    }
+    drawBody();
   }
 
   // Compact ranked rows with a proportional bar (same device as
   // salesMixCard's category bars below), not a generic full-width table —
   // spec: "compact ranked product rows rather than another generic
   // full-width table". Top 5 by default; "Show more" expands to 10.
-  function bestSellersRanked(items) {
+  function bestSellersRanked(items, scope, onToggle) {
     if (items.length === 0) return EmptyState({ icon: '✓', title: 'No sales recorded for this period', tight: true });
+    const expandKey = `bestSellersExpanded_${scope}`;
     const maxQty = Math.max(...items.map((r) => r.qtySold || 0), 1);
-    const visible = items.slice(0, state.bestSellersExpanded ? 10 : 5);
+    const visible = items.slice(0, state[expandKey] ? 10 : 5);
     const rows = visible.map((r, i) => h('div', { style: { padding: '7px 0' } },
       h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '3px' } },
         h('span', { class: 't-xs t-faint', style: { width: '16px', flexShrink: '0', fontWeight: '700' } }, `#${i + 1}`),
@@ -163,8 +210,8 @@ export async function render(ctx) {
       items.length > 5 ? h('div', { style: { marginTop: '8px', textAlign: 'center' } },
         Button({
           size: 'sm', variant: 'ghost',
-          onClick: () => { state.bestSellersExpanded = !state.bestSellersExpanded; drawReport(); },
-        }, state.bestSellersExpanded ? 'Show fewer' : `Show more (${Math.min(items.length, 10) - 5} more)`)) : null);
+          onClick: () => { state[expandKey] = !state[expandKey]; (onToggle || draw)(); },
+        }, state[expandKey] ? 'Show fewer' : `Show more (${Math.min(items.length, 10) - 5} more)`)) : null);
   }
 
   function downloadSalesSummaryCsv(sales) {
@@ -216,9 +263,19 @@ export async function render(ctx) {
   }
 
   await draw();
-  drawReport();
   drawToday();
+
+  // Top toolbar (spec C/D): Generate Report and View All Orders both
+  // prominent, before any of the page's own content — not a tiny link
+  // buried after Recent Orders the way the old bottom section was.
+  const toolbar = h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px', marginBottom: '14px', flexWrap: 'wrap' } },
+    h('div', { class: 't-xs t-faint' }, 'Figures refresh on demand — use the reload button above to pull the latest.'),
+    h('div', { style: { display: 'flex', gap: '8px' } },
+      Button({ variant: 'ghost', onClick: () => ctx.navigate('orderhistory') }, icon(ICONS.history, 14), ' View All Orders'),
+      Button({ variant: 'primary', onClick: openReportDrawer }, icon(ICONS.fileChart, 14), ' Generate Report')));
+
   return h('div', {},
+    toolbar,
     h('div', { class: 'eyebrow' }, "Today's Operations"),
     todayHost,
     host);
@@ -230,24 +287,29 @@ export async function render(ctx) {
  * section already computes for its own 'today' case — no second
  * calculation, just a dedicated always-on fetch instead of one tied to
  * state.period. */
+// 2026-10-15: a compact horizontal strip (same device as Menu Studio's
+// .menu-health-strip) instead of a big kpi-primary card — spec explicitly:
+// "Do not apply large pale beige backgrounds behind a few tiny numbers."
 function todaySnapshotCard(t) {
   const s = t.salesSummary;
   const a = t.orderActivity;
-  const freshness = t.asOf
-    ? h('div', { class: 't-xs t-faint', style: { marginTop: '8px' } }, 'As of ', stamp(t.asOf))
-    : null;
-  return Card({ className: 'kpi-primary' },
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '14px' } },
-      Stat({ value: money(s.revenue, '₱0'), label: "Today's Revenue" }),
-      Stat({ value: count(s.orders), label: 'Orders Today' }),
-      Stat({ value: s.avgOrder === null ? null : money(s.avgOrder), label: 'Avg. Order' }),
-      Stat({ value: count(a.preparing), label: 'Active Right Now' })),
-    (t.exceptions || []).length > 0
-      ? h('div', { class: 'callout callout-warn', style: { marginTop: '12px', marginBottom: '0' } },
+  const hasExceptions = (t.exceptions || []).length > 0;
+  return h('div', {},
+    h('div', { class: 'menu-health-strip' },
+      h('span', { class: 'mhs-item' }, h('b', {}, money(s.revenue, '₱0').textContent), ' today’s revenue'),
+      h('span', { class: 'mhs-dot' }),
+      h('span', { class: 'mhs-item' }, h('b', {}, count(s.orders).textContent), ' orders today'),
+      h('span', { class: 'mhs-dot' }),
+      h('span', { class: 'mhs-item' }, h('b', {}, s.avgOrder === null ? '—' : money(s.avgOrder).textContent), ' avg. order'),
+      h('span', { class: 'mhs-dot' }),
+      h('span', { class: `mhs-item ${a.preparing ? '' : 'mhs-good'}` }, h('b', {}, count(a.preparing).textContent), ' active orders'),
+      t.asOf ? h('span', { class: 'mhs-dot' }) : null,
+      t.asOf ? h('span', { class: 'mhs-item' }, 'as of ', stamp(t.asOf)) : null),
+    hasExceptions
+      ? h('div', { class: 'callout callout-warn', style: { marginTop: '8px', marginBottom: '0' } },
         h('p', {}, h('strong', {}, `${t.exceptions.length} exception${t.exceptions.length === 1 ? '' : 's'} today: `),
           t.exceptions.map((e) => e.note).join(' · ')))
-      : null,
-    freshness);
+      : null);
 }
 
 function deltaPill(value) {
@@ -281,29 +343,6 @@ function salesMixCard(d) {
           h('span', {}, c.category), h('span', { class: 't-xs t-faint' }, `${c.sharePct}%`)),
         h('div', { style: { height: '5px', borderRadius: '3px', background: 'var(--line-soft)', overflow: 'hidden' } },
           h('div', { style: { height: '100%', width: `${c.sharePct}%`, background: 'var(--amber)' } })))));
-}
-
-function whatsSellingCard(d, ctx) {
-  const rows = d.whatsSelling || [];
-  return Card({},
-    CardHeader({
-      title: "What's Selling",
-      right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('bestsellers') }, 'View all →'),
-    }),
-    rows.length === 0
-      ? EmptyState({ icon: '✓', title: 'Nothing sold yet', tight: true })
-      : h('div', { class: 'scrollpane' }, ...rows.map((r) => h('div', { class: 'mini-row' },
-        h('span', {}, r.name), Pill('info', `${r.qty} sold`)))));
-}
-
-function orderActivityCard(d) {
-  const a = d.orderActivity;
-  return Card({},
-    CardHeader({ title: 'Order Activity' }),
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3, minmax(0,1fr))', gap: '8px' } },
-      Stat({ value: count(a.completed), label: 'Completed' }),
-      Stat({ value: count(a.preparing), label: 'In Progress' }),
-      Stat({ value: count(a.voided), label: 'Voided' })));
 }
 
 function busyTimesCard(d) {
@@ -343,10 +382,14 @@ function exceptionsCard(d) {
       : rows.map((e) => h('div', { class: 'mini-row' }, h('span', {}, e.note), Pill('warn', e.kind.replace(/_/g, ' ')))));
 }
 
+// 2026-10-15: capped at 5 rows (was up to 30) — spec: "Do not place 15-20
+// recent orders on the main dashboard." Full history is one click away via
+// the page's own top-toolbar "View All Orders" button and this card's own
+// link, both pointing at the dedicated, server-paginated Order History page.
 function recentOrdersCard(d, ctx) {
-  const rows = d.recentOrders || [];
+  const rows = (d.recentOrders || []).slice(0, 5);
   return Card({},
-    CardHeader({ title: 'Recent Orders', desc: 'Largest section on this page, by design', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('orderhistory') }, 'View All →') }),
+    CardHeader({ title: 'Recent Orders', desc: 'Most recent 5 — see Order History for the full record', right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('orderhistory') }, 'View All →') }),
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'No orders recorded yet', tight: true })
       : h('table', {},
