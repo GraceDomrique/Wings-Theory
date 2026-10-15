@@ -18,6 +18,7 @@ import * as menu from './routes/menu/MenuStudio.js';
 import * as recipes from './routes/menu/Recipes.js';
 import * as combos from './routes/menu/Combos.js';
 
+import * as purchasinghub from './routes/purchasing/PurchasingHub.js';
 import * as forecasts from './routes/intelligence/Forecasting.js';
 import * as whattobuy from './routes/purchasing/WhatToBuy.js';
 import * as purchasing from './routes/purchasing/Purchasing.js';
@@ -52,7 +53,7 @@ const routes = {
   today,
   onhand, receiving, expiry, stockcounts, losses, unli, movements,
   menu, recipes, combos,
-  forecasts, whattobuy, purchasing,
+  purchasinghub, forecasts, whattobuy, purchasing,
   salesoverview, orderhistory, bestsellers, reports,
   inventoryoverview, historicalrecords, downloads, unlisummary,
   stockreplenishment, costslosses, reportshistory,

@@ -932,7 +932,10 @@ canvas{max-width:100%;}
 .action-chip.is-active{background:var(--amber-tint); border-color:var(--amber); color:var(--amber-deep);}
 
 @media (max-width:1180px){
-  .studio-layout{grid-template-columns:1fr;}
+  /* !important: call sites (MenuStudio.js's 25%/1fr/25%, PurchasingHub.js's
+     inline 1.6fr/1fr) set grid-template-columns inline, same reason the
+     admin-today/owner-overview breakpoint above needs it too. */
+  .studio-layout{grid-template-columns:1fr !important;}
   .studio-col-left .scrollpane{max-height:320px;}
 }
 

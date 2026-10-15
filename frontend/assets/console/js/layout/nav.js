@@ -63,15 +63,18 @@ export const ADMIN_TREE = [
     label: 'Menu & Recipes',
     icon: ICONS.bookOpen,
   },
+  // 2026-10-15 rebuild: collapsed from a 3-child accordion (Demand
+  // Forecasts / What to Buy / Purchase) into one primary nav item that
+  // opens the Purchasing workspace (PurchasingHub.js) directly — same
+  // consolidation as 'menu' above. 'forecasts', 'whattobuy' and 'purchasing'
+  // are no longer their own sidebar entries; their routes/components stay
+  // reachable as deep links from Purchasing's own actions ("View demand
+  // forecast evidence", "Full purchase order history") and as direct-URL
+  // targets — see ADMIN_EXTRA_ROUTE_IDS below.
   {
-    id: 'grp-purchasing',
+    id: 'purchasinghub',
     label: 'Purchasing',
     icon: ICONS.shoppingCart,
-    children: [
-      { id: 'forecasts', label: 'Demand Forecasts' },
-      { id: 'whattobuy', label: 'What to Buy' },
-      { id: 'purchasing', label: 'Purchase' },
-    ],
   },
   // 2026-10-15: consolidated from four children to three (Overview/Orders/
   // Reports) — Best Sellers is no longer its own sidebar entry; the same
@@ -174,7 +177,7 @@ const OWNER_EXTRA_ROUTE_IDS = [
  * — reached from Inventory's Quick Actions and "Needs attention" rows. */
 const ADMIN_EXTRA_ROUTE_IDS = [
   'receiving', 'expiry', 'stockcounts', 'losses', 'unli', 'movements', 'bestsellers',
-  'recipes', 'combos',
+  'recipes', 'combos', 'forecasts', 'whattobuy', 'purchasing',
 ];
 
 /** Display label for a route id that isn't a leaf in either tree anymore
@@ -192,6 +195,8 @@ const EXTRA_LABELS = {
   bestsellers: { group: 'Sales & Orders', label: 'Best Sellers' },
   recipes: { group: 'Menu & Recipes', label: 'Recipes & Costing' },
   combos: { group: 'Menu & Recipes', label: 'Combos' },
+  forecasts: { group: 'Purchasing', label: 'Demand Forecasts' },
+  whattobuy: { group: 'Purchasing', label: 'What to Buy' },
 };
 
 export function treeForRole(role) {
@@ -275,6 +280,7 @@ export const PAGE_SUB = {
   recipes: 'What each menu item is made of, and what it costs to make.',
   combos: 'What sells together (from real order history), combo ideas worth a real price, and what to publish to the POS.',
   forecasts: 'Predicted demand for each menu item, and how well that prediction has held up.',
+  purchasinghub: 'What needs buying, why, and what to do about it — plus the orders already in motion.',
   whattobuy: 'What needs buying, why, and how much.',
   purchasing: 'Purchase orders being processed, and every order ever placed, in one place.',
   salesoverview: 'How the business is performing, and how it compares to before.',
