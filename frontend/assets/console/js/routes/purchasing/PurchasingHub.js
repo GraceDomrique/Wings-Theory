@@ -6,6 +6,8 @@ import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
+import { BarChart } from '../../components/charts/BarChart.js';
+import { palette } from '../../components/charts/base.js';
 import {
   qty, days, asText, nodata, count, stamp, date,
 } from '../../lib/format.js';
@@ -256,11 +258,45 @@ export async function render(ctx) {
     return 'Comfortably covered until the next scheduled delivery.';
   }
 
+  // 2026-10-15: inline projected-cover chart (spec B: "Expandable forecast
+  // chart. Expected demand. Lead time and stock cover" visible in the
+  // purchasing decision itself, not "a small Demand Forecasts text button
+  // at the far right of the toolbar"). This is a straight-line projection
+  // from the SAME real numbers already shown above it (usable stock minus
+  // the real measured usedPerDay rate) — never a second prediction model,
+  // and never the per-MENU-ITEM Prophet forecast mislabeled as ingredient
+  // demand. Labelled "projected" throughout so it reads as simple
+  // arithmetic on a real rate, not a statistical forecast.
+  function depletionChart(r) {
+    if (r.usedPerDay === null || r.onHand === null) return null;
+    const horizon = Math.max(r.leadTimeDays || 7, 7);
+    const labels = [];
+    const values = [];
+    for (let day = 0; day <= horizon; day += 1) {
+      labels.push(day === 0 ? 'Today' : `+${day}d`);
+      values.push(Math.max(0, r.onHand - r.usedPerDay * day));
+    }
+    const leadTimeIdx = r.leadTimeDays || null;
+    return h('div', { style: { marginBottom: '14px' } },
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: '6px' } },
+        h('div', { class: 'eyebrow' }, 'Projected stock cover'),
+        h('span', { class: 't-xs t-faint' }, `~${asText.num(r.usedPerDay, '', 2)} ${r.baseUnit}/day`)),
+      BarChart({
+        labels, data: values,
+        colors: values.map((v, i) => (leadTimeIdx !== null && i >= leadTimeIdx ? palette.crit : palette.info)),
+        height: 90,
+      }),
+      leadTimeIdx !== null
+        ? h('div', { class: 't-xs t-faint', style: { marginTop: '4px' } }, `Bars past +${leadTimeIdx}d (supplier lead time) are shown in red — stock would be running on borrowed time by then at the current rate.`)
+        : null);
+  }
+
   function drawIngredientPanel(r) {
     const buying = needsBuying(r);
     const relatedPOs = orders.filter((po) => po.items.some((it) => it.ingredientId === r.ingredientId) && po.status !== 'cancelled');
     mount(rightHost, Card({},
       CardHeader({ title: r.name, desc: 'Purchase recommendation', right: statusPill(r) }),
+      depletionChart(r),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px', marginBottom: '14px' } },
         drawerField('Usable stock', qty(r.onHand, r.baseUnit)),
         drawerField('Estimated stock cover', days(r.daysLeft)),
