@@ -328,13 +328,48 @@ function unusualStockDifferenceCard(d, ctx) {
         Pill(severityFromAnomaly(r.severity), `${r.delta_base > 0 ? '+' : ''}${r.delta_base} ${r.base_unit}`)))));
 }
 
+// 2026-10-15 fix (spec: "do not expose internal stack traces, Windows file
+// paths, artifact filenames, or other diagnostic internals to ordinary
+// operational users"). This feed read `e.note` verbatim, which for a
+// startup_validation_failed audit row is the raw Python exception
+// (artifact_load_failed: [Errno 2] No such file or directory:
+// 'C:\Users\...\ml_artifacts\...json' — an actual screenshot from this
+// console). The audit row itself, and the diagnostic detail, are
+// unchanged server-side; this only decides what an ordinary admin sees in
+// this one feed. The full exception stays reachable to whoever is actually
+// diagnosing it via the server's own logs / the audit record's raw note
+// field — never deleted, just not printed here.
+const MODEL_LABEL = {
+  demand_prophet: 'Demand forecasting',
+  fpgrowth_combos: 'Combo suggestions',
+  stock_loss: 'Stock-loss detection',
+  unli_consumption: 'Unlimited Wings consumption detection',
+  flavor_consumption: 'Flavor-level consumption detection',
+};
+
+function safeActivityLine(e) {
+  if (e.action === 'startup_validation_failed') {
+    const label = MODEL_LABEL[e.entity_id] || `"${e.entity_id}"`;
+    return { text: `${label} unavailable — its saved model could not be loaded.`, severity: 'warn' };
+  }
+  return null;
+}
+
 function activityLogCard(d) {
   const rows = d.activityLog || [];
   return Card({ className: 'card-flex' },
     CardHeader({ title: 'Activity Log', desc: 'Recent actions' }),
     rows.length === 0
       ? EmptyState({ icon: '✓', title: 'Nothing recorded yet', tight: true })
-      : h('div', { class: 'scrollpane' }, ...rows.map((e) => h('div', { class: 'mini-row' },
-        h('span', {}, stamp(e.created_at), ' ', h('span', { class: 't-faint' }, e.user_id || 'system'), ' — ', e.action, ' ', e.entity_type, e.entity_id ? ` #${e.entity_id}` : ''),
-        e.note ? h('span', { class: 't-xs t-faint' }, e.note) : null))));
+      : h('div', { class: 'scrollpane' }, ...rows.map((e) => {
+        const safe = safeActivityLine(e);
+        if (safe) {
+          return h('div', { class: 'mini-row' },
+            h('span', {}, stamp(e.created_at), ' ', h('span', { class: 't-faint' }, 'system')),
+            h('span', { class: `t-xs t-strong ${SEV_TEXT_CLASS[safe.severity]}` }, safe.text));
+        }
+        return h('div', { class: 'mini-row' },
+          h('span', {}, stamp(e.created_at), ' ', h('span', { class: 't-faint' }, e.user_id || 'system'), ' — ', e.action, ' ', e.entity_type, e.entity_id ? ` #${e.entity_id}` : ''),
+          e.note ? h('span', { class: 't-xs t-faint' }, e.note) : null);
+      })));
 }
