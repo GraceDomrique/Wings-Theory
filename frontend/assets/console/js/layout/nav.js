@@ -76,20 +76,18 @@ export const ADMIN_TREE = [
     label: 'Purchasing',
     icon: ICONS.shoppingCart,
   },
-  // 2026-10-15: consolidated from four children to three (Overview/Orders/
-  // Reports) — Best Sellers is no longer its own sidebar entry; the same
-  // page (route id unchanged) is now reached from Overview's "What's
-  // Selling" card and from the new Reports center's Best Sellers section,
-  // and stays a valid direct-URL target via ADMIN_EXTRA_ROUTE_IDS below.
+  // 2026-10-15 rebuild: collapsed from a 3-child accordion (Overview /
+  // Orders / Reports) into one primary nav item — AdminSales.js now
+  // includes a "Generate Report" section inline (period picker, CSV
+  // exports, inventory valuation), and Recent Orders already links to full
+  // order search. 'orderhistory' and 'reports' are no longer their own
+  // sidebar entries but stay reachable as deep links (full historical
+  // search with server-side pagination, and the dedicated printable report
+  // center) — same consolidation as 'menu' and 'purchasinghub' above.
   {
-    id: 'grp-sales',
+    id: 'salesoverview',
     label: 'Sales & Orders',
     icon: ICONS.chartCombined,
-    children: [
-      { id: 'salesoverview', label: 'Overview' },
-      { id: 'orderhistory', label: 'Orders' },
-      { id: 'reports', label: 'Reports' },
-    ],
   },
   {
     id: 'grp-admin',
@@ -178,6 +176,7 @@ const OWNER_EXTRA_ROUTE_IDS = [
 const ADMIN_EXTRA_ROUTE_IDS = [
   'receiving', 'expiry', 'stockcounts', 'losses', 'unli', 'movements', 'bestsellers',
   'recipes', 'combos', 'forecasts', 'whattobuy', 'purchasing',
+  'orderhistory', 'reports',
 ];
 
 /** Display label for a route id that isn't a leaf in either tree anymore
@@ -197,6 +196,8 @@ const EXTRA_LABELS = {
   combos: { group: 'Menu & Recipes', label: 'Combos' },
   forecasts: { group: 'Purchasing', label: 'Demand Forecasts' },
   whattobuy: { group: 'Purchasing', label: 'What to Buy' },
+  orderhistory: { group: 'Sales & Orders', label: 'Orders' },
+  reports: { group: 'Sales & Orders', label: 'Reports' },
 };
 
 export function treeForRole(role) {

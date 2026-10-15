@@ -1,14 +1,16 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
+import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading } from '../../components/ui/Feedback.js';
 import { BarChart } from '../../components/charts/BarChart.js';
 import { palette, destroyAllCharts, destroyChart } from '../../components/charts/base.js';
-import { money, count, stamp } from '../../lib/format.js';
+import { money, count, stamp, asText } from '../../lib/format.js';
 import { getAdminSales } from '../../lib/api/sales.js';
+import { getSales, getValuation } from '../../lib/api/reports.js';
 import { openOrderDetail } from './orderDetailModal.js';
 
 /**
@@ -24,9 +26,17 @@ const PERIODS = [
   { value: 'this_month', label: 'This Month' },
 ];
 
+const REPORT_PERIODS = [
+  { value: 'today', label: 'Today' },
+  { value: 'this_week', label: 'This Week' },
+  { value: 'this_month', label: 'This Month' },
+  { value: 'all_time', label: 'All Time' },
+];
+
 export async function render(ctx) {
-  const state = { period: 'today', trendMetric: 'revenue' };
+  const state = { period: 'today', trendMetric: 'revenue', reportPeriod: 'this_month' };
   const host = h('div');
+  const reportHost = h('div');
 
   async function draw() {
     destroyAllCharts();
@@ -63,8 +73,92 @@ export async function render(ctx) {
       h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
         salesToStockCard(d, ctx2),
         exceptionsCard(d)),
-      h('div', { style: { marginTop: '14px' } }, recentOrdersCard(d, ctx2)));
+      h('div', { style: { marginTop: '14px' } }, recentOrdersCard(d, ctx2)),
+      h('div', { style: { marginTop: '14px' } }, reportHost));
     return host2;
+  }
+
+  // -------------------------------------------------------------------
+  // Generate Report — 2026-10-15 integration (spec: "Connect Reports...
+  // Provide a prominent Generate Report action"). Same two endpoints
+  // Reports.js reads (getSales/getValuation) with the same date-range
+  // semantics and CSV export, folded directly into this page instead of
+  // requiring a separate navigation to see totals or download them. The
+  // full Reports.js page stays reachable ('reports' route) for anyone who
+  // wants it as a dedicated, uncluttered printable view — not removed,
+  // just no longer the only way to generate a report.
+  // -------------------------------------------------------------------
+  async function drawReport() {
+    mount(reportHost, Card({}, Loading('Loading report…')));
+    const opts = state.reportPeriod === 'all_time' ? { all_time: true } : { preset: state.reportPeriod };
+    const [sales, valuation] = await Promise.all([getSales(opts), getValuation()]);
+    const range = sales.allTime ? 'all recorded history' : `${sales.startDate || '—'} to ${sales.endDate || '—'}`;
+
+    const reportPicker = h('div', { class: 'action-strip' },
+      ...REPORT_PERIODS.map((o) => h('button', {
+        class: `action-chip${state.reportPeriod === o.value ? ' is-active' : ''}`,
+        onClick: () => { state.reportPeriod = o.value; drawReport(); },
+      }, o.label)));
+
+    mount(reportHost, Card({},
+      CardHeader({
+        title: 'Generate Report',
+        desc: `Covers ${range} · generated ${new Date().toLocaleString()} · voided orders excluded from every total`,
+        right: Button({ size: 'sm', onClick: () => ctx.navigate('reports') }, 'Full report center →'),
+      }),
+      reportPicker,
+      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', margin: '14px 0' } },
+        Stat({ value: money(sales.revenue, '₱0'), label: 'Revenue' }),
+        Stat({ value: count(sales.orders), label: 'Orders' }),
+        Stat({ value: count(sales.covers), label: 'Covers' }),
+        Stat({ value: sales.averageOrder === null ? null : money(sales.averageOrder), label: 'Avg. Order' })),
+      h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' } },
+        h('div', { class: 'eyebrow' }, 'Best sellers this period'),
+        h('div', { style: { display: 'flex', gap: '8px' } },
+          Button({ size: 'sm', variant: 'ghost', onClick: () => downloadSalesSummaryCsv(sales) }, '↓ Sales summary CSV'),
+          Button({ size: 'sm', variant: 'ghost', onClick: () => downloadBestSellersCsv(sales) }, '↓ Best sellers CSV'))),
+      (sales.byItem || []).length === 0
+        ? EmptyState({ icon: '✓', title: 'No sales recorded for this period', tight: true })
+        : Table({
+          columns: [
+            { key: 'rank', label: '#', render: (r, i) => String((sales.byItem || []).indexOf(r) + 1) },
+            { key: 'name', label: 'Item', render: (r) => r.name },
+            { key: 'qty', label: 'Qty sold', render: (r) => h('span', { class: 'mono t-sm' }, count(r.qtySold)) },
+            { key: 'revenue', label: 'Revenue', render: (r) => h('span', { class: 'mono t-sm' }, money(r.revenue)) },
+          ],
+          rows: (sales.byItem || []).slice(0, 8),
+        }),
+      valuation.available
+        ? h('div', { class: 't-xs t-faint', style: { marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--line-soft)' } },
+          'Current inventory valuation: ', h('strong', {}, money(valuation.totalValue).textContent), ' · confirmed unit costs only, not tied to the period above')
+        : null));
+  }
+
+  function downloadSalesSummaryCsv(sales) {
+    const lines = [['metric', 'value'].join(','),
+      `revenue,${asText.num(sales.revenue, '', 2)}`,
+      `orders,${sales.orders ?? ''}`,
+      `items_sold,${sales.items ?? ''}`,
+      `avg_order,${asText.num(sales.averageOrder, '', 2)}`].join('\n');
+    downloadCsv(lines, 'sales-summary');
+  }
+
+  function downloadBestSellersCsv(sales) {
+    const head = ['rank', 'item', 'qty_sold', 'revenue'];
+    const lines = [head.join(',')];
+    (sales.byItem || []).forEach((r, i) => {
+      lines.push([i + 1, r.name, asText.num(r.qtySold, '', 0), asText.num(r.revenue, '', 2)]
+        .map((v) => `"${String(v).replace(/"/g, '""')}"`).join(','));
+    });
+    downloadCsv(lines.join('\n'), 'best-sellers');
+  }
+
+  function downloadCsv(csv, name) {
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const a = h('a', { href: URL.createObjectURL(blob), download: `wings-theory-${name}-${new Date().toISOString().slice(0, 10)}.csv` });
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
   function trendCard(d) {
@@ -89,6 +183,7 @@ export async function render(ctx) {
   }
 
   await draw();
+  drawReport();
   return host;
 }
 
