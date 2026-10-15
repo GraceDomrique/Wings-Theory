@@ -55,7 +55,7 @@ from sklearn.ensemble import IsolationForest
 from . import audit, model_registry, timeutil
 from . import ml_artifacts_io as artifacts
 from .db import write_tx
-from .errors import InvalidStateError, NotFoundError
+from .errors import InvalidStateError, ModelRegistryUnavailableError, NotFoundError
 
 REVIEW_STATUSES = ("flagged", "under_review", "confirmed_anomaly", "false_positive", "resolved")
 
@@ -387,7 +387,12 @@ def _score_with_isolation_forest(
     layer (large_fraction / variance-MAD) keeps answering, and the ML
     verdict is reported absent rather than fabricated."""
     if use_artifact:
-        path = model_registry.active_artifact_path(conn, model_key)
+        try:
+            path = model_registry.active_artifact_path(conn, model_key)
+        except ModelRegistryUnavailableError:
+            # Schema not migrated yet -- same posture as "no artifact yet":
+            # fall through to the fresh-fit-or-unavailable decision below.
+            path = None
         if path:
             try:
                 payload = artifacts.load_joblib(path)

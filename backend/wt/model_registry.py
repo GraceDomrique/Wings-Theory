@@ -26,7 +26,7 @@ import json
 import sqlite3
 
 from .db import write_tx
-from .errors import InvalidStateError, NotFoundError, ValidationError
+from .errors import InvalidStateError, ModelRegistryUnavailableError, NotFoundError, ValidationError
 
 MODES = ("SIMULATED", "MIXED", "REAL")
 MODEL_KEYS = (
@@ -45,9 +45,39 @@ def next_mode(current: str) -> str:
     return _NEXT_MODE[current]
 
 
+_REGISTRY_TABLES = ("ml_model_registry", "ml_training_run", "ml_approved_synthetic_batch")
+
+
+def _is_missing_registry_table(exc: sqlite3.OperationalError) -> bool:
+    """True only for "no such table: <one of this module's own tables>" --
+    migration 0050 hasn't been applied yet. A different OperationalError
+    (a malformed/corrupted schema, a locked database, etc.) returns False
+    so it propagates unmasked rather than being treated as an ordinary
+    "nothing trained yet" condition."""
+    msg = str(exc).lower()
+    return "no such table" in msg and any(t in msg for t in _REGISTRY_TABLES)
+
+
+def _execute(conn: sqlite3.Connection, sql: str, params: tuple = ()) -> sqlite3.Cursor:
+    """Every registry read goes through here so "table doesn't exist" is
+    raised as one specific, catchable error instead of a raw
+    sqlite3.OperationalError that callers would otherwise have to guess
+    about or let crash the request."""
+    try:
+        return conn.execute(sql, params)
+    except sqlite3.OperationalError as exc:
+        if _is_missing_registry_table(exc):
+            raise ModelRegistryUnavailableError(
+                "the ml_model_registry schema has not been created yet in this "
+                "database (migrations not applied) -- model-serving falls back "
+                "live; run db migrations to initialize the registry",
+            ) from exc
+        raise
+
+
 def _registry_row(conn: sqlite3.Connection, model_key: str) -> sqlite3.Row:
-    row = conn.execute(
-        "SELECT * FROM ml_model_registry WHERE model_key=?", (model_key,)
+    row = _execute(
+        conn, "SELECT * FROM ml_model_registry WHERE model_key=?", (model_key,)
     ).fetchone()
     if not row:
         raise NotFoundError(f"unknown model_key '{model_key}'")
@@ -69,14 +99,15 @@ def _hydrate(row: sqlite3.Row) -> dict:
 
 
 def _run_row(conn: sqlite3.Connection, run_id: int) -> sqlite3.Row:
-    row = conn.execute("SELECT * FROM ml_training_run WHERE id=?", (run_id,)).fetchone()
+    row = _execute(conn, "SELECT * FROM ml_training_run WHERE id=?", (run_id,)).fetchone()
     if not row:
         raise NotFoundError(f"training run {run_id} not found")
     return row
 
 
 def active_run(conn: sqlite3.Connection, model_key: str) -> dict | None:
-    row = conn.execute(
+    row = _execute(
+        conn,
         "SELECT r.* FROM ml_training_run r "
         "JOIN ml_model_registry m ON m.active_training_run_id = r.id "
         "WHERE m.model_key=?",
@@ -91,7 +122,8 @@ def active_artifact_path(conn: sqlite3.Connection, model_key: str) -> str | None
 
 
 def training_history(conn: sqlite3.Connection, model_key: str, limit: int = 20) -> list[dict]:
-    rows = conn.execute(
+    rows = _execute(
+        conn,
         "SELECT * FROM ml_training_run WHERE model_key=? ORDER BY trained_at DESC, id DESC LIMIT ?",
         (model_key, limit),
     ).fetchall()
@@ -100,7 +132,7 @@ def training_history(conn: sqlite3.Connection, model_key: str, limit: int = 20) 
 
 def list_models(conn: sqlite3.Connection) -> list[dict]:
     out = []
-    for row in conn.execute("SELECT * FROM ml_model_registry ORDER BY model_key"):
+    for row in _execute(conn, "SELECT * FROM ml_model_registry ORDER BY model_key"):
         out.append({
             "model_key": row["model_key"],
             "display_name": row["display_name"],
@@ -214,4 +246,4 @@ def rollback(conn: sqlite3.Connection, model_key: str, *, triggered_by: str, rea
 
 
 def approved_batch_ids(conn: sqlite3.Connection) -> list[str]:
-    return [r["batch_id"] for r in conn.execute("SELECT batch_id FROM ml_approved_synthetic_batch")]
+    return [r["batch_id"] for r in _execute(conn, "SELECT batch_id FROM ml_approved_synthetic_batch")]

@@ -94,6 +94,17 @@ class PasswordChangeRequiredError(WTError):
     http_status = 403
 
 
+class ModelRegistryUnavailableError(WTError):
+    """ml_model_registry/ml_training_run do not exist yet in this database
+    (migrations not applied -- e.g. a fresh checkout before db.migrate()
+    has run). Deliberately distinct from NotFoundError (registry exists,
+    row doesn't) and from a raw sqlite3 error on a genuinely corrupted
+    schema, which must still propagate unmasked -- this class covers only
+    the specific, recoverable-by-migrating "no such table" condition."""
+    code = "model_registry_unavailable"
+    http_status = 503
+
+
 class AuthenticationError(WTError):
     """The caller could not be identified at all — no token, expired token,
     malformed token, bad signature.

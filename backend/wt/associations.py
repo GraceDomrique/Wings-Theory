@@ -45,6 +45,7 @@ from mlxtend.preprocessing import TransactionEncoder
 
 from . import model_registry, timeutil
 from . import ml_artifacts_io as artifacts
+from .errors import ModelRegistryUnavailableError
 
 MIN_TRANSACTIONS = 30     # real transactions needed before a frequent-itemset pass is trustworthy
 
@@ -936,7 +937,13 @@ def active_combo_recommendations(conn: sqlite3.Connection) -> dict:
     ml_artifacts_io.fresh_fit_fallback_allowed), in which case this reports
     'served_from': 'unavailable' with no recommendations rather than mining
     in-request."""
-    path = model_registry.active_artifact_path(conn, "fpgrowth_combos")
+    try:
+        path = model_registry.active_artifact_path(conn, "fpgrowth_combos")
+    except ModelRegistryUnavailableError:
+        # Schema not migrated yet -- same posture as "no active run": fall
+        # through to the fresh-mine-or-unavailable decision below instead
+        # of letting a missing-table error crash the request.
+        path = None
     if path:
         try:
             payload = artifacts.load_json(path)

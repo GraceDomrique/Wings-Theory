@@ -28,6 +28,7 @@ import sqlite3
 from . import anomaly, audit, depletion, model_registry
 from . import ml_artifacts_io as artifacts
 from .db import write_tx
+from .errors import ModelRegistryUnavailableError
 from .ml_training import FPGROWTH_SCHEMA_VERSION, ISO_SCHEMA_VERSION, PROPHET_SCHEMA_VERSION
 
 _EXPECTED_FEATURE_NAMES = {
@@ -63,7 +64,16 @@ def _validate_payload(model_key: str, payload: dict) -> tuple[bool, str]:
 def validate_artifacts_on_startup(conn: sqlite3.Connection) -> dict:
     report: dict[str, dict] = {}
     for model_key in model_registry.MODEL_KEYS:
-        active = model_registry.active_run(conn, model_key)
+        try:
+            active = model_registry.active_run(conn, model_key)
+        except ModelRegistryUnavailableError as exc:
+            # Schema not migrated yet in this database -- distinct from
+            # "migrated but nothing trained": report it as such and move
+            # on to the next model_key rather than crashing app startup.
+            # Serving code already falls back live for every model_key
+            # (see module docstring), so this is safe, not a masked bug.
+            report[model_key] = {"status": "registry_unavailable", "detail": str(exc)}
+            continue
         if active is None:
             report[model_key] = {"status": "no_active_run", "detail": "nothing trained yet; serving falls back live"}
             continue
