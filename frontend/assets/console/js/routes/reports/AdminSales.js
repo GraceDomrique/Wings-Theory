@@ -1,7 +1,6 @@
 import { h, mount } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
-import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
@@ -34,9 +33,27 @@ const REPORT_PERIODS = [
 ];
 
 export async function render(ctx) {
+  // 'today' is its own fixed state, never driven by the Historical
+  // Performance period tabs below (spec: "Do not make the user choose
+  // between them merely to understand the business" / "Maintain separate
+  // state and date-window semantics for Today's Operations and Historical
+  // Performance") — switching the historical section to This Week or This
+  // Month must never make today's own figures disappear or change.
   const state = { period: 'today', trendMetric: 'revenue', reportPeriod: 'this_month' };
   const host = h('div');
+  const todayHost = h('div');
   const reportHost = h('div');
+
+  async function drawToday() {
+    let t;
+    try {
+      t = await getAdminSales({ period: 'today' });
+    } catch (e) {
+      mount(todayHost, EmptyState({ icon: '⨯', title: "Could not load today's figures", description: e.message || String(e), tight: true }));
+      return;
+    }
+    mount(todayHost, todaySnapshotCard(t));
+  }
 
   async function draw() {
     destroyAllCharts();
@@ -62,6 +79,7 @@ export async function render(ctx) {
   function content(d, ctx2) {
     const host2 = h('div');
     mount(host2,
+      h('div', { class: 'eyebrow', style: { margin: '18px 0 10px' } }, 'Historical Performance'),
       summaryCard(d, periodTabs()),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1.4fr 1fr', gap: '14px', marginTop: '14px', alignItems: 'start' } },
         trendCard(d),
@@ -117,21 +135,36 @@ export async function render(ctx) {
         h('div', { style: { display: 'flex', gap: '8px' } },
           Button({ size: 'sm', variant: 'ghost', onClick: () => downloadSalesSummaryCsv(sales) }, '↓ Sales summary CSV'),
           Button({ size: 'sm', variant: 'ghost', onClick: () => downloadBestSellersCsv(sales) }, '↓ Best sellers CSV'))),
-      (sales.byItem || []).length === 0
-        ? EmptyState({ icon: '✓', title: 'No sales recorded for this period', tight: true })
-        : Table({
-          columns: [
-            { key: 'rank', label: '#', render: (r, i) => String((sales.byItem || []).indexOf(r) + 1) },
-            { key: 'name', label: 'Item', render: (r) => r.name },
-            { key: 'qty', label: 'Qty sold', render: (r) => h('span', { class: 'mono t-sm' }, count(r.qtySold)) },
-            { key: 'revenue', label: 'Revenue', render: (r) => h('span', { class: 'mono t-sm' }, money(r.revenue)) },
-          ],
-          rows: (sales.byItem || []).slice(0, 8),
-        }),
+      bestSellersRanked(sales.byItem || []),
       valuation.available
         ? h('div', { class: 't-xs t-faint', style: { marginTop: '12px', paddingTop: '12px', borderTop: '1px solid var(--line-soft)' } },
           'Current inventory valuation: ', h('strong', {}, money(valuation.totalValue).textContent), ' · confirmed unit costs only, not tied to the period above')
         : null));
+  }
+
+  // Compact ranked rows with a proportional bar (same device as
+  // salesMixCard's category bars below), not a generic full-width table —
+  // spec: "compact ranked product rows rather than another generic
+  // full-width table". Top 5 by default; "Show more" expands to 10.
+  function bestSellersRanked(items) {
+    if (items.length === 0) return EmptyState({ icon: '✓', title: 'No sales recorded for this period', tight: true });
+    const maxQty = Math.max(...items.map((r) => r.qtySold || 0), 1);
+    const visible = items.slice(0, state.bestSellersExpanded ? 10 : 5);
+    const rows = visible.map((r, i) => h('div', { style: { padding: '7px 0' } },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '3px' } },
+        h('span', { class: 't-xs t-faint', style: { width: '16px', flexShrink: '0', fontWeight: '700' } }, `#${i + 1}`),
+        h('span', { class: 't-sm t-strong', style: { flex: '1', minWidth: '0' } }, r.name),
+        h('span', { class: 'mono t-xs t-faint' }, count(r.qtySold), ' sold'),
+        h('span', { class: 'mono t-sm t-strong', style: { minWidth: '72px', textAlign: 'right' } }, money(r.revenue))),
+      h('div', { style: { height: '5px', borderRadius: '3px', background: 'var(--line-soft)', overflow: 'hidden', marginLeft: '26px' } },
+        h('div', { style: { height: '100%', width: `${((r.qtySold || 0) / maxQty) * 100}%`, background: 'var(--amber)' } }))));
+    return h('div', {},
+      ...rows,
+      items.length > 5 ? h('div', { style: { marginTop: '8px', textAlign: 'center' } },
+        Button({
+          size: 'sm', variant: 'ghost',
+          onClick: () => { state.bestSellersExpanded = !state.bestSellersExpanded; drawReport(); },
+        }, state.bestSellersExpanded ? 'Show fewer' : `Show more (${Math.min(items.length, 10) - 5} more)`)) : null);
   }
 
   function downloadSalesSummaryCsv(sales) {
@@ -184,7 +217,37 @@ export async function render(ctx) {
 
   await draw();
   drawReport();
-  return host;
+  drawToday();
+  return h('div', {},
+    h('div', { class: 'eyebrow' }, "Today's Operations"),
+    todayHost,
+    host);
+}
+
+/** Today's Operations — a fixed snapshot, always 'today', regardless of
+ * whatever window Historical Performance below is currently showing. Reuses
+ * the same order-activity/recent-orders/exceptions data the historical
+ * section already computes for its own 'today' case — no second
+ * calculation, just a dedicated always-on fetch instead of one tied to
+ * state.period. */
+function todaySnapshotCard(t) {
+  const s = t.salesSummary;
+  const a = t.orderActivity;
+  const freshness = t.asOf
+    ? h('div', { class: 't-xs t-faint', style: { marginTop: '8px' } }, 'As of ', stamp(t.asOf))
+    : null;
+  return Card({ className: 'kpi-primary' },
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '14px' } },
+      Stat({ value: money(s.revenue, '₱0'), label: "Today's Revenue" }),
+      Stat({ value: count(s.orders), label: 'Orders Today' }),
+      Stat({ value: s.avgOrder === null ? null : money(s.avgOrder), label: 'Avg. Order' }),
+      Stat({ value: count(a.preparing), label: 'Active Right Now' })),
+    (t.exceptions || []).length > 0
+      ? h('div', { class: 'callout callout-warn', style: { marginTop: '12px', marginBottom: '0' } },
+        h('p', {}, h('strong', {}, `${t.exceptions.length} exception${t.exceptions.length === 1 ? '' : 's'} today: `),
+          t.exceptions.map((e) => e.note).join(' · ')))
+      : null,
+    freshness);
 }
 
 function deltaPill(value) {

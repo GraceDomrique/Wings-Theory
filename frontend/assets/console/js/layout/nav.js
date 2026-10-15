@@ -288,7 +288,7 @@ export const PAGE_SUB = {
   orderhistory: 'Every past order, searchable and ready to inspect.',
   bestsellers: 'What sells the most, and how that’s shifted over time.',
   inventoryoverview: 'Current stock, its value, and what needs a closer look.',
-  reports: 'Inventory value, at a glance.',
+  reports: 'Sales summary, best sellers and inventory valuation — generate and export a report for any period.',
   historicalrecords: 'A jumping-off point into every historical record the business keeps.',
   downloads: 'Printable and exportable records.',
   stockreplenishment: 'Inventory visibility and purchase recommendations — what to buy, what is expiring, and why.',

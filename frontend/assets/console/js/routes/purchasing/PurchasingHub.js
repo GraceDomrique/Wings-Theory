@@ -83,14 +83,21 @@ export async function render(ctx) {
     const inProgressCount = orders.filter((po) => po.status === 'ordered' || po.status === 'partially_received').length;
     const overdueCount = orders.filter((po) => po.status !== 'received' && po.status !== 'cancelled'
       && po.expectedDeliveryDate && new Date(po.expectedDeliveryDate) < new Date()).length;
-    mount(healthHost, h('div', { class: 'menu-health-strip' },
-      h('span', { class: `mhs-item ${urgent.length ? 'mhs-crit' : 'mhs-good'}` }, icon(ICONS.alertTriangle, 13), ' ', h('b', {}, count(urgent.length)), ' need buying'),
-      h('span', { class: 'mhs-dot' }),
-      h('span', { class: 'mhs-item' }, icon(ICONS.clipboardList, 13), ' ', h('b', {}, count(draftCount)), ' draft orders'),
-      h('span', { class: 'mhs-dot' }),
-      h('span', { class: `mhs-item ${inProgressCount ? '' : 'mhs-good'}` }, icon(ICONS.shoppingCart, 13), ' ', h('b', {}, count(inProgressCount)), ' in progress'),
-      h('span', { class: 'mhs-dot' }),
-      h('span', { class: `mhs-item ${overdueCount ? 'mhs-crit' : 'mhs-good'}` }, icon(ICONS.calendarClock, 13), ' ', h('b', {}, count(overdueCount)), ' overdue ', overdueCount === 1 ? 'delivery' : 'deliveries')));
+    // 2026-10-15: "Demand Forecasts" must stay a prominent, always-visible
+    // access point even though its own sidebar entry is gone (spec: "must
+    // not disappear during workspace consolidation") — a button at the end
+    // of the health strip, not buried inside a selected ingredient's panel,
+    // so it's reachable with nothing selected at all.
+    mount(healthHost, h('div', { class: 'menu-health-strip', style: { justifyContent: 'space-between' } },
+      h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' } },
+        h('span', { class: `mhs-item ${urgent.length ? 'mhs-crit' : 'mhs-good'}` }, icon(ICONS.alertTriangle, 13), ' ', h('b', {}, count(urgent.length)), ' need buying'),
+        h('span', { class: 'mhs-dot' }),
+        h('span', { class: 'mhs-item' }, icon(ICONS.clipboardList, 13), ' ', h('b', {}, count(draftCount)), ' draft orders'),
+        h('span', { class: 'mhs-dot' }),
+        h('span', { class: `mhs-item ${inProgressCount ? '' : 'mhs-good'}` }, icon(ICONS.shoppingCart, 13), ' ', h('b', {}, count(inProgressCount)), ' in progress'),
+        h('span', { class: 'mhs-dot' }),
+        h('span', { class: `mhs-item ${overdueCount ? 'mhs-crit' : 'mhs-good'}` }, icon(ICONS.calendarClock, 13), ' ', h('b', {}, count(overdueCount)), ' overdue ', overdueCount === 1 ? 'delivery' : 'deliveries')),
+      Button({ size: 'sm', variant: 'ghost', onClick: () => ctx.navigate('forecasts') }, icon(ICONS.chartLine, 13), ' Demand Forecasts')));
   }
 
   // ---------------------------------------------------------------------
@@ -219,7 +226,13 @@ export async function render(ctx) {
   // ---------------------------------------------------------------------
   function drawRight() {
     if (!selection) {
-      mount(rightHost, Card({}, EmptyState({ icon: '☰', title: 'Nothing selected', description: 'Click an ingredient or a purchase order to see details here.', tight: true })));
+      mount(rightHost, Card({ className: 'kpi-neutral', style: { minHeight: '220px', display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+        EmptyState({
+          icon: icon(ICONS.clipboardList, 26),
+          title: 'Select an ingredient or purchase order',
+          description: 'Choose a record on the left to view stock, forecasts, supplier information, and available actions.',
+          tight: true,
+        })));
       return;
     }
     if (selection.kind === 'ingredient') { drawIngredientPanel(selection.ref); return; }
@@ -471,10 +484,19 @@ export async function render(ctx) {
       onClick: () => { needsTab = id; drawNeeds(); },
     }, label)));
 
+  // 2026-10-15 fix: the Needs-attention/All-ingredients toggle used to sit
+  // INSIDE the left column, above needsHost, while the right column's
+  // rightHost had nothing above it — so the left panel's first card and the
+  // right panel's "Nothing selected" card started at two different heights.
+  // The toggle now sits above the two-column grid as its own row (it filters
+  // the left list either way, so it reads fine there too), so both columns'
+  // first real card shares one top edge — true align-items:start, not a
+  // margin fudged to match.
   return h('div', { class: 'purchasing-hub' },
     healthHost,
+    tabStrip,
     h('div', { class: 'studio-layout', style: { gridTemplateColumns: '1.6fr 1fr' } },
-      h('div', { class: 'studio-col' }, tabStrip, needsHost),
+      h('div', { class: 'studio-col' }, needsHost),
       h('div', { class: 'studio-col' }, rightHost)),
     h('div', { style: { marginTop: '14px' } }, poHost));
 }

@@ -87,7 +87,7 @@ export async function render(ctx) {
       h('span', { class: 'mhs-dot' }),
       h('span', { class: 'mhs-item mhs-good' }, icon(ICONS.checkCircle, 13), ' ', h('b', {}, count(menu.sellable)), ' sellable'),
       h('span', { class: 'mhs-dot' }),
-      h('span', { class: `mhs-item ${menu.blocked > 0 ? 'mhs-crit' : 'mhs-good'}` }, icon(ICONS.alertTriangle, 13), ' ', h('b', {}, count(menu.blocked)), ' blocked'),
+      h('span', { class: `mhs-item ${menu.blocked > 0 ? 'mhs-crit' : 'mhs-good'}` }, icon(ICONS.alertTriangle, 13), ' ', h('b', {}, count(menu.blocked)), ' unavailable'),
       h('span', { class: 'mhs-dot' }),
       h('span', { class: 'mhs-item' }, icon(ICONS.layers, 13), ' ', h('b', {}, count(standaloneRecipes.length)), ' standalone recipes')));
   }
@@ -124,7 +124,7 @@ export async function render(ctx) {
       h('span', { style: { flex: '1', minWidth: '0' } },
         h('div', { class: 't-sm', style: { fontWeight: isSel ? '700' : '500' } }, m.name),
         h('div', { class: 't-xs t-faint' }, m.price !== null ? money(m.price).textContent : 'no price')),
-      !m.sellable ? Pill('crit', 'blocked') : null));
+      !m.sellable ? Pill('crit', 'unavailable') : null));
     }
 
     const recipeRows = standaloneRecipes
@@ -155,7 +155,7 @@ export async function render(ctx) {
 
   function drawFilters() {
     return h('div', { class: 'action-strip', style: { marginBottom: '10px' } },
-      ...[['all', 'All'], ['available', 'Available'], ['blocked', 'Blocked']].map(([id, label]) => h('button', {
+      ...[['all', 'All'], ['available', 'Available'], ['blocked', 'Unavailable']].map(([id, label]) => h('button', {
         class: `action-chip${statusFilter === id ? ' is-active' : ''}`,
         onClick: () => { statusFilter = id; drawList(); },
       }, label)));
@@ -294,6 +294,7 @@ export async function render(ctx) {
           m.price = r.price;
           toast(`${m.name} is now ₱${value.toFixed(2)} on the POS.`, 'good');
           showDisplay();
+          drawList(); // the left library list holds its own price text, not re-derived from `m` on every render
         } catch (e) { err.textContent = e.message; }
       } }, 'Save');
       const cancel = Button({ size: 'sm', variant: 'ghost', onClick: showDisplay }, 'Cancel');
@@ -311,7 +312,7 @@ export async function render(ctx) {
 
     if (selectedKind === 'menu' && selected && !selected.sellable) {
       parts.push(h('div', { class: 'callout callout-crit', style: { marginBottom: '0' } },
-        h('p', {}, h('strong', {}, 'Blocked: '), str(selected.blockReason, 'reason not reported'))));
+        h('p', {}, h('strong', {}, 'Unavailable: '), str(selected.blockReason, 'reason not reported'))));
     }
 
     const comboOpportunities = combosReport.insufficientData ? 0 : combosReport.combos.length;
@@ -364,10 +365,14 @@ export async function render(ctx) {
     h('div', { class: 'studio-layout' },
       h('div', { class: 'studio-col studio-col-left' },
         h('div', { class: 'card', style: { padding: '12px' } },
+          h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', marginBottom: '10px' } },
+            h('div', { class: 'eyebrow' }, 'Recipe Library'),
+            Button({
+              size: 'sm', variant: 'primary', onClick: () => openAddRecipeModal(() => {}),
+            }, icon(ICONS.plus, 14), ' Create Recipe')),
           h('label', { class: 'field', style: { display: 'block', marginBottom: '10px' } }, searchInput),
           filterHost,
-          listHost),
-        Button({ size: 'sm', variant: 'ghost', style: { marginTop: '10px', width: '100%' }, onClick: () => openAddRecipeModal(() => {}) }, '+ Add standalone recipe')),
+          listHost)),
       h('div', { class: 'studio-col studio-col-center' }, centerHost),
       h('div', { class: 'studio-col studio-col-right' }, rightHost)));
 }
