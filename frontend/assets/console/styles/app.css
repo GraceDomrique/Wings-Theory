@@ -902,6 +902,34 @@ canvas{max-width:100%;}
    no longer references it. */
 .login-err{color:var(--crit); font-size:11.5px; margin-top:10px;}
 
+/* ============ ACCOUNT SETTINGS (2026-10-15 premium two-column workspace)
+   ============================================================================
+   Centered, bounded width (spec: "Center the workspace within a comfortable
+   maximum width. Do not stretch the form edge to edge.") — a charcoal
+   identity panel paired with the warm-ivory security card, not two copies
+   of the same card. */
+.account-settings-wrap{max-width:760px; margin:0 auto;}
+.account-settings-grid{display:grid; grid-template-columns:260px 1fr; gap:18px; align-items:start;}
+@media (max-width:700px){.account-settings-grid{grid-template-columns:1fr;}}
+
+.account-identity-panel{
+  background:var(--nav-bg); color:#fff; border-radius:var(--radius); padding:24px 20px;
+  display:flex; flex-direction:column; align-items:center; text-align:center;
+  box-shadow:var(--shadow);
+}
+.account-avatar{
+  width:64px; height:64px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+  font-size:22px; font-weight:700; margin-bottom:14px;
+  background:var(--accent-blue); color:#fff; border:2px solid var(--amber);
+}
+.account-identity-name{font-family:var(--font-display); font-size:17px; font-weight:600;}
+.account-identity-username{font-size:12px; color:#9DA6AE; margin-top:2px;}
+.account-identity-divider{width:100%; height:1px; background:var(--nav-line); margin:18px 0 14px;}
+.account-identity-row{display:flex; align-items:center; gap:8px; font-size:11.5px; color:#B9C0C6;}
+
+.account-security-panel{padding:22px 20px;}
+.account-security-field{display:block; margin-bottom:14px;}
+
 /* ============ MENU STUDIO (2026-10-15 integrated Menu & Recipes workspace)
    ============================================================================
    Left/center/right three-column product editor — see MenuStudio.js's own
