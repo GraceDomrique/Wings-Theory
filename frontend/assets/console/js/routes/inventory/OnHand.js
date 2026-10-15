@@ -1,6 +1,5 @@
 import { h, mount, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
-import { RailCard } from '../../components/ui/RailCard.js';
 import { Stat } from '../../components/ui/Stat.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Table } from '../../components/ui/Table.js';
@@ -54,6 +53,7 @@ export async function render(ctx) {
   const attentionHost = h('div');
   const filterHost = h('div');
   const tableCard = h('div');
+  const actionsHost = h('div');
 
   async function reload() {
     const [ingredientsR, valuationR, expiryR] = await Promise.all([
@@ -90,21 +90,26 @@ export async function render(ctx) {
     return map;
   }
 
+  // 2026-10-15 recompose (asymmetric-composition pass): the four KPI figures
+  // used to sit as four equal-width cards in their own full-width row, with
+  // Needs Attention as a second full-width row beneath — the exact "three
+  // KPI cards then a table" repetition the redesign asked to move away from.
+  // They now share one wide "Stock Health" panel (a single large headline
+  // figure plus three compact status chips and the valuation line), paired
+  // asymmetrically beside the Attention queue the way Today pairs its store
+  // status hero beside Today's Sales — related numbers read together, and
+  // the page gets a shape distinct from Today's instead of reusing its exact
+  // 4-up grid treatment.
   function drawStats() {
     const low = lowStockIngredients();
-    statsHost.replaceChildren();
-    mount(statsHost,
-      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '10px' } },
-        // Neutral Information Card — a plain count, not a status; no tint.
-        Card({ className: 'kpi-neutral' }, Stat({ value: count(ingredients.length), label: 'Ingredients tracked' })),
-        // Status Cards — tinted by severity, each with its own icon so the
-        // signal survives in text + icon, not color alone.
-        RailCard({ severity: low.length ? 'warn' : 'good', icon: ICONS.packageMinus },
-          Stat({ value: count(low.length), label: 'Low or need restock' })),
-        RailCard({ severity: expiry.buckets.soon.length ? 'warn' : 'good', icon: ICONS.calendarClock },
-          Stat({ value: count(expiry.buckets.soon.length), label: 'Expiring soon' })),
-        RailCard({ severity: expiry.buckets.expired.length ? 'crit' : 'good', icon: ICONS.alertTriangle },
-          Stat({ value: count(expiry.buckets.expired.length), label: 'Expired batches' }))),
+    mount(statsHost, Card({ className: 'kpi-primary', style: { height: '100%' } },
+      h('div', { class: 'eyebrow' }, 'Stock health'),
+      h('div', { class: 'grid', style: { gridTemplateColumns: 'auto 1fr', gap: '18px', alignItems: 'center', margin: '6px 0 14px' } },
+        Stat({ value: count(ingredients.length), label: 'Ingredients tracked' }),
+        h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(3,1fr)', gap: '8px' } },
+          statChip(low.length, 'Low / restock', low.length ? 'warn' : 'good', ICONS.packageMinus),
+          statChip(expiry.buckets.soon.length, 'Expiring soon', expiry.buckets.soon.length ? 'warn' : 'good', ICONS.calendarClock),
+          statChip(expiry.buckets.expired.length, 'Expired', expiry.buckets.expired.length ? 'crit' : 'good', ICONS.alertTriangle))),
       // A one-line figure, not another KPI tile — valuation duplicates
       // nothing above and carries two real caveats a bare number can't say:
       // only ingredients with a CONFIRMED cost per unit are counted
@@ -112,10 +117,22 @@ export async function render(ctx) {
       // stock (on_hand_base) — it does NOT subtract expired quantity the way
       // "Usable" elsewhere on this page does. Labelled explicitly so this
       // number is never read as "what's actually usable, priced."
-      h('div', { class: 't-xs t-faint', style: { marginTop: '10px' } },
+      h('div', { class: 't-xs', style: { color: 'var(--amber-deep)' } },
         'Total recorded stock value: ',
         h('strong', {}, valuation.available ? moneyShort(valuation.totalValue).textContent : 'not available'),
-        valuation.available ? ' · confirmed unit costs only, includes any expired quantity' : ` · ${valuation.reason}`));
+        valuation.available ? ' · confirmed unit costs only, includes any expired quantity' : ` · ${valuation.reason}`)));
+  }
+
+  /** A single compact status figure for the Stock Health panel — smaller
+   * than a full RailCard (three sit side by side in one card here, not one
+   * each in their own full card) but keeps the same severity tint + icon so
+   * the signal still reads without relying on color alone. */
+  function statChip(value, label, severity, iconPaths) {
+    return h('div', { class: `rail rail-${severity}`, style: { borderRadius: 'var(--radius-sm)', padding: '8px 10px', display: 'flex', alignItems: 'center', gap: '8px' } },
+      h('span', { class: 'rail-icon', style: { width: '26px', height: '26px' } }, icon(iconPaths, 13)),
+      h('div', {},
+        h('div', { style: { fontSize: '17px', fontWeight: '700', lineHeight: '1.1' } }, count(value)),
+        h('div', { class: 't-xs t-faint' }, label)));
   }
 
   /** "Needs attention" — two summary rows, not a repeated item-by-item list
@@ -127,7 +144,8 @@ export async function render(ctx) {
     const lowCount = lowStockIngredients().length;
 
     if (expiredCount === 0 && lowCount === 0) {
-      mount(attentionHost);
+      mount(attentionHost, h('div', { class: 'attn-card', style: { height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center' } },
+        EmptyState({ icon: '✓', title: 'Nothing needs attention', description: 'No expired batches or low-stock ingredients right now.', tight: true })));
       return;
     }
 
@@ -151,7 +169,7 @@ export async function render(ctx) {
       }));
     }
 
-    mount(attentionHost, h('div', { class: 'attn-card' },
+    mount(attentionHost, h('div', { class: 'attn-card', style: { height: '100%', marginBottom: '0' } },
       h('div', { class: 'eyebrow', style: { marginBottom: '8px' } }, 'What needs attention'),
       h('div', { class: 'attn-grid' }, ...rows)));
   }
@@ -239,16 +257,30 @@ export async function render(ctx) {
     }));
   }
 
-  function quickActionTile({
+  function actionChip({
     iconPaths, label, severity = 'flat', onClick,
   }) {
-    return h('button', { class: 'quick-action', onClick },
-      h('span', { class: `kpi-icon kpi-icon-${severity}` }, icon(iconPaths, 16)),
+    return h('button', { class: 'action-chip', onClick },
+      h('span', { class: `kpi-icon kpi-icon-${severity}` }, icon(iconPaths, 13)),
       h('span', {}, label));
   }
 
   await reload();
   ctx.setSearchHandler(drawTable);
+
+  mount(actionsHost, h('div', { class: 'action-strip' },
+    actionChip({
+      iconPaths: ICONS.packagePlus, label: 'Receive Delivery', severity: 'info', onClick: () => openReceiveModal(ingredients, reload),
+    }),
+    actionChip({
+      iconPaths: ICONS.clipboardCheck, label: 'Count Stock', severity: 'good', onClick: () => openBulkCountModal(ingredients, reload),
+    }),
+    actionChip({
+      iconPaths: ICONS.trash2, label: 'Record Waste', severity: 'crit', onClick: () => openWasteModal(ingredients, reload),
+    }),
+    actionChip({
+      iconPaths: ICONS.history, label: 'Stock Activity', severity: 'flat', onClick: () => ctx.navigate('movements'),
+    })));
 
   mount(tableCard, Card({},
     CardHeader({
@@ -259,25 +291,17 @@ export async function render(ctx) {
     h('div', { style: { display: 'flex', gap: '8px', marginBottom: '10px' } }, filterHost),
     tableHost));
 
+  // 2026-10-15 recompose: Stock Health and Needs Attention now pair
+  // side-by-side (asymmetric 1.3fr/1fr, same device as Today's hero row)
+  // instead of each taking a full-width row; the action strip sits as a
+  // slim toolbar between that pairing and the table, instead of its own
+  // full KPI-sized card bank — see app.css's .action-strip comment.
   return h('div', {},
-    statsHost,
-    attentionHost,
-    Card({ style: { marginTop: '14px' } },
-      CardHeader({ title: 'Quick Actions' }),
-      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '10px' } },
-        quickActionTile({
-          iconPaths: ICONS.packagePlus, label: 'Receive Delivery', severity: 'info', onClick: () => openReceiveModal(ingredients, reload),
-        }),
-        quickActionTile({
-          iconPaths: ICONS.clipboardCheck, label: 'Count Stock', severity: 'good', onClick: () => openBulkCountModal(ingredients, reload),
-        }),
-        quickActionTile({
-          iconPaths: ICONS.trash2, label: 'Record Waste', severity: 'crit', onClick: () => openWasteModal(ingredients, reload),
-        }),
-        quickActionTile({
-          iconPaths: ICONS.history, label: 'Stock Activity', severity: 'flat', onClick: () => ctx.navigate('movements'),
-        }))),
-    h('div', { style: { marginTop: '14px' } }, tableCard));
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1.3fr 1fr', gap: '14px', alignItems: 'stretch' } },
+      statsHost,
+      attentionHost),
+    h('div', { style: { margin: '14px 0' } }, actionsHost),
+    tableCard);
 }
 
 /**

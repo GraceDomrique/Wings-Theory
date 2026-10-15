@@ -705,6 +705,23 @@ select:disabled{cursor:default; opacity:0.6;}
 .quick-action:focus-visible{outline:2px solid var(--amber); outline-offset:1px;}
 .quick-action .kpi-icon{width:32px; height:32px; border-radius:var(--radius-sm); flex-shrink:0;}
 
+/* Compact Action Strip (2026-10-15) — a second, denser treatment for the
+   same "quick action" concept as .quick-action above, used where a page
+   already has a strong KPI/attention composition up top and a second row of
+   big square tiles would just repeat that page's own visual rhythm (and
+   every other workspace's). Pill-shaped, inline, icon + label on one line —
+   reads as a toolbar, not a fourth bank of KPI-sized cards. */
+.action-strip{display:flex; flex-wrap:wrap; gap:8px;}
+.action-chip{
+  display:inline-flex; align-items:center; gap:8px; padding:9px 14px 9px 10px; border-radius:999px;
+  border:1px solid var(--line); background:var(--surface); font-size:12.5px; font-weight:600; color:var(--ink);
+  transition:background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.action-chip:hover{background:var(--amber-tint); border-color:rgba(199,119,53,.3);}
+.action-chip:active{transform:scale(.97);}
+.action-chip:focus-visible{outline:2px solid var(--amber); outline-offset:1px;}
+.action-chip .kpi-icon{width:24px; height:24px; border-radius:50%; flex-shrink:0;}
+
 /* The ingredient drawer's action tiles are the same Action Card, just
    square-ish and selectable (one can be "open" at a time). */
 .action-tile{padding:12px 8px;}
