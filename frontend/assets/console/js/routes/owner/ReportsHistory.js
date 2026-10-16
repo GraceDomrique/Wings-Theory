@@ -9,6 +9,7 @@ import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Loading, toast } from '../../components/ui/Feedback.js';
 import { Tabbar } from '../../components/ui/Tabbar.js';
 import { BarChart } from '../../components/charts/BarChart.js';
+import { DoughnutChart } from '../../components/charts/DoughnutChart.js';
 import { destroyAllCharts } from '../../components/charts/base.js';
 import {
   money, count, qty, date, stamp, nodata, asText,
@@ -541,6 +542,10 @@ function humaniseCat(cat) {
   return cat.replace(/_/g, ' ').replace(/^./, (c) => c.toUpperCase());
 }
 
+// Doughnut, not a plain count list — every entry here shares the same unit
+// (a flagged-event count), unlike Top-5-by-quantity elsewhere on this page
+// which deliberately stays a list because its rows mix base units (kg vs.
+// pc vs. L) that a shared chart axis would misrepresent as comparable.
 function categoryBreakdown(stockLoss) {
   const byCat = new Map();
   for (const a of stockLoss) {
@@ -549,7 +554,9 @@ function categoryBreakdown(stockLoss) {
   }
   const entries = [...byCat.entries()].sort((a, b) => b[1] - a[1]);
   if (entries.length === 0) return EmptyState({ icon: '✓', title: 'No flagged losses in this window', tight: true });
-  return h('div', {}, ...entries.map(([cat, cnt]) => h('div', { class: 'mini-row' }, h('span', {}, humaniseCat(cat)), Pill('flat', count(cnt)))));
+  return h('div', {},
+    DoughnutChart({ labels: entries.map(([cat]) => humaniseCat(cat)), data: entries.map(([, cnt]) => cnt), height: 150 }),
+    h('div', { style: { marginTop: '10px' } }, ...entries.map(([cat, cnt]) => h('div', { class: 'mini-row' }, h('span', {}, humaniseCat(cat)), Pill('flat', count(cnt))))));
 }
 
 async function lossesTab() {

@@ -5,6 +5,7 @@ import { Tabbar } from '../../components/ui/Tabbar.js';
 import { Table } from '../../components/ui/Table.js';
 import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
+import { Drawer } from '../../components/ui/Drawer.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
 import { ageFromNow, stamp, date } from '../../lib/format.js';
@@ -265,7 +266,11 @@ export async function render(ctx) {
       } catch (e) { err.textContent = e.message; err.style.display = ''; } finally { submit.disabled = false; }
     });
 
-    const modal = Modal({ title: 'New instruction to Admin', onClose: () => {} },
+    // Drawer, not Modal — only the Owner ever opens this (the trigger button
+    // is isOwner-gated below), so this stays scoped to the Owner's own
+    // "sliding form" treatment without changing Admin's "Mark complete"
+    // modal just below, which Admin alone ever opens.
+    const modal = Drawer({ title: 'New instruction to Admin', onClose: () => {} },
       h('label', { class: 'field' }, 'Title', titleInput),
       h('label', { class: 'field', style: { marginTop: '10px' } }, 'Description', bodyInput),
       h('label', { class: 'field', style: { marginTop: '10px' } }, 'Priority', priorityInput),

@@ -1246,3 +1246,76 @@ canvas{max-width:100%;}
   .print-only{display:block;}
   .no-print{display:none !important;}
 }
+
+/* ============================================================================
+   OWNER-ONLY VISUAL IDENTITY (2026-10-16 "Business Command Center" redesign,
+   round 2 — feedback: the shared ivory/stone palette read flat and washed
+   out, --bg #F2F0EB and --surface #FFFEFB sit only a few percent apart with
+   nothing giving the page real depth, and the plain underline Tabbar reads
+   as an old-fashioned admin-panel control, not a restaurant workspace.
+
+   Everything below is scoped to body.role-owner — a class Sidebar.js
+   already sets per session (see app.css's own body.role-admin block above
+   for the precedent) — so NONE of it touches Admin's screens or the exact
+   stakeholder-pinned hexes in tokens.css. This is pure CSS-custom-property
+   override + new selectors; no shared component's class names changed. ========================================================================= */
+
+/* Richer, deeper canvas: a warmer neutral with real contrast against card
+   surfaces (was 2 shades of near-identical ivory), plus a genuinely visible
+   directional wash of the brand accent and the slate-blue status color —
+   a second pass after the first wash read as barely-there (opacity .06-.08,
+   two muted ellipses) — so the page reads as designed, not flat/pastel. */
+body.role-owner{
+  --bg:#E4DBC5;
+  --surface-sunk:#F2EBDC;
+  --line:#D6C7A0;
+  --line-soft:#E5D8B8;
+}
+body.role-owner .content{
+  background-image:
+    radial-gradient(ellipse 1000px 560px at 8% -12%, rgba(217,103,36,0.18), transparent 62%),
+    radial-gradient(ellipse 820px 580px at 104% -4%, rgba(64,94,114,0.14), transparent 60%),
+    radial-gradient(ellipse 900px 500px at 50% 115%, rgba(56,106,85,0.08), transparent 55%);
+  background-color:var(--bg);
+  background-attachment:fixed;
+}
+
+/* Tab switcher — segmented pill control instead of the thin underline strip
+   (same Tabbar.js markup/JS, purely a different skin via this scope, so
+   Admin's own Tabbar instances are pixel-identical to before). */
+body.role-owner .tabbar{
+  display:inline-flex; gap:2px; width:auto; max-width:100%; border-bottom:none;
+  background:var(--surface-sunk); padding:4px; border-radius:999px; margin-bottom:18px;
+}
+body.role-owner .tabbar button{
+  border:none; border-bottom:none; margin-bottom:0; border-radius:999px;
+  padding:9px 18px; font-size:12.5px; transition:background .14s ease, color .14s ease;
+}
+body.role-owner .tabbar button.active{
+  background:var(--amber); color:#fff; box-shadow:0 3px 10px rgba(217,103,36,0.28);
+}
+body.role-owner .tabbar button:hover:not(.active){background:rgba(36,42,38,0.05); color:var(--ink);}
+@media (max-width:600px){ body.role-owner .tabbar{border-radius:var(--radius);} }
+
+/* Stat tiles — a colored gradient wash and left accent instead of a flat
+   white box with a small icon chip, so the headline numbers row reads with
+   some weight instead of four identical pale rectangles. */
+body.role-owner .stat-tile-card{
+  position:relative; overflow:hidden; border-left:3px solid transparent;
+}
+body.role-owner .stat-tile-card::before{
+  content:''; position:absolute; inset:0; opacity:.5; pointer-events:none;
+  background:linear-gradient(135deg, var(--_tile-tint, transparent) 0%, transparent 65%);
+}
+body.role-owner .stat-tile-card:has(.kpi-icon-crit){ border-left-color:var(--crit); --_tile-tint:var(--crit-tint); }
+body.role-owner .stat-tile-card:has(.kpi-icon-warn){ border-left-color:var(--warn); --_tile-tint:var(--warn-tint); }
+body.role-owner .stat-tile-card:has(.kpi-icon-good){ border-left-color:var(--good); --_tile-tint:var(--good-tint); }
+body.role-owner .stat-tile-card:has(.kpi-icon-info){ border-left-color:var(--info); --_tile-tint:var(--info-tint); }
+body.role-owner .stat-tile-card > *{ position:relative; }
+
+/* Section-accent card headers — Business Rhythm / rhythm-tile already carry
+   their own tint; this gives every other Owner CardHeader a thin brand-accent
+   rule under its title so sections separate from one another without
+   needing a heavier full-color block. */
+body.role-owner .card-head{ border-bottom:1px solid var(--line-soft); padding-bottom:10px; margin-bottom:14px; }
+body.role-owner .card-head .card-title{ position:relative; }

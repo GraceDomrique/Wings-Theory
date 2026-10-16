@@ -1,7 +1,6 @@
 import { h, mount, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
-import { StatTile } from '../../components/ui/StatTile.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
@@ -15,28 +14,35 @@ import { getOwnerOverview } from '../../lib/api/dashboard.js';
 import { openOrderDetail } from '../reports/orderDetailModal.js';
 
 /**
- * Owner Overview — reference-mockup landing screen (2026-10 relayout):
- * attention banner -> 4 headline stat tiles -> 2-col (sales trend / Owner
- * Decisions) -> 3-col (Inventory Outlook / Next 7 Days / Recent Activity)
- * -> full Recent Orders table. Everything the earlier version of this page
- * showed (Customer Pulse, Top Categories, Business Rhythm, Sales->Stock,
- * Messages) still renders, just folded into a second section below the
- * mockup's own sections rather than removed, per "preserve existing
- * functionality" — the mockup doesn't show them, it doesn't say to delete
- * them either.
+ * Owner Overview — business-command-center redesign (2026-10-16):
+ *
+ * A dedicated photo hero (36-pcs/6-flavor wing platter) opens the page with
+ * the decision-maker's four numbers — Today's Sales, Orders Today, Average
+ * Spend per Order, and Sales Performance vs. last week — plus a direct
+ * purchasing call-to-action when stock needs it, so the Owner's very first
+ * look answers "how is my restaurant doing right now." Business Rhythm (the
+ * most distinctive, least-used-to-be-buried section) moves up to sit
+ * directly under the attention strip instead of at the bottom of a long
+ * scroll. Everything below follows the same priority order the brief asks
+ * for: sales & best sellers, then stock & purchasing, then decisions/risks,
+ * then recent activity — nothing removed from the prior layout, only
+ * reordered and relabeled into plainer restaurant language.
  *
  * One aggregation call (getOwnerOverview -> GET /console/dashboard/
- * owner-overview, wt/dashboard_overview.owner_overview()). Nothing here
- * fits its own model or invents a figure — a mockup widget needing data
- * the backend doesn't expose (e.g. a unified order+PO activity log) renders
- * from the closest real data this payload actually carries, never a
- * fabricated stand-in.
+ * owner-overview, wt/dashboard_overview.owner_overview()). Every number on
+ * this page is read straight from that payload or derived from two of its
+ * own fields with ordinary arithmetic (e.g. revenue / orders for average
+ * spend) — nothing here fits its own model or invents a figure.
  */
+
+const OWNER_HERO_PHOTO = "url('/img/POSimg/Unlimited/Wings-Platter-36pcs-6flavors.jpg')";
 
 const ICON = {
   revenue: '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
   orders: '<path d="M4 19V5a2 2 0 012-2h9l5 5v11a2 2 0 01-2 2H6a2 2 0 01-2-2z"/><path d="M9 13h6M9 17h6M9 9h2"/>',
   stock: '<path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+  spend: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/>',
+  trend: '<path d="M22 17l-9-9-4 4-6-6"/><path d="M22 7v10h-10"/>',
 };
 
 // One icon + pastel tint per "needs your attention" kind — a quick visual
@@ -56,12 +62,15 @@ const SEV_TINT = { crit: 'var(--crit-tint)', warn: 'var(--warn-tint)', good: 'va
 const SEV_INK = { crit: 'var(--crit)', warn: 'var(--warn)', good: 'var(--good)', info: 'var(--info)', flat: 'var(--ink-soft)' };
 
 // One icon + pastel tint per Business Rhythm insight, same idea — see
-// businessRhythmCard below.
+// businessRhythmCard below. Titles are the plain-English labels the brief
+// asks for (Best Sales Days / Busiest Hours / Payday Sales Effect); the
+// underlying calculations (weekendRevenueSharePct, peakHour, etc.) are
+// unchanged — only the on-screen wording moved.
 const RHYTHM_ICON = {
-  'Weekends Matter': '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+  'Best Sales Days': '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
   'Dinner Leads': '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
-  'Peak Hour': '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
-  'Payday Pattern': '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+  'Busiest Hours': '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+  'Payday Sales Effect': '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
 };
 const RHYTHM_TINT = ['var(--amber-tint)', 'var(--info-tint)', 'var(--good-tint)', 'var(--cocoa-tint)'];
 const RHYTHM_INK = ['var(--amber-deep)', 'var(--info)', 'var(--good)', 'var(--cocoa-deep)'];
@@ -86,45 +95,101 @@ export async function render(ctx) {
 
   return h('div', { class: 'owner-overview' },
     stale,
+    heroBanner(d, ctx),
     bannerHost,
-    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', margin: '14px 0' } },
-      StatTile({
-        iconPath: ICON.revenue, severity: 'good', label: "Today's Revenue",
-        value: d.todayRevenue ? money(d.todayRevenue.revenue, '₱0') : null,
-        sub: d.todayRevenue ? deltaLine(d.todayRevenue.deltaPct, 'vs yesterday') : null,
-      }),
-      StatTile({
-        iconPath: ICON.revenue, severity: 'info', label: "This Month's Revenue",
-        value: d.monthRevenue ? money(d.monthRevenue.revenue, '₱0') : null,
-        sub: d.monthRevenue ? deltaLine(d.monthRevenue.deltaPct, 'vs last month') : null,
-      }),
-      StatTile({
-        iconPath: ICON.orders, severity: 'flat', label: 'Orders Today',
-        value: d.todayRevenue ? count(d.todayRevenue.orders) : null,
-        sub: d.todayRevenue ? deltaLine(d.todayRevenue.ordersDeltaPct, 'vs yesterday') : null,
-      }),
-      StatTile({
-        iconPath: ICON.stock, severity: (d.stockAtRisk.needRestock || 0) > 0 ? 'crit' : 'good', label: 'Stock at Risk',
-        value: count((d.stockAtRisk.needRestock || 0) + (d.stockAtRisk.expiringSoon || 0)),
-        sub: h('span', { class: 't-xs t-faint' }, `${d.stockAtRisk.needRestock || 0} urgent · ${d.stockAtRisk.expiringSoon || 0} low`),
-      })),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '14px' } },
+
+    // Business Rhythm, promoted: the brief's core complaint was that this
+    // section — one of the Owner's most distinctive features — used to sit
+    // at the very bottom of a long scroll. It now runs right under the
+    // attention strip, before any other secondary section.
+    h('div', { style: { marginTop: '14px' } }, businessRhythmCard(d)),
+
+    // Sales & best sellers.
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '14px', marginTop: '14px' } },
       salesTrendCard(d, ctx),
       ownerDecisionsCard(d, ctx)),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
-      inventoryOutlookCard(d, ctx),
-      comingUpCard(d),
-      recentActivityCard(d)),
-    h('div', { style: { marginTop: '14px' } }, recentOrdersCard(d, ctx)),
-
-    // Everything the prior layout showed that the mockup doesn't call out
-    // by name — preserved, not deleted.
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '14px', marginTop: '14px' } },
-      salesToStockCard(d, ctx),
+      topCategoriesCard(d),
       customerPulseCard(d),
-      topCategoriesCard(d)),
-    h('div', { style: { marginTop: '14px' } }, businessRhythmCard(d)),
-    h('div', { style: { marginTop: '14px' } }, messagesCard(d, ctx)));
+      comingUpCard(d)),
+
+    // Stock & purchasing.
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
+      stockPurchasingCard(d, ctx),
+      salesToStockCard(d, ctx)),
+
+    // Recent decisions & activity.
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
+      recentActivityCard(d),
+      messagesCard(d, ctx)),
+    h('div', { style: { marginTop: '14px' } }, recentOrdersCard(d, ctx)));
+}
+
+// =============================================================================
+// Hero — the Owner's first-screen read: today's headline numbers over a
+// wing platter photo, in the same .photo-hero treatment AdminToday's Store
+// Status banner uses, with its own photo and its own (business-performance,
+// not operational-status) set of four numbers, plus a direct purchasing
+// action when stock actually needs one.
+// =============================================================================
+
+function heroBanner(d, ctx) {
+  const t = d.todayRevenue;
+  const p = d.businessPulse;
+  const sev = statusSeverity(p.status);
+  const needRestock = d.stockAtRisk.needRestock || 0;
+  const avgSpend = t && t.orders ? money(t.revenue / t.orders, '—') : null;
+  return Card({ className: 'owner-hero photo-hero', style: { backgroundImage: OWNER_HERO_PHOTO } },
+    Pill(sev, statusLabel(p.status)),
+    h('div', { style: { fontSize: '24px', fontWeight: '700', margin: '8px 0 2px', fontFamily: 'var(--font-display)' } },
+      p.interpretation),
+    h('div', { class: 'grid store-status-stats', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px', marginTop: '16px' } },
+      heroStat(t ? money(t.revenue, '₱0').textContent : '—', "Today's Sales", 'good', ICON.revenue),
+      heroStat(t ? count(t.orders).textContent : '—', 'Orders Today', 'info', ICON.orders, () => ctx.navigate('orderhistory')),
+      heroStat(avgSpend ? avgSpend.textContent : '—', 'Avg. Spend / Order', 'flat', ICON.spend),
+      heroStat(p.deltas.revenue_pct === null ? 'n/a' : `${p.deltas.revenue_pct > 0 ? '+' : ''}${p.deltas.revenue_pct.toFixed(1)}%`, 'Sales vs Last Week', sev, ICON.trend, () => ctx.navigate('salesoverview'))),
+    needRestock > 0
+      ? Button({
+        variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('stockreplenishment'), style: { marginTop: '16px' },
+      }, `Review What to Buy — ${needRestock} ingredient${needRestock === 1 ? '' : 's'} →`)
+      : null);
+}
+
+function heroStat(value, label, severity, iconPath, onClick) {
+  return h('div', {
+    class: `stat-tile stat-tile-${severity}`,
+    style: { cursor: onClick ? 'pointer' : 'default' },
+    onClick,
+  },
+  h('span', { class: `kpi-icon kpi-icon-${severity}` }, icon(iconPath, 15)),
+  h('div', {},
+    h('div', { class: 'stat-tile-value' }, value),
+    h('div', { class: 'stat-tile-label' }, label)));
+}
+
+// =============================================================================
+// Stock & Purchasing — combines the old Inventory Outlook counts with a
+// direct purchasing action, so the Owner doesn't have to leave Overview to
+// learn what needs buying before deciding whether to act on it.
+// =============================================================================
+
+function stockPurchasingCard(d, ctx) {
+  const needRestock = d.stockAtRisk.needRestock || 0;
+  const expiringSoon = d.stockAtRisk.expiringSoon || 0;
+  return Card({ className: 'card-flex' },
+    CardHeader({
+      title: 'Stock & Purchasing', desc: 'What needs buying, and what is expiring',
+      right: Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('stockreplenishment') }, 'Review →'),
+    }),
+    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr 1fr', gap: '10px' } },
+      Stat({ value: count(needRestock), label: 'Need Purchasing' }),
+      Stat({ value: count(expiringSoon), label: 'Expiring Soon' }),
+      Stat({ value: count((d.needsAttention || []).length), label: 'Priority Risks' })),
+    needRestock > 0 || expiringSoon > 0
+      ? Button({
+        variant: 'primary', size: 'sm', onClick: () => ctx.navigate('stockreplenishment'), style: { marginTop: '12px' },
+      }, 'Draft Purchase Order →')
+      : h('div', { class: 't-xs t-faint', style: { marginTop: '12px' } }, 'Nothing needs purchasing right now.'));
 }
 
 function deltaPill(value) {
@@ -142,6 +207,14 @@ function statusSeverity(status) {
   if (status === 'Doing Well') return 'good';
   if (status === 'Worth Watching') return 'warn';
   return 'flat';
+}
+
+// businessPulse.status is "flat" (not a word, just the fallback severity
+// name) whenever there isn't enough last-week data to compare against yet
+// — display-only relabel so the pill reads as a sentence instead of a
+// severity keyword leaking onto the page.
+function statusLabel(status) {
+  return status === 'flat' ? 'Not enough data yet' : status;
 }
 
 // =============================================================================
@@ -191,7 +264,7 @@ function salesTrendCard(d, ctx) {
     CardHeader({
       title: 'Sales Performance', desc: `This week ${p.label || ''}`,
       right: h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
-        Pill(sev, p.status), deltaPill(p.deltas.revenue_pct)),
+        Pill(sev, statusLabel(p.status)), deltaPill(p.deltas.revenue_pct)),
     }),
     t && t.weeks && t.weeks.length > 0
       ? LineChart({
@@ -237,15 +310,6 @@ function ownerDecisionsCard(d, ctx) {
 // =============================================================================
 // Inventory Outlook / Next 7 Days / Recent Activity — 3-col row.
 // =============================================================================
-
-function inventoryOutlookCard(d) {
-  return Card({ className: 'card-flex' },
-    CardHeader({ title: 'Inventory Outlook' }),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px' } },
-      Stat({ value: count(d.stockAtRisk.needRestock), label: 'Need Restock' }),
-      Stat({ value: count(d.stockAtRisk.expiringSoon), label: 'Expiring Soon' }),
-      Stat({ value: count((d.needsAttention || []).length), label: 'Priority Risks' })));
-}
 
 function comingUpCard(d) {
   const f = d.comingUp;
@@ -345,17 +409,17 @@ function businessRhythmCard(d) {
   }
   const tiles = [];
   if (r.weekendRevenueSharePct !== null) {
-    tiles.push({ title: 'Weekends Matter', body: `Fri–Sun generate ${r.weekendRevenueSharePct}% of weekly sales.` });
+    tiles.push({ title: 'Best Sales Days', body: `Fri–Sun generate ${r.weekendRevenueSharePct}% of weekly sales.` });
   }
   if (r.dinnerShareOfOrdersPct !== null) {
     tiles.push({ title: 'Dinner Leads', body: `${r.dinnerShareOfOrdersPct}% of orders occur from 5 PM onward.` });
   }
   if (r.peakHour !== null) {
-    tiles.push({ title: 'Peak Hour', body: `Most orders are placed around ${r.peakHour}:00.` });
+    tiles.push({ title: 'Busiest Hours', body: `Most orders are placed around ${r.peakHour}:00.` });
   }
   if (r.paydayDeltaPct !== null) {
     tiles.push({
-      title: 'Payday Pattern',
+      title: 'Payday Sales Effect',
       body: r.paydayDeltaPct > 0
         ? `Sales around payday periods run about ${r.paydayDeltaPct}% higher.`
         : `Sales around payday periods run about ${Math.abs(r.paydayDeltaPct)}% lower.`,

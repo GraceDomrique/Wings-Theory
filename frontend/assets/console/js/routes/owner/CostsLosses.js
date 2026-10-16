@@ -6,7 +6,8 @@ import { Pill } from '../../components/ui/Pill.js';
 import { Button } from '../../components/ui/Button.js';
 import { Table } from '../../components/ui/Table.js';
 import { Tabbar } from '../../components/ui/Tabbar.js';
-import { Modal, ModalError } from '../../components/ui/Modal.js';
+import { ModalError } from '../../components/ui/Modal.js';
+import { Drawer } from '../../components/ui/Drawer.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
 import { DoughnutChart } from '../../components/charts/DoughnutChart.js';
@@ -304,7 +305,7 @@ function unusualUsageSection(ctx, { stockLoss, consumptionAnomalies }) {
         toast('Sent to Admin.', 'good');
       } catch (e) { err.textContent = e.message; err.style.display = ''; } finally { submit.disabled = false; }
     });
-    const modal = Modal({ title: 'Ask Admin to Investigate', onClose: () => {} },
+    const modal = Drawer({ title: 'Ask Admin to Investigate', onClose: () => {} },
       h('label', { class: 'field' }, 'Title', titleInput),
       h('label', { class: 'field', style: { marginTop: '10px' } }, 'Description', bodyInput),
       h('label', { class: 'field', style: { marginTop: '10px' } }, 'Priority', priorityInput),

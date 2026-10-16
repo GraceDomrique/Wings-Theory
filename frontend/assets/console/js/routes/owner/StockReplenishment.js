@@ -4,7 +4,8 @@ import { StatTile } from '../../components/ui/StatTile.js';
 import { Button } from '../../components/ui/Button.js';
 import { Pill } from '../../components/ui/Pill.js';
 import { Table } from '../../components/ui/Table.js';
-import { Modal, ModalError } from '../../components/ui/Modal.js';
+import { ModalError } from '../../components/ui/Modal.js';
+import { Drawer } from '../../components/ui/Drawer.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Tabbar } from '../../components/ui/Tabbar.js';
 import { toast } from '../../components/ui/Feedback.js';
@@ -263,7 +264,7 @@ export async function render(ctx) {
       }
     });
 
-    const modal = Modal({
+    const modal = Drawer({
       title: `Draft a purchase order — ${r.name}`,
       desc: 'This does not affect stock or notify a supplier. Admin sees it and marks it ordered when it is placed.',
       onClose: () => {},
@@ -341,7 +342,7 @@ export async function render(ctx) {
       }
     });
 
-    const modal = Modal({
+    const modal = Drawer({
       title: `Draft a purchase order — ${supplier}`,
       desc: 'This does not affect stock or notify a supplier. Admin sees it and marks it ordered when it is placed.',
       onClose: () => {},
@@ -411,7 +412,7 @@ export async function render(ctx) {
   }
 
   function openDetailModal(r) {
-    Modal({
+    Drawer({
       title: r.name,
       desc: r.supplier ? `Supplier: ${r.supplier}` : 'No supplier recorded',
       onClose: () => {},
@@ -542,7 +543,7 @@ export async function render(ctx) {
       }
     });
 
-    const modal = Modal({
+    const modal = Drawer({
       title: 'Generate purchasing list',
       desc: 'Built fresh from the same stock and forecast data this page reads — never from what happens to be on screen.',
       onClose: () => {},
@@ -608,7 +609,7 @@ export async function render(ctx) {
       }
     });
 
-    const modal = Modal({
+    const modal = Drawer({
       title: 'Generate expiry report',
       desc: 'Does not change stock — discarding expired stock still requires an Admin action.',
       onClose: () => {},

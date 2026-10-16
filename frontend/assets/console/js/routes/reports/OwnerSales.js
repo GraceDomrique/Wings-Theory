@@ -1,4 +1,4 @@
-import { h, mount } from '../../lib/dom.js';
+import { h, mount, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { StatTile } from '../../components/ui/StatTile.js';
 import { Pill } from '../../components/ui/Pill.js';
@@ -101,6 +101,20 @@ const ICON = {
   items: '<path d="M21 8l-9-5-9 5 9 5 9-5z"/><path d="M3 8v8l9 5 9-5V8"/><path d="M12 13v8"/>',
   avg: '<circle cx="12" cy="12" r="9"/><path d="M12 7v10M9.5 9.5a2.5 2.5 0 012.5-1h.5a2 2 0 010 4h-1a2 2 0 000 4h.5a2.5 2.5 0 002.5-1"/>',
 };
+
+// Same icon + pastel-tile treatment as the Overview page's Business Rhythm
+// card (OwnerOverview.js) — restaurant-plain-English titles, not the raw
+// field names (Weekends Matter -> Best Sales Days, Peak Hour -> Busiest
+// Hours, Payday Pattern -> Payday Sales Effect), kept consistent across both
+// pages that render the same businessRhythm payload.
+const RHYTHM_ICON = {
+  'Best Sales Days': '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+  'Dinner Leads': '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/>',
+  'Busiest Hours': '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+  'Payday Sales Effect': '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',
+};
+const RHYTHM_TINT = ['var(--amber-tint)', 'var(--info-tint)', 'var(--good-tint)', 'var(--cocoa-tint)'];
+const RHYTHM_INK = ['var(--amber-deep)', 'var(--info)', 'var(--good)', 'var(--cocoa-deep)'];
 
 // 2026-10 relayout: the page used to read as ~14 equally-weighted cards in
 // one long column — every insight competing for the same attention whether
@@ -292,16 +306,28 @@ function businessRhythmCard(d) {
   const r = d.businessRhythm;
   if (!r.available) return Card({}, CardHeader({ title: 'Business Rhythm' }), EmptyState({ icon: '▤', title: 'Not enough order history yet', tight: true }));
   const tiles = [];
-  if (r.weekendRevenueSharePct !== null) tiles.push(['Weekends Matter', `Fri–Sun generate ${r.weekendRevenueSharePct}% of weekly sales.`]);
-  if (r.dinnerShareOfOrdersPct !== null) tiles.push(['Dinner Leads', `${r.dinnerShareOfOrdersPct}% of orders occur from 5 PM onward.`]);
-  if (r.peakHour !== null) tiles.push(['Peak Hour', `Most orders are placed around ${r.peakHour}:00.`]);
-  if (r.paydayDeltaPct !== null) tiles.push(['Payday Pattern', `Sales around payday periods run about ${Math.abs(r.paydayDeltaPct)}% ${r.paydayDeltaPct > 0 ? 'higher' : 'lower'}.`]);
+  if (r.weekendRevenueSharePct !== null) tiles.push({ title: 'Best Sales Days', body: `Fri–Sun generate ${r.weekendRevenueSharePct}% of weekly sales.` });
+  if (r.dinnerShareOfOrdersPct !== null) tiles.push({ title: 'Dinner Leads', body: `${r.dinnerShareOfOrdersPct}% of orders occur from 5 PM onward.` });
+  if (r.peakHour !== null) tiles.push({ title: 'Busiest Hours', body: `Most orders are placed around ${r.peakHour}:00.` });
+  if (r.paydayDeltaPct !== null) {
+    tiles.push({
+      title: 'Payday Sales Effect',
+      body: r.paydayDeltaPct > 0
+        ? `Sales around payday periods run about ${r.paydayDeltaPct}% higher.`
+        : `Sales around payday periods run about ${Math.abs(r.paydayDeltaPct)}% lower.`,
+    });
+  }
   return Card({},
-    CardHeader({ title: 'Business Rhythm', desc: `Last ${r.windowDays} days` }),
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '10px' } },
-      ...tiles.map(([title, body]) => h('div', { class: 'card', style: { padding: '10px 12px' } },
-        h('div', { style: { fontWeight: '600', fontSize: '12.5px', marginBottom: '4px' } }, title),
-        h('div', { class: 't-xs t-faint' }, body)))));
+    CardHeader({ title: 'Business Rhythm', desc: `Recurring patterns, last ${r.windowDays} days` }),
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: '12px' } },
+      ...tiles.map((t, i) => h('div', {
+        class: 'rhythm-tile', style: { background: RHYTHM_TINT[i % RHYTHM_TINT.length] },
+      },
+      h('div', { class: 'attn-icon', style: { background: 'rgba(255,255,255,0.6)', color: RHYTHM_INK[i % RHYTHM_INK.length] } },
+        icon(RHYTHM_ICON[t.title] || ICON.revenue, 18)),
+      h('div', { style: { minWidth: 0 } },
+        h('div', { style: { fontWeight: '700', fontSize: '13px', color: RHYTHM_INK[i % RHYTHM_INK.length], marginBottom: '3px' } }, t.title),
+        h('div', { class: 't-xs', style: { color: 'var(--ink-soft)', lineHeight: '1.4' } }, t.body))))));
 }
 
 function oftenOrderedTogetherCard(d) {
