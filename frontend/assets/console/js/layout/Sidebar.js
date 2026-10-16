@@ -61,7 +61,12 @@ export function Sidebar({ activeId, onNavigate }) {
     collapsed = next;
     saveCollapsed(collapsed);
     applyCollapsedClass();
-    collapseToggle.classList.toggle('open', !collapsed);
+    // The icon is a left-pointing chevron by default ("collapse this
+    // further left"), rotated 180 degrees (.open) to point right ("expand
+    // this back out"). That must show when the rail IS collapsed (the
+    // click now expands it) and hide once it's expanded again (the click
+    // now collapses it) -- the inverse of what this used to read.
+    collapseToggle.classList.toggle('open', collapsed);
     collapseLabel.textContent = collapsed ? '' : 'Collapse';
   }
 
@@ -236,7 +241,7 @@ export function Sidebar({ activeId, onNavigate }) {
   else mobileQuery.addListener(syncGroupDisplayToTier); // older WebKit (in-app webviews)
 
   const collapseLabel = h('span', { class: 'nav-item-label' }, collapsed ? '' : 'Collapse');
-  const collapseToggle = h('span', { class: 'nav-collapse-chevron' + (collapsed ? '' : ' open') }, icon(COLLAPSE_ICON));
+  const collapseToggle = h('span', { class: 'nav-collapse-chevron' + (collapsed ? ' open' : '') }, icon(COLLAPSE_ICON));
   const collapseBtn = h('button', {
     class: 'nav-collapse-toggle',
     title: collapsed ? 'Expand sidebar' : 'Collapse sidebar',

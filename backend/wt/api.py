@@ -497,6 +497,18 @@ def change_password(
     ).fetchone()
     if not row:
         raise AuthenticationError("account no longer active — please sign in again")
+    # 2026-10-16: POS/Kitchen are shared station logins, not personal
+    # accounts -- any cashier or kitchen staffer voluntarily changing that
+    # shared password locks out everyone else on the station until an
+    # admin resets it again. Only admin/owner may change their own password
+    # at will; a cashier/kitchen account may still complete a password this
+    # endpoint is the only path for -- finishing an admin-issued reset
+    # (must_change_password=1) -- since that is the admin acting through
+    # the account, not a voluntary self-change.
+    if row["role"] in ("cashier", "kitchen") and not row["must_change_password"]:
+        raise PermissionError_(
+            "Only an administrator can change this account's password. Ask an admin to reset it from Users & Access."
+        )
     if not auth.verify_password(body.current_password, row["password_hash"], row["password_salt"]):
         raise AuthenticationError("current password is incorrect")
     if body.new_password != body.confirm_new_password:

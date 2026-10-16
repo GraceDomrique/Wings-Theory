@@ -59,9 +59,7 @@ function securityNotesPanel() {
   return Card({ className: 'account-security-panel' },
     CardHeader({ title: 'About your account' }),
     h('ul', { class: 't-sm t-soft', style: { margin: 0, paddingLeft: '18px', lineHeight: '1.7' } },
-      h('li', {}, 'Changing your password signs out every other device currently signed in to this account.'),
-      h('li', {}, 'Your username and display name can only be changed by an administrator, from Users & Access.'),
-      h('li', {}, 'This console is reachable only on the restaurant’s local network.')));
+      h('li', {}, 'Changing your password signs out every other device currently signed in to this account.')));
 }
 
 // RIGHT — Account Security: the password form, unchanged behavior, redrawn
