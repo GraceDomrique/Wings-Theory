@@ -45,6 +45,13 @@ DEFAULT_DB = PRODUCTION_DB  # noqa: same path, kept as an alias for clarity at c
 # pointed at the wrong database" and "real mode accidentally pointed at the
 # demo database" are both structurally impossible, not just discouraged.
 DEMO_DB = BACKEND_DIR / "wings_theory_demo.db"
+# The sanitized, version-controlled snapshot shipped in the repo (see
+# scripts/build_github_deploy_snapshot.py). Schema + menu + recipes +
+# config + demo activity, with password hashes/sessions scrubbed -- never
+# the live production file. Used exactly once, by bootstrap_from_snapshot_
+# if_missing() below, to give a fresh deployment something to boot from
+# without a manual seed step or a first-run migration-from-empty.
+DEPLOY_SNAPSHOT = BACKEND_DIR / "deploy" / "wings_theory.snapshot.db"
 
 VALID_ENVIRONMENTS = ("production", "development", "test", "demo")
 
@@ -136,6 +143,29 @@ def db_path() -> Path:
             "or write demonstration data."
         )
     return path
+
+
+def bootstrap_from_snapshot_if_missing() -> bool:
+    """If the database this process would open does not exist on disk yet,
+    seed it from the committed deployment snapshot (DEPLOY_SNAPSHOT) before
+    anything else touches it. A plain sqlite3.connect() to a missing path
+    silently creates an empty file, so this must run before db_path() is
+    ever connected to -- otherwise migrate() would "successfully" produce
+    an empty, menu-less, recipe-less database instead of the shipped one.
+
+    Never overwrites or touches a database that already exists -- this is
+    a first-run bootstrap only, not a reset/restore path. Returns True iff
+    it actually copied the snapshot into place."""
+    target = db_path()
+    if str(target) == ":memory:":
+        return False
+    if target.exists():
+        return False
+    if not DEPLOY_SNAPSHOT.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(DEPLOY_SNAPSHOT, target)
+    return True
 
 
 def connect(path: str | Path | None = None, *, check_same_thread: bool = True) -> sqlite3.Connection:

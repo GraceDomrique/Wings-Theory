@@ -182,7 +182,7 @@ class TestProvenanceClause(_MLTestBase):
     def test_simulated_mode_sees_only_the_approved_batch_sentinel(self):
         ing = self._fresh_ingredient_id()
         self._approve_batch("batch-A")
-        self._insert_ledger_row(delta=-5, balance_after=95, user_id="owner", ingredient_id=ing,
+        self._insert_ledger_row(delta=-5, balance_after=95, user_id="Administrator", ingredient_id=ing,
                                 ref_id="REAL-1", batch_id=None, created_at="2026-01-01")
         self._insert_ledger_row(delta=-3, balance_after=92, user_id="simulated_workbook_import", ingredient_id=ing,
                                 ref_id="SYN-1", batch_id="batch-A", created_at="2026-01-02")
@@ -196,7 +196,7 @@ class TestProvenanceClause(_MLTestBase):
     def test_real_mode_excludes_the_sentinel_even_from_an_approved_batch(self):
         ing = self._fresh_ingredient_id()
         self._approve_batch("batch-B")
-        self._insert_ledger_row(delta=-5, balance_after=95, user_id="owner", ingredient_id=ing,
+        self._insert_ledger_row(delta=-5, balance_after=95, user_id="Administrator", ingredient_id=ing,
                                 ref_id="REAL-2", batch_id=None, created_at="2026-01-01")
         self._insert_ledger_row(delta=-3, balance_after=92, user_id="simulated_workbook_import", ingredient_id=ing,
                                 ref_id="SYN-2", batch_id="batch-B", created_at="2026-01-02")
@@ -210,7 +210,7 @@ class TestProvenanceClause(_MLTestBase):
     def test_mixed_mode_unions_real_and_approved_synthetic_only(self):
         ing = self._fresh_ingredient_id()
         self._approve_batch("batch-C")
-        self._insert_ledger_row(delta=-5, balance_after=95, user_id="owner", ingredient_id=ing,
+        self._insert_ledger_row(delta=-5, balance_after=95, user_id="Administrator", ingredient_id=ing,
                                 ref_id="REAL-3", batch_id=None, created_at="2026-01-01")
         self._insert_ledger_row(delta=-3, balance_after=92, user_id="simulated_workbook_import", ingredient_id=ing,
                                 ref_id="SYN-3", batch_id="batch-C", created_at="2026-01-02")
@@ -229,7 +229,7 @@ class TestProvenanceClause(_MLTestBase):
         # cheap, fast sanity check that the fixture builder above is wired
         # the way the other tests in this class assume.
         with self.assertRaises(TypeError):
-            self._insert_ledger_row(delta=-1, balance_after=1, user_id="owner", ref_id="X")
+            self._insert_ledger_row(delta=-1, balance_after=1, user_id="Administrator", ref_id="X")
 
 
 class TestPassBDerivedViewDoubleCounting(_MLTestBase):
@@ -272,7 +272,7 @@ class TestPassBDerivedViewDoubleCounting(_MLTestBase):
                 "INSERT INTO unli_reconciliation "
                 "(service_date, unli_item_id, heads, theoretical_base, actual_base, variance_base, "
                 " status, validation_state, recorded_by) "
-                "VALUES ('2026-02-02', ?, 10, 500, 480, -20, 'within_tolerance', 'validated', 'owner')",
+                "VALUES ('2026-02-02', ?, 10, 500, 480, -20, 'within_tolerance', 'validated', 'Administrator')",
                 (self.wings_item_id,),
             )
         records = anomaly._consumption_records(self.conn, 365, mode="MIXED")
@@ -428,7 +428,7 @@ class TestMLModeTransitionEndToEnd(_MLTestBase):
                         " user_id, created_at) "
                         "VALUES (?,?,?,?,'test',?,?,?)",
                         (ing, -(3 + k), 300 - day * 2 - k, "wastage" if k == 0 else "spoilage",
-                         f"E2E-REAL-{day}-{k}", "owner", created),
+                         f"E2E-REAL-{day}-{k}", "Administrator", created),
                     )
                     real_ledger_ids.append(cur.lastrowid)
         self.assertEqual(len(real_ledger_ids), 30)
@@ -441,7 +441,7 @@ class TestMLModeTransitionEndToEnd(_MLTestBase):
                     "INSERT INTO anomaly_validation_sample "
                     "(ledger_id, sample_source, model_prediction, model_version, eligibility_version, "
                     " human_label, reviewed_by, reviewed_at) "
-                    "VALUES (?, 'model_flagged', ?, ?, ?, ?, 'owner', datetime('now'))",
+                    "VALUES (?, 'model_flagged', ?, ?, ?, ?, 'Administrator', datetime('now'))",
                     (ledger_id, prediction, anomaly.ANOMALY_MODEL_VERSION,
                      anomaly.ELIGIBILITY_FILTER_VERSION, label),
                 )

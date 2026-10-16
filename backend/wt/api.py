@@ -144,6 +144,10 @@ _model_details_cache = TTLCache(ttl_seconds=1800)
 
 @app.on_event("startup")
 def _startup() -> None:
+    # Must run before the first connect() -- sqlite3.connect() to a missing
+    # path silently creates an empty file, which would make this a no-op
+    # forever after. See db.bootstrap_from_snapshot_if_missing's docstring.
+    db.bootstrap_from_snapshot_if_missing()
     conn = db.get_conn()
     db.migrate(conn)
     # No-op unless WT_ENV=production is explicitly set — see

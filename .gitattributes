@@ -1,0 +1,6 @@
+# Deployment DB snapshot and trained model binaries are large, opaque
+# blobs -- Git LFS keeps them out of ordinary clone/diff bandwidth. Text
+# manifests (JSON/MD) are intentionally left as normal Git text, not LFS,
+# so they stay diffable.
+backend/deploy/*.db filter=lfs diff=lfs merge=lfs -text
+backend/ml_artifacts/*.joblib filter=lfs diff=lfs merge=lfs -text

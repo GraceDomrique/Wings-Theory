@@ -1,0 +1,57 @@
+{
+  "models": [
+    {
+      "model_key": "demand_prophet",
+      "run_id": 39,
+      "mode": "REAL",
+      "schema_version": "demand_prophet_v1",
+      "trained_at": "2026-10-12 17:42:54",
+      "artifact_path": "ml_artifacts/demand_prophet__2b2a7617aac9.joblib",
+      "status": "present",
+      "sha256": "8b357024ea341e9b6c0f4a54433c1f92f54f69707a558aa88be15c994877b8d0",
+      "bytes": 149356
+    },
+    {
+      "model_key": "flavor_consumption_isoforest",
+      "run_id": 38,
+      "mode": "SIMULATED",
+      "schema_version": "anomaly_isoforest_v1",
+      "trained_at": "2026-10-12 17:40:41",
+      "artifact_path": "ml_artifacts/flavor_consumption_isoforest__bb6cd0cedd20.joblib",
+      "status": "present",
+      "sha256": "f8b4c2c9251275fa79b2bfcae71cf480a028167bdc936cf1e51eac3c570345df",
+      "bytes": 2154354
+    },
+    {
+      "model_key": "fpgrowth_combos",
+      "run_id": 40,
+      "mode": "REAL",
+      "schema_version": "fpgrowth_combos_v1",
+      "trained_at": "2026-10-12 17:42:54",
+      "artifact_path": "ml_artifacts/fpgrowth_combos__8147c0d858f2.json",
+      "status": "present",
+      "sha256": "ad81d3a96caa265d2bc5dcfadc5cc60df2dacb79355c1328d3c7e8e945906677",
+      "bytes": 5418
+    },
+    {
+      "model_key": "stock_loss_isoforest",
+      "run_id": 31,
+      "mode": "SIMULATED",
+      "schema_version": "anomaly_isoforest_v1",
+      "trained_at": "2026-10-12 16:59:58",
+      "artifact_path": "ml_artifacts/stock_loss_isoforest__cb9abd10b51a.joblib",
+      "status": "MISSING_AT_SOURCE"
+    },
+    {
+      "model_key": "unli_consumption_isoforest",
+      "run_id": 37,
+      "mode": "SIMULATED",
+      "schema_version": "anomaly_isoforest_v1",
+      "trained_at": "2026-10-12 17:40:41",
+      "artifact_path": "ml_artifacts/unli_consumption_isoforest__b686237424c8.joblib",
+      "status": "present",
+      "sha256": "ff5443e2b7c4098492da84f5c9043755302efc03134caa70f9790ff7e775ed3b",
+      "bytes": 2374678
+    }
+  ]
+}

@@ -183,3 +183,56 @@ not whether `pip install` itself works (already true).
 - A full `wings_theory.db` backup was taken before any of this phase's
   database writes: `backend/backups/wings_theory.pre_ml_deployment_prep.
   <timestamp>.db`.
+
+## 2026-10-16: shipping artifacts + a sanitized DB snapshot to GitHub
+
+Everything above stayed local (nothing under `backend/ml_artifacts/` or any
+`.db` was ever pushed). This phase makes the repo itself deployable: a
+fresh `git clone` now has what it needs to boot without training a model
+or seeding a database by hand.
+
+**What changed:**
+
+- `backend/ml_artifacts/` is still gitignored *as a directory* (a local
+  training run writes a new hash-named file every time — that churn stays
+  untracked), but the files the registry currently calls **active** are
+  carved back out by exact name in `.gitignore` and committed, tracked via
+  Git LFS (`.gitattributes`). `backend/ml_artifacts/MANIFEST.json` records
+  each one's `model_key`/`run_id`/`mode`/`schema_version`/sha256.
+- `scripts/build_github_deploy_snapshot.py` takes a **consistent** copy of
+  `wings_theory.db` via SQLite's online backup API (`sqlite3.Connection.
+  backup()` — correct under WAL/concurrent writers, unlike a raw file
+  copy), then sanitizes the copy: every `app_user` password is replaced
+  with a documented demo credential (`must_change_password=1` set, so
+  first login forces a real change) and `auth_session` is cleared. Output:
+  `backend/deploy/wings_theory.snapshot.db` (Git LFS) +
+  `backend/deploy/SNAPSHOT_MANIFEST.json`. The live source database is
+  only ever read, never opened for writing.
+- `wt.db.bootstrap_from_snapshot_if_missing()`, called from `api.py`'s
+  startup event *before* the first `db.get_conn()`, copies
+  `backend/deploy/wings_theory.snapshot.db` into place **only if** the
+  configured `WT_DB` path does not already exist. An existing database —
+  production, demo, or a prior run's — is never touched.
+
+**Finding reported, not silently patched:** the registry's currently
+active `stock_loss_isoforest` run (id 31, `stock_loss_isoforest__
+cb9abd10b51a.joblib`) has no artifact file anywhere in the repo or its
+backups — it is missing at the source, not just excluded here. (The
+artifact this document described on 2026-10-13, `...fb238ca8dbf8.joblib`,
+was superseded by a later retrain whose file never made it to disk; see
+`backend/deploy/SNAPSHOT_MANIFEST.json`'s `ml_artifacts` list, which marks
+it `MISSING_AT_SOURCE` rather than fabricating a replacement.) This is not
+a crash: `ml_startup.validate_artifacts_on_startup()` already rolls back
+to the previous run for that one model and the rule-based layer serves in
+the meantime — exactly the designed degradation path. Retraining
+`stock_loss_isoforest` to produce a real replacement file is a separate,
+deliberate action (`POST /console/ml/models/stock_loss_isoforest/train`),
+not done as part of this packaging work.
+
+**Credentials in the public snapshot:** every account's password hash in
+`backend/deploy/wings_theory.snapshot.db` was replaced before it was ever
+written to disk under Git's control. The documented demo password is
+`WingsTheoryDemo!2026` (see `scripts/build_github_deploy_snapshot.py`'s
+`DEMO_PASSWORD`); every account is flagged `must_change_password=1`. No
+password hash, session token, or `.secret` JWT-signing key from the real
+source database is present anywhere in Git history for this phase.

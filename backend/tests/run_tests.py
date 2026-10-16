@@ -1523,12 +1523,12 @@ class TestVarianceReviewAPI(unittest.TestCase):
         # A genuine role='owner' account (see auth.CAPABILITIES / the 2026-09-11
         # addition) has inventory.read but not inventory.write -- exactly the
         # read-without-write shape this class used to exercise via the now-
-        # deactivated 'manager' account. Provisioned the same way a real
-        # deployment operator would (owner_provisioning is the only path to
-        # role='owner').
-        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
-        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
-        cls.H_OWNER_ROLE = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+        # deactivated 'manager' account. seed.seed_users() now seeds exactly
+        # one such account ('business_owner') -- provision_first_owner's own
+        # single-active-owner constraint (migration 0027) refuses to create
+        # a second one, so this logs into the seeded account directly rather
+        # than provisioning a redundant 'biz_owner'.
+        cls.H_OWNER_ROLE = {"Authorization": f"Bearer {token('business_owner', 'ownerwingstheory')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -4393,15 +4393,14 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        # The seeded username 'owner' is actually role=admin (historical
-        # naming, predates the real 'owner' role — see
+        # The seeded username 'Administrator' is actually role=admin
+        # (historical naming predates the real 'owner' role -- see
         # TestComboPublishEndToEnd's own comment on this exact confusion).
-        # A genuine owner-ROLE account is only created through
-        # owner_provisioning.provision_first_owner.
-        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
-        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
+        # A genuine owner-ROLE account is seeded directly now ('business_owner'
+        # -- see wt/seed.py's seed_users()), so there is no second one to
+        # provision here.
         cls.conn.commit()
-        cls._owner_role_password = provisioned["temporary_password"]
+        cls._owner_role_password = "ownerwingstheory"
 
     @classmethod
     def tearDownClass(cls):
@@ -4411,7 +4410,7 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         scrub(cls.path)
 
     def _login(self, username, password="wingstheory"):
-        if username == "biz_owner" and password == "wingstheory":
+        if username == "business_owner" and password == "wingstheory":
             password = self._owner_role_password
         r = self.client.post("/auth/login", json={"username": username, "password": password})
         self.assertEqual(r.status_code, 200, r.text)
@@ -4598,7 +4597,7 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         menu = self.client.get("/pos/menu", headers=self._h(cashier))
         self.assertEqual(menu.status_code, 200, menu.text)
 
-        owner = self._login("biz_owner")
+        owner = self._login("business_owner")
         overview = self.client.get(
             "/console/dashboard/owner-overview", headers=self._h(owner)
         )
@@ -7157,12 +7156,11 @@ class TestComboPublishEndToEnd(unittest.TestCase):
         cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
 
         # A genuine owner-ROLE account (distinct from the seeded username
-        # 'owner', which is role=admin) — the only way to create one is
-        # owner_provisioning.provision_first_owner, same as
-        # TestOwnerRoleAndProvisioning.
-        provisioned = owner_provisioning.provision_first_owner(conn, "biz_owner", "B. Owner")
-        conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
-        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+        # 'Administrator', which is role=admin) is seeded directly now as
+        # 'business_owner' (see wt/seed.py's seed_users()) -- migration
+        # 0027's single-active-owner constraint means there can only be
+        # the one, so this logs into it rather than provisioning another.
+        cls.H_OWNER = {"Authorization": f"Bearer {token('business_owner', 'ownerwingstheory')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -7654,9 +7652,7 @@ class TestCorrectStockCapability(unittest.TestCase):
         cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
         cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
 
-        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
-        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
-        cls.H_OWNER_ROLE = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+        cls.H_OWNER_ROLE = {"Authorization": f"Bearer {token('business_owner', 'ownerwingstheory')}"}
 
         cls.ing = add_ingredient(cls.conn, "KitWings", pack=1000, on_hand=100)
         cls.conn.commit()
@@ -14651,7 +14647,13 @@ class TestOwnerRoleAndProvisioning(unittest.TestCase):
         # (ADMIN cannot create one — see test_admin_direct_api_attempt_to_
         # create_owner_is_rejected below). The only path is the deployment-only
         # owner_provisioning module, exercised directly here exactly as a real
-        # deployment operator would run it from the CLI.
+        # deployment operator would run it from the CLI. seed.seed_users() now
+        # seeds its own 'business_owner' (role='owner', active) by default --
+        # deactivated here so this class still gets the "no owner exists yet"
+        # precondition provision_first_owner needs, and so 'biz_owner' remains
+        # the single provisioned account every test below (duplicate-username,
+        # second-owner-rejected, etc.) exercises.
+        cls.conn.execute("UPDATE app_user SET is_active=0 WHERE username='business_owner'")
         provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
         cls.owner_temp_password = provisioned["temporary_password"]
         cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
@@ -14792,11 +14794,11 @@ class TestOwnerRoleAndProvisioning(unittest.TestCase):
         )
 
     def test_seeded_owner_username_keeps_its_admin_role_not_silently_converted(self):
-        # The seeded username 'owner' predates the 'owner' role (migration
-        # 0024) and has always carried role='admin'. Provisioning the real
-        # OWNER account ('biz_owner', above) must never repurpose it.
+        # The seeded username 'Administrator' predates the 'owner' role
+        # (migration 0024) and has always carried role='admin'. Provisioning
+        # the real OWNER account ('biz_owner', above) must never repurpose it.
         row = self.conn.execute(
-            "SELECT role FROM app_user WHERE username='owner'"
+            "SELECT role FROM app_user WHERE username='Administrator'"
         ).fetchone()
         self.assertEqual(row["role"], "admin")
 
@@ -14959,9 +14961,10 @@ class TestOwnerInstructions(unittest.TestCase):
         # OWNER is provisioned via the deployment-only mechanism, not the
         # (now-forbidden) admin account-management endpoint — see
         # TestOwnerRoleAndProvisioning for that restriction's own coverage.
-        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
-        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
-        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+        # seed.seed_users() now seeds its own owner-role account
+        # ('business_owner') by default, so this logs into it directly
+        # rather than provisioning a redundant second one.
+        cls.H_OWNER = {"Authorization": f"Bearer {token('business_owner', 'ownerwingstheory')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -15090,9 +15093,7 @@ class TestInstructionAssigneesAndAudit(unittest.TestCase):
             r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
         cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
-        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
-        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
-        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('business_owner', 'ownerwingstheory')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -15105,7 +15106,7 @@ class TestInstructionAssigneesAndAudit(unittest.TestCase):
         r = self.client.get("/console/instructions/assignees", headers=self.H_OWNER)
         self.assertEqual(r.status_code, 200, r.text)
         usernames = [i["username"] for i in r.json()["items"]]
-        self.assertIn("owner", usernames)
+        self.assertIn("Administrator", usernames)
         for item in r.json()["items"]:
             self.assertNotIn("password_hash", item)
             self.assertNotIn("locked_until", item)
@@ -15143,7 +15144,7 @@ class TestInstructionAssigneesAndAudit(unittest.TestCase):
         self.assertEqual(events[0]["entity_type"], "page")
         self.assertEqual(events[0]["entity_id"], "receiving")
         self.assertEqual(events[0]["action"], "view")
-        self.assertEqual(events[0]["user_id"], "owner")
+        self.assertEqual(events[0]["user_id"], "Administrator")
         self.assertEqual(events[0]["note"], "Inventory → Receiving")
         self.assertIsNotNone(events[0]["created_at"])
 
@@ -15184,9 +15185,10 @@ class TestPurchaseOrders(unittest.TestCase):
         # OWNER is provisioned via the deployment-only mechanism, not the
         # (now-forbidden) admin account-management endpoint — see
         # TestOwnerRoleAndProvisioning for that restriction's own coverage.
-        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
-        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
-        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+        # seed.seed_users() now seeds its own owner-role account
+        # ('business_owner') by default, so this logs into it directly
+        # rather than provisioning a redundant second one.
+        cls.H_OWNER = {"Authorization": f"Bearer {token('business_owner', 'ownerwingstheory')}"}
 
         ing = cls.conn.execute(
             "SELECT id, on_hand_base, pack_size, yield_factor FROM ingredient "
@@ -15546,7 +15548,7 @@ class TestAuditGapCoverage(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         events = self._events("ingredient", "receive")
         self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["user_id"], "owner")
+        self.assertEqual(events[0]["user_id"], "Administrator")
         self.assertIsNotNone(events[0]["new_value"])
 
     def test_count_is_audited(self):
@@ -15662,16 +15664,20 @@ class TestNewMigrationsIntegrity(unittest.TestCase):
             self.assertEqual(before_accounts, after_accounts)
 
             roles = {r["username"]: r["role"] for r in after_accounts}
-            self.assertEqual(roles["owner"], "admin")
+            self.assertEqual(roles["Administrator"], "admin")
+            self.assertEqual(roles["business_owner"], "owner")
             self.assertEqual(roles["manager"], "manager")
             self.assertEqual(roles["cashier1"], "cashier")
             self.assertEqual(roles["kitchen1"], "kitchen")
 
-            # the widened CHECK actually accepts 'owner' now
+            # the widened CHECK actually accepts 'owner' now -- is_active=0
+            # here since migration 0027's partial unique index already has
+            # a live role='owner' account (the seeded 'business_owner')
+            # and only one may be active at a time.
             conn.execute(
                 "INSERT INTO app_user (username, display_name, role, password_hash, password_salt, "
-                "password_changed_at, must_change_password) VALUES "
-                "('migration_test_owner','T','owner','x','y', datetime('now'), 1)"
+                "password_changed_at, must_change_password, is_active) VALUES "
+                "('migration_test_owner','T','owner','x','y', datetime('now'), 1, 0)"
             )
             conn.commit()
         finally:
@@ -16588,7 +16594,7 @@ class TestPOSTablesAndHeadFlavors(unittest.TestCase):
         # can't read it, so this proves the fix through the exact same
         # credentials the real kitchen display authenticates with.
         kit_token = self.client.post(
-            "/auth/login", json={"username": "kitchen1", "password": "wingstheory"}
+            "/auth/login", json={"username": "kitchen1", "password": "wingstheorykds"}
         ).json()["token"]
         h_kit = {"Authorization": f"Bearer {kit_token}"}
         q = self.client.get("/kds/queue", headers=h_kit).json()
@@ -17824,6 +17830,89 @@ class TestFlavorAnomalySimulation(Base):
         false_alarm_days = sum(1 for e in events if e["service_date"] in normal_dates)
         self.assertEqual(false_alarm_days, 0,
                          "a purely normal day must never generate a flagged event")
+
+
+class TestDeploySnapshotBootstrap(unittest.TestCase):
+    """wt.db.bootstrap_from_snapshot_if_missing: the one piece of startup
+    wiring that lets a fresh clone boot from the committed, sanitized
+    backend/deploy/wings_theory.snapshot.db instead of needing a manual
+    seed/migration step (see api.py's _startup and db.py's docstring)."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.target = Path(self.tmpdir) / "wings_theory.db"
+        self.snapshot = Path(self.tmpdir) / "snapshot.db"
+        # A tiny real sqlite file stands in for the real snapshot -- the
+        # function under test only cares about file existence/copying, not
+        # schema contents.
+        conn = sqlite3.connect(str(self.snapshot))
+        conn.execute("CREATE TABLE marker (value TEXT)")
+        conn.execute("INSERT INTO marker VALUES ('from_snapshot')")
+        conn.commit()
+        conn.close()
+        os.environ["WT_ENV"] = "production"
+        os.environ["WT_DB"] = str(self.target)
+        db.close_conn()
+        self._orig_snapshot = db.DEPLOY_SNAPSHOT
+        self._orig_prod = db.PRODUCTION_DB
+        db.DEPLOY_SNAPSHOT = self.snapshot
+        db.PRODUCTION_DB = self.target
+
+    def tearDown(self):
+        db.close_conn()
+        db.DEPLOY_SNAPSHOT = self._orig_snapshot
+        db.PRODUCTION_DB = self._orig_prod
+        os.environ.pop("WT_ENV", None)
+        os.environ.pop("WT_DB", None)
+        import shutil as _shutil
+        _shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_bootstraps_when_target_missing(self):
+        self.assertFalse(self.target.exists())
+        bootstrapped = db.bootstrap_from_snapshot_if_missing()
+        self.assertTrue(bootstrapped)
+        self.assertTrue(self.target.exists())
+        conn = sqlite3.connect(str(self.target))
+        self.assertEqual(
+            conn.execute("SELECT value FROM marker").fetchone()[0], "from_snapshot")
+        conn.close()
+
+    def test_never_overwrites_an_existing_database(self):
+        conn = sqlite3.connect(str(self.target))
+        conn.execute("CREATE TABLE marker (value TEXT)")
+        conn.execute("INSERT INTO marker VALUES ('already_here')")
+        conn.commit()
+        conn.close()
+        bootstrapped = db.bootstrap_from_snapshot_if_missing()
+        self.assertFalse(bootstrapped)
+        conn = sqlite3.connect(str(self.target))
+        self.assertEqual(
+            conn.execute("SELECT value FROM marker").fetchone()[0], "already_here")
+        conn.close()
+
+    def test_noop_when_no_snapshot_is_shipped(self):
+        self.snapshot.unlink()
+        bootstrapped = db.bootstrap_from_snapshot_if_missing()
+        self.assertFalse(bootstrapped)
+        self.assertFalse(self.target.exists())
+
+    def test_persists_across_a_simulated_restart(self):
+        """Bootstrap once, then confirm a second process (same path, no
+        snapshot copy needed any more) sees the exact same data -- the
+        'persistence across application restarts' requirement."""
+        db.bootstrap_from_snapshot_if_missing()
+        db.close_conn()
+        conn2 = sqlite3.connect(str(self.target))
+        conn2.execute("INSERT INTO marker VALUES ('written_after_restart')")
+        conn2.commit()
+        conn2.close()
+
+        bootstrapped_again = db.bootstrap_from_snapshot_if_missing()
+        self.assertFalse(bootstrapped_again)
+        conn3 = sqlite3.connect(str(self.target))
+        rows = {r[0] for r in conn3.execute("SELECT value FROM marker")}
+        conn3.close()
+        self.assertEqual(rows, {"from_snapshot", "written_after_restart"})
 
 
 def main() -> int:
