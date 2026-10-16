@@ -21,10 +21,18 @@ import { session } from '../../lib/api/client.js';
  */
 export async function render(ctx) {
   const isOwner = (session.user || {}).role === 'owner';
-  const [items, models] = await Promise.all([
-    listDemandSummaries(),
-    getModelDetails().catch(() => null),
-  ]);
+  const items = await listDemandSummaries();
+
+  // getModelDetails() is NOT awaited alongside the data this page actually
+  // needs to render: /console/model-details is a known-slow endpoint (see
+  // Losses.js's own fix for the same issue) that otherwise blocks the whole
+  // chart from ever appearing. freshnessHost starts with a neutral loading
+  // placeholder and is swapped for the real banner once the call resolves,
+  // same decoupled pattern as Losses.js's modelStatusHost.
+  const freshnessHost = h('div', { class: 'load-note' }, 'Checking purchase-recommendation freshness…');
+  getModelDetails()
+    .then((models) => mount(freshnessHost, freshnessBanner(models, isOwner)))
+    .catch(() => mount(freshnessHost, freshnessBanner(null, isOwner)));
 
   const ready = items.filter((i) => !i.insufficientData);
   const best = items.slice().sort((a, b) => b.daysOfHistory - a.daysOfHistory)[0];
@@ -172,7 +180,7 @@ export async function render(ctx) {
 
   return h('div', {},
     banner,
-    freshnessBanner(models, isOwner),
+    freshnessHost,
     Card({},
       CardHeader({
         title: 'Next 7 days — top menu items',
