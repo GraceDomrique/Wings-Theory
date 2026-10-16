@@ -945,7 +945,18 @@ canvas{max-width:100%;}
 }
 
 @media (max-width:860px){
-  .grid{grid-template-columns:1fr !important;}
+  /* minmax(0,1fr), not a bare 1fr: an fr track's implicit minimum is its
+     content's min-content size, not 0 -- a bare `1fr` here only ever
+     collapsed the COLUMN COUNT to one, not the actual pixel width, whenever
+     that one remaining column held something with a wide min-content size
+     (a multi-column Table.js table, in particular). Found on Instructions
+     at 375px: .grid correctly resolved to a single grid-template-columns
+     track, but that track measured 511px/474px wide regardless -- the
+     6-column instructions table inside it held the track open past the
+     viewport, silently clipped by a parent's overflow:hidden rather than
+     visibly overflowing or scrolling. Any other .grid wrapping a wide table
+     had the identical latent bug. */
+  .grid{grid-template-columns:minmax(0,1fr) !important;}
 
   /* The hero stat strip (storeStatusBanner's Need Attention/Deliveries/
      Running Low/Stock Healthy row) sits INSIDE a .photo-hero card that the
@@ -1166,7 +1177,8 @@ canvas{max-width:100%;}
   /* !important: call sites (MenuStudio.js's 25%/1fr/25%, PurchasingHub.js's
      inline 1.6fr/1fr) set grid-template-columns inline, same reason the
      admin-today/owner-overview breakpoint above needs it too. */
-  .studio-layout{grid-template-columns:1fr !important;}
+  /* minmax(0,1fr) -- same fr-track-min-content-floor bug as .grid above. */
+  .studio-layout{grid-template-columns:minmax(0,1fr) !important;}
   .studio-col-left .scrollpane{max-height:320px;}
 }
 
