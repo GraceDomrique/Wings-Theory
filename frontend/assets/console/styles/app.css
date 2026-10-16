@@ -1307,21 +1307,52 @@ body.role-owner .tabbar button.active{
 body.role-owner .tabbar button:hover:not(.active){background:rgba(36,42,38,0.05); color:var(--ink);}
 @media (max-width:600px){ body.role-owner .tabbar{border-radius:var(--radius);} }
 
-/* Stat tiles — a colored gradient wash and left accent instead of a flat
-   white box with a small icon chip, so the headline numbers row reads with
-   some weight instead of four identical pale rectangles. */
+/* Stat tiles — round 4 feedback ("more unique, more cool and creative"):
+   the pale-tint-wash + thin left bar from round 2 was a step up from flat
+   white, but still reads as "a card with a slightly colored corner," not
+   genuinely distinctive. This pass gives each severity a real identity: a
+   solid gradient icon badge (white icon on color, not color-on-pale-tint),
+   an oversized translucent ghost ring bleeding off the card's own corner as
+   a decorative backdrop, and a hover lift so the row feels alive rather
+   than static. --_tile-c/--_tile-c2 (a two-stop gradient per severity) and
+   --_tile-tint replace the single tint variable the previous pass used. */
 body.role-owner .stat-tile-card{
   position:relative; overflow:hidden; border-left:3px solid transparent;
+  transition:transform .15s ease, box-shadow .15s ease;
+}
+body.role-owner .stat-tile-card:hover{
+  transform:translateY(-2px); box-shadow:0 10px 28px rgba(23,28,22,0.12);
 }
 body.role-owner .stat-tile-card::before{
-  content:''; position:absolute; inset:0; opacity:.5; pointer-events:none;
+  content:''; position:absolute; inset:0; opacity:.45; pointer-events:none;
   background:linear-gradient(135deg, var(--_tile-tint, transparent) 0%, transparent 65%);
 }
-body.role-owner .stat-tile-card:has(.kpi-icon-crit){ border-left-color:var(--crit); --_tile-tint:var(--crit-tint); }
-body.role-owner .stat-tile-card:has(.kpi-icon-warn){ border-left-color:var(--warn); --_tile-tint:var(--warn-tint); }
-body.role-owner .stat-tile-card:has(.kpi-icon-good){ border-left-color:var(--good); --_tile-tint:var(--good-tint); }
-body.role-owner .stat-tile-card:has(.kpi-icon-info){ border-left-color:var(--info); --_tile-tint:var(--info-tint); }
+/* The ghost ring — a large, mostly-transparent circle outline anchored past
+   the card's own bottom-right edge, in the tile's own color. Decorative
+   only (aria-hidden via ::after having no content read by a screen reader),
+   gives the tile a "designed" focal point instead of empty whitespace. */
+body.role-owner .stat-tile-card::after{
+  content:''; position:absolute; width:120px; height:120px; right:-40px; bottom:-40px;
+  border-radius:50%; border:16px solid var(--_tile-c, transparent); opacity:.08; pointer-events:none;
+}
+body.role-owner .stat-tile-card:has(.kpi-icon-crit){ border-left-color:var(--crit); --_tile-tint:var(--crit-tint); --_tile-c:var(--crit); --_tile-c2:#C06157; }
+body.role-owner .stat-tile-card:has(.kpi-icon-warn){ border-left-color:var(--warn); --_tile-tint:var(--warn-tint); --_tile-c:var(--warn); --_tile-c2:#AD7B3F; }
+body.role-owner .stat-tile-card:has(.kpi-icon-good){ border-left-color:var(--good); --_tile-tint:var(--good-tint); --_tile-c:var(--good); --_tile-c2:#59967A; }
+body.role-owner .stat-tile-card:has(.kpi-icon-info){ border-left-color:var(--info); --_tile-tint:var(--info-tint); --_tile-c:var(--info); --_tile-c2:#6D8CA0; }
+body.role-owner .stat-tile-card:has(.kpi-icon-flat){ border-left-color:var(--ink-faint); --_tile-tint:var(--surface-sunk); --_tile-c:var(--ink-faint); --_tile-c2:#9C9385; }
 body.role-owner .stat-tile-card > *{ position:relative; }
+
+/* Icon badge — solid two-stop gradient fill, white icon, soft colored
+   shadow, instead of the console-wide pale-tint-background/colored-icon
+   .kpi-icon treatment every other role/screen still uses untouched. */
+body.role-owner .stat-tile-card .kpi-icon{
+  background:linear-gradient(135deg, var(--_tile-c, var(--ink-faint)), var(--_tile-c2, var(--ink-faint)));
+  color:#fff; box-shadow:0 4px 12px color-mix(in srgb, var(--_tile-c, #000) 35%, transparent);
+}
+body.role-owner .stat-tile-card .stat .n{ letter-spacing:-.01em; }
+body.role-owner .stat-tile-card .stat .l{
+  text-transform:uppercase; letter-spacing:.04em; font-size:10px; font-weight:700; color:var(--ink-faint);
+}
 
 /* Section-accent card headers — Business Rhythm / rhythm-tile already carry
    their own tint; this gives every other Owner CardHeader a thin brand-accent
