@@ -40,7 +40,7 @@ export function Topbar({ title, sub, onSearch, onSignOut }) {
     signOutBtn);
 
   const el = h('div', { class: 'topbar' },
-    h('div', {}, crumbEl, h1, subEl),
+    h('div', { class: 'topbar-titles' }, crumbEl, h1, subEl),
     h('div', { class: 'topbar-right' },
       h('div', { class: 'search' },
         icon('<circle cx="11" cy="11" r="8"/><path d="M21 21l-4.35-4.35"/>', 14),

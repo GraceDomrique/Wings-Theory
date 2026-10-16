@@ -72,7 +72,23 @@ export function Sidebar({ activeId, onNavigate }) {
     return null;
   }
 
+  const isMobile = () => window.matchMedia('(max-width:600px)').matches;
+  // Mobile's floating sheet is a transient, one-at-a-time affordance, not
+  // the desktop accordion's persisted expand/collapse state -- routing its
+  // open/close through `expanded` (and therefore through saveExpanded, i.e.
+  // localStorage) would let a phone session silently overwrite whatever
+  // groups the user had deliberately left expanded on desktop, since both
+  // share the same EXPANDED_KEY. Tracked separately instead.
+  let mobileOpenGroup = null;
+
   function setGroupOpen(groupId, open) {
+    if (isMobile()) {
+      const body = groupBodies.get(groupId);
+      const toggle = groupToggles.get(groupId);
+      if (body) body.style.display = open ? '' : 'none';
+      if (toggle) toggle.classList.toggle('open', open);
+      return;
+    }
     if (open) expanded.add(groupId); else expanded.delete(groupId);
     saveExpanded(expanded);
     const body = groupBodies.get(groupId);
@@ -81,13 +97,22 @@ export function Sidebar({ activeId, onNavigate }) {
     if (toggle) toggle.classList.toggle('open', open);
   }
 
-  function leafButton(item) {
+  function leafButton(item, groupId) {
     const badge = item.badge ? h('span', { class: 'nav-badge', style: { display: 'none' } }) : null;
     if (badge) badges.set(item.badge, badge);
     const btn = h('button', {
       class: 'nav-item' + (item.id === activeId ? ' active' : ''),
       title: item.label,
-      onClick: () => onNavigate(item.id),
+      onClick: () => {
+        onNavigate(item.id);
+        // Mobile only (<=600px, the bottom-tab-bar tier): a selected leaf's
+        // group sheet floats fixed above the bar and would otherwise stay
+        // open over the page the user just navigated to -- the spec's own
+        // "closes after selection" requirement for a drawer. Desktop's
+        // inline-expanded accordion is untouched (collapsing it on every
+        // click there would undo the point of leaving groups expanded).
+        if (groupId && isMobile()) { setGroupOpen(groupId, false); mobileOpenGroup = null; }
+      },
     }, h('span', { class: 'nav-item-label' }, item.label), badge);
     leafButtons.set(item.id, btn);
     return btn;
@@ -108,7 +133,13 @@ export function Sidebar({ activeId, onNavigate }) {
       return btn;
     }
 
-    const isOpen = expanded.has(node.id) || node.id === forceOpenGroup;
+    // At the mobile bottom-tab-bar tier (<=600px) a group's body is a
+    // floating sheet, not an inline list -- it must start closed (the user
+    // taps the group icon to open it) even when it's the active page's own
+    // parent group or was left expanded from a desktop session, otherwise
+    // the sheet would cover freshly-loaded content on first paint/reload
+    // without the user asking for it.
+    const isOpen = !isMobile() && (expanded.has(node.id) || node.id === forceOpenGroup);
     if (isOpen) expanded.add(node.id);
 
     const chevron = h('span', { class: 'nav-group-chevron' + (isOpen ? ' open' : '') }, icon(CHEVRON));
@@ -122,6 +153,15 @@ export function Sidebar({ activeId, onNavigate }) {
       // opens that group, landing the user exactly where a click normally
       // would — rather than building a hover flyout submenu for this.
       onClick: () => {
+        if (isMobile()) {
+          // One sheet at a time: opening a second group while the first is
+          // still showing would stack two floating sheets over the bar.
+          const willOpen = mobileOpenGroup !== node.id;
+          if (mobileOpenGroup && mobileOpenGroup !== node.id) setGroupOpen(mobileOpenGroup, false);
+          setGroupOpen(node.id, willOpen);
+          mobileOpenGroup = willOpen ? node.id : null;
+          return;
+        }
         const wasCollapsed = collapsed;
         if (wasCollapsed) setCollapsed(false);
         setGroupOpen(node.id, wasCollapsed || !expanded.has(node.id));
@@ -131,7 +171,7 @@ export function Sidebar({ activeId, onNavigate }) {
     const body = h('div', {
       class: 'nav-group-body',
       style: { display: isOpen ? '' : 'none' },
-    }, ...node.children.map(leafButton));
+    }, ...node.children.map((child) => leafButton(child, node.id)));
     groupBodies.set(node.id, body);
 
     return h('div', { class: 'nav-group' }, toggle, body);
@@ -177,9 +217,19 @@ export function Sidebar({ activeId, onNavigate }) {
   /** Called on every route change. A leaf outside the currently-collapsed
    * group still needs its group force-opened so the active item is visible
    * — this is the reload/direct-link case, handled the same way as first
-   * render. */
+   * render.
+   *
+   * Skipped at <=600px (the mobile bottom-tab-bar tier): there, a group's
+   * children render as a floating sheet above the bar rather than an
+   * inline-expanded list, and leafButton's own onClick already closes that
+   * sheet right after navigating (spec: "closes after selection"). Without
+   * this guard, THIS force-open — running moments later, once the
+   * navigation's hashchange reaches AppShell.draw() — immediately reopened
+   * the very sheet the user had just dismissed by picking an item from it,
+   * because the newly-active leaf still belongs to a now-collapsed group. */
   el.setActive = (id) => {
     for (const [key, btn] of leafButtons) btn.classList.toggle('active', key === id);
+    if (window.matchMedia('(max-width:600px)').matches) return;
     for (const node of tree) {
       if (node.children && node.children.some((c) => c.id === id) && !expanded.has(node.id)) {
         setGroupOpen(node.id, true);

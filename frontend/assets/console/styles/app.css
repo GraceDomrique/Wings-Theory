@@ -49,7 +49,17 @@ button{font-family:inherit; cursor:pointer;}
 
 /* ============ SHELL ============ */
 .shell{display:grid; grid-template-columns:236px 1fr; height:100vh; overflow:hidden; transition:grid-template-columns .15s ease;}
-body.nav-collapsed .shell{grid-template-columns:68px 1fr;}
+/* min-width:601px: the manual collapse toggle is a desktop/laptop affordance.
+   Below 600px the shell already has its own fixed mobile layout (the bottom
+   tab bar, further down this file) that must win regardless of whatever
+   collapsed/expanded state the user last left on a wider screen -- without
+   this guard, a persisted body.nav-collapsed from localStorage (it is never
+   viewport-scoped) beat the 600px breakpoint's .shell rule purely on
+   selector specificity (two classes vs. one), silently squeezing the mobile
+   layout back into the narrow icon-rail two-column grid it was designed to
+   replace (found testing at 375px: .shell computed to 68px/1fr instead of
+   the expected single column). */
+@media (min-width:601px){ body.nav-collapsed .shell{grid-template-columns:68px 1fr;} }
 
 /* ---- Sidebar ---- */
 /* Deepened to navy-black (2026-10 reference-design pass) -- was var(--ink),
@@ -146,7 +156,7 @@ body.role-owner{--brand-accent:#C4A477;}
    self-hosts Fraunces/Inter/JetBrains Mono (LAN deployment, no remote font
    fetches), rather than pulling in a dedicated script font for one line. */
 .sidebar-photo-wordmark{font-style:italic; font-size:19px; font-weight:600; margin-bottom:4px; letter-spacing:.2px;}
-body.nav-collapsed .sidebar-photo{display:none;}
+@media (min-width:601px){ body.nav-collapsed .sidebar-photo{display:none;} }
 
 /* --role-accent-tint* lives on body, so this renders correctly wherever the
    avatar is reused (currently only the topbar's profile chip). */
@@ -165,17 +175,21 @@ body.nav-collapsed .sidebar-photo{display:none;}
 .nav-collapse-chevron svg{width:14px; height:14px;}
 .nav-collapse-chevron.open{transform:rotate(180deg);}
 
-body.nav-collapsed .brand-text,
-body.nav-collapsed .nav-item-label,
-body.nav-collapsed .nav-group-label,
-body.nav-collapsed .nav-group-chevron,
-body.nav-collapsed .nav-badge{display:none;}
-body.nav-collapsed .nav-item,
-body.nav-collapsed .nav-item-top,
-body.nav-collapsed .nav-group-toggle,
-body.nav-collapsed .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
-body.nav-collapsed .nav-group-body{display:none !important;}
-body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:0;}
+/* min-width:601px guard: see the matching note by .shell above -- same
+   persisted-desktop-state-vs-mobile-breakpoint specificity conflict. */
+@media (min-width:601px){
+  body.nav-collapsed .brand-text,
+  body.nav-collapsed .nav-item-label,
+  body.nav-collapsed .nav-group-label,
+  body.nav-collapsed .nav-group-chevron,
+  body.nav-collapsed .nav-badge{display:none;}
+  body.nav-collapsed .nav-item,
+  body.nav-collapsed .nav-item-top,
+  body.nav-collapsed .nav-group-toggle,
+  body.nav-collapsed .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
+  body.nav-collapsed .nav-group-body{display:none !important;}
+  body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:0;}
+}
 
 /* ---- Main ---- */
 .main{display:flex; flex-direction:column; min-width:0; height:100vh; overflow:hidden;}
@@ -188,10 +202,16 @@ body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:
   display:flex; align-items:center; justify-content:space-between; gap:16px;
   padding:14px 26px; background:var(--nav-bg); border-bottom:3px solid var(--role-accent); flex-shrink:0;
 }
-.breadcrumb{font-size:11px; font-weight:600; letter-spacing:.3px; text-transform:uppercase; color:var(--role-accent); margin-bottom:2px;}
-.topbar h1{font-family:var(--font-display); font-size:21px; font-weight:600; margin:0; color:#fff;}
-.topbar .sub{font-size:12px; color:#9C9385; margin-top:1px;}
-.topbar-right{display:flex; align-items:center; gap:10px;}
+.breadcrumb{font-size:11px; font-weight:600; letter-spacing:.3px; text-transform:uppercase; color:var(--role-accent); margin-bottom:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.topbar h1{font-family:var(--font-display); font-size:21px; font-weight:600; margin:0; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.topbar .sub{font-size:12px; color:#9C9385; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+/* min-width:0 is load-bearing: a flex child's default min-width is auto
+   (its content's natural width), so without this the title block never
+   actually shrinks below "Today's description, fully spelled out" and the
+   ellipsis rules above never engage -- the topbar just overflows instead. */
+.topbar-titles{min-width:0; flex:1; overflow:hidden;}
+.topbar-right{display:flex; align-items:center; gap:10px; flex-shrink:0;}
+
 .topbar .search{
   display:flex; align-items:center; gap:8px; background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.12);
   border-radius:8px; padding:7px 12px; color:#9C9385; font-size:12.5px; width:230px;
@@ -229,6 +249,28 @@ body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:
   color:var(--role-accent-ink); background:var(--role-accent); border-radius:99px; padding:2.5px 7px; width:fit-content;
 }
 .topbar-profile .icon-btn{margin-left:4px;}
+
+/* Adaptive top bar (spec: desktop full title+description+controls; tablet
+   shortens the description via the ellipsis rules above and drops search;
+   phone drops the description and profile text entirely, leaving title +
+   refresh + avatar). Found by testing at 375px: the topbar previously had
+   no narrow treatment at all, so search (fixed 230px, merely
+   visibility:hidden -- still reserved its layout space) plus the full name/
+   role profile chip pushed the refresh button off the right edge of the
+   viewport (topbar content 548px wide inside a 375px box). Placed after the
+   base .topbar-profile .id rule above (not just inside a later media query)
+   because both selectors share identical specificity -- source order, not
+   the media query, is what decides which one wins. */
+@media (max-width:760px){
+  .topbar{padding:12px 14px; gap:8px;}
+  .topbar .search{display:none !important;}
+  .topbar-profile{padding-left:8px; gap:6px;}
+  .topbar-profile .id{display:none;}
+}
+@media (max-width:480px){
+  .topbar .sub, .breadcrumb{display:none;}
+  .topbar h1{font-size:17px;}
+}
 
 .content{flex:1; overflow-y:auto; padding:20px 26px 32px;}
 
@@ -628,6 +670,20 @@ input[type="month"], input[type="time"], input:not([type]){
   border-radius:7px; border:1px solid var(--line); background:var(--surface);
   color:var(--ink); padding:7px 11px; font-size:12px; font-family:inherit; font-weight:500; outline:none;
 }
+/* Same mobile touch-target/iOS-zoom fix as .field's own inputs below --
+   this is the shared base every bare input/select/textarea falls back to,
+   so it needs the same bump independently (the .field rule only wins where
+   a .field wrapper is actually present). */
+@media (max-width:600px){
+  select,
+  textarea,
+  input[type="text"], input[type="number"], input[type="search"],
+  input[type="email"], input[type="password"], input[type="tel"],
+  input[type="url"], input[type="date"], input[type="datetime-local"],
+  input[type="month"], input[type="time"], input:not([type]){
+    padding:11px 12px; font-size:16px;
+  }
+}
 select:focus, textarea:focus,
 input[type="text"]:focus, input[type="number"]:focus, input[type="search"]:focus,
 input[type="email"]:focus, input[type="password"]:focus, input[type="tel"]:focus,
@@ -655,6 +711,14 @@ select:disabled{cursor:default; opacity:0.6;}
   display:block; width:100%; margin-top:5px; border-radius:7px; border:1px solid var(--line); background:var(--surface);
   color:var(--ink); padding:7px 11px; font-size:12px; font-family:inherit; font-weight:500; outline:none;
 }
+/* Mobile touch targets: desktop's compact 12px/7px padding (~26px tall) is
+   fine for a mouse but under the ~44px a finger needs, and Mobile Safari
+   zooms the whole page in on focus for any input under 16px font-size --
+   both fixed by bumping just this breakpoint, so desktop density (tuned for
+   dense tables/forms) is untouched. */
+@media (max-width:600px){
+  .field > input, .field > select, .field > textarea{ padding:11px 12px; font-size:16px; }
+}
 .field > input:focus, .field > select:focus, .field > textarea:focus{border-color:var(--amber);}
 .field > input::placeholder, .field > textarea::placeholder{color:var(--ink-faint); font-weight:400;}
 .field .hint{font-weight:400; color:var(--ink-faint); font-size:10.5px; margin-top:4px;}
@@ -675,6 +739,16 @@ select:disabled{cursor:default; opacity:0.6;}
 .load-note{font-size:11.5px; color:var(--ink-faint); padding:18px; text-align:center;}
 
 .toast-host{position:fixed; right:20px; bottom:20px; display:flex; flex-direction:column; gap:8px; z-index:80;}
+/* Mobile's bottom tab bar (<=600px, see .shell/.sidebar further down) is
+   also position:fixed + z-index:80 and covers the screen's bottom ~68px --
+   left at bottom:20px, a toast would render partly underneath/inside it
+   instead of above it. Right:20px also collides with the bar's own
+   right-edge nav items, so this centers the toast full-width instead,
+   matching .content's own 78px bottom padding at this breakpoint. */
+@media (max-width:600px){
+  .toast-host{left:12px; right:12px; bottom:78px; align-items:stretch;}
+  .toast{max-width:none;}
+}
 .toast{background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--line); border-radius:var(--radius);
   box-shadow:var(--shadow); padding:11px 15px; font-size:12.5px; max-width:340px;}
 
@@ -883,17 +957,41 @@ canvas{max-width:100%;}
      rail is a no-op).  */
   .shell{grid-template-columns:68px 1fr;}
   .sidebar-photo{display:none;}
+  .nav-item,
+  .nav-item-top,
+  .nav-group-toggle,
+  .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
+  .brand{justify-content:center; padding-left:0; padding-right:0;}
+}
+/* min-width:601px: same specificity/bleed-through problem as the two rules
+   above -- labels, the group label, the chevron and the count badge must
+   stay hidden for the icon-only rail tier, but the <600px tier below styles
+   all four of these (smaller nav-item-label/nav-group-label text under an
+   icon, a positioned nav-badge dot) on the assumption they are visible.
+   Scoping this here instead of leaving it unconditional is what actually
+   lets that mobile styling show: found by testing at 375px that opening a
+   group's sheet (Management -> Setup & Verification/Users & Access/Audit
+   Trail) rendered as a blank dark box -- every row's text was present in
+   the DOM and correctly colored, just display:none via this same rule. */
+@media (min-width:601px) and (max-width:860px){
   .brand-text,
   .nav-item-label,
   .nav-group-label,
   .nav-group-chevron,
   .nav-badge{display:none;}
-  .nav-item,
-  .nav-item-top,
-  .nav-group-toggle,
-  .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
+}
+/* min-width:601px: this is the icon-rail tier's own "never show an inline-
+   expanded group body, just the icon" rule. !important is needed to beat
+   Sidebar.js's own inline style:{display: isOpen?'':'none'} on a genuinely
+   collapsed/icon-only sidebar -- but left unconditional, it also wins (by
+   !important, regardless of source order) over the <600px tier below, which
+   needs that same element to actually become visible as a floating sheet
+   when tapped. Found by testing at 375px: tapping "Management" in the
+   bottom bar toggled Sidebar.js's internal state correctly (confirmed via
+   the DOM) but the sheet never appeared, because this rule's !important
+   permanently won regardless of that state. */
+@media (min-width:601px) and (max-width:860px){
   .nav-group-body{display:none !important;}
-  .brand{justify-content:center; padding-left:0; padding-right:0;}
 }
 
 /* True phone width: the 68px icon rail above still eats a visible slice of
