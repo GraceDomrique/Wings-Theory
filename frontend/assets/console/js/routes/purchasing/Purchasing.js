@@ -11,9 +11,22 @@ import { toast } from '../../components/ui/Feedback.js';
 import { stamp, date, asText, count } from '../../lib/format.js';
 import { listPurchaseOrders, markOrdered, cancelPurchaseOrder, receiveLine } from '../../lib/api/purchaseOrders.js';
 import { session } from '../../lib/api/client.js';
+import { ICONS } from '../../lib/icons.js';
 
 const ICON = {
   cart: '<path d="M6 2l1.5 5h9L18 2"/><path d="M3 7h18l-1.7 10.2A2 2 0 0117.3 19H6.7a2 2 0 01-2-1.8L3 7z"/><circle cx="9" cy="22" r="1"/><circle cx="16" cy="22" r="1"/>',
+};
+
+// Owner-only (round 3 feedback: Owner's tab chips should carry a small icon
+// like Admin's own Quick Actions row — Admin's identical Tabbar here stays
+// icon-less, exactly as it already renders, since drawTabbar() below only
+// attaches this map's icon when isOwner is true).
+const TAB_ICON = {
+  draft: ICONS.clipboardList,
+  inprogress: ICONS.clockArrowDown,
+  completed: ICONS.checkCircle,
+  cancelled: ICONS.close,
+  history: ICONS.history,
 };
 
 function statusLabel(status) {
@@ -171,7 +184,11 @@ export async function render(ctx) {
 
   function drawTabbar() {
     mount(tabbarHost, Tabbar({
-      items: TABS.map((t) => ({ id: t.id, label: `${t.label} (${(t.statuses ? all.filter((po) => t.statuses.includes(po.status)) : all).length})` })),
+      items: TABS.map((t) => ({
+        id: t.id,
+        icon: isOwner ? TAB_ICON[t.id] : undefined,
+        label: `${t.label} (${(t.statuses ? all.filter((po) => t.statuses.includes(po.status)) : all).length})`,
+      })),
       activeId: activeTab,
       onChange: (id) => { activeTab = id; selectedId = null; draw(); },
     }));
@@ -253,23 +270,24 @@ export async function render(ctx) {
   const completedCount = all.filter((po) => po.status === 'received').length;
   const cancelledCount = all.filter((po) => po.status === 'cancelled').length;
 
-  // 2026-10-15 recompose: the title/action line and the 4 stat tiles used to
-  // be two separate full-width rows (title row, then a 4-up tile row below
-  // it) — the same "stacked equal rows" shape fixed on Inventory and Menu.
-  // The title+action block now pairs beside a compact 2x2 tile grid instead,
-  // so the page's own "what you do here" and "what's the current count"
-  // read as one composed header instead of two.
+  // 2026-10-16 recompose (round 3 feedback): the previous "title+button
+  // beside a 2x2 tile grid" pairing left the button vertically centered
+  // against a taller tile grid — a lot of dead space above and below it,
+  // the exact layout the brief called out. Back to one header row (title +
+  // description on the left, the action on the right, same baseline) with
+  // the 4 stat tiles as their own full-width row underneath — the same
+  // header shape Stock & Replenishment and Costs & Losses already use.
   return h('div', {},
-    h('div', { class: 'grid', style: { gridTemplateColumns: '1.1fr 1fr', gap: '18px', marginBottom: '18px', alignItems: 'center' } },
+    h('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', gap: '14px', marginBottom: '18px', flexWrap: 'wrap' } },
       h('div', {},
         h('div', { class: 'eyebrow', style: { marginBottom: '4px' } }, 'Purchase orders'),
-        h('div', { class: 't-sm t-faint', style: { marginBottom: '14px' } }, 'Draft, in progress, completed and cancelled, all in one place.'),
-        isOwner ? Button({ variant: 'primary', onClick: () => ctx.navigate('stockreplenishment') }, '+ Create Purchase Order') : null),
-      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2,1fr)', gap: '10px' } },
-        StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(draftCount), label: 'Draft' }),
-        StatTile({ iconPath: ICON.cart, severity: inProgressCount > 0 ? 'warn' : 'good', value: count(inProgressCount), label: 'In Progress' }),
-        StatTile({ iconPath: ICON.cart, severity: 'good', value: count(completedCount), label: 'Completed' }),
-        StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(cancelledCount), label: 'Cancelled' }))),
+        h('div', { class: 't-sm t-faint' }, 'Draft, in progress, completed and cancelled, all in one place.')),
+      isOwner ? Button({ variant: 'primary', onClick: () => ctx.navigate('stockreplenishment') }, '+ Create Purchase Order') : null),
+    h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '14px', marginBottom: '18px' } },
+      StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(draftCount), label: 'Draft' }),
+      StatTile({ iconPath: ICON.cart, severity: inProgressCount > 0 ? 'warn' : 'good', value: count(inProgressCount), label: 'In Progress' }),
+      StatTile({ iconPath: ICON.cart, severity: 'good', value: count(completedCount), label: 'Completed' }),
+      StatTile({ iconPath: ICON.cart, severity: 'flat', value: count(cancelledCount), label: 'Cancelled' })),
     tabbarHost,
     h('div', { style: { marginTop: '14px', marginBottom: '14px' } }, listHost),
     detailHost);

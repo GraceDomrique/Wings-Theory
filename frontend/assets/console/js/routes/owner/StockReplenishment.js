@@ -9,6 +9,7 @@ import { Drawer } from '../../components/ui/Drawer.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { Tabbar } from '../../components/ui/Tabbar.js';
 import { toast } from '../../components/ui/Feedback.js';
+import { ICONS } from '../../lib/icons.js';
 import {
   qty, days, date, count, asText, nodata,
 } from '../../lib/format.js';
@@ -83,9 +84,9 @@ export async function render(ctx) {
 
   function tabItems() {
     return [
-      { id: 'needsbuying', label: `Needs purchasing${urgent.length ? ` (${urgent.length})` : ''}` },
-      { id: 'all', label: `All ingredients (${rows.length})` },
-      { id: 'expiring', label: `Expiring soon (${expiry.batches.length})` },
+      { id: 'needsbuying', icon: ICON.needsPurchase, label: `Needs purchasing${urgent.length ? ` (${urgent.length})` : ''}` },
+      { id: 'all', icon: ICONS.package, label: `All ingredients (${rows.length})` },
+      { id: 'expiring', icon: ICON.expiring, label: `Expiring soon (${expiry.batches.length})` },
     ];
   }
 
@@ -269,19 +270,29 @@ export async function render(ctx) {
       desc: 'This does not affect stock or notify a supplier. Admin sees it and marks it ordered when it is placed.',
       onClose: () => {},
     },
-    h('label', { class: 'field' }, 'Quantity',
-      h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, qtyInput, unitLabel)),
-    h('label', { class: 'field', style: { marginTop: '10px' } }, 'Supplier', supplierInput),
-    h('label', { class: 'field', style: { marginTop: '10px' } }, 'Expected delivery date', dateInput),
-    h('label', { class: 'field', style: { marginTop: '10px' } }, 'Note', noteInput),
+    r.suggestedOrderQty !== null
+      ? h('div', { class: 'callout callout-info', style: { marginBottom: '16px' } },
+        h('p', { style: { margin: 0 } },
+          h('strong', {}, 'Recommended: '),
+          `~${asText.num(r.suggestedOrderQty, '', 2)} ${r.suggestedOrderUnit || r.baseUnit} — already filled in below.`))
+      : null,
+    h('div', { class: 'field-group' },
+      h('div', { class: 'field-group-title' }, 'Order details'),
+      h('label', { class: 'field' }, 'Quantity',
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } }, qtyInput, unitLabel)),
+      h('label', { class: 'field' }, 'Supplier', supplierInput)),
+    h('div', { class: 'field-group' },
+      h('div', { class: 'field-group-title' }, 'Delivery'),
+      h('label', { class: 'field' }, 'Expected delivery date', dateInput),
+      h('label', { class: 'field' }, 'Note', noteInput)),
     err,
-    h('div', { style: { marginTop: '14px', display: 'flex', justifyContent: 'flex-end' } }, submit));
+    h('div', { class: 'drawer-footer' }, submit));
   }
 
   function openGroupDraftModal(supplier, items) {
     const lines = items.map((r) => ({
       r,
-      include: h('input', { type: 'checkbox', checked: true }),
+      include: h('input', { type: 'checkbox', class: 'toggle-switch', checked: true }),
       qtyInput: h('input', {
         type: 'number', step: '0.01', min: '0.01',
         value: r.suggestedOrderQty !== null ? String(r.suggestedOrderQty) : '',
@@ -347,12 +358,16 @@ export async function render(ctx) {
       desc: 'This does not affect stock or notify a supplier. Admin sees it and marks it ordered when it is placed.',
       onClose: () => {},
     },
-    ...lineRows,
-    h('label', { class: 'field', style: { marginTop: '10px' } }, 'Supplier', supplierInput),
-    h('label', { class: 'field', style: { marginTop: '10px' } }, 'Expected delivery date', dateInput),
-    h('label', { class: 'field', style: { marginTop: '10px' } }, 'Note', noteInput),
+    h('div', { class: 'field-group' },
+      h('div', { class: 'field-group-title' }, `Items (${items.length})`),
+      ...lineRows),
+    h('div', { class: 'field-group' },
+      h('div', { class: 'field-group-title' }, 'Delivery'),
+      h('label', { class: 'field' }, 'Supplier', supplierInput),
+      h('label', { class: 'field' }, 'Expected delivery date', dateInput),
+      h('label', { class: 'field' }, 'Note', noteInput)),
     err,
-    h('div', { style: { marginTop: '14px', display: 'flex', justifyContent: 'flex-end' } }, submit));
+    h('div', { class: 'drawer-footer' }, submit));
   }
 
   // =========================================================================
@@ -509,12 +524,12 @@ export async function render(ctx) {
       h('option', { value: 'urgent_only' }, 'Urgent items only (out of stock / buy now)'),
       h('option', { value: 'selected', disabled: selected.size === 0 }, `Selected ingredients (${selected.size} checked)`),
       h('option', { value: 'all' }, 'All ingredients'));
-    const groupCheckbox = h('input', { type: 'checkbox', checked: true });
+    const groupCheckbox = h('input', { type: 'checkbox', class: 'toggle-switch', checked: true });
     const formatSelect = h('select', {},
       h('option', { value: 'pdf' }, 'PDF'),
       h('option', { value: 'csv' }, 'CSV'),
       h('option', { value: 'xlsx' }, 'Excel (.xlsx)'));
-    const costsCheckbox = h('input', { type: 'checkbox', checked: true });
+    const costsCheckbox = h('input', { type: 'checkbox', class: 'toggle-switch', checked: true });
     const err = ModalError();
     const submit = Button({ variant: 'primary' }, 'Generate & download');
 
@@ -548,16 +563,20 @@ export async function render(ctx) {
       desc: 'Built fresh from the same stock and forecast data this page reads — never from what happens to be on screen.',
       onClose: () => {},
     },
-    h('label', { class: 'field' }, 'Scope', scopeSelect),
-    h('label', {
-      class: 'field', style: { marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px' },
-    }, groupCheckbox, 'Group by supplier (PDF only)'),
-    h('label', { class: 'field', style: { marginTop: '10px' } }, 'Format', formatSelect),
-    h('label', {
-      class: 'field', style: { marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px' },
-    }, costsCheckbox, 'Include estimated cost columns'),
+    h('div', { class: 'field-group' },
+      h('div', { class: 'field-group-title' }, 'Report scope'),
+      h('label', { class: 'field' }, 'Scope', scopeSelect),
+      h('label', { class: 'field' }, 'Format', formatSelect)),
+    h('div', { class: 'field-group' },
+      h('div', { class: 'field-group-title' }, 'Options'),
+      h('label', { class: 'field-toggle-row' },
+        h('span', {}, h('div', { class: 'field-toggle-label' }, 'Group by supplier'), h('div', { class: 'field-toggle-desc' }, 'PDF format only')),
+        groupCheckbox),
+      h('label', { class: 'field-toggle-row' },
+        h('span', { class: 'field-toggle-label' }, 'Include estimated cost columns'),
+        costsCheckbox)),
     err,
-    h('div', { style: { marginTop: '14px', display: 'flex', justifyContent: 'flex-end' } }, submit));
+    h('div', { class: 'drawer-footer' }, submit));
   }
 
   function openExpiryReportModal() {
@@ -576,7 +595,7 @@ export async function render(ctx) {
     filterSelect.addEventListener('change', () => {
       customRow.style.display = filterSelect.value === 'custom' ? 'flex' : 'none';
     });
-    const missingCheckbox = h('input', { type: 'checkbox' });
+    const missingCheckbox = h('input', { type: 'checkbox', class: 'toggle-switch' });
     const formatSelect = h('select', {},
       h('option', { value: 'pdf' }, 'PDF'),
       h('option', { value: 'csv' }, 'CSV'),
@@ -614,14 +633,18 @@ export async function render(ctx) {
       desc: 'Does not change stock — discarding expired stock still requires an Admin action.',
       onClose: () => {},
     },
-    h('label', { class: 'field' }, 'Filter', filterSelect),
-    customRow,
-    h('label', {
-      class: 'field', style: { marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px' },
-    }, missingCheckbox, 'Include batches with no recorded expiry'),
-    h('label', { class: 'field', style: { marginTop: '10px' } }, 'Format', formatSelect),
+    h('div', { class: 'field-group' },
+      h('div', { class: 'field-group-title' }, 'Report scope'),
+      h('label', { class: 'field' }, 'Filter', filterSelect),
+      customRow,
+      h('label', { class: 'field' }, 'Format', formatSelect)),
+    h('div', { class: 'field-group' },
+      h('div', { class: 'field-group-title' }, 'Options'),
+      h('label', { class: 'field-toggle-row' },
+        h('span', { class: 'field-toggle-label' }, 'Include batches with no recorded expiry'),
+        missingCheckbox)),
     err,
-    h('div', { style: { marginTop: '14px', display: 'flex', justifyContent: 'flex-end' } }, submit));
+    h('div', { class: 'drawer-footer' }, submit));
   }
 
   draw();

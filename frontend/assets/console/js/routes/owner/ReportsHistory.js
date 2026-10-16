@@ -10,6 +10,7 @@ import { Loading, toast } from '../../components/ui/Feedback.js';
 import { Tabbar } from '../../components/ui/Tabbar.js';
 import { BarChart } from '../../components/charts/BarChart.js';
 import { DoughnutChart } from '../../components/charts/DoughnutChart.js';
+import { ICONS } from '../../lib/icons.js';
 import { destroyAllCharts } from '../../components/charts/base.js';
 import {
   money, count, qty, date, stamp, nodata, asText,
@@ -65,10 +66,10 @@ const ICON = {
 };
 
 const TABS = [
-  { id: 'sales', label: 'Historical Sales' },
-  { id: 'purchasing', label: 'Inventory & Purchasing' },
-  { id: 'losses', label: 'Losses & Consumption' },
-  { id: 'downloads', label: 'Downloads' },
+  { id: 'sales', icon: ICON.revenue, label: 'Historical Sales' },
+  { id: 'purchasing', icon: ICONS.package, label: 'Inventory & Purchasing' },
+  { id: 'losses', icon: ICONS.alertTriangle, label: 'Losses & Consumption' },
+  { id: 'downloads', icon: ICONS.download, label: 'Downloads' },
 ];
 
 export async function render(ctx) {

@@ -35,7 +35,11 @@ import { openOrderDetail } from '../reports/orderDetailModal.js';
  * spend) — nothing here fits its own model or invents a figure.
  */
 
-const OWNER_HERO_PHOTO = "url('/img/POSimg/Unlimited/Wings-Platter-36pcs-6flavors.jpg')";
+// 12pcs-Wings-Rack.jpg (round 3 feedback: "use a better yummy looking wings
+// with sauce") — glossy sauce-glazed wings with visible steam and a ranch
+// dip, a stronger appetite-appeal hero shot than the 36pcs platter's flatter
+// overhead product photo it replaces.
+const OWNER_HERO_PHOTO = "url('/img/POSimg/Ala%20Carte/12pcs-Wings-Rack.jpg')";
 
 const ICON = {
   revenue: '<path d="M3 3v18h18"/><path d="M7 15l4-6 4 3 5-8"/>',

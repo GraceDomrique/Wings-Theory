@@ -723,7 +723,17 @@ select:disabled{cursor:default; opacity:0.6;}
    still apply exactly as before -- the rule above only changes what a
    NON-.field input/select/textarea falls back to. */
 .field{display:block; font-size:11.5px; font-weight:600; color:var(--ink-soft);}
-.field > input, .field > select, .field > textarea{
+/* :not([type=checkbox]):not([type=radio]) — console-wide bug fix: this rule
+   used to catch EVERY <input> inside a .field label, including a checkbox
+   built the "checkbox + its own label text" way (groupCheckbox/costsCheckbox
+   in Stock & Replenishment's report drawers, UsersAccess.js's effective-role
+   toggle, PurchasingHub/WhatToBuy's line-item "include" checkboxes — Owner
+   and Admin screens alike). width:100% + 7px/11px input padding stretched
+   the native checkbox into a tall, centered blue slab with its label text
+   shoved off to the side instead of sitting beside a normal-sized box. Scoped
+   out here so a checkbox/radio keeps its native intrinsic size; the custom
+   switch look below is layered on top of that correctly-sized box. */
+.field > input:not([type="checkbox"]):not([type="radio"]), .field > select, .field > textarea{
   display:block; width:100%; margin-top:5px; border-radius:7px; border:1px solid var(--line); background:var(--surface);
   color:var(--ink); padding:7px 11px; font-size:12px; font-family:inherit; font-weight:500; outline:none;
 }
@@ -1319,3 +1329,84 @@ body.role-owner .stat-tile-card > *{ position:relative; }
    needing a heavier full-color block. */
 body.role-owner .card-head{ border-bottom:1px solid var(--line-soft); padding-bottom:10px; margin-bottom:14px; }
 body.role-owner .card-head .card-title{ position:relative; }
+
+/* ============================================================================
+   OWNER DRAWER FORMS — round 3 feedback: the sliding-drawer forms (Draft
+   Purchase Order, Generate Purchasing List, Generate Expiry Report) were
+   still just raw stacked label+input pairs, no different from the plain
+   Modal they replaced — and the "checkbox + its own label text" rows
+   (Group by supplier, Include estimated cost columns) rendered broken (see
+   the .field > input fix above this block) with the checkbox and its label
+   nowhere near each other. This section gives Owner's Drawer forms real
+   structure: a toggle-switch instead of a stretched/broken checkbox, and a
+   tinted "settings group" wrapper so related fields read as one unit instead
+   of an undifferentiated vertical list. Everything here is additive new
+   selectors (.toggle-switch, .field-group) — no existing component renamed,
+   so a call site that doesn't opt in (Admin's own Modal forms) is untouched.
+   ========================================================================= */
+
+/* A real toggle switch, not a bare checkbox — same input element underneath
+   (keeps state/onChange/checked wiring exactly as every call site already
+   wrote it), just re-skinned. Native checkbox visually hidden via opacity
+   rather than display:none so it stays keyboard-focusable/clickable. */
+.toggle-switch{
+  position:relative; display:inline-block; width:38px; height:22px; flex-shrink:0;
+  appearance:none; -webkit-appearance:none; margin:0; cursor:pointer;
+  background:var(--line); border-radius:999px; border:none; outline:none;
+  transition:background .15s ease;
+}
+.toggle-switch::before{
+  content:''; position:absolute; top:2px; left:2px; width:18px; height:18px;
+  border-radius:50%; background:#fff; box-shadow:0 1px 3px rgba(23,28,22,0.3);
+  transition:transform .15s ease;
+}
+.toggle-switch:checked{background:var(--amber);}
+.toggle-switch:checked::before{transform:translateX(16px);}
+.toggle-switch:focus-visible{box-shadow:0 0 0 3px var(--amber-tint);}
+.field-toggle-row{
+  display:flex; align-items:center; justify-content:space-between; gap:12px;
+  padding:10px 0;
+}
+.field-toggle-row .field-toggle-label{font-size:12.5px; font-weight:600; color:var(--ink);}
+.field-toggle-row .field-toggle-desc{font-size:11px; color:var(--ink-faint); margin-top:1px;}
+
+/* Settings group — a tinted sub-card inside a Drawer that bundles related
+   fields (e.g. "Report Settings": scope + format + toggles) under one small
+   caption, instead of every field reading as equally-weighted in one long
+   column. */
+.field-group{
+  background:var(--surface-sunk); border:1px solid var(--line-soft); border-radius:var(--radius-sm);
+  padding:14px 16px; margin-bottom:14px;
+}
+.field-group + .field-group{margin-top:-4px;}
+.field-group-title{
+  font-size:10.5px; font-weight:700; letter-spacing:.06em; text-transform:uppercase;
+  color:var(--ink-faint); margin-bottom:10px;
+}
+.field-group .field + .field{margin-top:10px;}
+.field-group .field-toggle-row + .field-toggle-row{border-top:1px solid var(--line-soft);}
+
+/* Drawer footer — pins the primary action to the bottom edge instead of
+   however far down the last field happens to end, and gives it a visible
+   separator from the form above it. */
+.drawer-footer{
+  position:sticky; bottom:0; margin:18px -20px -20px; padding:14px 20px;
+  background:var(--surface); border-top:1px solid var(--line-soft);
+  display:flex; justify-content:flex-end; gap:8px;
+}
+
+/* ============================================================================
+   OWNER TAB CHIPS — round 3 feedback: "check all buttons", referencing
+   Admin's Inventory Quick Actions row (icon badge + bold label, rounded
+   pill) as the bar to match. Tabbar.js now accepts an optional `icon` per
+   item (today/stockreplenishment/purchasing/costslosses call sites pass one
+   for Owner only — Admin's own Tabbar call sites pass none, so their markup
+   and look are byte-for-byte unchanged). This only styles the icon slot the
+   component already conditionally renders. */
+body.role-owner .tabbar button{ display:inline-flex; align-items:center; gap:7px; }
+body.role-owner .tabbar .tab-icon{
+  width:18px; height:18px; border-radius:6px; display:flex; align-items:center; justify-content:center;
+  background:rgba(36,42,38,0.08); color:var(--ink-soft); flex-shrink:0; transition:background .14s ease, color .14s ease;
+}
+body.role-owner .tabbar .tab-icon svg{width:11px; height:11px;}
+body.role-owner .tabbar button.active .tab-icon{background:rgba(255,255,255,0.22); color:#fff;}

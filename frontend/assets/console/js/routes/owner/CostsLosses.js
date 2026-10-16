@@ -11,6 +11,7 @@ import { Drawer } from '../../components/ui/Drawer.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
 import { DoughnutChart } from '../../components/charts/DoughnutChart.js';
+import { ICONS } from '../../lib/icons.js';
 import {
   count, qty, delta, stamp, pct, humanise, nodata, money,
 } from '../../lib/format.js';
@@ -120,11 +121,11 @@ export async function render(ctx) {
   // the approved reference mockup), with the four headline figures staying
   // visible above the tabs regardless of which one is open.
   const TABS = [
-    { id: 'inventory', label: 'Inventory Value' },
-    { id: 'losses', label: 'Recorded Losses' },
-    { id: 'usage', label: 'Unusual Usage' },
-    { id: 'unli', label: 'Unlimited Wings' },
-    { id: 'margins', label: 'Menu Cost Insights' },
+    { id: 'inventory', icon: ICON.value, label: 'Inventory Value' },
+    { id: 'losses', icon: ICON.losses, label: 'Recorded Losses' },
+    { id: 'usage', icon: ICON.alert, label: 'Unusual Usage' },
+    { id: 'unli', icon: ICONS.chefHat, label: 'Unlimited Wings' },
+    { id: 'margins', icon: ICONS.receipt, label: 'Menu Cost Insights' },
   ];
   let activeTab = TABS.some((t) => t.id === ctx.tab) ? ctx.tab : 'inventory';
   const body = h('div');
