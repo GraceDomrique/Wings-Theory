@@ -15,6 +15,7 @@ import {
 } from '../../lib/api/comboPricing.js';
 import { getCombinations } from '../../lib/api/reports.js';
 import { openAddRecipeModal, openEditRecipeModal } from './Recipes.js';
+import { session } from '../../lib/api/client.js';
 
 /**
  * Menu Studio — 2026-10-15 integrated workspace replacing the Menu /
@@ -40,12 +41,19 @@ import { openAddRecipeModal, openEditRecipeModal } from './Recipes.js';
  * link for the same reason (ADMIN_EXTRA_ROUTE_IDS in nav.js).
  */
 export async function render(ctx) {
+  // Combo discovery/review (FP-Growth pairings, draft approval) is an
+  // Admin-only workspace — 'combos' isn't in Owner's route list (nav.js),
+  // so the "Open workspace →" button went nowhere for Owner anyway. Owner
+  // now reaches this page too (for menu/ingredient price editing), so skip
+  // fetching and rendering that card entirely for them rather than showing
+  // a dead end.
+  const isAdmin = (session.user || {}).role !== 'owner';
   const [menu, recipes, combosReport, drafts, published] = await Promise.all([
     listMenuItems(),
     listRecipes(),
-    getCombinations(365).catch(() => ({ insufficientData: true, combos: [] })),
-    listDraftCombos().catch(() => []),
-    listCombos().catch(() => []),
+    isAdmin ? getCombinations(365).catch(() => ({ insufficientData: true, combos: [] })) : Promise.resolve({ insufficientData: true, combos: [] }),
+    isAdmin ? listDraftCombos().catch(() => []) : Promise.resolve([]),
+    isAdmin ? listCombos().catch(() => []) : Promise.resolve([]),
   ]);
 
   // Keyed by the recipe's numeric row id (`pk`), not its string business
@@ -329,7 +337,7 @@ export async function render(ctx) {
       ? published.filter((c) => c.components.some((comp) => comp.menuItemId === selected.id))
       : [];
 
-    parts.push(Card({},
+    if (isAdmin) parts.push(Card({},
       CardHeader({
         title: 'Discover Combos',
         desc: 'FP-Growth pairings, drafts and published combos',
@@ -366,7 +374,11 @@ export async function render(ctx) {
 
   return h('div', { class: 'menu-studio' },
     healthHost,
-    h('div', { class: 'studio-layout' },
+    // Owner never gets the Discover Combos card (admin-only, see drawRight()
+    // above) — rendering an empty third column for them left a wide dead
+    // strip of blank card down the right side. Drop that column and widen
+    // center to fill it, instead of mounting an empty rightHost.
+    h('div', { class: isAdmin ? 'studio-layout' : 'studio-layout studio-layout-no-right' },
       h('div', { class: 'studio-col studio-col-left' },
         h('div', { class: 'card', style: { padding: '12px' } },
           h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px', marginBottom: '10px' } },
@@ -378,5 +390,5 @@ export async function render(ctx) {
           filterHost,
           listHost)),
       h('div', { class: 'studio-col studio-col-center' }, centerHost),
-      h('div', { class: 'studio-col studio-col-right' }, rightHost)));
+      isAdmin ? h('div', { class: 'studio-col studio-col-right' }, rightHost) : null));
 }

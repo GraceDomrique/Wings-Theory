@@ -86,10 +86,15 @@ body.role-owner{--brand-accent:#C4A477;}
 
 .brand{display:flex; align-items:center; gap:10px; padding:6px 8px 18px; border-bottom:1px solid rgba(255,255,255,0.08); margin-bottom:14px;}
 .brand-mark{
-  width:34px; height:34px; border-radius:8px; background:var(--brand-accent);
-  display:flex; align-items:center; justify-content:center; color:var(--nav-bg); flex-shrink:0;
+  width:34px; height:34px; border-radius:8px;
+  display:flex; align-items:center; justify-content:center; flex-shrink:0;
 }
 .brand-mark svg{width:20px; height:20px;}
+/* The wing artwork is already full-color (its own orange/black outline),
+   so the role-tinted background swatch the old icon glyph needed would
+   just clash with it — shown plain, scaled to fill the same 34px slot the
+   glyph used to occupy. */
+.brand-mark-img{width:100%; height:100%; object-fit:contain;}
 .brand-text .t1{font-family:var(--font-display); font-weight:700; font-size:15.5px; letter-spacing:.2px; color:#fff;}
 .brand-text .t2{font-size:10px; letter-spacing:1.4px; text-transform:uppercase; color:var(--brand-accent); margin-top:1px;}
 
@@ -563,6 +568,33 @@ td.num{text-align:right;}
 .tabbar button:hover{color:var(--ink);}
 .tabbar button.active{color:var(--role-accent); border-bottom-color:var(--role-accent);}
 
+/* Owner Sales' Period/Compare-against bar — 2026-10-16: used to be a 2-col
+   grid of two full-width-stretched <select>s inside a generic Card, which
+   read as a plain, oversized form row. Now a single compact pill strip:
+   each field hugs its own content (icon + label + auto-width select), a
+   thin divider separates the two, and the whole bar sits on its own tinted
+   surface instead of a heavyweight bordered Card. */
+.period-filter-bar{
+  display:flex; align-items:center; flex-wrap:wrap; gap:18px;
+  background:var(--surface-2,#f1ece3); border:1px solid var(--line);
+  border-radius:var(--radius,12px); padding:10px 16px; margin-bottom:14px;
+}
+.period-filter-field{display:flex; align-items:center; gap:10px; flex-wrap:wrap;}
+.period-filter-label{
+  display:inline-flex; align-items:center; gap:6px; font-size:11.5px; font-weight:700;
+  color:var(--ink-soft); text-transform:uppercase; letter-spacing:.03em; white-space:nowrap;
+}
+.period-filter-label svg{opacity:.7;}
+.period-filter-bar select{
+  width:auto; min-width:0; padding:7px 30px 7px 12px; font-size:13px; font-weight:600;
+  background-color:var(--surface,#fff); border-radius:999px;
+}
+.period-filter-divider{width:1px; align-self:stretch; min-height:22px; background:var(--line);}
+@media (max-width:600px){
+  .period-filter-bar{flex-direction:column; align-items:stretch; gap:12px;}
+  .period-filter-divider{display:none;}
+}
+
 /* Status Card (spec item 3) — 2026-10-14: previously a plain white card with
    a 3px colored stripe down the left edge, repeated identically for every
    status regardless of urgency ("the generic AI dashboard" look the redesign
@@ -624,7 +656,7 @@ td.num{text-align:right;}
 
 /* Callout — the tinted explanatory banners (forecast status, reconciliation
    how-it-works). Severity-tinted, same four colors, no fifth. */
-.callout{border-radius:var(--radius); border:1px solid var(--line); padding:12px 16px; font-size:12.5px; margin-bottom:14px;}
+.callout{border-radius:var(--radius); border:1px solid var(--line); padding:12px 16px; font-size:13.5px; margin-bottom:14px;}
 .callout p{margin:0;}
 .callout-warn{background:var(--warn-tint); border-color:rgba(138,90,30,.2); color:var(--warn);}
 .callout-info{background:var(--info-tint); border-color:rgba(73,103,122,.2); color:var(--info);}
@@ -1211,6 +1243,7 @@ canvas{max-width:100%;}
 .mhs-dot{width:3px; height:3px; border-radius:50%; background:var(--line);}
 
 .studio-layout{display:grid; grid-template-columns:25% 1fr 25%; gap:14px; align-items:start;}
+.studio-layout-no-right{grid-template-columns:25% 1fr;}
 .studio-col{min-width:0;}
 
 .studio-list-cat{

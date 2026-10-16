@@ -9,13 +9,16 @@ import { api } from './client.js';
  *
  * @param {{period?:string, comparison?:string, periodStart?:string,
  *          periodEnd?:string, comparisonStart?:string, comparisonEnd?:string}} [opts]
+ * @param {AbortSignal} [signal] lets a caller cancel a stale in-flight
+ *   request (e.g. the Period/Compare filters changed again before this one
+ *   finished) instead of letting two responses race to repaint the page.
  */
-export async function getOwnerSales(opts = {}) {
+export async function getOwnerSales(opts = {}, signal) {
   return api.get('/console/sales/owner', {
     period: opts.period, comparison: opts.comparison,
     period_start: opts.periodStart, period_end: opts.periodEnd,
     comparison_start: opts.comparisonStart, comparison_end: opts.comparisonEnd,
-  });
+  }, signal);
 }
 
 /** @param {{period?:string}} [opts] */

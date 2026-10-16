@@ -114,7 +114,13 @@ CAPABILITIES = {
     "order.read":         ("cashier", "manager", "admin", "owner"),
     "menu.read":          ("cashier", "kitchen", "manager", "admin", "owner"),
     "inventory.read":     ("manager", "admin", "owner"),
-    "inventory.write":    ("admin",),
+    # 2026-10-16: widened to owner so Owner can edit an ingredient's price
+    # (unit_cost) the same way Admin does — edit_ingredient() is also the
+    # only path to reorder points/supplier/expiry fields, so this grants
+    # the whole ingredient-edit surface, not price alone; narrower scoping
+    # would need a new ingredient.write_price capability if that is ever
+    # a problem in practice.
+    "inventory.write":    ("admin", "owner"),
     # 2026-10 audit: inventory.write alone meant the only person on-site who
     # could correct a physical stock count was 'admin' — a back-office role,
     # not whoever is actually standing in front of the shortage. This is
@@ -145,7 +151,11 @@ CAPABILITIES = {
     # demonstrated a cashier-specific need for it.
     "inventory.correct_stock": ("kitchen", "admin"),
     "recipe.read":        ("manager", "admin", "owner"),
-    "recipe.write":       ("admin",),
+    # 2026-10-16: Owner asked for direct menu-price edit access, same as
+    # Admin — the one deliberate exception to "Owner never gains write
+    # access to the operational system itself" (see purchase_order.* and
+    # instruction.* above), made at the Owner's explicit request.
+    "recipe.write":       ("admin", "owner"),
     # Whether a service charge applies at all, and which of the
     # Senior/PWD/Staff discount cards a cashier may select — a business
     # decision, admin-only like every other write capability. Reading the
@@ -158,7 +168,11 @@ CAPABILITIES = {
     # feed — a monitoring capability, so the manager keeps it, alongside the
     # kitchen station that reads its own pending list from the KDS. Actually
     # *submitting* a reconciliation is unli.reconcile.write, just below.
-    "unli.reconcile":     ("kitchen", "manager", "admin"),
+    # Owner-facing pages (CostsLosses, ReportsHistory, UnliSummary) read this
+    # same history read-only for oversight — granting it widens no write
+    # capability, matching the read-only pattern instruction.read/
+    # purchase_order.read already use for Owner.
+    "unli.reconcile":     ("kitchen", "manager", "admin", "owner"),
     # Recording the measurement is a create action against a real ledger
     # entry (it posts a stock correction). The kitchen is the only station
     # that can physically weigh the tray, so it keeps this; the manager,

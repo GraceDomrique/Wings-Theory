@@ -1,4 +1,4 @@
-import { h, mount } from '../../lib/dom.js';
+import { h, mount, icon } from '../../lib/dom.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Stat } from '../../components/ui/Stat.js';
 import { StatTile } from '../../components/ui/StatTile.js';
@@ -11,7 +11,7 @@ import { Tabbar } from '../../components/ui/Tabbar.js';
 import { BarChart } from '../../components/charts/BarChart.js';
 import { DoughnutChart } from '../../components/charts/DoughnutChart.js';
 import { ICONS } from '../../lib/icons.js';
-import { destroyAllCharts } from '../../components/charts/base.js';
+import { destroyChart } from '../../components/charts/base.js';
 import {
   money, count, qty, date, stamp, nodata, asText,
 } from '../../lib/format.js';
@@ -204,6 +204,13 @@ function monthlyFromByDay(byDay) {
 async function salesTab() {
   const state = { mode: 'year', year: CURRENT_YEAR, customStart: '', customEnd: '' };
   const host = h('div');
+  // Only this tab's own chart instances, not destroyAllCharts() — this
+  // tab's content gets torn down and cached tabs (Inventory & Purchasing,
+  // Losses & Consumption) can still be holding live Chart.js instances on
+  // detached-but-not-destroyed canvases; destroying those out from under
+  // them is the exact "this._fn is not a function" crash base.js's
+  // destroyChart() doc comment describes.
+  let chartNodes = [];
 
   function range() {
     if (state.mode === 'custom' && state.customStart && state.customEnd) {
@@ -229,10 +236,15 @@ async function salesTab() {
       h('input', { type: 'date', value: state.customStart, onChange: (e) => { state.customStart = e.target.value; } }),
       h('input', { type: 'date', value: state.customEnd, onChange: (e) => { state.customEnd = e.target.value; } }),
       Button({ size: 'sm', onClick: () => drawMain() }, 'Apply')) : null;
-    return Card({ style: { marginBottom: '14px' } },
-      h('div', { style: { display: 'flex', gap: '10px', alignItems: 'center', flexWrap: 'wrap' } },
-        h('label', { class: 'field' }, h('div', { class: 't-xs t-faint' }, 'Year'), yearSelect),
-        customBtn, customInputs));
+    // Same compact pill-strip treatment as Owner Sales' Period/Compare bar
+    // (app.css .period-filter-bar) — a full-width Card around one small
+    // select used to leave a long stretch of empty white space beside it.
+    return h('div', { class: 'period-filter-bar' },
+      h('div', { class: 'period-filter-field' },
+        h('span', { class: 'period-filter-label' }, icon(ICONS.calendarClock, 13), 'Year'),
+        yearSelect),
+      h('div', { class: 'period-filter-divider' }),
+      h('div', { class: 'period-filter-field' }, customBtn, customInputs));
   }
 
   function statsCard(d) {
@@ -377,7 +389,8 @@ async function salesTab() {
   }
 
   async function drawMain() {
-    destroyAllCharts();
+    for (const n of chartNodes) destroyChart(n);
+    chartNodes = [];
     mount(host, Loading('Loading sales…'));
     const { start, end } = range();
     let ownerData;
@@ -395,6 +408,7 @@ async function salesTab() {
       return;
     }
     mount(host, controls(), content(ownerData, salesData));
+    chartNodes = [...host.querySelectorAll('.chart-box')];
   }
 
   await drawMain();
@@ -563,6 +577,7 @@ function categoryBreakdown(stockLoss) {
 async function lossesTab() {
   let windowDays = 90;
   const host = h('div');
+  let chartNodes = [];
 
   function windowPicker() {
     const sel = h('select', { onChange: (e) => { windowDays = Number(e.target.value); draw(); } },
@@ -617,7 +632,8 @@ async function lossesTab() {
   }
 
   async function draw() {
-    destroyAllCharts();
+    for (const n of chartNodes) destroyChart(n);
+    chartNodes = [];
     mount(host, Loading('Loading losses…'));
     let anomalies;
     let variance;
@@ -633,6 +649,7 @@ async function lossesTab() {
       return;
     }
     mount(host, content(anomalies, variance, unli));
+    chartNodes = [...host.querySelectorAll('.chart-box')];
   }
 
   await draw();

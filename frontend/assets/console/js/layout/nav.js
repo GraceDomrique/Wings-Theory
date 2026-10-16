@@ -137,6 +137,17 @@ export const OWNER_TREE = [
     label: 'Purchase Orders',
     icon: ICONS.shoppingCart,
   },
+  // 2026-10-16: Owner was granted recipe.write/inventory.write (menu and
+  // ingredient price editing) but this tree never gained a leaf for Menu
+  // Studio — the permission existed with no sidebar path to reach it, and
+  // routeRoles() below still refused a direct /menu URL too (not in
+  // OWNER_EXTRA_ROUTE_IDS either). Added as its own top-level page, same
+  // component (MenuStudio.js) Admin uses.
+  {
+    id: 'menu',
+    label: 'Menu & Recipes',
+    icon: ICONS.bookOpen,
+  },
   {
     id: 'costslosses',
     label: 'Costs & Losses',

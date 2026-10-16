@@ -121,7 +121,7 @@ export class ApiError extends Error {
 let onUnauthorized = () => {};
 export function setUnauthorizedHandler(fn) { onUnauthorized = fn; }
 
-async function request(method, path, body) {
+async function request(method, path, body, signal) {
   const headers = { 'Content-Type': 'application/json' };
   const token = session.token;
   if (token) headers.Authorization = `Bearer ${token}`;
@@ -132,8 +132,15 @@ async function request(method, path, body) {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     });
   } catch (e) {
+    // A caller-initiated abort (e.g. a filter changed again before the
+    // previous fetch finished) is not a network failure — rethrow the
+    // DOMException as-is so callers can tell the two apart with
+    // `e.name === 'AbortError'` instead of showing a false "server did
+    // not respond" error for a request they themselves cancelled.
+    if (e.name === 'AbortError') throw e;
     throw new ApiError(0, 'The server did not respond. Is it running?', null);
   }
 
@@ -171,13 +178,13 @@ async function request(method, path, body) {
 }
 
 export const api = {
-  get: (path, params) => {
+  get: (path, params, signal) => {
     const qs = params
       ? '?' + new URLSearchParams(
         Object.entries(params).filter(([, v]) => v !== undefined && v !== null && v !== '')
       ).toString()
       : '';
-    return request('GET', path + qs);
+    return request('GET', path + qs, undefined, signal);
   },
   post: (path, body) => request('POST', path, body),
   patch: (path, body) => request('PATCH', path, body),

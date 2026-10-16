@@ -32,12 +32,24 @@ const COMPARISONS = [
   { value: 'last_year', label: 'Same period last year' },
   { value: 'custom', label: 'Custom range' },
 ];
+const ICON_CALENDAR = '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4"/><path d="M8 2v4"/><path d="M3 10h18"/>';
+const ICON_COMPARE = '<path d="M8 3 4 7l4 4"/><path d="M4 7h16"/><path d="m16 21 4-4-4-4"/><path d="M20 17H4"/>';
 
 export async function render(ctx) {
   const state = { period: 'this_week', comparison: 'previous_period', periodStart: '', periodEnd: '', comparisonStart: '', comparisonEnd: '' };
   const host = h('div');
+  // Flipping Period/Compare-against fires a new fetch before the previous
+  // one lands — without this, both responses can land out of order and the
+  // stale one repaints the page last, and the loading spinner lingers for
+  // as long as the slowest of the two instead of just the latest. Aborting
+  // the in-flight request the moment a newer one starts fixes both: only
+  // ever one request in flight, and it's always the latest filter choice.
+  let inFlight = null;
 
   async function draw() {
+    if (inFlight) inFlight.abort();
+    const controller = new AbortController();
+    inFlight = controller;
     destroyAllCharts();
     mount(host, Loading('Loading sales…'));
     let d;
@@ -46,11 +58,13 @@ export async function render(ctx) {
         period: state.period, comparison: state.comparison,
         periodStart: state.periodStart || undefined, periodEnd: state.periodEnd || undefined,
         comparisonStart: state.comparisonStart || undefined, comparisonEnd: state.comparisonEnd || undefined,
-      });
+      }, controller.signal);
     } catch (e) {
+      if (e.name === 'AbortError') return; // superseded by a newer draw() — that one owns the host now
       mount(host, EmptyState({ icon: '⨯', title: 'Could not load sales data', description: e.message || String(e) }));
       return;
     }
+    if (controller.signal.aborted) return;
     mount(host, controls(), content(d, ctx));
   }
 
@@ -69,10 +83,14 @@ export async function render(ctx) {
       h('input', { type: 'date', value: state.comparisonEnd, onChange: (e) => { state.comparisonEnd = e.target.value; } }),
       Button({ size: 'sm', onClick: () => draw() }, 'Apply')) : null;
 
-    return Card({ style: { marginBottom: '14px' } },
-      h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(2, minmax(0,1fr))', gap: '14px' } },
-        h('label', { class: 'field' }, h('div', { class: 't-xs t-faint' }, 'Period'), periodSel, customPeriod),
-        h('label', { class: 'field' }, h('div', { class: 't-xs t-faint' }, 'Compare against'), comparisonSel, customComparison)));
+    return h('div', { class: 'period-filter-bar' },
+      h('div', { class: 'period-filter-field' },
+        h('span', { class: 'period-filter-label' }, icon(ICON_CALENDAR, 13), 'Period'),
+        periodSel, customPeriod),
+      h('div', { class: 'period-filter-divider' }),
+      h('div', { class: 'period-filter-field' },
+        h('span', { class: 'period-filter-label' }, icon(ICON_COMPARE, 13), 'Compare against'),
+        comparisonSel, customComparison));
   }
 
   await draw();
@@ -181,7 +199,7 @@ function mainChartCard(d) {
   return Card({},
     CardHeader({ title: 'Sales Trend', desc: `${chart.granularity === 'month' ? 'Monthly' : 'Daily'} revenue — current vs. comparison period` }),
     LineChart({
-      labels, data: curData, color: palette.amber, height: 220,
+      labels, data: curData, color: palette.amber, height: 220, label: 'Current',
       extraSeries: [{ label: 'Comparison', data: cmpData, color: palette.info, dashed: true }],
     }));
 }

@@ -16,12 +16,20 @@ import { h, icon } from '../../lib/dom.js';
  * @param {{items:{id:string,label:string,icon?:string}[], activeId:string, onChange:(id:string)=>void}} opts
  */
 export function Tabbar({ items, activeId, onChange }) {
+  // `current` tracks the active tab inside this closure so repeat clicks
+  // keep working even when the caller built this bar once and never
+  // recreates it with a fresh `activeId` on every render (the previous
+  // version compared against the frozen `activeId` argument forever, so
+  // clicking back to the tab that was active when Tabbar() was first
+  // called always silently no-op'd).
+  let current = activeId;
   const bar = h('div', { class: 'tabbar' });
   for (const item of items) {
     bar.appendChild(h('button', {
-      class: item.id === activeId ? 'active' : '',
+      class: item.id === current ? 'active' : '',
       onClick: () => {
-        if (item.id === activeId) return;
+        if (item.id === current) return;
+        current = item.id;
         for (const b of bar.children) b.classList.remove('active');
         const idx = items.indexOf(item);
         bar.children[idx].classList.add('active');

@@ -8,7 +8,9 @@ import { Button } from '../../components/ui/Button.js';
 import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { toast } from '../../components/ui/Feedback.js';
-import { stamp, date, asText, count } from '../../lib/format.js';
+import {
+  stamp, date, asText, count, humanise,
+} from '../../lib/format.js';
 import { listPurchaseOrders, markOrdered, cancelPurchaseOrder, receiveLine } from '../../lib/api/purchaseOrders.js';
 import { session } from '../../lib/api/client.js';
 import { ICONS } from '../../lib/icons.js';
@@ -212,7 +214,12 @@ export async function render(ctx) {
         ],
         rows,
         rowClass: (po) => (po.id === selectedId ? 'row-selected' : ''),
-        onRowClick: (po) => { selectedId = po.id; drawDetail(); },
+        // Was only calling drawDetail() — the Table itself never got
+        // rebuilt, so rowClass kept evaluating against the OLD selectedId
+        // and the highlight stayed stuck on whichever row was selected
+        // first (DOM classes don't update themselves). draw() rebuilds the
+        // whole list with the new selectedId baked into rowClass.
+        onRowClick: (po) => { selectedId = po.id; draw(); },
         empty: EmptyState({
           icon: '≡',
           title: all.length ? 'No purchase orders match this view' : 'No purchase orders yet',
@@ -232,10 +239,13 @@ export async function render(ctx) {
     mount(detailHost, Card({},
       CardHeader({
         title: `PO-${po.id}`,
-        // stamp() returns a DOM node, not a string — interpolating it
-        // directly into the template literal below used to print the
-        // literal "[object Text]" (2026-10 rendering bug fix).
-        desc: `Supplier: ${po.supplier || '—'} · Created ${stamp(po.createdAt).textContent} by ${po.createdBy || '—'}`,
+        // A dense "Supplier: X · Created Y by raw_username" string read as
+        // a debug log line. Broken into its own labeled row, with the
+        // username humanized (business_owner -> Business Owner) instead
+        // of shown as a raw account handle.
+        desc: h('div', { class: 't-xs t-soft', style: { display: 'flex', flexWrap: 'wrap', gap: '4px 14px', marginTop: '2px' } },
+          h('span', {}, h('strong', {}, 'Supplier '), po.supplier || '—'),
+          h('span', {}, h('strong', {}, 'Created '), stamp(po.createdAt).textContent, ' by ', po.createdBy ? humanise(po.createdBy) : '—')),
         right: Pill(sev, label),
       }),
       h('div', { class: 'grid', style: { gridTemplateColumns: '1.6fr 1fr', gap: '18px' } },
