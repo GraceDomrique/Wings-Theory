@@ -72,7 +72,15 @@ export function Sidebar({ activeId, onNavigate }) {
     return null;
   }
 
-  const isMobile = () => window.matchMedia('(max-width:600px)').matches;
+  // 860px, not 600px: below 860 the sidebar is ALREADY an icon-only rail
+  // (app.css's 601-860px tier), where an inline-expanded group body has no
+  // room to lay out and used to be hidden outright (display:none !important)
+  // with no way to reach it at all -- "Management" was simply unopenable at
+  // tablet/narrow-desktop widths. Reusing the same floating-sheet affordance
+  // the <=600px bottom-tab-bar tier already has (just anchored beside the
+  // icon instead of above the bar — see app.css) makes every width below
+  // 860px able to open a group, not just phone width.
+  const isMobile = () => window.matchMedia('(max-width:860px)').matches;
   // Mobile's floating sheet is a transient, one-at-a-time affordance, not
   // the desktop accordion's persisted expand/collapse state -- routing its
   // open/close through `expanded` (and therefore through saveExpanded, i.e.
@@ -85,7 +93,21 @@ export function Sidebar({ activeId, onNavigate }) {
     if (isMobile()) {
       const body = groupBodies.get(groupId);
       const toggle = groupToggles.get(groupId);
-      if (body) body.style.display = open ? '' : 'none';
+      if (body) {
+        body.style.display = open ? '' : 'none';
+        // 601-860px (icon rail): the floating sheet is position:fixed,
+        // anchored next to whichever group's icon was actually tapped (see
+        // app.css's media query) -- unlike the <=600px bottom-bar tier,
+        // which pins the sheet above the bar via its own bottom/left/right
+        // and must NOT get a conflicting inline `top` here.
+        if (open && window.matchMedia('(min-width:601px)').matches) {
+          const anchorTop = body.parentElement.getBoundingClientRect().top;
+          const maxTop = window.innerHeight - body.offsetHeight - 10;
+          body.style.top = `${Math.max(10, Math.min(anchorTop, maxTop))}px`;
+        } else {
+          body.style.top = '';
+        }
+      }
       if (toggle) toggle.classList.toggle('open', open);
       return;
     }
@@ -219,8 +241,8 @@ export function Sidebar({ activeId, onNavigate }) {
    * — this is the reload/direct-link case, handled the same way as first
    * render.
    *
-   * Skipped at <=600px (the mobile bottom-tab-bar tier): there, a group's
-   * children render as a floating sheet above the bar rather than an
+   * Skipped at <=860px (the icon-rail and bottom-tab-bar tiers): there, a
+   * group's children render as a floating sheet rather than an
    * inline-expanded list, and leafButton's own onClick already closes that
    * sheet right after navigating (spec: "closes after selection"). Without
    * this guard, THIS force-open — running moments later, once the
@@ -229,7 +251,7 @@ export function Sidebar({ activeId, onNavigate }) {
    * because the newly-active leaf still belongs to a now-collapsed group. */
   el.setActive = (id) => {
     for (const [key, btn] of leafButtons) btn.classList.toggle('active', key === id);
-    if (window.matchMedia('(max-width:600px)').matches) return;
+    if (window.matchMedia('(max-width:860px)').matches) return;
     for (const node of tree) {
       if (node.children && node.children.some((c) => c.id === id) && !expanded.has(node.id)) {
         setGroupOpen(node.id, true);

@@ -1514,11 +1514,11 @@ class TestVarianceReviewAPI(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u, password="wingstheory"):
+        def token(u, password):
             r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}  # role=admin, see TestConsoleAPI
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}  # role=admin, see TestConsoleAPI
 
         # A genuine role='owner' account (see auth.CAPABILITIES / the 2026-09-11
         # addition) has inventory.read but not inventory.write -- exactly the
@@ -2591,16 +2591,16 @@ class TestConsoleAPI(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
         # 2026-09 RBAC revision: inventory.write/recipe.write/queue.resolve
         # moved from manager to admin (see auth.CAPABILITIES) — the write
         # calls this class exercises need the admin token now.
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -2934,7 +2934,7 @@ class TestConsoleAPI(unittest.TestCase):
                          "kitchen must not be able to record a billing charge")
 
         admin_token = self.client.post(
-            "/auth/login", json={"username": "owner", "password": "wingstheory"}
+            "/auth/login", json={"username": "Administrator", "password": "wingstheoryadd"}
         ).json()["token"]
         admin_attempt = self.client.post(
             f"/pos/orders/{oid}/leftover-charge",
@@ -3314,11 +3314,11 @@ class TestAdminAuditLog(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -3349,7 +3349,7 @@ class TestAdminAuditLog(unittest.TestCase):
         self.assertEqual(by_field["supplier"]["new_value"], "New Supplier Co.")
         self.assertEqual(by_field["reorder_point_base"]["new_value"], "5000.0")
         self.assertEqual(by_field["supplier"]["action"], "edit")
-        self.assertEqual(by_field["supplier"]["user_id"], "owner")
+        self.assertEqual(by_field["supplier"]["user_id"], "Administrator")
 
     def test_editing_ingredient_unit_cost_rejects_infinity(self):
         # httpx's `json=` kwarg cannot encode a non-finite float at all --
@@ -3382,7 +3382,7 @@ class TestAdminAuditLog(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["action"], "create")
         self.assertEqual(events[0]["new_value"], "Audit Test Batter")
-        self.assertEqual(events[0]["user_id"], "owner")
+        self.assertEqual(events[0]["user_id"], "Administrator")
 
     def test_changing_menu_price_logs_before_and_after(self):
         item = self.conn.execute("SELECT id, price FROM menu_item LIMIT 1").fetchone()
@@ -3408,7 +3408,7 @@ class TestAdminAuditLog(unittest.TestCase):
         events = self._events_for("user", "cashier1")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["action"], "password_reset")
-        self.assertEqual(events[0]["user_id"], "owner")
+        self.assertEqual(events[0]["user_id"], "Administrator")
         # the whole point: attribution without ever persisting the credential
         self.assertIsNone(events[0]["previous_value"])
         self.assertIsNone(events[0]["new_value"])
@@ -3454,10 +3454,10 @@ class TestRBAC(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
 
     @classmethod
@@ -3595,10 +3595,10 @@ class TestPagePermissions(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
 
     @classmethod
@@ -3737,7 +3737,7 @@ class TestLoginAudit(unittest.TestCase):
         # test_deactivated_account_login_is_logged_as_unknown_user below for
         # what happens if it's still tried). Any other live account proves
         # the same thing: a successful login is actually recorded.
-        r = self.client.post("/auth/login", json={"username": "cashier1", "password": "wingstheory"})
+        r = self.client.post("/auth/login", json={"username": "cashier1", "password": "wingstheorycash"})
         self.assertEqual(r.status_code, 200)
         ev = self._last_event("cashier1")
         self.assertEqual(ev["success"], 1)
@@ -3779,7 +3779,7 @@ class TestLoginAudit(unittest.TestCase):
             self.client.post("/auth/login", json={"username": "kitchen1", "password": "wrong"})
         # account is now locked; this attempt never reaches password
         # verification at all
-        r = self.client.post("/auth/login", json={"username": "kitchen1", "password": "wingstheory"})
+        r = self.client.post("/auth/login", json={"username": "kitchen1", "password": "wingstheorykds"})
         self.assertEqual(r.status_code, 423)
         ev = self._last_event("kitchen1")
         self.assertEqual(ev["success"], 0)
@@ -3798,25 +3798,25 @@ class TestLoginAudit(unittest.TestCase):
         # 'manager' account is deactivated (migration 0034) and can no
         # longer log in at all, so cashier stands in here.
         cash_token = self.client.post(
-            "/auth/login", json={"username": "cashier1", "password": "wingstheory"}
+            "/auth/login", json={"username": "cashier1", "password": "wingstheorycash"}
         ).json()["token"]
         r = self.client.get("/console/audit/logins", headers={"Authorization": f"Bearer {cash_token}"})
         self.assertEqual(r.status_code, 403)
 
     def test_audit_logins_endpoint_returns_recent_events(self):
         owner_token = self.client.post(
-            "/auth/login", json={"username": "owner", "password": "wingstheory"}
+            "/auth/login", json={"username": "Administrator", "password": "wingstheoryadd"}
         ).json()["token"]
         r = self.client.get(
             "/console/audit/logins", headers={"Authorization": f"Bearer {owner_token}"}
         )
         self.assertEqual(r.status_code, 200, r.text)
         events = r.json()["events"]
-        self.assertTrue(any(e["username"] == "owner" and e["success"] == 1 for e in events))
+        self.assertTrue(any(e["username"] == "Administrator" and e["success"] == 1 for e in events))
 
     def test_audit_actions_endpoint_requires_audit_read_and_returns_events(self):
         owner_token = self.client.post(
-            "/auth/login", json={"username": "owner", "password": "wingstheory"}
+            "/auth/login", json={"username": "Administrator", "password": "wingstheoryadd"}
         ).json()["token"]
         self.client.post(
             "/console/users/cashier1/reset_password",
@@ -3841,7 +3841,7 @@ class TestLoginAudit(unittest.TestCase):
         # instead; this is a real behavioural fact about issue_token, not a
         # data-naming issue this migration introduced.
         kitchen_token = self.client.post(
-            "/auth/login", json={"username": "kitchen1", "password": "wingstheory"}
+            "/auth/login", json={"username": "kitchen1", "password": "wingstheorykds"}
         ).json()["token"]
         r = self.client.get("/console/audit/actions", headers={"Authorization": f"Bearer {kitchen_token}"})
         self.assertEqual(r.status_code, 403)
@@ -3854,7 +3854,7 @@ class TestLoginAudit(unittest.TestCase):
         # reset endpoint works and is gated, not leaving the account in a
         # different state than it found it in for whoever runs next.
         from wt.auth import hash_password
-        h, s = hash_password("wingstheory")
+        h, s = hash_password("wingstheorycash")
         self.conn.execute(
             "UPDATE app_user SET password_hash=?, password_salt=?, "
             "password_changed_at=datetime('now','subsec'), must_change_password=0 "
@@ -3900,14 +3900,14 @@ class TestMLResultCaching(unittest.TestCase):
         # console reader" -- so it is aliased to the (live) owner token
         # instead, same substitution already used throughout this suite
         # (e.g. TestLoginAudit) for the same retired-account reason.
-        cls.H_MGR = {"Authorization": f"Bearer {cls._token('owner')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {cls._token('Administrator', 'wingstheoryadd')}"}
 
-        cls.H_CASH = {"Authorization": f"Bearer {cls._token('cashier1')}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {cls._token('owner')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {cls._token('cashier1', 'wingstheorycash')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {cls._token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
-    def _token(cls, username):
-        r = cls.client.post("/auth/login", json={"username": username, "password": "wingstheory"})
+    def _token(cls, username, password):
+        r = cls.client.post("/auth/login", json={"username": username, "password": password})
         return r.json()["token"]
 
     @classmethod
@@ -4012,14 +4012,14 @@ class TestDashboardSummary(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        # inventory.read is all these endpoints need; 'owner' (username,
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        # inventory.read is all these endpoints need; 'Administrator' (username,
         # role=admin -- see TestConsoleAPI) stands in for the deactivated
         # 'manager' account here.
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -4141,7 +4141,7 @@ class TestPasswordSecurity(unittest.TestCase):
         # flagged, 'owner' would now be blocked by wt/api.py's needs() gate
         # from calling the very reset-password endpoint these tests exist to
         # cover.
-        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='owner'")
+        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='Administrator'")
 
     @classmethod
     def tearDownClass(cls):
@@ -4160,12 +4160,12 @@ class TestPasswordSecurity(unittest.TestCase):
         return {"Authorization": f"Bearer {token}"}
 
     def test_fresh_seeded_account_is_flagged_must_change_password(self):
-        r = self._login("cashier1")
+        r = self._login("cashier1", "wingstheorycash")
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()["must_change_password"])
 
     def test_self_service_change_requires_correct_current_password(self):
-        token = self._token("cashier1")
+        token = self._token("cashier1", "wingstheorycash")
         r = self.client.post(
             "/auth/change_password", headers=self._auth_headers(token),
             json={"current_password": "wrong", "new_password": "a-real-new-password-1",
@@ -4174,38 +4174,38 @@ class TestPasswordSecurity(unittest.TestCase):
         self.assertEqual(r.status_code, 401)
 
     def test_self_service_change_requires_matching_confirmation(self):
-        token = self._token("cashier1")
+        token = self._token("cashier1", "wingstheorycash")
         r = self.client.post(
             "/auth/change_password", headers=self._auth_headers(token),
-            json={"current_password": "wingstheory", "new_password": "a-real-new-password-2",
+            json={"current_password": "wingstheorycash", "new_password": "a-real-new-password-2",
                   "confirm_new_password": "does-not-match"},
         )
         self.assertEqual(r.status_code, 422)
         self.assertEqual(r.json()["code"], "validation_error")
 
     def test_self_service_change_rejects_short_password(self):
-        token = self._token("cashier1")
+        token = self._token("cashier1", "wingstheorycash")
         r = self.client.post(
             "/auth/change_password", headers=self._auth_headers(token),
-            json={"current_password": "wingstheory", "new_password": "short1",
+            json={"current_password": "wingstheorycash", "new_password": "short1",
                   "confirm_new_password": "short1"},
         )
         self.assertEqual(r.status_code, 422)
 
     def test_self_service_change_rejects_the_known_compromised_default(self):
-        token = self._token("cashier1")
+        token = self._token("cashier1", "wingstheorycash")
         r = self.client.post(
             "/auth/change_password", headers=self._auth_headers(token),
-            json={"current_password": "wingstheory", "new_password": "wingstheory",
+            json={"current_password": "wingstheorycash", "new_password": "wingstheory",
                   "confirm_new_password": "wingstheory"},
         )
         self.assertEqual(r.status_code, 422)
 
     def test_self_service_change_rejects_password_equal_to_username(self):
-        token = self._token("cashier1")
+        token = self._token("cashier1", "wingstheorycash")
         r = self.client.post(
             "/auth/change_password", headers=self._auth_headers(token),
-            json={"current_password": "wingstheory", "new_password": "cashier1",
+            json={"current_password": "wingstheorycash", "new_password": "cashier1",
                   "confirm_new_password": "cashier1"},
         )
         self.assertEqual(r.status_code, 422)
@@ -4253,14 +4253,14 @@ class TestPasswordSecurity(unittest.TestCase):
         self.assertEqual(fresh.status_code, 200)
 
     def test_admin_reset_is_forbidden_for_non_admin_roles(self):
-        cash_token = self._token("cashier1")
+        cash_token = self._token("cashier1", "wingstheorycash")
         r = self.client.post(
             "/console/users/pwtest_adminreset/reset_password", headers=self._auth_headers(cash_token),
         )
         self.assertEqual(r.status_code, 403)
 
     def test_admin_reset_generates_a_working_password_and_invalidates_old_tokens(self):
-        admin_token = self._token("owner")
+        admin_token = self._token("Administrator", "wingstheoryadd")
         old_token = self._token("pwtest_adminreset")
 
         r = self.client.post(
@@ -4281,7 +4281,7 @@ class TestPasswordSecurity(unittest.TestCase):
         self.assertTrue(fresh_login.json()["must_change_password"])
 
     def test_admin_reset_unknown_username_is_404(self):
-        admin_token = self._token("owner")
+        admin_token = self._token("Administrator", "wingstheoryadd")
         r = self.client.post(
             "/console/users/does-not-exist/reset_password", headers=self._auth_headers(admin_token),
         )
@@ -4292,7 +4292,7 @@ class TestPasswordSecurity(unittest.TestCase):
         # process's control: the generated password does not appear in any
         # row this project's own audit trail (verification_event) writes,
         # confirming the reset path never routed it through that table.
-        admin_token = self._token("owner")
+        admin_token = self._token("Administrator", "wingstheoryadd")
         r = self.client.post(
             "/console/users/pwtest_noleak/reset_password", headers=self._auth_headers(admin_token),
         )
@@ -4348,7 +4348,7 @@ class TestPasswordSecurity(unittest.TestCase):
         from wt.auth import MAX_LOGIN_ATTEMPTS
         for _ in range(MAX_LOGIN_ATTEMPTS - 2):
             self._login("cashier1", "wrong-password")
-        good = self._login("cashier1", "wingstheory")
+        good = self._login("cashier1", "wingstheorycash")
         self.assertEqual(good.status_code, 200)
         row = self.conn.execute(
             "SELECT failed_login_count, locked_until FROM app_user WHERE username='cashier1'"
@@ -4427,7 +4427,7 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         """The test named in the brief as 'Logout -> old token must be
         rejected', proved directly against the API with no browser or
         localStorage involved at all -- exactly the gap this fix closes."""
-        token = self._login("cashier1")
+        token = self._login("cashier1", "wingstheorycash")
         ok = self.client.get("/pos/menu", headers=self._h(token))
         self.assertEqual(ok.status_code, 200, ok.text)
 
@@ -4448,7 +4448,7 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         write endpoint, not just a read, closes the gap completely: even
         bypassing the UI and POSTing directly with the "resumed" token must
         fail."""
-        token = self._login("cashier1")
+        token = self._login("cashier1", "wingstheorycash")
         self.client.post("/auth/logout", headers=self._h(token))
 
         menu = self.client.get("/pos/menu", headers=self._h(token))
@@ -4467,8 +4467,8 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         active tab — logout is scoped to the one token it was called with,
         not every session the account holds (that broader "everywhere" case
         is what a password change/reset does instead, proved below)."""
-        tab_a = self._login("cashier1")
-        tab_b = self._login("cashier1")
+        tab_a = self._login("cashier1", "wingstheorycash")
+        tab_b = self._login("cashier1", "wingstheorycash")
         self.assertNotEqual(tab_a, tab_b)
 
         self.client.post("/auth/logout", headers=self._h(tab_a))
@@ -4479,7 +4479,7 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         self.assertEqual(b_still_fine.status_code, 200, b_still_fine.text)
 
     def test_logout_is_idempotent_not_a_500(self):
-        token = self._login("cashier1")
+        token = self._login("cashier1", "wingstheorycash")
         first = self.client.post("/auth/logout", headers=self._h(token))
         self.assertEqual(first.status_code, 200)
         second = self.client.post("/auth/logout", headers=self._h(token))
@@ -4544,11 +4544,11 @@ class TestAuthSessionLifecycle(unittest.TestCase):
             (h, s),
         )
         self.conn.commit()
-        target = self._login("resettest_cashier")
+        target = self._login("resettest_cashier", "wingstheory")
         still_good = self.client.get("/pos/menu", headers=self._h(target))
         self.assertEqual(still_good.status_code, 200)
 
-        owner = self._login("owner")
+        owner = self._login("Administrator", "wingstheoryadd")
         reset = self.client.post(
             "/console/users/resettest_cashier/reset_password", headers=self._h(owner),
         )
@@ -4571,7 +4571,7 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         (creating an ingredient) is admin-only -- auth.CAPABILITIES, not
         anything the frontend nav hides -- so a cashier token reaching it
         directly, bypassing the POS UI entirely, must still be refused."""
-        token = self._login("cashier1")
+        token = self._login("cashier1", "wingstheorycash")
         r = self.client.post(
             "/console/ingredients", headers=self._h(token),
             json={"name": "Cashier Should Not Create This", "base_unit": "g",
@@ -4586,7 +4586,7 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         the console nav never shows this screen to a kitchen account, but
         that is UI convenience only; the server-side capability check is
         the real boundary being proved here."""
-        token = self._login("kitchen1")
+        token = self._login("kitchen1", "wingstheorykds")
         r = self.client.get("/console/dashboard/owner-overview", headers=self._h(token))
         self.assertEqual(r.status_code, 403, r.text)
 
@@ -4594,7 +4594,7 @@ class TestAuthSessionLifecycle(unittest.TestCase):
         """None of the above narrows what a legitimately authorized account
         can still do -- a live cashier session reaches its own POS routes,
         and a live owner session reaches its own owner-only route."""
-        cashier = self._login("cashier1")
+        cashier = self._login("cashier1", "wingstheorycash")
         menu = self.client.get("/pos/menu", headers=self._h(cashier))
         self.assertEqual(menu.status_code, 200, menu.text)
 
@@ -7149,12 +7149,12 @@ class TestComboPublishEndToEnd(unittest.TestCase):
         from wt.api import app
         cls.client = TestClient(app)
 
-        def token(u, password="wingstheory"):
+        def token(u, password):
             r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}  # seeded 'owner' username has role=admin
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}  # seeded 'Administrator' username has role=admin
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
 
         # A genuine owner-ROLE account (distinct from the seeded username
         # 'owner', which is role=admin) — the only way to create one is
@@ -7647,12 +7647,12 @@ class TestCorrectStockCapability(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u, password="wingstheory"):
+        def token(u, password):
             r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}   # username 'owner', role=admin
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}   # username 'Administrator', role=admin
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
 
         provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
         cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
@@ -9122,13 +9122,13 @@ class TestUnliRBAC(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
+        def token(u, password):
             return cls.client.post("/auth/login",
-                                   json={"username": u, "password": "wingstheory"}).json()["token"]
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+                                   json={"username": u, "password": password}).json()["token"]
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -10082,13 +10082,13 @@ class TestRefillAPI(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
+        def token(u, password):
             return cls.client.post("/auth/login",
-                                   json={"username": u, "password": "wingstheory"}).json()["token"]
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+                                   json={"username": u, "password": password}).json()["token"]
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -10964,11 +10964,11 @@ class TestOrderIntegrityRegressions(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
+        def token(u, password):
             return cls.client.post("/auth/login",
-                                   json={"username": u, "password": "wingstheory"}).json()["token"]
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+                                   json={"username": u, "password": password}).json()["token"]
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -11191,13 +11191,13 @@ class TestPOSInventoryIntegrationMatrix(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
+        def token(u, password):
             return cls.client.post("/auth/login",
-                                   json={"username": u, "password": "wingstheory"}).json()["token"]
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+                                   json={"username": u, "password": password}).json()["token"]
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -14044,8 +14044,8 @@ class TestReplenishmentEndToEnd(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
         # manager_token() always 401s now -- see TestRBAC's own
         # test_manager_token_is_rejected_everywhere_now_deactivated
@@ -14057,11 +14057,11 @@ class TestReplenishmentEndToEnd(unittest.TestCase):
         # console reader" -- so it is aliased to the (live) owner token
         # instead, same substitution already used throughout this suite
         # (e.g. TestLoginAudit) for the same retired-account reason.
-        cls.H_MGR = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_MGR = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -14268,11 +14268,11 @@ class TestProphetDemandModelSetting(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
         # A dedicated item with enough real history for Prophet to fit --
         # backdated inserts (like TestForecasting's own fixtures), since the
@@ -14643,9 +14643,9 @@ class TestOwnerRoleAndProvisioning(unittest.TestCase):
         def token(u, password="wingstheory"):
             r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}  # seeded 'owner' username has role=admin
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}  # seeded 'Administrator' username has role=admin
         cls.H_MGR = {"Authorization": f"Bearer {manager_token(cls.conn)}"}
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
 
         # OWNER accounts are no longer reachable through POST /console/users
         # (ADMIN cannot create one — see test_admin_direct_api_attempt_to_
@@ -14955,7 +14955,7 @@ class TestOwnerInstructions(unittest.TestCase):
         def token(u, password="wingstheory"):
             r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
         # OWNER is provisioned via the deployment-only mechanism, not the
         # (now-forbidden) admin account-management endpoint — see
         # TestOwnerRoleAndProvisioning for that restriction's own coverage.
@@ -15089,7 +15089,7 @@ class TestInstructionAssigneesAndAudit(unittest.TestCase):
         def token(u, password="wingstheory"):
             r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
         provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
         cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
         cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
@@ -15126,7 +15126,7 @@ class TestInstructionAssigneesAndAudit(unittest.TestCase):
         def token(u, password="wingstheory"):
             r = self.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        h_cash = {"Authorization": f"Bearer {token('cashier1')}"}
+        h_cash = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
         r = self.client.get("/console/audit/actions", headers=h_cash)
         self.assertEqual(r.status_code, 403, r.text)
 
@@ -15180,7 +15180,7 @@ class TestPurchaseOrders(unittest.TestCase):
         def token(u, password="wingstheory"):
             r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
         # OWNER is provisioned via the deployment-only mechanism, not the
         # (now-forbidden) admin account-management endpoint — see
         # TestOwnerRoleAndProvisioning for that restriction's own coverage.
@@ -15515,12 +15515,12 @@ class TestAuditGapCoverage(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -15710,11 +15710,11 @@ class TestPOSFixes(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}  # role=admin, see seed.py
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}  # role=admin, see seed.py
 
     @classmethod
     def tearDownClass(cls):
@@ -15967,11 +15967,11 @@ class TestHistoricalSourceTracking(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_KIT = {"Authorization": f"Bearer {token('kitchen1', 'wingstheorykds')}"}
 
     @classmethod
     def tearDownClass(cls):
@@ -16170,11 +16170,11 @@ class TestPOSTablesAndHeadFlavors(unittest.TestCase):
         cls.client = TestClient(app)
         cls.conn = db.get_conn()
 
-        def token(u):
-            r = cls.client.post("/auth/login", json={"username": u, "password": "wingstheory"})
+        def token(u, password):
+            r = cls.client.post("/auth/login", json={"username": u, "password": password})
             return r.json()["token"]
-        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1')}"}
-        cls.H_OWNER = {"Authorization": f"Bearer {token('owner')}"}
+        cls.H_CASH = {"Authorization": f"Bearer {token('cashier1', 'wingstheorycash')}"}
+        cls.H_OWNER = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
     @classmethod
     def tearDownClass(cls):

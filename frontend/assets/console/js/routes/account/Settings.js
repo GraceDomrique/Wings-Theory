@@ -8,12 +8,12 @@ import { session } from '../../lib/api/client.js';
 import { changePassword, MIN_PASSWORD_LENGTH } from '../../lib/api/account.js';
 
 /**
- * Account Settings — 2026-10-15 redesign (spec E: "premium account
- * workspace"). Same single destination for every role as before (pinned at
- * the bottom of the sidebar — see Sidebar.js / nav.js's routeRoles
- * ('settings')), same password-change endpoint; only the composition
- * changed, from a plain stacked form to a centered two-column layout:
- * identity on the left, security on the right.
+ * Account Settings — same single destination for every role as before
+ * (pinned at the bottom of the sidebar — see Sidebar.js / nav.js's
+ * routeRoles('settings')), same password-change endpoint; a two-column
+ * layout, identity on the left, security on the right, sized to match every
+ * other full-width page in the console rather than floating as a narrow
+ * centered column.
  *
  * The password-change logic is unchanged from the previous version of this
  * file (same changePassword() call, same validation, same "every other
@@ -22,10 +22,11 @@ import { changePassword, MIN_PASSWORD_LENGTH } from '../../lib/api/account.js';
 export async function render() {
   const u = session.user || {};
 
-  return h('div', { class: 'account-settings-wrap' },
-    h('div', { class: 'account-settings-grid' },
-      identityPanel(u),
-      securityPanel()));
+  return h('div', { class: 'account-settings-grid' },
+    identityPanel(u),
+    h('div', {},
+      securityPanel(),
+      securityNotesPanel()));
 }
 
 function initials(name) {
@@ -48,7 +49,22 @@ function identityPanel(u) {
       : null,
     h('div', { style: { marginTop: '12px' } }, Pill('flat', ROLE_LABEL[u.role] || u.role || 'unknown')),
     h('div', { class: 'account-identity-divider' }),
-    h('div', { class: 'account-identity-row' }, icon(ICONS.userRound, 14), h('span', {}, 'Signed in to Wings Theory Operations Console')));
+    h('div', { class: 'account-identity-row' }, icon(ICONS.userRound, 14), h('span', {}, 'Signed in to Wings Theory Operations Console')),
+    u.username
+      ? h('div', { class: 'account-identity-row' }, icon(ICONS.userRound, 14), h('span', {}, 'Username: ', h('strong', {}, u.username)))
+      : null);
+}
+
+// A short note below the password form so the right column doesn't read as
+// a lone short card floating above empty space on a wide screen — plain,
+// factual, no invented data.
+function securityNotesPanel() {
+  return Card({ className: 'account-security-panel' },
+    CardHeader({ title: 'About your account' }),
+    h('ul', { class: 't-sm t-soft', style: { margin: 0, paddingLeft: '18px', lineHeight: '1.7' } },
+      h('li', {}, 'Changing your password signs out every other device currently signed in to this account.'),
+      h('li', {}, 'Your username and display name can only be changed by an administrator, from Users & Access.'),
+      h('li', {}, 'This console is reachable only on the restaurant’s local network.')));
 }
 
 // RIGHT — Account Security: the password form, unchanged behavior, redrawn

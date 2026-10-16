@@ -107,11 +107,14 @@ def import_unli(conn, ids: dict[str, int]) -> int:
 
 
 def seed_users(conn) -> None:
-    """Every seeded account shares the same placeholder password
-    ('wingstheory') and is flagged must_change_password=1 for exactly that
-    reason -- see migration 0014's docstring for why the same flag is set
-    there too (that UPDATE only reaches rows that already exist, so a fresh
-    install needs it set here at INSERT time instead).
+    """Each seeded account gets its own default password (not one placeholder
+    shared across every role) and is flagged must_change_password=1 so an
+    admin is still prompted to pick something private -- see migration
+    0014's docstring for why the same flag is set there too (that UPDATE
+    only reaches rows that already exist, so a fresh install needs it set
+    here at INSERT time instead). Username and display name are both
+    editable afterward from Users & Access (routes/admin/UsersAccess.js);
+    these are starting values, not fixed identities.
 
     password_changed_at is set explicitly here rather than left to a
     column default -- the column has none (see migration 0014's docstring
@@ -125,13 +128,14 @@ def seed_users(conn) -> None:
     # migration existed; this is what makes a brand-new install match that
     # same end state from the start, instead of a fresh install and an
     # upgraded one landing on different manager account states).
-    for username, display, role, is_active in [
-        ("owner", "R. Alonzo", "admin", 1),
-        ("manager", "M. Santos", "manager", 0),
-        ("cashier1", "J. Cruz", "cashier", 1),
-        ("kitchen1", "D. Lim", "kitchen", 1),
+    for username, display, role, password, is_active in [
+        ("Administrator", "R. Alonzo", "admin", "wingstheoryadd", 1),
+        ("business_owner", "Business Owner", "owner", "ownerwingstheory", 1),
+        ("manager", "M. Santos", "manager", "wingstheory", 0),
+        ("cashier1", "J. Cruz", "cashier", "wingstheorycash", 1),
+        ("kitchen1", "D. Lim", "kitchen", "wingstheorykds", 1),
     ]:
-        h, s = hash_password("wingstheory")
+        h, s = hash_password(password)
         conn.execute(
             "INSERT OR IGNORE INTO app_user "
             "(username, display_name, role, password_hash, password_salt, "

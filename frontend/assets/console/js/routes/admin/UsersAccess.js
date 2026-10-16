@@ -8,7 +8,7 @@ import { toast } from '../../components/ui/Feedback.js';
 import { ageFromNow } from '../../lib/format.js';
 import { session } from '../../lib/api/client.js';
 import {
-  listUsers, createUser, resetPassword, updateDisplayName,
+  listUsers, createUser, resetPassword, updateDisplayName, updateUsername,
 } from '../../lib/api/account.js';
 import { getCapabilityMatrix, getUserCapabilities, setUserCapability } from '../../lib/api/permissions.js';
 
@@ -116,7 +116,7 @@ export async function render(ctx) {
       : locked ? Pill('crit', 'locked')
         : Pill('good', 'active');
     const resetBtn = Button({ size: 'sm', onClick: () => openResetModal(u.username) }, 'Reset password');
-    const renameBtn = Button({ size: 'sm', variant: 'ghost', onClick: () => openRenameModal(u.username, u.displayName) }, 'Rename');
+    const renameBtn = Button({ size: 'sm', variant: 'ghost', onClick: () => openRenameModal(u.username, u.displayName) }, 'Edit');
 
     return Card({ style: { display: 'flex', gap: '14px', alignItems: 'flex-start' } },
       h('div', {
@@ -168,27 +168,41 @@ export async function render(ctx) {
 
   function openRenameModal(username, currentDisplayName) {
     const nameInput = h('input', { type: 'text', value: currentDisplayName || '' });
+    const usernameInput = h('input', { type: 'text', value: username });
     const err = ModalError();
     const submit = Button({ variant: 'primary' }, 'Save');
     submit.addEventListener('click', async () => {
       err.textContent = ''; err.style.display = 'none';
       const displayName = nameInput.value.trim();
+      const newUsername = usernameInput.value.trim();
       if (!displayName) { err.textContent = 'Enter a display name.'; err.style.display = ''; return; }
+      if (!newUsername) { err.textContent = 'Enter a username.'; err.style.display = ''; return; }
       submit.disabled = true;
       try {
-        await updateDisplayName(username, displayName);
-        toast(`${username}'s display name updated.`, 'good');
+        // The sign-in username and the display name are changed with two
+        // separate calls (separate endpoints, separate audit entries) —
+        // display name first since it always succeeds; a username clash is
+        // then the only way this can partially apply.
+        if (displayName !== currentDisplayName) await updateDisplayName(username, displayName);
+        let effectiveUsername = username;
+        if (newUsername !== username) {
+          await updateUsername(username, newUsername);
+          effectiveUsername = newUsername;
+          toast(`Signed in as ${username} will need to sign in again as ${newUsername}.`, 'warn');
+        }
+        toast(`${effectiveUsername}'s account details updated.`, 'good');
         modal.close();
         const fresh = await listUsers().catch(() => null);
         if (fresh) drawUsers(fresh);
       } catch (e) { err.textContent = e.message; err.style.display = ''; } finally { submit.disabled = false; }
     });
     const modal = Modal({
-      title: `Rename — ${username}`,
-      desc: 'Changes only the display name shown in the console — never the username used to sign in.',
+      title: `Edit account — ${username}`,
+      desc: 'Changing the username signs that account out everywhere — it must sign in again with the new username.',
       onClose: () => {},
     },
       h('label', { class: 'field' }, 'Display name', nameInput),
+      h('label', { class: 'field', style: { marginTop: '10px' } }, 'Username', usernameInput),
       err, submit);
   }
 

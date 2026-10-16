@@ -657,6 +657,36 @@ def update_display_name(
     return {"ok": True, "username": username, "display_name": body.display_name}
 
 
+class UpdateUsernameIn(BaseModel):
+    new_username: str = Field(min_length=1, max_length=64)
+
+
+@app.patch("/console/users/{username}/username", tags=["console"])
+def update_username(
+    username: str, body: UpdateUsernameIn, c: sqlite3.Connection = Depends(conn),
+    p: dict = Depends(needs("user.manage")),
+):
+    """Admin-only rename of the username used to sign in. Any token already
+    issued for this account carries the OLD username as its `sub` claim
+    (see auth.issue_token) and stops matching this row immediately — the
+    account is signed out everywhere, same as a password change, and must
+    sign in again with the new username."""
+    new_username = body.new_username.strip()
+    if not new_username:
+        raise ValidationError("username cannot be blank")
+    row = c.execute("SELECT * FROM app_user WHERE username=?", (username,)).fetchone()
+    if not row:
+        raise NotFoundError(f"user '{username}' not found")
+    if new_username != username:
+        clash = c.execute("SELECT 1 FROM app_user WHERE username=?", (new_username,)).fetchone()
+        if clash:
+            raise ValidationError(f"username '{new_username}' is already taken")
+    with db.write_tx(c):
+        c.execute("UPDATE app_user SET username=? WHERE id=?", (new_username, row["id"]))
+        audit.log(c, "user", new_username, "username_change", p["sub"], previous_value=username, new_value=new_username)
+    return {"ok": True, "username": new_username}
+
+
 @app.get("/console/users/{username}/capabilities", tags=["console"])
 def get_user_capabilities(
     username: str, c: sqlite3.Connection = Depends(conn),

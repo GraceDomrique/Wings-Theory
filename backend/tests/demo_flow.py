@@ -39,11 +39,11 @@ def main() -> int:
 
     # --- auth -------------------------------------------------------------
     cashier = client.post("/auth/login", json={"username": "cashier1",
-                                               "password": "wingstheory"}).json()
+                                               "password": "wingstheorycash"}).json()
     kitchen = client.post("/auth/login", json={"username": "kitchen1",
-                                               "password": "wingstheory"}).json()
-    owner = client.post("/auth/login", json={"username": "owner",
-                                             "password": "wingstheory"}).json()
+                                               "password": "wingstheorykds"}).json()
+    owner = client.post("/auth/login", json={"username": "Administrator",
+                                             "password": "wingstheoryadd"}).json()
     H_CASH = {"Authorization": f"Bearer {cashier['token']}"}
     H_KIT = {"Authorization": f"Bearer {kitchen['token']}"}
     H_OWN = {"Authorization": f"Bearer {owner['token']}"}

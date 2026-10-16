@@ -8,8 +8,17 @@ import { h } from '../../lib/dom.js';
  * still in flight is exactly the class of lie spec section 6 point 4 forbids.
  */
 
+/**
+ * Shown on every route swap (AppShell.js's draw()) and inside any panel
+ * still waiting on its own fetch (VerificationItem, etc.) — previously just
+ * plain centered text, which on a full page-body swap left the whole content
+ * area looking broken/empty rather than "working on it". A small spinner
+ * plus the same label reads as active progress instead.
+ */
 export function Loading(label = 'Loading…') {
-  return h('div', { class: 'load-note' }, label);
+  return h('div', { class: 'load-note' },
+    h('span', { class: 'load-spinner', 'aria-hidden': 'true' }),
+    h('span', {}, label));
 }
 
 export function SkeletonLines(n = 3) {

@@ -752,7 +752,25 @@ select:disabled{cursor:default; opacity:0.6;}
 .skeleton{background:linear-gradient(90deg,var(--line-soft),var(--surface-sunk),var(--line-soft));
   background-size:200% 100%; animation:sk 1.2s ease-in-out infinite; border-radius:var(--radius-sm); height:12px;}
 @keyframes sk{0%{background-position:200% 0;}100%{background-position:-200% 0;}}
-.load-note{font-size:11.5px; color:var(--ink-faint); padding:18px; text-align:center;}
+.load-note{
+  font-size:11.5px; color:var(--ink-faint); padding:18px; text-align:center;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px;
+  min-height:120px; animation:load-note-in .15s ease-out;
+}
+@keyframes load-note-in{from{opacity:0;}to{opacity:1;}}
+.load-spinner{
+  width:22px; height:22px; border-radius:50%;
+  border:2.5px solid var(--line-soft); border-top-color:var(--amber);
+  animation:load-spin .7s linear infinite;
+}
+@keyframes load-spin{to{transform:rotate(360deg);}}
+/* A route swap replaces the WHOLE .content body with this (AppShell.js's
+   draw()) — centering it in the available viewport height, not just its own
+   18px of padding, is what keeps the page from reading as "broken/empty"
+   for however long the next route's render() takes. A smaller, inline use
+   (e.g. VerificationItem's "Loading history…" inside a drawer) doesn't need
+   this — min-height alone already gives it reasonable breathing room. */
+.content > .load-note{min-height:calc(100vh - 160px);}
 
 .toast-host{position:fixed; right:20px; bottom:20px; display:flex; flex-direction:column; gap:8px; z-index:80;}
 /* Mobile's bottom tab bar (<=600px, see .shell/.sidebar further down) is
@@ -1007,18 +1025,40 @@ canvas{max-width:100%;}
   .nav-group-chevron,
   .nav-badge{display:none;}
 }
-/* min-width:601px: this is the icon-rail tier's own "never show an inline-
-   expanded group body, just the icon" rule. !important is needed to beat
-   Sidebar.js's own inline style:{display: isOpen?'':'none'} on a genuinely
-   collapsed/icon-only sidebar -- but left unconditional, it also wins (by
-   !important, regardless of source order) over the <600px tier below, which
-   needs that same element to actually become visible as a floating sheet
-   when tapped. Found by testing at 375px: tapping "Management" in the
-   bottom bar toggled Sidebar.js's internal state correctly (confirmed via
-   the DOM) but the sheet never appeared, because this rule's !important
-   permanently won regardless of that state. */
+/* min-width:601px and max-width:860px: the icon-rail tier. A group's body
+   has no room to expand inline here, but unlike the plain "hide it, full
+   stop" rule this used to be, Sidebar.js (isMobile(), 860px threshold)
+   treats this whole tier the same as the <=600px bottom-tab-bar tier: a
+   tapped group opens as a floating sheet instead of an inline list, so
+   "Management" (and every other group) stays reachable at tablet / narrow
+   desktop widths instead of being unopenable. Anchored beside the rail
+   icon rather than above a bottom bar, since there's no bottom bar here. */
 @media (min-width:601px) and (max-width:860px){
-  .nav-group-body{display:none !important;}
+  /* position:fixed, not :absolute -- .nav-tree (the icon rail) is
+     overflow-y:auto, and an overflow:auto/hidden ancestor clips an
+     absolutely-positioned descendant that extends past its own (here,
+     68px-wide) box, which is what made an earlier version of this rule
+     invisible: the sheet WAS opening (Sidebar.js's state, confirmed via the
+     DOM) and WAS in the DOM at the right coordinates, just clipped away by
+     .nav-tree before it ever reached the icon rail's right edge.
+     position:fixed is not clipped by an ancestor's overflow (only a
+     transform/filter/perspective on an ancestor would re-capture it, and
+     none of .nav-tree/.sidebar/.shell set one) -- same reason the <=600px
+     bottom-sheet tier below already works. `top` is set inline by
+     Sidebar.js, next to whichever icon was actually tapped. */
+  .nav-group-body{
+    position:fixed; left:76px; width:220px; z-index:90;
+    border-left:none; background:var(--nav-bg); border:1px solid rgba(255,255,255,0.1);
+    border-radius:10px; padding:6px; box-shadow:0 10px 30px rgba(0,0,0,0.3);
+  }
+  .nav-group-body .nav-item{flex-direction:row; justify-content:flex-start; padding:10px 12px; font-size:13px; border-radius:8px;}
+  /* This tier's own icon-rail rule (above: ".nav-item-label{display:none}")
+     hides every nav label indiscriminately, including a child's -- but a
+     child inside the open sheet has no icon of its own to fall back to, so
+     without this override tapping "Management" opened an empty dark box
+     with no readable item in it. */
+  .nav-group-body .nav-item-label{display:block;}
+  .nav-group-label, .nav-group-chevron{display:none;}
 }
 
 /* True phone width: the 68px icon rail above still eats a visible slice of
@@ -1075,20 +1115,24 @@ canvas{max-width:100%;}
    no longer references it. */
 .login-err{color:var(--crit); font-size:11.5px; margin-top:10px;}
 
-/* ============ ACCOUNT SETTINGS (2026-10-15 premium two-column workspace)
+/* ============ ACCOUNT SETTINGS ==============================================
    ============================================================================
-   Centered, bounded width (spec: "Center the workspace within a comfortable
-   maximum width. Do not stretch the form edge to edge.") — a charcoal
-   identity panel paired with the warm-ivory security card, not two copies
-   of the same card. */
-.account-settings-wrap{max-width:760px; margin:0 auto;}
-.account-settings-grid{display:grid; grid-template-columns:260px 1fr; gap:18px; align-items:start;}
-@media (max-width:700px){.account-settings-grid{grid-template-columns:1fr;}}
+   This used to be the only page in the console centered in a narrow, bounded
+   column (max-width:760px; margin:0 auto) while every other route fills the
+   content area edge to edge — on a wide display that read as a tiny floating
+   island in an otherwise empty page, visually disconnected from the rest of
+   the app. Rebuilt to use the same full-width, fixed-sidebar-plus-flexible-
+   content pattern the rest of the console already uses (see .studio-layout)
+   instead of inventing a one-off layout just for this page: a charcoal
+   identity panel paired with the warm-ivory security card, not two copies of
+   the same card, but sized like the rest of the console, not a landing page. */
+.account-settings-grid{display:grid; grid-template-columns:280px minmax(0,1fr); gap:16px; align-items:start; max-width:1040px;}
+@media (max-width:760px){.account-settings-grid{grid-template-columns:1fr;}}
 
 .account-identity-panel{
   background:var(--nav-bg); color:#fff; border-radius:var(--radius); padding:24px 20px;
   display:flex; flex-direction:column; align-items:center; text-align:center;
-  box-shadow:var(--shadow);
+  box-shadow:var(--shadow); position:sticky; top:0;
 }
 .account-avatar{
   width:64px; height:64px; border-radius:50%; display:flex; align-items:center; justify-content:center;
@@ -1098,10 +1142,12 @@ canvas{max-width:100%;}
 .account-identity-name{font-family:var(--font-display); font-size:17px; font-weight:600;}
 .account-identity-username{font-size:12px; color:#9DA6AE; margin-top:2px;}
 .account-identity-divider{width:100%; height:1px; background:var(--nav-line); margin:18px 0 14px;}
-.account-identity-row{display:flex; align-items:center; gap:8px; font-size:11.5px; color:#B9C0C6;}
+.account-identity-row{display:flex; align-items:center; gap:8px; font-size:11.5px; color:#B9C0C6; text-align:left;}
+.account-identity-row + .account-identity-row{margin-top:8px;}
 
-.account-security-panel{padding:22px 20px;}
+.account-security-panel{padding:22px 20px; margin-bottom:16px;}
 .account-security-field{display:block; margin-bottom:14px;}
+@media (max-width:760px){.account-identity-panel{position:static;}}
 
 /* ============ OPERATIONS INTELLIGENCE (2026-10-15, Admin Today) ===========
    ============================================================================ */

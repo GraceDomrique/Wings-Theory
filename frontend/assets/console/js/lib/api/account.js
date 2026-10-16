@@ -82,4 +82,15 @@ export function updateDisplayName(username, displayName) {
   });
 }
 
+/**
+ * Admin-only rename of the username used to sign in. Signs that account out
+ * everywhere (same mechanism as a password change) — the account must sign
+ * in again with the new username afterward.
+ */
+export function updateUsername(username, newUsername) {
+  return api.patch(`/console/users/${encodeURIComponent(username)}/username`, {
+    new_username: newUsername,
+  });
+}
+
 export { MIN_PASSWORD_LENGTH };
