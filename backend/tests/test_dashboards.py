@@ -63,14 +63,15 @@ class TestDashboardEndpoints(unittest.TestCase):
             r = cls.client.post("/auth/login", json={"username": username, "password": password})
             return r.json()["token"]
 
-        # username 'owner' seeds role='admin' (see wt/seed.py's own comment —
-        # an unfortunate but pre-existing naming collision in the fixture,
-        # not something this test file introduces).
-        cls.H_ADMIN = {"Authorization": f"Bearer {token('owner')}"}
+        # username 'Administrator' seeds role='admin' (see wt/seed.py's own
+        # comment — an unfortunate but pre-existing naming collision in the
+        # fixture, not something this test file introduces).
+        cls.H_ADMIN = {"Authorization": f"Bearer {token('Administrator', 'wingstheoryadd')}"}
 
-        provisioned = owner_provisioning.provision_first_owner(cls.conn, "biz_owner", "B. Owner")
-        cls.conn.execute("UPDATE app_user SET must_change_password=0 WHERE username='biz_owner'")
-        cls.H_OWNER = {"Authorization": f"Bearer {token('biz_owner', provisioned['temporary_password'])}"}
+        # seed.seed_users() now seeds its own owner-role account
+        # ('business_owner') by default, so this logs into it directly
+        # rather than provisioning a redundant second one.
+        cls.H_OWNER = {"Authorization": f"Bearer {token('business_owner', 'ownerwingstheory')}"}
 
     @classmethod
     def tearDownClass(cls):

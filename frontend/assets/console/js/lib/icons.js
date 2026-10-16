@@ -57,6 +57,12 @@ export const ICONS = {
   // gradients, no feather detail, so it still reads cleanly at 24px.
   brandMark: '<path d="M3 7l4.2 11 3.3-7.5L13.8 18l4.2-11"/><path d="M17.3 9.5L21 7"/>',
   arrowUpRight: '<path d="M7 17 17 7"/><path d="M7 7h10v10"/>',
+
+  // Role avatars (Account Settings / Users & Access) — a role-shaped icon
+  // instead of plain text initials, so the account card reads at a glance
+  // instead of needing the role Pill text below it to tell admin from owner.
+  shieldCheck: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+  crown: '<path d="M11.562 3.266a.5.5 0 0 1 .876 0L15.39 8.87a1 1 0 0 0 1.516.294L21.183 5.5a.5.5 0 0 1 .798.519l-2.834 10.246a1 1 0 0 1-.956.734H5.81a1 1 0 0 1-.957-.734L2.02 6.02a.5.5 0 0 1 .798-.519l4.276 3.664a1 1 0 0 0 1.516-.294z"/><path d="M5 21h14"/>',
 };
 
 /** Convenience: `iconName('package', 20)` → an <svg> node, via lib/dom.js's icon(). */

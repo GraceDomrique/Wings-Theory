@@ -29,20 +29,17 @@ export async function render() {
       securityNotesPanel()));
 }
 
-function initials(name) {
-  return (name || '?').trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
-}
-
 const ROLE_LABEL = { admin: 'Administrator', owner: 'Owner', cashier: 'Cashier', kitchen: 'Kitchen' };
 
 // LEFT — Account Identity: a dark charcoal panel (spec: "charcoal profile
 // panel with tasteful slate-blue and muted-orange accents") distinct from
 // the warm-ivory security card beside it, so the two halves read as
 // "who you are" vs. "what you do here" at a glance, not two copies of the
-// same white card.
+// same white card. A plain person icon, not a per-role icon -- the sidebar
+// mark (layout/Sidebar.js) is where role identity (shield/crown) is shown.
 function identityPanel(u) {
   return h('div', { class: 'account-identity-panel' },
-    h('div', { class: 'account-avatar' }, initials(u.displayName || u.username)),
+    h('div', { class: 'account-avatar' }, icon(ICONS.userRound, 30)),
     h('div', { class: 'account-identity-name' }, u.displayName || u.username || 'Unknown'),
     u.username && u.username !== u.displayName
       ? h('div', { class: 'account-identity-username' }, '@', u.username)

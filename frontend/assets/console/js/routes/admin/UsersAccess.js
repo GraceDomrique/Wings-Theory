@@ -1,4 +1,5 @@
-import { h, mount } from '../../lib/dom.js';
+import { h, mount, icon } from '../../lib/dom.js';
+import { ICONS } from '../../lib/icons.js';
 import { Card, CardHeader } from '../../components/ui/Card.js';
 import { Table } from '../../components/ui/Table.js';
 import { Pill } from '../../components/ui/Pill.js';
@@ -95,9 +96,6 @@ function humanCapability(capability) {
   return `${verb} ${groupFor(capability).toLowerCase()}`;
 }
 
-function initials(name) {
-  return (name || '?').trim().split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
-}
 
 export async function render(ctx) {
   const isAdmin = (session.user || {}).role === 'admin';
@@ -124,7 +122,7 @@ export async function render(ctx) {
           width: '40px', height: '40px', borderRadius: '99px', background: color.bg, color: color.fg,
           fontWeight: '700', fontSize: '13px', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: '0',
         },
-      }, initials(u.displayName || u.username)),
+      }, icon(ICONS.userRound, 18)),
       h('div', { style: { flexGrow: '1', minWidth: '0' } },
         h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' } },
           h('div', { style: { fontWeight: '600', fontSize: '14px' } }, u.displayName || u.username),

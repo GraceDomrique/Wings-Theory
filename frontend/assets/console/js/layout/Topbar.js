@@ -1,5 +1,6 @@
 import { h, icon } from '../lib/dom.js';
 import { session } from '../lib/api/client.js';
+import { ICONS } from '../lib/icons.js';
 
 /**
  * Page title/sub, search, the refresh control, and a profile chip with an
@@ -21,19 +22,18 @@ export function Topbar({ title, sub, onSearch, onSignOut }) {
     onInput: (e) => onSearch && onSearch(e.target.value),
   });
 
-  const refresh = h('button', {
+  const user = session.user || {};
+  // Admin and owner don't get the manual reload button -- removed for
+  // those two roles on request; cashier/kitchen keep it.
+  const refresh = (user.role === 'admin' || user.role === 'owner') ? null : h('button', {
     class: 'icon-btn', title: 'Reload this page’s data',
   }, icon('<path d="M21 12a9 9 0 11-3-6.7"/><path d="M21 3v6h-6"/>', 15));
-
-  const user = session.user || {};
-  const initials = (user.displayName || user.username || '?')
-    .split(/\s+/).map((w) => w[0]).slice(0, 2).join('').toUpperCase();
   const signOutBtn = h('button', {
     class: 'icon-btn', title: 'Sign out', onClick: () => onSignOut && onSignOut(),
   }, icon('<path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/>', 15));
 
   const profile = h('div', { class: 'topbar-profile' },
-    h('div', { class: 'avatar' }, initials),
+    h('div', { class: 'avatar' }, icon(ICONS.userRound, 16)),
     h('div', { class: 'id' },
       h('div', { class: 'name' }, user.displayName || user.username || 'Signed in'),
       user.role ? h('div', { class: 'role' }, user.role) : null),
@@ -70,6 +70,6 @@ export function Topbar({ title, sub, onSearch, onSignOut }) {
     if (!visible) input.value = '';
   };
   el.setSearchPlaceholder = (text) => { input.placeholder = text || 'Search…'; };
-  el.onRefresh = (fn) => refresh.addEventListener('click', fn);
+  el.onRefresh = (fn) => refresh && refresh.addEventListener('click', fn);
   return el;
 }

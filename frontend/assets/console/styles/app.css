@@ -1126,28 +1126,32 @@ canvas{max-width:100%;}
    instead of inventing a one-off layout just for this page: a charcoal
    identity panel paired with the warm-ivory security card, not two copies of
    the same card, but sized like the rest of the console, not a landing page. */
-.account-settings-grid{display:grid; grid-template-columns:280px minmax(0,1fr); gap:16px; align-items:start; max-width:1040px;}
+/* align-items:stretch (not :start): the identity panel used to be visibly
+   shorter than the security+about stack beside it, which on a tall viewport
+   read as one more patch of dead whitespace rather than a deliberate layout
+   -- stretching it to match the right column's full height, with its own
+   content vertically centered inside that height, makes the page use the
+   space instead of just leaving it blank. */
+.account-settings-grid{display:grid; grid-template-columns:280px minmax(0,1fr); gap:16px; align-items:stretch; max-width:1100px;}
 @media (max-width:760px){.account-settings-grid{grid-template-columns:1fr;}}
 
 .account-identity-panel{
   background:var(--nav-bg); color:#fff; border-radius:var(--radius); padding:24px 20px;
-  display:flex; flex-direction:column; align-items:center; text-align:center;
-  box-shadow:var(--shadow); position:sticky; top:0;
+  display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center;
+  box-shadow:var(--shadow);
 }
 .account-avatar{
-  width:64px; height:64px; border-radius:50%; display:flex; align-items:center; justify-content:center;
-  font-size:22px; font-weight:700; margin-bottom:14px;
-  background:var(--accent-blue); color:#fff; border:2px solid var(--amber);
+  width:76px; height:76px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+  margin-bottom:16px; background:var(--accent-blue); color:#fff; border:2px solid var(--amber);
 }
-.account-identity-name{font-family:var(--font-display); font-size:17px; font-weight:600;}
+.account-identity-name{font-family:var(--font-display); font-size:18px; font-weight:600;}
 .account-identity-username{font-size:12px; color:#9DA6AE; margin-top:2px;}
-.account-identity-divider{width:100%; height:1px; background:var(--nav-line); margin:18px 0 14px;}
+.account-identity-divider{width:100%; height:1px; background:var(--nav-line); margin:20px 0 16px;}
 .account-identity-row{display:flex; align-items:center; gap:8px; font-size:11.5px; color:#B9C0C6; text-align:left;}
-.account-identity-row + .account-identity-row{margin-top:8px;}
+.account-identity-row + .account-identity-row{margin-top:10px;}
 
 .account-security-panel{padding:22px 20px; margin-bottom:16px;}
 .account-security-field{display:block; margin-bottom:14px;}
-@media (max-width:760px){.account-identity-panel{position:static;}}
 
 /* ============ OPERATIONS INTELLIGENCE (2026-10-15, Admin Today) ===========
    ============================================================================ */

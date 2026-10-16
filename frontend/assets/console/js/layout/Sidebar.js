@@ -218,17 +218,19 @@ export function Sidebar({ activeId, onNavigate }) {
   }, icon(ICONS.userRound), h('span', { class: 'nav-item-label' }, 'Account Settings'));
   leafButtons.set('settings', settingsBtn);
 
-  // 2026-10-15 brand redesign: one WT wing monogram (ICONS.brandMark) for
-  // both roles — a generic orange square with a plain letter "W" replaced
-  // with an original mark, per role-accent color (see app.css's
-  // --brand-accent, scoped to this component only — not the console's
-  // existing --role-accent nav-highlight system). This is the console
-  // shell's own chrome; the official Wings Theory restaurant logo
+  // The sidebar mark used to be the same WT wing monogram (ICONS.brandMark)
+  // for every role, told apart only by --brand-accent's color tint -- at a
+  // glance an admin's and an owner's sidebar looked identical. Now it's the
+  // same role icon used everywhere else in the console for these two roles
+  // (Account Settings' identity panel, the topbar avatar, Users & Access'
+  // account cards): a shield for admin, a crown for owner. This is the
+  // console shell's own chrome; the official Wings Theory restaurant logo
   // (/img/logo.png, used on the sign-in screen) is untouched.
+  const BRAND_MARK_ICON = { admin: ICONS.shieldCheck, owner: ICONS.crown };
   const subtitle = role === 'owner' ? 'Owner Intelligence' : 'Operations Console';
   const el = h('aside', { class: 'sidebar' },
     h('div', { class: 'brand' },
-      h('div', { class: 'brand-mark' }, icon(ICONS.brandMark, 20)),
+      h('div', { class: 'brand-mark' }, icon(BRAND_MARK_ICON[role] || ICONS.brandMark, 20)),
       h('div', { class: 'brand-text' },
         h('div', { class: 't1' }, 'Wings Theory'),
         h('div', { class: 't2' }, subtitle))),
