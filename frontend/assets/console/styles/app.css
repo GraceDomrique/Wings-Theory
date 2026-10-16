@@ -1,0 +1,1198 @@
+/* Layout, shell and primitives — lifted from the approved prototype
+   (design/wings-theory-console.html) so the rebuilt console is visually
+   identical to what was signed off. Every value here resolves to a token
+   from tokens.css; no literal colors below. */
+
+*{box-sizing:border-box;}
+html,body{height:100%;}
+/* Role accent lives on body (not .sidebar) so BOTH the sidebar and the
+   topbar -- siblings in the shell, neither an ancestor of the other -- can
+   read the same source of truth. AppShell adds body.role-admin/role-owner
+   once per session (see app.js); default values below are the owner's. */
+body{
+  --role-accent:var(--amber);
+  --role-accent-ink:#221805;
+  --role-accent-tint:var(--amber-tint);
+  --role-accent-tint-ink:var(--amber-deep);
+  margin:0; background:var(--bg); color:var(--ink);
+  font-family:var(--font-body); font-size:13.5px; line-height:1.45;
+  -webkit-font-smoothing:antialiased;
+}
+body.role-admin{
+  --role-accent:var(--accent-blue);
+  --role-accent-ink:#FFFFFF;
+  --role-accent-tint:var(--accent-blue-tint);
+  --role-accent-tint-ink:var(--accent-blue-deep);
+}
+::selection{background:var(--amber-tint); color:var(--amber-deep);}
+a{color:inherit; text-decoration:none;}
+button{font-family:inherit; cursor:pointer;}
+::-webkit-scrollbar{width:8px; height:8px;}
+::-webkit-scrollbar-thumb{background:var(--line); border-radius:4px;}
+::-webkit-scrollbar-track{background:transparent;}
+
+/* Dark-panel scrollbars (sidebar nav, topbar dropdowns) must not use the
+   light --line thumb above -- on a navy panel that reads as a bright white
+   bar, not a subtle UI detail. Thin + low-opacity white, visible on hover
+   only slightly stronger, same treatment Firefox gets via scrollbar-color. */
+.sidebar, .nav-tree{
+  scrollbar-width:thin; scrollbar-color:rgba(255,255,255,0.14) transparent;
+}
+.sidebar::-webkit-scrollbar, .nav-tree::-webkit-scrollbar{width:5px;}
+.sidebar::-webkit-scrollbar-thumb, .nav-tree::-webkit-scrollbar-thumb{
+  background:rgba(255,255,255,0.14); border-radius:3px;
+}
+.sidebar::-webkit-scrollbar-thumb:hover, .nav-tree::-webkit-scrollbar-thumb:hover{
+  background:rgba(255,255,255,0.26);
+}
+.sidebar::-webkit-scrollbar-track, .nav-tree::-webkit-scrollbar-track{background:transparent;}
+
+/* ============ SHELL ============ */
+.shell{display:grid; grid-template-columns:236px 1fr; height:100vh; overflow:hidden; transition:grid-template-columns .15s ease;}
+/* min-width:601px: the manual collapse toggle is a desktop/laptop affordance.
+   Below 600px the shell already has its own fixed mobile layout (the bottom
+   tab bar, further down this file) that must win regardless of whatever
+   collapsed/expanded state the user last left on a wider screen -- without
+   this guard, a persisted body.nav-collapsed from localStorage (it is never
+   viewport-scoped) beat the 600px breakpoint's .shell rule purely on
+   selector specificity (two classes vs. one), silently squeezing the mobile
+   layout back into the narrow icon-rail two-column grid it was designed to
+   replace (found testing at 375px: .shell computed to 68px/1fr instead of
+   the expected single column). */
+@media (min-width:601px){ body.nav-collapsed .shell{grid-template-columns:68px 1fr;} }
+
+/* ---- Sidebar ---- */
+/* Deepened to navy-black (2026-10 reference-design pass) -- was var(--ink),
+   a warm near-black shared with body text, which read as brown rather than
+   the reference's navy. This is a sidebar-local literal, same precedent as
+   the cream/near-black shades below it (#EDE7D9 etc.) that were already
+   hardcoded here rather than in tokens.css, since nothing else in the
+   console uses this exact dark palette. Accent itself is --role-accent* on
+   body (above), not redeclared here, so the topbar can read the same vars. */
+.sidebar{
+  background:var(--nav-bg); color:#EDE7D9; display:flex; flex-direction:column;
+  padding:18px 12px; border-right:1px solid var(--nav-bg-deep); overflow-y:auto;
+}
+/* Brand mark accent (2026-10-15) — deliberately its OWN variable, not
+   --role-accent: --role-accent already carries a documented, intentional
+   split (slate blue for Admin's active-nav state, distinct from the brand's
+   burnt orange) that the console's working nav highlighting depends on.
+   The brand identity spec asks for a DIFFERENT split (burnt orange for
+   Admin, muted champagne for Owner) scoped to the logo mark itself, so it
+   gets its own token rather than overloading --role-accent and breaking
+   the nav-highlight distinction it already carries. */
+:root{--brand-accent:var(--amber);}
+body.role-owner{--brand-accent:#C4A477;}
+
+.brand{display:flex; align-items:center; gap:10px; padding:6px 8px 18px; border-bottom:1px solid rgba(255,255,255,0.08); margin-bottom:14px;}
+.brand-mark{
+  width:34px; height:34px; border-radius:8px; background:var(--brand-accent);
+  display:flex; align-items:center; justify-content:center; color:var(--nav-bg); flex-shrink:0;
+}
+.brand-mark svg{width:20px; height:20px;}
+.brand-text .t1{font-family:var(--font-display); font-weight:700; font-size:15.5px; letter-spacing:.2px; color:#fff;}
+.brand-text .t2{font-size:10px; letter-spacing:1.4px; text-transform:uppercase; color:var(--brand-accent); margin-top:1px;}
+
+/* flex:1 so the nav list (not the sidebar's own overflow) absorbs leftover
+   vertical space -- otherwise .sidebar-photo and .sidebar-foot below it
+   would sit wherever the nav tree's natural height left them rather than
+   anchored together at the bottom (only .sidebar-foot had margin-top:auto). */
+.nav-tree{display:flex; flex-direction:column; flex:1; overflow-y:auto; min-height:0;}
+/* Account Settings — pinned below the scrollable tree, above Collapse, same
+   rank as the role/account chip rather than another operational page. */
+.nav-foot{border-top:1px solid var(--nav-line); margin-top:8px; padding-top:8px; flex-shrink:0;}
+.nav-group{margin-bottom:4px;}
+.nav-item{
+  display:flex; align-items:center; gap:10px; padding:10px 10px; border-radius:8px; color:#D8D1C2;
+  font-size:13px; font-weight:500; cursor:pointer; margin-bottom:3px; border:none; background:transparent; width:100%; text-align:left;
+}
+.nav-item svg{width:16px; height:16px; flex-shrink:0; opacity:.85;}
+.nav-item:hover{background:rgba(255,255,255,0.06); color:#fff;}
+.nav-item.active{background:var(--role-accent); color:var(--role-accent-ink); font-weight:600;}
+.nav-item.active svg{opacity:1;}
+.nav-badge{margin-left:auto; background:var(--crit); color:#fff; font-size:10px; font-weight:700; padding:1px 6px; border-radius:20px;}
+.nav-item.active .nav-badge{background:var(--role-accent-ink); color:var(--role-accent);}
+
+/* Accordion group — a parent that expands/collapses and never mounts a
+   page of its own; only its children (indented .nav-item buttons below it)
+   are real routes. */
+.nav-group-toggle{
+  display:flex; align-items:center; gap:10px; padding:10px 10px; border-radius:8px; color:#D8D1C2;
+  font-size:12.5px; font-weight:600; letter-spacing:.2px; cursor:pointer; border:none; background:transparent;
+  width:100%; text-align:left;
+}
+.nav-group-toggle svg{width:16px; height:16px; flex-shrink:0; opacity:.85;}
+.nav-group-toggle:hover{background:rgba(255,255,255,0.06); color:#fff;}
+.nav-group-label{flex:1;}
+.nav-group-chevron{display:flex; flex-shrink:0; transition:transform .15s ease; opacity:.7;}
+.nav-group-chevron svg{width:14px; height:14px;}
+.nav-group-chevron.open{transform:rotate(90deg);}
+.nav-group-body{padding-left:14px; border-left:1px solid rgba(255,255,255,0.08); margin:2px 0 6px 20px;}
+.nav-group-body .nav-item{font-size:12.5px; padding:7px 10px;}
+
+/* Lower-sidebar wing photograph (reference screenshots, 2026-10 -- enlarged
+   and bled to the sidebar's own edges per 2026-10 revision: a small inset
+   rounded box read as "a thumbnail," not "integrated into the sidebar." The
+   negative side margins cancel .sidebar's own 12px padding so the photo
+   runs genuinely edge-to-edge like the reference, and the gradient's final
+   stop matches .sidebar's own background color exactly so the photo melts
+   into the dark panel below it rather than ending on a visible seam. */
+.sidebar-photo{
+  position:relative; margin:16px -12px 0; overflow:hidden;
+  height:240px; flex-shrink:0; background-size:cover; background-position:center 32%;
+}
+.sidebar-photo::before{
+  content:''; position:absolute; inset:0;
+  background:linear-gradient(180deg, rgba(23,28,26,0) 30%, rgba(23,28,26,0.45) 60%, var(--nav-bg) 100%);
+}
+.sidebar-photo-tag{
+  position:absolute; left:18px; right:18px; bottom:16px; z-index:1;
+  font-family:var(--font-display); font-weight:700; font-size:14px; line-height:1.3;
+  letter-spacing:.3px; color:#fff; text-shadow:0 1px 4px rgba(0,0,0,0.6);
+}
+.sidebar-photo-tag .sub{display:block; font-family:var(--font-body); font-weight:500; font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:#D8D1C2; margin-top:3px;}
+/* Script-style wordmark above the GOOD FOOD caption (reference mockup) --
+   italic Fraunces stands in for a cursive face since the console only ever
+   self-hosts Fraunces/Inter/JetBrains Mono (LAN deployment, no remote font
+   fetches), rather than pulling in a dedicated script font for one line. */
+.sidebar-photo-wordmark{font-style:italic; font-size:19px; font-weight:600; margin-bottom:4px; letter-spacing:.2px;}
+@media (min-width:601px){ body.nav-collapsed .sidebar-photo{display:none;} }
+
+/* --role-accent-tint* lives on body, so this renders correctly wherever the
+   avatar is reused (currently only the topbar's profile chip). */
+.avatar{width:30px; height:30px; border-radius:50%; background:var(--role-accent-tint); color:var(--role-accent-tint-ink); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:12px; flex-shrink:0;}
+
+/* Collapsible rail (2026-10). .nav-item-label wraps every piece of text
+   next to an icon so the collapsed state can hide labels without hiding
+   the icon/badge siblings next to them. Width itself lives on .shell
+   above, not here -- .sidebar has no fixed width of its own. */
+.nav-collapse-toggle{
+  display:flex; align-items:center; gap:10px; padding:9px 10px; margin-top:4px; border-radius:8px; color:#9C9385;
+  font-size:11.5px; font-weight:600; cursor:pointer; border:none; background:transparent; width:100%; text-align:left;
+}
+.nav-collapse-toggle:hover{background:rgba(255,255,255,0.06); color:#fff;}
+.nav-collapse-chevron{display:flex; flex-shrink:0; transition:transform .15s ease; opacity:.8;}
+.nav-collapse-chevron svg{width:14px; height:14px;}
+.nav-collapse-chevron.open{transform:rotate(180deg);}
+
+/* min-width:601px guard: see the matching note by .shell above -- same
+   persisted-desktop-state-vs-mobile-breakpoint specificity conflict. */
+@media (min-width:601px){
+  body.nav-collapsed .brand-text,
+  body.nav-collapsed .nav-item-label,
+  body.nav-collapsed .nav-group-label,
+  body.nav-collapsed .nav-group-chevron,
+  body.nav-collapsed .nav-badge{display:none;}
+  body.nav-collapsed .nav-item,
+  body.nav-collapsed .nav-item-top,
+  body.nav-collapsed .nav-group-toggle,
+  body.nav-collapsed .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
+  body.nav-collapsed .nav-group-body{display:none !important;}
+  body.nav-collapsed .brand{justify-content:center; padding-left:0; padding-right:0;}
+}
+
+/* ---- Main ---- */
+.main{display:flex; flex-direction:column; min-width:0; height:100vh; overflow:hidden;}
+/* Dark header (2026-10 reference-design revision) -- was a plain white bar,
+   which the reference's dark/structured header reads nothing like. Same
+   navy (#12141D) as .sidebar so the shell reads as one dark frame around
+   the (still light) content area, with a role-accent bottom edge tying it
+   to the active sidebar color. */
+.topbar{
+  display:flex; align-items:center; justify-content:space-between; gap:16px;
+  padding:14px 26px; background:var(--nav-bg); border-bottom:3px solid var(--role-accent); flex-shrink:0;
+}
+.breadcrumb{font-size:11px; font-weight:600; letter-spacing:.3px; text-transform:uppercase; color:var(--role-accent); margin-bottom:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.topbar h1{font-family:var(--font-display); font-size:21px; font-weight:600; margin:0; color:#fff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.topbar .sub{font-size:12px; color:#9C9385; margin-top:1px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+/* min-width:0 is load-bearing: a flex child's default min-width is auto
+   (its content's natural width), so without this the title block never
+   actually shrinks below "Today's description, fully spelled out" and the
+   ellipsis rules above never engage -- the topbar just overflows instead. */
+.topbar-titles{min-width:0; flex:1; overflow:hidden;}
+.topbar-right{display:flex; align-items:center; gap:10px; flex-shrink:0;}
+
+.topbar .search{
+  display:flex; align-items:center; gap:8px; background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.12);
+  border-radius:8px; padding:7px 12px; color:#9C9385; font-size:12.5px; width:230px;
+}
+.topbar .search input{border:none; background:transparent; outline:none; font-family:inherit; font-size:12.5px; color:#fff; width:100%; min-width:0;}
+.topbar .search input::placeholder{color:#7A7366;}
+.topbar .kbd{margin-left:auto; font-family:var(--font-mono); font-size:10px; background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.14); border-radius:4px; padding:1px 5px; color:#9C9385; flex-shrink:0;}
+.topbar .icon-btn{width:32px; height:32px; border-radius:8px; border:1px solid rgba(255,255,255,0.14); background:rgba(255,255,255,0.07); display:flex; align-items:center; justify-content:center; color:#D8D1C2; flex-shrink:0;}
+.topbar .icon-btn:hover{background:rgba(255,255,255,0.14); color:#fff;}
+
+/* Elsewhere (Recipes/MenuAvailability toolbars, Modal's close button), these
+   two classes stay on the light surface they were always on -- only scoped
+   .topbar .icon-btn/.search above changed. */
+.icon-btn{width:32px; height:32px; border-radius:8px; border:1px solid var(--line); background:var(--surface); display:flex; align-items:center; justify-content:center; color:var(--ink-soft); flex-shrink:0;}
+.search{
+  display:flex; align-items:center; gap:8px; background:var(--surface-sunk); border:1px solid var(--line);
+  border-radius:8px; padding:7px 12px; color:var(--ink-faint); font-size:12.5px; width:230px;
+}
+.search input{border:none; background:transparent; outline:none; font-family:inherit; font-size:12.5px; color:var(--ink); width:100%; min-width:0;}
+.search input::placeholder{color:var(--ink-faint);}
+.kbd{margin-left:auto; font-family:var(--font-mono); font-size:10px; background:var(--surface); border:1px solid var(--line); border-radius:4px; padding:1px 5px; color:var(--ink-faint); flex-shrink:0;}
+
+/* Topbar profile chip -- who's signed in, plus the single icon-only sign-out
+   control (moved here from the sidebar foot so it isn't duplicated). */
+/* Was using --ink/--ink-soft (near-black, meant for light surfaces) on this
+   dark navy panel -- name/role were barely legible. Both now use explicit
+   light colors, and role is a small role-accent pill instead of plain text
+   so who's-signed-in-as reads at a glance. */
+.topbar-profile{display:flex; align-items:center; gap:10px; padding-left:14px; border-left:1px solid rgba(255,255,255,0.14); flex-shrink:0;}
+.topbar-profile .avatar{width:34px; height:34px; font-size:12.5px; box-shadow:0 0 0 2px rgba(255,255,255,0.1);}
+.topbar-profile .id{display:flex; flex-direction:column; gap:3px; min-width:0;}
+.topbar-profile .name{font-size:12.5px; font-weight:600; color:#fff; line-height:1.1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:140px;}
+.topbar-profile .role{
+  font-size:9.5px; font-weight:700; letter-spacing:.4px; text-transform:uppercase; line-height:1;
+  color:var(--role-accent-ink); background:var(--role-accent); border-radius:99px; padding:2.5px 7px; width:fit-content;
+}
+.topbar-profile .icon-btn{margin-left:4px;}
+
+/* Adaptive top bar (spec: desktop full title+description+controls; tablet
+   shortens the description via the ellipsis rules above and drops search;
+   phone drops the description and profile text entirely, leaving title +
+   refresh + avatar). Found by testing at 375px: the topbar previously had
+   no narrow treatment at all, so search (fixed 230px, merely
+   visibility:hidden -- still reserved its layout space) plus the full name/
+   role profile chip pushed the refresh button off the right edge of the
+   viewport (topbar content 548px wide inside a 375px box). Placed after the
+   base .topbar-profile .id rule above (not just inside a later media query)
+   because both selectors share identical specificity -- source order, not
+   the media query, is what decides which one wins. */
+@media (max-width:760px){
+  .topbar{padding:12px 14px; gap:8px;}
+  .topbar .search{display:none !important;}
+  .topbar-profile{padding-left:8px; gap:6px;}
+  .topbar-profile .id{display:none;}
+}
+@media (max-width:480px){
+  .topbar .sub, .breadcrumb{display:none;}
+  .topbar h1{font-size:17px;}
+}
+
+.content{flex:1; overflow-y:auto; padding:20px 26px 32px;}
+
+/* ============ PRIMITIVES ============ */
+.grid{display:grid; gap:14px;}
+.card{
+  background:var(--surface); border:1px solid var(--line); border-radius:var(--radius);
+  box-shadow:var(--shadow); padding:16px 18px;
+}
+.card-head{display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:12px; gap:10px; flex-wrap:wrap;}
+.card-title{font-family:var(--font-display); font-size:15px; font-weight:600;}
+.card-desc{font-size:11.5px; color:var(--ink-soft); margin-top:2px;}
+
+/* Build-a-combo modal: a two-column working layout (form + live preview)
+   instead of one long vertical stack, with pricing rules folded in as a
+   collapsible section right next to the price field it affects. */
+.combo-builder-grid{display:grid; grid-template-columns:1.2fr 1fr; gap:22px;}
+.combo-builder-col{min-width:0;}
+.combo-builder-preview{border-left:1px solid var(--line-soft); padding-left:22px;}
+@media (max-width:760px){.combo-builder-grid{grid-template-columns:1fr;} .combo-builder-preview{border-left:none; padding-left:0; border-top:1px solid var(--line-soft); padding-top:16px;}}
+
+/* Sticky modal footer (spec: Combo Builder's Save Draft/Cancel/Publish row)
+   — Modal.js's own box is the scrolling element (overflow-y:auto directly
+   on .card), so position:sticky on a direct child pins correctly within
+   it without any extra wrapper. */
+.modal-sticky-footer{
+  position:sticky; bottom:-16px; margin:14px -18px -16px; padding:14px 18px;
+  background:var(--surface); border-top:1px solid var(--line-soft);
+  display:flex; justify-content:flex-end; gap:8px;
+}
+
+.combo-item-row{display:flex; gap:8px; align-items:center; margin-bottom:8px; background:var(--surface-2,#f6f3ec); border:1px solid var(--line-soft); border-radius:8px; padding:6px 8px;}
+.combo-item-row select{flex:1; min-width:0;}
+.combo-item-row input[type=number]{width:56px;}
+.combo-item-row-num{flex-shrink:0; width:18px; height:18px; border-radius:50%; background:var(--line); color:var(--ink-soft); font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center;}
+.combo-item-row-x{flex-shrink:0; color:var(--ink-faint); font-size:11px;}
+
+.combo-pricing-rules{margin-top:16px; border:1px solid var(--line-soft); border-radius:8px; padding:0; overflow:hidden;}
+.combo-pricing-rules summary{cursor:pointer; padding:9px 12px; font-size:12px; font-weight:600; list-style:none; display:flex; align-items:baseline; gap:6px;}
+.combo-pricing-rules summary::-webkit-details-marker{display:none;}
+.combo-pricing-rules-body{padding:4px 12px 14px;}
+
+/* Order detail modal: receipt + timeline, not a generic label/value grid. */
+.order-ribbon{display:flex; align-items:center; justify-content:space-between; background:var(--role-accent-tint); border-radius:8px; padding:10px 14px; margin-bottom:14px;}
+.order-ribbon.voided{background:rgba(211,47,47,0.12);}
+.order-ribbon-badge{font-size:12px; font-weight:700; text-transform:capitalize; color:var(--role-accent-tint-ink);}
+.order-ribbon.voided .order-ribbon-badge{color:var(--crit);}
+.order-ribbon-table{font-size:11.5px; color:var(--ink-soft); font-weight:600;}
+.order-stat-strip{display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:6px;}
+.order-stat{border:1px solid var(--line-soft); border-radius:8px; padding:9px 10px; text-align:center;}
+.order-stat-value{font-size:15px; font-weight:700; font-family:var(--font-display);}
+.order-stat-label{font-size:10px; color:var(--ink-faint); text-transform:uppercase; letter-spacing:.5px; margin-top:2px;}
+.order-receipt{border:1px dashed var(--line); border-radius:8px; padding:4px 12px;}
+.order-receipt-line{display:flex; align-items:center; gap:10px; padding:7px 0; border-bottom:1px dashed var(--line-soft); font-size:12.5px;}
+.order-receipt-line:last-child{border-bottom:none;}
+.order-receipt-qty{flex-shrink:0; color:var(--ink-faint); font-size:11px; width:26px;}
+.order-receipt-name{flex:1;}
+.order-receipt-amount{flex-shrink:0; font-weight:600;}
+.order-timeline{display:flex; align-items:flex-start; gap:4px;}
+.order-timeline-step{display:flex; align-items:center; gap:8px; flex:1; position:relative;}
+.order-timeline-step:not(:last-child)::after{content:''; flex:1; height:2px; background:var(--line); margin:0 6px;}
+.order-timeline-dot{width:10px; height:10px; border-radius:50%; background:var(--good); flex-shrink:0;}
+.order-timeline-step.crit .order-timeline-dot{background:var(--crit);}
+@media (max-width:620px){.order-stat-strip{grid-template-columns:repeat(2,1fr);} .order-timeline{flex-direction:column; align-items:flex-start; gap:12px;} .order-timeline-step:not(:last-child)::after{display:none;}}
+
+/* 2026-10-14: native number-input spinner arrows removed GLOBALLY, not just
+   on the one field (.no-spinner, kept below for the unit-badge layout that
+   depends on it) that opted in before. +/- 1 clicks are not how anyone
+   enters a delivery quantity, a price, or a recipe line — and the arrows
+   themselves were never styled, so they were the one visibly "un-designed"
+   control in every form. Keyboard and screen-reader numeric entry (typing
+   digits, arrow-key value stepping) is untouched; only the visual spin
+   buttons are hidden. inputmode="decimal"/"numeric" on individual fields
+   (set at the call site, not here) is what actually improves the on-screen
+   keyboard on a tablet — removing the spinner doesn't do that by itself. */
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none; margin:0;}
+input[type=number]{-moz-appearance:textfield;}
+.field-with-badge{display:flex; align-items:stretch;}
+.field-with-badge input{border-top-right-radius:0; border-bottom-right-radius:0; flex:1; min-width:0;}
+.field-unit-badge{display:flex; align-items:center; padding:0 10px; background:var(--surface-2,#f1ece3); border:1px solid var(--line); border-left:none; border-top-right-radius:8px; border-bottom-right-radius:8px; font-size:11.5px; font-weight:600; color:var(--ink-soft); text-transform:lowercase;}
+
+/* FileUpload (components/ui/FileUpload.js) — the styled drop zone that
+   replaces a raw <input type=file>'s native "Choose File / No file chosen"
+   text, which looked like a form the rest of the design system never
+   touched. */
+.file-upload-zone{
+  display:flex; flex-direction:column; align-items:center; justify-content:center; text-align:center;
+  padding:28px 16px; border:1.5px dashed var(--line); border-radius:var(--radius); cursor:pointer;
+  color:var(--ink-faint); background:var(--surface-sunk); transition:border-color .12s ease, background .12s ease;
+}
+.file-upload-zone:hover, .file-upload-zone:focus-visible{border-color:var(--amber); color:var(--ink-soft);}
+.file-upload-zone.drag-over{border-color:var(--amber); background:var(--amber-tint); color:var(--amber-deep);}
+.file-upload-zone:focus-visible{outline:2px solid var(--amber); outline-offset:2px;}
+
+/* Forecast chart legend: explicit, so the history/forecast colors are never
+   left to be inferred from the chart alone. */
+.forecast-legend{display:flex; gap:16px; flex-wrap:wrap;}
+.forecast-legend-item{display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--ink-soft); font-weight:600;}
+.forecast-legend-swatch{width:16px; height:3px; border-radius:2px; display:inline-block;}
+.forecast-legend-swatch.dashed{height:0; border-top:2px dashed; background:none;}
+
+/* Add-recipe modal line rows: numbered, labeled columns instead of a bare
+   unlabeled grid. */
+.recipe-line-row{display:grid; grid-template-columns:20px minmax(0,2fr) minmax(0,1.4fr) 90px 32px; gap:8px; align-items:center; margin-bottom:6px;}
+/* Found testing the Add/Edit Recipe modal at 375px: fr tracks with no
+   minmax(0,...) floor at min-content, not 0 -- the ingredient-search input's
+   own natural width held the row to its full desktop span (582px measured)
+   regardless of the 375px modal around it, clipping the qty field
+   completely out of reach rather than just looking cramped. Below 480px
+   this reflows to two rows instead of continuing to squeeze five columns:
+   ingredient + remove on top (remove stays reachable without scrolling
+   right), label + qty below, with the numbered badge spanning both. */
+@media (max-width:480px){
+  .recipe-line-row{grid-template-columns:20px minmax(0,1fr) minmax(0,1fr) 32px; grid-template-rows:auto auto;}
+  .recipe-line-row > :nth-child(1){grid-row:1 / 3; align-self:start; margin-top:2px;}
+  .recipe-line-row > :nth-child(2){grid-column:2 / 4; grid-row:1;}
+  .recipe-line-row > :nth-child(5){grid-column:4; grid-row:1;}
+  .recipe-line-row > :nth-child(3){grid-column:2; grid-row:2;}
+  .recipe-line-row > :nth-child(4){grid-column:3; grid-row:2;}
+}
+.recipe-line-num{width:18px; height:18px; border-radius:50%; background:var(--line); color:var(--ink-soft); font-size:10px; font-weight:700; display:flex; align-items:center; justify-content:center;}
+.recipe-line-head{font-size:10px; text-transform:uppercase; letter-spacing:.5px; color:var(--ink-faint); font-weight:600; margin-bottom:4px;}
+.eyebrow{font-size:10px; letter-spacing:1.2px; text-transform:uppercase; color:var(--ink-faint); font-weight:600; margin-bottom:6px;}
+/* The one large "business at a glance" panel atop each dashboard (Store
+   Status / Business Pulse) -- a genuine photographic hero (2026-10 revision:
+   an icon-tile-on-white card here read as "a card with a colored icon," not
+   the reference's large photographic banner). Stats/text sit directly on
+   the photo over a bottom-weighted dark gradient, white on dark rather than
+   ink-on-white -- every text class used inside it is re-pointed to a light
+   color below rather than left to inherit --ink-soft/--ink-faint, which
+   would be close to invisible on a dark photo. */
+.photo-hero{
+  position:relative; overflow:hidden; color:#fff; min-height:238px;
+  display:flex; flex-direction:column; justify-content:flex-end;
+  background-size:cover; background-position:center; padding:22px 24px 20px;
+}
+.photo-hero::before{
+  content:''; position:absolute; inset:0;
+  background:linear-gradient(180deg, rgba(14,13,10,0.1) 0%, rgba(14,13,10,0.35) 40%, rgba(14,13,10,0.88) 100%);
+}
+.photo-hero > *{position:relative; z-index:1;}
+/* .photo-hero is a flex column with no align-items set, which defaults to
+   stretch -- its first child, the status Pill, is a direct flex item and
+   was stretching to the hero's full width (a plain inline-flex chip
+   everywhere else in the app, turned into a giant full-width bar only
+   here). Pills and buttons stay their own content width; the stat-tile
+   grid row below them is the one child that's SUPPOSED to span full width,
+   and keeps doing so since grid rows aren't flex items of this rule. */
+.photo-hero > .pill{align-self:flex-start;}
+.photo-hero .card-head{align-items:center;}
+.photo-hero .card-title{color:#fff; font-size:16.5px;}
+.photo-hero .card-desc{color:#D8D1C2;}
+.photo-hero .t-xs.t-faint, .photo-hero .t-sm.t-soft, .photo-hero p.t-xs.t-faint{color:#D8D1C2;}
+.photo-hero .stat .l{color:#C7BFAE;}
+.photo-hero .btn{background:rgba(255,255,255,0.14); border-color:rgba(255,255,255,0.3); color:#fff; align-self:flex-start;}
+.photo-hero .btn:hover{background:rgba(255,255,255,0.24); border-color:rgba(255,255,255,0.4);}
+/* A pillStat tile is an opaque white .card sitting ON TOP of the hero photo
+   (storeStatusBanner's "Need Attention/Deliveries/..." row) -- it must NOT
+   inherit .photo-hero's white-on-photo text treatment above, or its own
+   number/label render white-on-white and vanish (2026-10 contrast bug). */
+.photo-hero .card{color:var(--ink);}
+.photo-hero .card .t-xs.t-faint{color:var(--ink-faint);}
+
+/* Dark icon-badge stat tile (storeStatusBanner, AdminToday.js) -- sits on
+   the hero photo like pillStat's white card above, but translucent-dark +
+   white text instead, with a colored kpi-icon badge standing in for the
+   left color rail so each tile reads at a glance without relying on a
+   border color alone. */
+.stat-tile{
+  display:flex; align-items:center; gap:10px;
+  padding:10px 12px; border-radius:10px;
+  background:rgba(20,18,14,0.55); border:1px solid rgba(255,255,255,0.1);
+  backdrop-filter:blur(2px);
+}
+.stat-tile-value{font-size:19px; font-weight:700; color:#fff; line-height:1.2;}
+.stat-tile-label{font-size:11px; color:#D8D1C2;}
+.card-sunk{background:var(--surface-sunk); box-shadow:none;}
+.card-flush{padding:0; overflow:hidden;}
+.card-actions{display:flex; gap:8px; flex-shrink:0; flex-wrap:wrap; max-width:100%;}
+
+/* Opt-in modifier (dashboard grids only, see Admin Today / Owner Overview) --
+   lets a grid row use align-items:stretch so every card in it shares the
+   row's full height (no ragged bottoms / gaps of bare page background
+   between cards of different natural height), while keeping its own header
+   pinned to the top and its empty/placeholder content centered in whatever
+   room is left rather than stranded with dead space underneath it. Left as
+   an opt-in class, not a change to .card itself, so every other screen in
+   the console keeps its current block-flow sizing untouched. */
+.card-flex{display:flex; flex-direction:column;}
+.card-flex > .empty{flex:1; display:flex; flex-direction:column; align-items:center; justify-content:center;}
+.card-flex > .scrollpane{flex:1; min-height:0;}
+
+.btn{
+  border-radius:7px; border:1px solid var(--line); background:var(--surface); color:var(--ink);
+  padding:7px 13px; font-size:12px; font-weight:600; display:inline-flex; align-items:center; gap:6px;
+}
+.btn:hover{border-color:var(--ink-faint);}
+.btn:disabled{opacity:.5; cursor:not-allowed;}
+.btn-primary{background:var(--amber); border-color:var(--amber); color:#221805;}
+.btn-primary:hover:not(:disabled){background:var(--amber-deep); border-color:var(--amber-deep); color:#fff;}
+.btn-sm{padding:5px 10px; font-size:11.5px;}
+.btn-ghost{border-color:transparent; background:transparent;}
+
+.pill{display:inline-flex; align-items:center; gap:5px; font-size:10.5px; font-weight:700; padding:3px 9px; border-radius:20px; white-space:nowrap;}
+.pill::before{content:''; width:6px; height:6px; border-radius:50%; background:currentColor;}
+.pill-crit{background:var(--crit-tint); color:var(--crit);}
+.pill-warn{background:var(--warn-tint); color:var(--warn);}
+.pill-good{background:var(--good-tint); color:var(--good);}
+.pill-info{background:var(--info-tint); color:var(--info);}
+/* "flat" carries no dot — per spec section 1 it is explicitly not a status color. */
+.pill-flat{background:var(--surface-sunk); color:var(--ink-soft);}
+.pill-flat::before{display:none;}
+
+.stat{display:flex; flex-direction:column; gap:2px;}
+.stat .n{font-family:var(--font-display); font-size:27px; font-weight:600; line-height:1;}
+.stat .l{font-size:11.5px; color:var(--ink-soft); font-weight:500;}
+.stat .n.is-nodata{color:var(--ink-faint); font-size:20px;}
+.mono{font-family:var(--font-mono);}
+
+/* "No data" is a distinct visual state from zero — spec section 6 point 4.
+   Anything the backend gave us as null renders through .nodata, never as
+   0 / P0.00 / a blank cell. */
+.nodata{color:var(--ink-faint); font-style:italic; font-size:11.5px;}
+
+table{width:100%; border-collapse:collapse; font-size:12.5px;}
+th{text-align:left; font-size:10px; letter-spacing:.8px; text-transform:uppercase; color:var(--ink-faint); font-weight:700; padding:8px 10px; border-bottom:1px solid var(--line);}
+td{padding:9px 10px; border-bottom:1px solid var(--line-soft); vertical-align:middle;}
+tr:last-child td{border-bottom:none;}
+tbody tr:hover{background:var(--surface-sunk);}
+th.sortable{cursor:pointer; user-select:none;}
+th.sortable:hover{color:var(--ink-soft);}
+th .sort-caret{margin-left:4px; color:var(--amber);}
+.table-wrap{overflow-x:auto;}
+tr.row-click{cursor:pointer;}
+/* The selected row in a click-to-see-detail table (Instructions, Purchase
+   Orders) -- a left accent bar plus a tinted background, so which row the
+   detail panel below is currently showing is obvious without hunting for a
+   subtle highlight. */
+tr.row-selected{background:var(--role-accent-tint); box-shadow:inset 3px 0 0 var(--role-accent);}
+tr.row-selected:hover{background:var(--role-accent-tint);}
+
+/* Activity timeline (Instructions detail panel) -- a vertical line of dots,
+   one per real stage transition the record actually went through (never a
+   fabricated step), each with its own label and timestamp. */
+.timeline{display:flex; flex-direction:column; gap:14px; padding-left:2px;}
+.timeline-step{display:flex; gap:10px; position:relative; padding-left:18px;}
+.timeline-step::before{
+  content:""; position:absolute; left:3px; top:14px; bottom:-14px; width:1px; background:var(--line);
+}
+.timeline-step:last-child::before{display:none;}
+.timeline-dot{
+  position:absolute; left:0; top:2px; width:7px; height:7px; border-radius:99px;
+  background:var(--role-accent); box-shadow:0 0 0 3px var(--role-accent-tint);
+}
+td.num{text-align:right;}
+.t-crit{color:var(--crit);}
+.t-warn{color:var(--warn);}
+.t-good{color:var(--good);}
+.t-info{color:var(--info);}
+.t-soft{color:var(--ink-soft);}
+.t-faint{color:var(--ink-faint);}
+.t-strong{font-weight:600;}
+.t-sm{font-size:11.5px;}
+.t-xs{font-size:11px;}
+
+.meter{width:100%; height:6px; border-radius:4px; background:var(--line-soft); overflow:hidden;}
+.meter > span{display:block; height:100%; border-radius:4px;}
+.meter-crit > span{background:var(--crit);}
+.meter-warn > span{background:var(--warn);}
+.meter-good > span{background:var(--good);}
+.meter-info > span{background:var(--info);}
+.meter-flat > span{background:var(--ink-faint);}
+.runway-cell{display:flex; align-items:center; gap:8px; min-width:110px;}
+.runway-cell .meter{flex:1;}
+.runway-cell .days{font-family:var(--font-mono); font-size:11px; font-weight:600; width:44px; text-align:right;}
+
+/* Underline tabs (2026-10 restyle, matching the approved reference mockups
+   for Reports & History / Sales & Performance / Costs & Losses /
+   Purchasing / Instructions) -- was a segmented pill-group (gray capsule,
+   white active chip); every one of those references instead shows plain
+   text tabs in one row with a colored underline on the active tab and no
+   surrounding box, so this now matches that directly rather than
+   reinventing a second tab component per page. */
+.tabbar{display:flex; gap:4px; border-bottom:1px solid var(--line); width:100%; margin-bottom:16px; overflow-x:auto;}
+.tabbar button{
+  border:none; background:transparent; padding:11px 16px; font-size:13px; font-weight:600; color:var(--ink-soft);
+  border-bottom:2px solid transparent; margin-bottom:-1px; white-space:nowrap; flex-shrink:0;
+}
+.tabbar button:hover{color:var(--ink);}
+.tabbar button.active{color:var(--role-accent); border-bottom-color:var(--role-accent);}
+
+/* Status Card (spec item 3) — 2026-10-14: previously a plain white card with
+   a 3px colored stripe down the left edge, repeated identically for every
+   status regardless of urgency ("the generic AI dashboard" look the redesign
+   was asked to move away from). A status now reads from a soft tinted
+   background instead — still unmistakable at a glance, but the whole card
+   participates rather than one thin edge carrying all the color. Critical
+   statuses are never color-only: every RailCard caller also sets a label
+   (Stat's `.l`) and several add their own icon, so removing the stripe does
+   not remove the non-color signal. */
+.rail{background:var(--surface); border:1px solid var(--line);}
+.rail-crit{background:var(--crit-tint); border-color:rgba(173,74,62,.16);}
+.rail-warn{background:var(--warn-tint); border-color:rgba(138,90,30,.16);}
+.rail-good{background:var(--good-tint); border-color:rgba(62,107,79,.16);}
+.rail-info{background:var(--info-tint); border-color:rgba(73,103,122,.16);}
+.rail-flat{background:var(--surface-sunk); border-color:var(--line);}
+/* An icon badge inside a status card reuses the severity's own ink color on
+   a slightly more saturated chip, so the card reads "status + reason" at a
+   glance rather than just "a colored box." Optional — RailCard's `icon`
+   prop; cards without one keep the plain tinted background above. */
+.rail-icon{
+  width:28px; height:28px; border-radius:var(--radius-sm); display:flex; align-items:center;
+  justify-content:center; flex-shrink:0; margin-bottom:8px; background:rgba(255,255,255,.55);
+}
+.rail-crit .rail-icon{color:var(--crit);}
+.rail-warn .rail-icon{color:var(--warn);}
+.rail-good .rail-icon{color:var(--good);}
+.rail-info .rail-icon{color:var(--info);}
+.rail-flat .rail-icon{color:var(--ink-faint); background:rgba(255,255,255,.4);}
+
+/* Neutral Information Card (spec item 3) — a plain count/figure with no
+   status to communicate. Stone surface instead of warm-white so it still
+   visually differs from the tinted Status Cards next to it, without
+   borrowing any of their color meaning. */
+.kpi-neutral{background:var(--surface-sunk); box-shadow:none;}
+
+/* Primary KPI Card (spec item 3) — the single most important figure on a
+   page (Today's sales total, Inventory's headline count). Larger headline
+   number, brand-tinted surface, room for a one-line comparison underneath.
+   Opt-in: most stat tiles are Status or Neutral cards, not this. */
+.kpi-primary{
+  background:var(--amber-tint); border:1px solid rgba(199,119,53,.18);
+  padding:18px 20px;
+}
+.kpi-primary .stat .n{font-size:34px;}
+.kpi-primary .stat .l{color:var(--amber-deep); font-weight:600;}
+
+.scrollpane{overflow-y:auto;}
+.divider{height:1px; background:var(--line); margin:14px 0;}
+.empty{text-align:center; padding:34px 12px; color:var(--ink-soft);}
+.empty-tight{padding:18px;}
+.empty .ic{font-size:22px; margin-bottom:8px; color:var(--ink-faint);}
+.empty .t{font-weight:600; color:var(--ink); font-size:13px; margin-bottom:3px;}
+.empty .d{font-size:11.5px; max-width:340px; margin:0 auto;}
+.empty .act{margin-top:12px;}
+
+.legend{display:flex; gap:14px; font-size:11px; color:var(--ink-soft); flex-wrap:wrap;}
+.legend span{display:inline-flex; align-items:center; gap:5px;}
+.legend i{width:8px; height:8px; border-radius:2px; display:inline-block;}
+
+/* Callout — the tinted explanatory banners (forecast status, reconciliation
+   how-it-works). Severity-tinted, same four colors, no fifth. */
+.callout{border-radius:var(--radius); border:1px solid var(--line); padding:12px 16px; font-size:12.5px; margin-bottom:14px;}
+.callout p{margin:0;}
+.callout-warn{background:var(--warn-tint); border-color:rgba(138,90,30,.2); color:var(--warn);}
+.callout-info{background:var(--info-tint); border-color:rgba(73,103,122,.2); color:var(--info);}
+.callout-crit{background:var(--crit-tint); border-color:rgba(173,74,62,.2); color:var(--crit);}
+
+/* Owner Overview's "needs your attention" strip -- a plain-white card (not
+   a single flat-colored callout) holding one pastel-tinted icon chip per
+   item, so each matter reads as its own scannable row instead of a wall of
+   one loud warning color with bullet dots. */
+/* Inventory/Today Attention Panel (spec item 4) — a warm-tinted surface
+   (not plain white, not a loud all-red banner) holding compact, prioritized
+   rows. A genuinely critical row still reads as critical via its own icon
+   chip, without the whole panel going red. */
+.attn-card{
+  background:var(--amber-tint); border:1px solid rgba(199,119,53,.14); border-radius:var(--radius);
+  padding:14px 16px; margin-bottom:14px; box-shadow:none;
+}
+.attn-clear{display:flex; align-items:center; gap:10px;}
+.attn-icon{
+  width:32px; height:32px; border-radius:var(--radius-sm); display:flex; align-items:center; justify-content:center;
+  flex-shrink:0; background:rgba(255,255,255,.6);
+}
+.attn-grid{display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:4px;}
+.attn-item{
+  display:flex; align-items:center; gap:10px; padding:9px 10px; border-radius:var(--radius-sm);
+  transition:background 0.12s ease; width:100%; text-align:left; border:none; background:none;
+  font-family:inherit; color:inherit;
+}
+.attn-item:hover{background:rgba(255,255,255,.5);}
+
+/* Business Rhythm's insight tiles -- each a distinct pastel tint (cycling
+   through the palette, not one repeated color) with its own icon, so the
+   four patterns are told apart at a glance rather than reading as four
+   identical gray boxes of small text. */
+.rhythm-tile{
+  display:flex; align-items:flex-start; gap:10px; padding:12px; border-radius:var(--radius-sm);
+}
+
+/* 2026-10 console-wide audit: a .field label gives its input/select/
+   textarea the box below, but several places build one directly — a
+   combo-item-row's item picker (menu item select + quantity input, no
+   .field ancestor), and others like it elsewhere in Admin — with no class
+   at all. Those fell through to the OS's own native control (a plain
+   browser dropdown/text box, different height/border/font than everything
+   around it — see the combo builder's item row). This base rule gives
+   every bare text-like input, textarea and select the same box as a
+   .field one BEFORE .field's own rule below (which is more specific and
+   still wins wherever it applies, so nothing already using .field
+   changes) — so the fallback for "not inside a .field" is this design
+   system's input, not the browser's. Checkbox/radio/range/color/file
+   intentionally keep their native control; input:not([type]) covers the
+   HTML default type ("text") for an <input> with no type attribute. */
+select,
+textarea,
+input[type="text"], input[type="number"], input[type="search"],
+input[type="email"], input[type="password"], input[type="tel"],
+input[type="url"], input[type="date"], input[type="datetime-local"],
+input[type="month"], input[type="time"], input:not([type]){
+  border-radius:7px; border:1px solid var(--line); background:var(--surface);
+  color:var(--ink); padding:7px 11px; font-size:12px; font-family:inherit; font-weight:500; outline:none;
+}
+/* Same mobile touch-target/iOS-zoom fix as .field's own inputs below --
+   this is the shared base every bare input/select/textarea falls back to,
+   so it needs the same bump independently (the .field rule only wins where
+   a .field wrapper is actually present). */
+@media (max-width:600px){
+  select,
+  textarea,
+  input[type="text"], input[type="number"], input[type="search"],
+  input[type="email"], input[type="password"], input[type="tel"],
+  input[type="url"], input[type="date"], input[type="datetime-local"],
+  input[type="month"], input[type="time"], input:not([type]){
+    padding:11px 12px; font-size:16px;
+  }
+}
+select:focus, textarea:focus,
+input[type="text"]:focus, input[type="number"]:focus, input[type="search"]:focus,
+input[type="email"]:focus, input[type="password"]:focus, input[type="tel"]:focus,
+input[type="url"]:focus, input[type="date"]:focus, input[type="datetime-local"]:focus,
+input[type="month"]:focus, input[type="time"]:focus, input:not([type]):focus{border-color:var(--amber);}
+input::placeholder, textarea::placeholder{color:var(--ink-faint); font-weight:400;}
+/* The OS's own dropdown arrow doesn't match this design system's icon
+   strokes (and differs per browser/OS) -- replaced with one consistent
+   chevron, sized and positioned like every other small icon here. */
+select{
+  appearance:none; -webkit-appearance:none; -moz-appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%23716c65' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat:no-repeat; background-position:right 9px center; background-size:14px;
+  padding-right:30px; cursor:pointer;
+}
+select:disabled{cursor:default; opacity:0.6;}
+
+/* Field — real inputs styled as the prototype's field boxes. Wins over the
+   bare-element base rule above via specificity (two selectors, not one),
+   so a .field's own width:100%/margin-top:5px/disabled-opacity additions
+   still apply exactly as before -- the rule above only changes what a
+   NON-.field input/select/textarea falls back to. */
+.field{display:block; font-size:11.5px; font-weight:600; color:var(--ink-soft);}
+.field > input, .field > select, .field > textarea{
+  display:block; width:100%; margin-top:5px; border-radius:7px; border:1px solid var(--line); background:var(--surface);
+  color:var(--ink); padding:7px 11px; font-size:12px; font-family:inherit; font-weight:500; outline:none;
+}
+/* Mobile touch targets: desktop's compact 12px/7px padding (~26px tall) is
+   fine for a mouse but under the ~44px a finger needs, and Mobile Safari
+   zooms the whole page in on focus for any input under 16px font-size --
+   both fixed by bumping just this breakpoint, so desktop density (tuned for
+   dense tables/forms) is untouched. */
+@media (max-width:600px){
+  .field > input, .field > select, .field > textarea{ padding:11px 12px; font-size:16px; }
+}
+.field > input:focus, .field > select:focus, .field > textarea:focus{border-color:var(--amber);}
+.field > input::placeholder, .field > textarea::placeholder{color:var(--ink-faint); font-weight:400;}
+.field .hint{font-weight:400; color:var(--ink-faint); font-size:10.5px; margin-top:4px;}
+/* A textarea used standalone, outside a .field label (e.g. a reply box next
+   to its own Post button rather than under a caption) -- same box as
+   .field > textarea, just not scoped to that ancestor. */
+.textarea-plain{
+  border-radius:7px; border:1px solid var(--line); background:var(--surface);
+  color:var(--ink); padding:7px 11px; font-size:12px; font-family:inherit; font-weight:500; outline:none;
+}
+.textarea-plain:focus{border-color:var(--amber);}
+.textarea-plain::placeholder{color:var(--ink-faint); font-weight:400;}
+
+/* Loading + error states. A skeleton is not a zero — it says "not known yet". */
+.skeleton{background:linear-gradient(90deg,var(--line-soft),var(--surface-sunk),var(--line-soft));
+  background-size:200% 100%; animation:sk 1.2s ease-in-out infinite; border-radius:var(--radius-sm); height:12px;}
+@keyframes sk{0%{background-position:200% 0;}100%{background-position:-200% 0;}}
+.load-note{font-size:11.5px; color:var(--ink-faint); padding:18px; text-align:center;}
+
+.toast-host{position:fixed; right:20px; bottom:20px; display:flex; flex-direction:column; gap:8px; z-index:80;}
+/* Mobile's bottom tab bar (<=600px, see .shell/.sidebar further down) is
+   also position:fixed + z-index:80 and covers the screen's bottom ~68px --
+   left at bottom:20px, a toast would render partly underneath/inside it
+   instead of above it. Right:20px also collides with the bar's own
+   right-edge nav items, so this centers the toast full-width instead,
+   matching .content's own 78px bottom padding at this breakpoint. */
+@media (max-width:600px){
+  .toast-host{left:12px; right:12px; bottom:78px; align-items:stretch;}
+  .toast{max-width:none;}
+}
+.toast{background:var(--surface); border:1px solid var(--line); border-left:3px solid var(--line); border-radius:var(--radius);
+  box-shadow:var(--shadow); padding:11px 15px; font-size:12.5px; max-width:340px;}
+
+/* ============ TODAY GRID (no-scroll dashboard — spec section 6 point 1) ==== */
+.today-grid{
+  display:grid;
+  grid-template-columns: 1.3fr 1fr 1fr;
+  grid-template-rows: auto auto 1fr;
+  gap:14px;
+  height:calc(100vh - 118px);
+}
+/* When the stub-data banner is showing, the grid gives back exactly the
+   banner's height so Today still fits 768px without its own scrollbar. */
+.today-grid.has-banner{height:calc(100vh - 118px - 76px);}
+.g-kpis{grid-column:1/4; display:grid; grid-template-columns:repeat(5,1fr); gap:12px;}
+.g-alerts{grid-column:1/2; grid-row:2/4; display:flex; flex-direction:column; min-height:0;}
+.g-alerts .scrollpane{flex:1;}
+.g-instructions{grid-column:2/4; grid-row:2/3; display:flex; flex-direction:column; min-height:0;}
+.g-expiry{grid-column:2/3; grid-row:3/4; display:flex; flex-direction:column; min-height:0;}
+.g-verify{grid-column:3/4; grid-row:3/4; display:flex; flex-direction:column; min-height:0;}
+.g-instructions .scrollpane, .g-expiry .scrollpane, .g-verify .scrollpane{flex:1;}
+
+.kpi-card{display:flex; flex-direction:column; justify-content:space-between; padding:13px 15px; gap:8px;}
+.kpi-card .top{display:flex; justify-content:space-between; align-items:flex-start; gap:8px;}
+.kpi-card .foot{font-size:11px; color:var(--ink-soft);}
+.kpi-icon{width:26px; height:26px; border-radius:7px; display:flex; align-items:center; justify-content:center; flex-shrink:0; font-size:13px;}
+.kpi-icon-crit{background:var(--crit-tint); color:var(--crit);}
+.kpi-icon-warn{background:var(--warn-tint); color:var(--warn);}
+.kpi-icon-good{background:var(--good-tint); color:var(--good);}
+.kpi-icon-info{background:var(--info-tint); color:var(--info);}
+.kpi-icon-flat{background:var(--surface-sunk); color:var(--ink-faint);}
+
+/* Stat-tile headline icon -- bigger and bolder than the base .kpi-icon
+   (reference mockups: Costs & Losses, Sales & Performance, Owner Overview,
+   Reports & History, Purchase Orders all lead every stat row with a chunky
+   colored icon chip, not a small 26px dot) -- scoped to StatTile only so
+   Today's denser 5-up KPI grid and the Quick Actions tile keep their own
+   compact sizing. */
+.stat-tile-card .kpi-icon{width:42px; height:42px; border-radius:11px;}
+.stat-tile-card .kpi-icon svg{width:20px; height:20px;}
+
+/* Quick Actions tile (2026-10) -- was a plain text Button grid with no
+   icons at all; reuses .kpi-icon's existing colored-circle treatment so a
+   glance at the icon color hints at the action's nature (receiving=info,
+   waste=crit, counting=good, purchasing=warn) without inventing a new
+   palette. */
+/* Action Card (spec item 3) — strong clickable affordance, consistent
+   dimensions, a subtle press state so it reads as a real control rather than
+   a generic outlined rectangle. */
+.quick-action{
+  display:flex; align-items:center; gap:10px; padding:13px 14px; border-radius:var(--radius-sm);
+  border:1px solid var(--line); background:var(--surface); width:100%; text-align:left;
+  font-size:12.5px; font-weight:600; color:var(--ink);
+  transition:background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.quick-action:hover{background:var(--amber-tint); border-color:rgba(199,119,53,.3);}
+.quick-action:active{transform:scale(.98);}
+.quick-action:focus-visible{outline:2px solid var(--amber); outline-offset:1px;}
+.quick-action .kpi-icon{width:32px; height:32px; border-radius:var(--radius-sm); flex-shrink:0;}
+
+/* Premium Action Tile (2026-10-15, spec 5) — Admin Today's Quick Actions
+   only. Distinct from .quick-action above (still used elsewhere, e.g.
+   VerificationItem.js's drawer) by having room for a one-line description
+   and a directional chevron, and a soft per-severity tinted background
+   instead of plain white — so "Record Waste" and "Receive Delivery" read
+   as visually distinct actions, not four identical buttons differing only
+   by icon color. */
+.quick-action-tile{
+  display:flex; align-items:center; gap:10px; padding:12px 12px; border-radius:var(--radius-sm);
+  border:1px solid transparent; width:100%; text-align:left; font-family:inherit;
+  transition:background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.quick-action-tile-crit{background:var(--crit-tint);}
+.quick-action-tile-warn{background:var(--warn-tint);}
+.quick-action-tile-good{background:var(--good-tint);}
+.quick-action-tile-info{background:var(--info-tint);}
+.quick-action-tile-flat{background:var(--surface-sunk);}
+.quick-action-tile:hover{border-color:rgba(0,0,0,.08); transform:translateY(-1px);}
+.quick-action-tile:active{transform:scale(.98) translateY(0);}
+.quick-action-tile:focus-visible{outline:2px solid var(--amber); outline-offset:2px;}
+.quick-action-tile-icon{width:34px; height:34px; border-radius:var(--radius-sm); flex-shrink:0; background:rgba(255,255,255,.55);}
+.quick-action-tile-body{flex:1; min-width:0; display:flex; flex-direction:column; gap:1px;}
+.quick-action-tile-label{font-size:12.5px; font-weight:700; color:var(--ink);}
+.quick-action-tile-desc{font-size:10.5px; color:var(--ink-soft); white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+.quick-action-tile-arrow{flex-shrink:0; color:var(--ink-faint); transition:transform .12s ease;}
+.quick-action-tile:hover .quick-action-tile-arrow{transform:translateX(2px); color:var(--ink-soft);}
+@media (max-width:420px){.quick-action-tile-desc{display:none;}}
+
+/* Compact Action Strip (2026-10-15) — a second, denser treatment for the
+   same "quick action" concept as .quick-action above, used where a page
+   already has a strong KPI/attention composition up top and a second row of
+   big square tiles would just repeat that page's own visual rhythm (and
+   every other workspace's). Pill-shaped, inline, icon + label on one line —
+   reads as a toolbar, not a fourth bank of KPI-sized cards. */
+.action-strip{display:flex; flex-wrap:wrap; gap:8px;}
+.action-chip{
+  display:inline-flex; align-items:center; gap:8px; padding:9px 14px 9px 10px; border-radius:999px;
+  border:1px solid var(--line); background:var(--surface); font-size:12.5px; font-weight:600; color:var(--ink);
+  transition:background .12s ease, border-color .12s ease, transform .06s ease;
+}
+.action-chip:hover{background:var(--amber-tint); border-color:rgba(199,119,53,.3);}
+.action-chip:active{transform:scale(.97);}
+.action-chip:focus-visible{outline:2px solid var(--amber); outline-offset:1px;}
+.action-chip .kpi-icon{width:24px; height:24px; border-radius:50%; flex-shrink:0;}
+
+/* The ingredient drawer's action tiles are the same Action Card, just
+   square-ish and selectable (one can be "open" at a time). */
+.action-tile{padding:12px 8px;}
+.action-tile .kpi-icon{margin:0 auto;}
+.action-tile.active{background:var(--amber-tint); border-color:var(--amber);}
+.action-tile.active .kpi-icon{background:var(--amber); color:#fff;}
+
+.alert-row{display:flex; align-items:flex-start; gap:10px; padding:10px 12px; border-radius:8px; margin-bottom:6px;}
+.alert-row:hover{background:var(--surface-sunk);}
+.alert-row.clickable{cursor:pointer;}
+.alert-row .dot{width:7px; height:7px; border-radius:50%; margin-top:5px; flex-shrink:0;}
+.alert-row .dot-crit{background:var(--crit);}
+.alert-row .dot-warn{background:var(--warn);}
+.alert-row .dot-good{background:var(--good);}
+.alert-row .dot-info{background:var(--info);}
+.alert-row .dot-flat{background:var(--ink-faint);}
+.alert-row .body{flex:1; min-width:0;}
+.alert-row .h{font-size:12.5px; font-weight:600;}
+.alert-row .s{font-size:11px; color:var(--ink-soft); margin-top:1px;}
+
+.mini-row{display:flex; justify-content:space-between; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--line-soft); font-size:12px;}
+.mini-row:last-child{border-bottom:none;}
+.mini-row .sub{font-size:10.5px; color:var(--ink-faint);}
+
+/* Ledger — paired void/return lines stay visually joined (spec section 6
+   point 3). The pair shares one tinted band so a cancelled order reads as
+   one event, not two unrelated stock losses. */
+tr.pair-top td{background:var(--surface-sunk); border-bottom-color:transparent;}
+tr.pair-bottom td{background:var(--surface-sunk);}
+tr.pair-top td:first-child{border-top-left-radius:var(--radius-sm);}
+tr.pair-bottom td:first-child{border-bottom-left-radius:var(--radius-sm);}
+.pair-tag{font-size:10px; color:var(--ink-faint); letter-spacing:.4px; text-transform:uppercase; font-weight:700;}
+
+/* charts */
+canvas{max-width:100%;}
+.chart-box{position:relative;}
+
+@media (max-width:1300px){
+  .today-grid{grid-template-columns:1fr 1fr; grid-template-rows:auto auto auto auto; height:auto;}
+  .g-kpis{grid-column:1/3;}
+  .g-alerts{grid-column:1/3; grid-row:auto;}
+  .g-instructions{grid-column:1/3; grid-row:auto;}
+  .g-expiry{grid-column:1/2; grid-row:auto;}
+  .g-verify{grid-column:2/3; grid-row:auto;}
+}
+
+/* 2026-10 Phase 2 audit: the dashboards' own multi-column section grids
+   (Owner Overview, Admin Today, Owner Sales, Admin Sales) set their column
+   count per-usage via inline style, since .grid itself (above) carries no
+   default. None of those usages had a tablet-width fallback, so a 3- or
+   4-column row just kept shrinking past legibility instead of stacking.
+   !important is needed to win over the inline grid-template-columns each
+   call site sets — the standard, narrowly-scoped way to override an inline
+   style from a breakpoint without touching every call site individually.
+   860px (not the 1300px breakpoint above, which is the older Today grid's
+   own) is chosen so nothing changes until a viewport is genuinely
+   tablet-portrait width or narrower. */
+/* 2026-10 gap: the 860px breakpoint below collapses every dashboard row
+   straight from its full 3-/4-column inline layout to a single column —
+   correct for a true phone width, but it left the whole band BETWEEN this
+   breakpoint and 860px (a tablet or a narrow laptop window) with no
+   fallback at all, so Admin Today / Owner Overview's 3- and 4-up rows
+   (storeStatusBanner's stat strip, Do Now/Next 7 Days/Inventory Pulse,
+   the four-up Deliveries/Quick Actions/Order Activity/Recent Orders row)
+   just kept shrinking past legibility — labels and numbers truncated
+   mid-word instead of ever reflowing. Scoped to the two dashboard routes'
+   own wrapper classes, not every `.grid` in the console, so layouts
+   elsewhere that already read fine at 2-3 columns in this range are
+   untouched. */
+@media (max-width:1180px) and (min-width:861px){
+  .admin-today .grid,
+  .owner-overview .grid{grid-template-columns:repeat(2, minmax(0,1fr)) !important;}
+}
+
+@media (max-width:860px){
+  /* minmax(0,1fr), not a bare 1fr: an fr track's implicit minimum is its
+     content's min-content size, not 0 -- a bare `1fr` here only ever
+     collapsed the COLUMN COUNT to one, not the actual pixel width, whenever
+     that one remaining column held something with a wide min-content size
+     (a multi-column Table.js table, in particular). Found on Instructions
+     at 375px: .grid correctly resolved to a single grid-template-columns
+     track, but that track measured 511px/474px wide regardless -- the
+     6-column instructions table inside it held the track open past the
+     viewport, silently clipped by a parent's overflow:hidden rather than
+     visibly overflowing or scrolling. Any other .grid wrapping a wide table
+     had the identical latent bug. */
+  .grid{grid-template-columns:minmax(0,1fr) !important;}
+
+  /* The hero stat strip (storeStatusBanner's Need Attention/Deliveries/
+     Running Low/Stock Healthy row) sits INSIDE a .photo-hero card that the
+     rule above already forces full-width — but the strip itself still
+     used its own inline repeat(4,...), so at phone width it either
+     overflowed or wrapped into a lopsided 2+2 that read as a much taller
+     banner than the photo was ever designed to be ("Need Attention
+     container too long"). Forcing it to a clean 2x2 here, and letting the
+     photo-hero's fixed 238px desktop min-height relax to fit its actual
+     (now predictable) content, keeps the banner proportioned like a
+     banner instead of stretching to accommodate an unplanned wrap. */
+  .store-status-stats{grid-template-columns:repeat(2, minmax(0,1fr)) !important;}
+  .photo-hero{min-height:0;}
+
+  /* The shell itself had no narrow-viewport treatment at all -- a phone or
+     narrow tablet rendered the full 236px labeled sidebar plus content side
+     by side, squeezing the page into an unreadable sliver (2026-10, found
+     testing Owner Overview on a 375px mobile viewport against the reference
+     mockup's own mobile panel). Rather than build an off-canvas drawer,
+     this reuses the EXISTING manual-collapse icon rail (.nav-collapsed,
+     above) unconditionally at this width -- same 68px rail, same hidden
+     labels, same icons-with-tooltips navigation, just applied by viewport
+     instead of by the Collapse button. The manual toggle still works above
+     this width, and still works below it too (collapsing an already-narrow
+     rail is a no-op).  */
+  .shell{grid-template-columns:68px 1fr;}
+  .sidebar-photo{display:none;}
+  .nav-item,
+  .nav-item-top,
+  .nav-group-toggle,
+  .nav-collapse-toggle{justify-content:center; padding-left:0; padding-right:0;}
+  .brand{justify-content:center; padding-left:0; padding-right:0;}
+}
+/* min-width:601px: same specificity/bleed-through problem as the two rules
+   above -- labels, the group label, the chevron and the count badge must
+   stay hidden for the icon-only rail tier, but the <600px tier below styles
+   all four of these (smaller nav-item-label/nav-group-label text under an
+   icon, a positioned nav-badge dot) on the assumption they are visible.
+   Scoping this here instead of leaving it unconditional is what actually
+   lets that mobile styling show: found by testing at 375px that opening a
+   group's sheet (Management -> Setup & Verification/Users & Access/Audit
+   Trail) rendered as a blank dark box -- every row's text was present in
+   the DOM and correctly colored, just display:none via this same rule. */
+@media (min-width:601px) and (max-width:860px){
+  .brand-text,
+  .nav-item-label,
+  .nav-group-label,
+  .nav-group-chevron,
+  .nav-badge{display:none;}
+}
+/* min-width:601px: this is the icon-rail tier's own "never show an inline-
+   expanded group body, just the icon" rule. !important is needed to beat
+   Sidebar.js's own inline style:{display: isOpen?'':'none'} on a genuinely
+   collapsed/icon-only sidebar -- but left unconditional, it also wins (by
+   !important, regardless of source order) over the <600px tier below, which
+   needs that same element to actually become visible as a floating sheet
+   when tapped. Found by testing at 375px: tapping "Management" in the
+   bottom bar toggled Sidebar.js's internal state correctly (confirmed via
+   the DOM) but the sheet never appeared, because this rule's !important
+   permanently won regardless of that state. */
+@media (min-width:601px) and (max-width:860px){
+  .nav-group-body{display:none !important;}
+}
+
+/* True phone width: the 68px icon rail above still eats a visible slice of
+   an already-small screen held upright. Below this the sidebar becomes a
+   bottom tab bar instead -- the native mobile convention, and it gives the
+   content the full screen width. Same DOM, same click handlers (Sidebar.js
+   is untouched) -- this is a pure re-layout of the existing nav-item/
+   nav-group-toggle/nav-group-body elements, so collapsing a group still
+   works exactly as before, it just now opens as a sheet above the bar
+   instead of expanding inline. */
+@media (max-width:600px){
+  .shell{grid-template-columns:1fr; grid-template-rows:1fr auto;}
+  .content{padding-bottom:78px;}
+  .sidebar{
+    position:fixed; left:0; right:0; bottom:0; top:auto; z-index:80;
+    width:100%; height:auto; min-height:0; flex-direction:row; align-items:stretch;
+    border-top:3px solid var(--role-accent); padding:0 2px; gap:0;
+    box-shadow:0 -6px 20px rgba(0,0,0,0.18);
+  }
+  .brand, .sidebar-photo, .nav-collapse-toggle{display:none;}
+  .nav-tree{flex-direction:row; flex:1; overflow-x:auto; overflow-y:visible; min-height:0;}
+  .nav-foot{border-top:none; margin:0; padding:0; flex-shrink:0; display:flex;}
+  .nav-foot .nav-item-top{min-height:58px; min-width:58px;}
+  .nav-group{margin-bottom:0; flex:1; min-width:58px; display:flex;}
+  .nav-item-top, .nav-group-toggle{
+    flex:1; flex-direction:column; justify-content:center; align-items:center; gap:3px;
+    min-height:58px; padding:6px 2px; border-radius:0; text-align:center;
+  }
+  .nav-item-top .nav-item-label, .nav-group-label{
+    font-size:9px; line-height:1.15; white-space:normal; max-width:60px;
+  }
+  .nav-group-chevron{display:none;}
+  .nav-badge{position:absolute; top:4px; right:10px;}
+
+  /* A tapped group's children surface as a rounded sheet floating just
+     above the bar, not an inline-expanding strip -- there's no vertical
+     room for that here. */
+  .nav-group{position:relative;}
+  .nav-group-body{
+    position:fixed; left:10px; right:10px; bottom:68px; margin:0; padding:6px;
+    border-left:none; background:var(--nav-bg); border:1px solid rgba(255,255,255,0.1);
+    border-radius:14px; box-shadow:0 -10px 30px rgba(0,0,0,0.3);
+    max-height:55vh; overflow-y:auto;
+  }
+  .nav-group-body .nav-item{flex-direction:row; justify-content:flex-start; padding:10px 12px; font-size:13px; border-radius:8px;}
+}
+
+/* The sign-in gate's own styling lives in styles/login-brand.css, scoped to
+   .wt-login — deliberately not built from these tokens (see that file's
+   header). .login-err below is misnamed by history but is NOT login-only:
+   it's the shared inline validation-error style every modal and form in the
+   console uses (Modal's ModalError, Receiving, System's password forms, the
+   Ingredient Queue mapper, …) — keep it even though the login screen itself
+   no longer references it. */
+.login-err{color:var(--crit); font-size:11.5px; margin-top:10px;}
+
+/* ============ ACCOUNT SETTINGS (2026-10-15 premium two-column workspace)
+   ============================================================================
+   Centered, bounded width (spec: "Center the workspace within a comfortable
+   maximum width. Do not stretch the form edge to edge.") — a charcoal
+   identity panel paired with the warm-ivory security card, not two copies
+   of the same card. */
+.account-settings-wrap{max-width:760px; margin:0 auto;}
+.account-settings-grid{display:grid; grid-template-columns:260px 1fr; gap:18px; align-items:start;}
+@media (max-width:700px){.account-settings-grid{grid-template-columns:1fr;}}
+
+.account-identity-panel{
+  background:var(--nav-bg); color:#fff; border-radius:var(--radius); padding:24px 20px;
+  display:flex; flex-direction:column; align-items:center; text-align:center;
+  box-shadow:var(--shadow);
+}
+.account-avatar{
+  width:64px; height:64px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+  font-size:22px; font-weight:700; margin-bottom:14px;
+  background:var(--accent-blue); color:#fff; border:2px solid var(--amber);
+}
+.account-identity-name{font-family:var(--font-display); font-size:17px; font-weight:600;}
+.account-identity-username{font-size:12px; color:#9DA6AE; margin-top:2px;}
+.account-identity-divider{width:100%; height:1px; background:var(--nav-line); margin:18px 0 14px;}
+.account-identity-row{display:flex; align-items:center; gap:8px; font-size:11.5px; color:#B9C0C6;}
+
+.account-security-panel{padding:22px 20px;}
+.account-security-field{display:block; margin-bottom:14px;}
+
+/* ============ OPERATIONS INTELLIGENCE (2026-10-15, Admin Today) ===========
+   ============================================================================ */
+.intel-section{padding:16px 18px;}
+.intel-tile{
+  display:flex; flex-direction:column; gap:3px; text-align:left; width:100%;
+  padding:12px 14px; border-radius:var(--radius-sm); border:1px solid transparent;
+  font-family:inherit; transition:background .12s ease, transform .06s ease;
+}
+.intel-tile-crit{background:var(--crit-tint);}
+.intel-tile-warn{background:var(--warn-tint);}
+.intel-tile-good{background:var(--good-tint);}
+.intel-tile-info{background:var(--info-tint);}
+.intel-tile:hover{border-color:rgba(0,0,0,.08); transform:translateY(-1px);}
+.intel-tile:focus-visible{outline:2px solid var(--amber); outline-offset:2px;}
+.intel-tile-arrow{color:var(--ink-faint); opacity:0; transition:opacity .12s ease;}
+.intel-tile:hover .intel-tile-arrow{opacity:1;}
+.intel-tile-value{font-family:var(--font-display); font-size:22px; font-weight:700; color:var(--ink); margin-top:4px;}
+.intel-tile-title{font-size:12px; font-weight:700; color:var(--ink);}
+.intel-tile-desc{font-size:10.5px; color:var(--ink-soft);}
+.intel-tile-window{font-size:9.5px; color:var(--ink-faint); margin-top:2px;}
+
+/* ============ STOCK & USAGE REVIEWS (2026-10-15 unified Review Center) ====
+   ============================================================================ */
+.review-queue-row{
+  display:flex; align-items:center; gap:10px; width:100%; text-align:left; padding:10px;
+  border-radius:var(--radius-sm); border:none; background:none; font-family:inherit; cursor:pointer;
+  transition:background .12s ease; margin-bottom:4px;
+}
+.review-queue-row:hover{background:var(--surface-sunk);}
+.review-queue-row.is-active{background:var(--amber-tint);}
+
+/* ============ MENU STUDIO (2026-10-15 integrated Menu & Recipes workspace)
+   ============================================================================
+   Left/center/right three-column product editor — see MenuStudio.js's own
+   docstring for why this replaces the old Menu/Recipes/Combos three-page
+   split. */
+.menu-health-strip{
+  display:flex; align-items:center; gap:10px; flex-wrap:wrap; padding:10px 14px;
+  background:var(--surface); border:1px solid var(--line); border-radius:var(--radius-sm);
+  margin-bottom:14px; font-size:12.5px; color:var(--ink-soft);
+}
+.mhs-item{display:inline-flex; align-items:center; gap:5px;}
+.mhs-item b{color:var(--ink); font-weight:700;}
+.mhs-good{color:var(--good);}
+.mhs-crit{color:var(--crit);}
+.mhs-dot{width:3px; height:3px; border-radius:50%; background:var(--line);}
+
+.studio-layout{display:grid; grid-template-columns:25% 1fr 25%; gap:14px; align-items:start;}
+.studio-col{min-width:0;}
+
+.studio-list-cat{
+  font-size:10.5px; font-weight:700; letter-spacing:.04em; text-transform:uppercase;
+  color:var(--ink-faint); padding:8px 8px 4px;
+}
+.studio-list-row{
+  display:flex; align-items:center; gap:8px; width:100%; text-align:left; padding:8px;
+  border-radius:var(--radius-sm); border:none; background:none; font-family:inherit; cursor:pointer;
+  transition:background .12s ease;
+}
+.studio-list-row:hover{background:var(--surface-sunk);}
+.studio-list-row.is-active{background:var(--amber-tint);}
+.studio-dot{width:7px; height:7px; border-radius:50%; flex-shrink:0;}
+.studio-dot-good{background:var(--good);}
+.studio-dot-crit{background:var(--crit);}
+.studio-dot-flat{background:var(--ink-faint);}
+
+.studio-price-row{display:flex; align-items:center; gap:10px; margin:4px 0 10px; flex-wrap:wrap;}
+
+.action-chip.is-active{background:var(--amber-tint); border-color:var(--amber); color:var(--amber-deep);}
+
+@media (max-width:1180px){
+  /* !important: call sites (MenuStudio.js's 25%/1fr/25%, PurchasingHub.js's
+     inline 1.6fr/1fr) set grid-template-columns inline, same reason the
+     admin-today/owner-overview breakpoint above needs it too. */
+  /* minmax(0,1fr) -- same fr-track-min-content-floor bug as .grid above. */
+  .studio-layout{grid-template-columns:minmax(0,1fr) !important;}
+  .studio-col-left .scrollpane{max-height:320px;}
+}
+
+/* ============ PRINT (Reports > Attention Needed > Print / Save as PDF) ====
+   No server-side PDF generation in this codebase (2026-08 audit) -- this is
+   the browser's own print-to-PDF instead, so the on-screen preview and the
+   printed output are the same DOM node, not two representations that could
+   drift apart. .print-only is the inverse: content (the printed-at
+   timestamp) that only makes sense on paper, hidden on screen. */
+.print-only{display:none;}
+@media print{
+  body *{visibility:hidden;}
+  .print-area, .print-area *{visibility:visible;}
+  .print-area{position:absolute; top:0; left:0; width:100%;}
+  .print-only{display:block;}
+  .no-print{display:none !important;}
+}

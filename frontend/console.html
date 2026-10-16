@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wings Theory — Operations Console</title>
+<link rel="icon" href="/img/logo.png">
+<script src="/assets/bfcache-guard.js"></script>
+
+<!--
+  Operations Console — rebuilt against design/wings-theory-console.html and
+  design/wings-theory-frontend-spec.md.
+
+  This file is only the entry point. Everything else lives under
+  /assets/console/ as ES modules, mirroring the component boundaries in spec
+  section 2:
+
+    styles/tokens.css        spec section 1 design tokens, verbatim
+    styles/app.css           shell + primitives, from the approved prototype
+    js/components/ui/*       Card, Pill, Stat, Meter, Tabbar, EmptyState,
+                             RailCard, Table, Button
+    js/components/charts/*   LineChart, BarChart, DoughnutChart (Chart.js)
+    js/components/domain/*   IngredientRow, AlertRow, ExpiryCard,
+                             VerificationItem
+    js/lib/api/*             one file per domain; the ONLY place a backend
+                             field name becomes a UI field name
+    js/lib/format.js         the "no data is not zero" rule (spec 6.4)
+    js/lib/severity.js       display-only severity mapping
+    js/routes/*              the eight sections
+
+  The sign-in gate is the one deliberate exception to the Console's own light
+  design system: by explicit decision it matches POS/KDS exactly — same dark
+  brand.css/brand.js (logo, wing-strike intro), same login layout — while
+  every screen past it uses tokens.css/app.css below. brand.css's own custom
+  properties are namespaced --wt-*, so it cannot collide with tokens.css's
+  --line/--amber/etc; login-brand.css scopes its dark palette to .wt-login
+  literal-hex-only for the same reason: design-system.css itself is NOT
+  loaded here, because its :root would repaint every other screen dark too.
+-->
+
+<!-- 2026-09 fix: Fraunces/Inter/JetBrains Mono used to be loaded live from
+     fonts.googleapis.com/fonts.gstatic.com, and Chart.js below used to load
+     from a CDN too — both silently broken on this system's actual
+     deployment target (LAN-only, no internet reachability at all; see
+     wt/auth.py's own threat-model docstring and start_server.ps1's
+     no-WAN-dependency design). Every font file (16 woff2, one per weight/
+     unicode-range subset Google's own CSS split them into) and the Chart.js
+     4.4.4 UMD bundle below are now vendored under /assets — same bytes,
+     same version, no network call outside this server.
+     /assets/fonts/fonts.css, not a console-only copy: pos.html and kds.html
+     already had this exact same link (to a file that never existed at that
+     path — a second silent 404, this one pre-existing and unrelated to the
+     CDN issue above), so the vendored file goes where they already expect
+     it, same shared-asset pattern as brand.css/design-system.css. -->
+<link rel="stylesheet" href="/assets/fonts/fonts.css">
+
+<link rel="stylesheet" href="/assets/brand.css">
+<link rel="stylesheet" href="/assets/console/styles/tokens.css">
+<link rel="stylesheet" href="/assets/console/styles/app.css">
+<link rel="stylesheet" href="/assets/console/styles/login-brand.css">
+
+<!-- Chart.js 4.4.4, vendored locally — see the fonts comment above for why.
+     Loaded before the app so components/charts/base.js can rely on the
+     global. -->
+<script src="/assets/vendor/chart.umd.min.js"></script>
+<!-- Same brand intro POS/KDS use — defines window.WingsIntro. A classic
+     script (not a module), so it runs synchronously during parse, before
+     app.js (a deferred module) ever executes. -->
+<script src="/assets/brand.js"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/assets/console/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+Avg_Items_Per_Txn,Empty_Reason,Holdout_Candidates_Considered,Holdout_Candidates_Rejected,Holdout_Candidates_Validated,Method,Min_Confidence,Min_Lift,Min_Support,Mining_Basis,N_Final_Recommendations,N_Frequent_Itemsets,N_Rules,Threshold_Tier,Transactions,Unique_Products
+1.55,,7,6,1,FP-Growth (mlxtend),0.05,1.1,0.00059,chronological_train_holdout,1,364,7,primary,21058,32

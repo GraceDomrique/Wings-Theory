@@ -1,0 +1,6 @@
+Bias,Dataset,Detail,Items_Scored,MAE,Model,Samples,Status,WAPE_pct
+0.1696,"REAL (item-level, chronological rolling backtest)",,16,2.3036,naive_previous_period,16,measured,86.46
+0.8862,"REAL (item-level, chronological rolling backtest)",,16,2.655,trailing_moving_average,16,measured,146.09
+1.544,"REAL (item-level, chronological rolling backtest)",,16,3.651,day_of_week_seasonal,16,measured,206.49
+1.5961,"REAL (item-level, chronological rolling backtest)",,16,3.6022,prophet,16,measured,210.34
+,REAL,"{""best_baseline_mean_wape"": 86.46, ""prophet_mean_wape"": 210.34, ""absolute_improvement_wape_pts"": -123.88, ""percentage_improvement"": -143.3, ""prophet_actually_better"": false, ""note"": ""Positive improvement means Prophet's fleet-mean WAPE across the rolling backtest folds is lower than the best baseline's. A negative value is reported as-is -- it means the baseline measurably won on this data.""}",,,prophet_vs_baseline,,measured,

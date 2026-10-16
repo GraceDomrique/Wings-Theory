@@ -1,0 +1,58 @@
+# Deliberately short, still.
+#
+# Not here, and why:
+#   alembic      — migrations are numbered .sql files run by wt/db.py. One
+#                  deployment, one branch; Alembic's machinery earns its keep
+#                  at multi-environment scale, not here.
+#   python-jose  — wt/auth.py signs HS256 with hmac + hashlib from the stdlib.
+#   passlib      — PBKDF2 via hashlib.pbkdf2_hmac.
+#   sqlalchemy   — the write paths need exact control over emitted SQL and
+#                  rowcounts; an ORM unit-of-work would reorder them.
+#   pytest       — tests use stdlib unittest so they run on a bare install.
+fastapi>=0.111,<0.116
+uvicorn[standard]>=0.29
+pydantic>=2.9,<3
+
+# Phase 3 — forecasting, anomaly detection, product-combination analysis.
+# Named explicitly by the owner (Prophet, scikit-learn's IsolationForest,
+# mlxtend's FP-growth). wt/forecasting.py, wt/anomaly.py, and
+# wt/associations.py always still report "insufficient data" honestly below
+# their minimum sample thresholds rather than fitting noise on a thin
+# ledger — the model choice changed, that principle didn't.
+#
+# prophet needs a working CmdStan build (a compiled C++ sampler) to actually
+# run, not just a pip install — on Windows that means a real toolchain
+# (RTools64/mingw-w64, NOT an old 32-bit MinGW that may already be on PATH).
+# See wt/forecasting.py's _PROPHET_AVAILABLE fallback: if that build isn't
+# present, per-item demand forecasts quietly drop to the trailing-average
+# method and say so, rather than the console hard-failing.
+prophet>=1.1,<2
+scikit-learn>=1.4,<2
+mlxtend>=0.23,<1
+pandas>=2.0,<3
+
+# wt/ml_artifacts_io.py imports joblib directly to persist/load every
+# trained IsolationForest/Prophet artifact in backend/ml_artifacts/ — pinned
+# explicitly rather than relying on it riding in transitively under
+# scikit-learn, since that import would break if sklearn ever dropped it.
+joblib>=1.3,<2
+
+# wt/xlsx_history_import.py reads the owner's .xlsx workbooks directly
+# (pandas alone needs an engine for .xlsx; this is that engine). Also used,
+# write-side this time, by wt/reports_export.py for the Owner's downloadable
+# .xlsx purchasing-list/expiry reports.
+openpyxl>=3.1,<4
+
+# wt/reports_export.py — server-generated, paginated PDF reports (the
+# purchasing-recommendation and expiry reports on Owner's Stock &
+# Replenishment page). Pure-Python, no system dependency (unlike e.g.
+# WeasyPrint's Cairo/Pango requirement), which matters on the same bare
+# Windows mini-PC noted above for prophet/passlib.
+reportlab>=4.0,<5
+
+# wt/combos.py's menu-item image upload: decodes an uploaded combo/menu-item
+# image, verifies the bytes actually are a JPEG/PNG/WEBP (not just named
+# like one), and re-encodes before it ever touches disk. Images are sent as
+# base64 JSON like every other request body here, so python-multipart is
+# deliberately not added just for this.
+Pillow>=10.0,<13

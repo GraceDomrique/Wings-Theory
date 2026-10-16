@@ -1,0 +1,277 @@
+import { h, mount, icon } from '../../lib/dom.js';
+import { Card, CardHeader } from '../../components/ui/Card.js';
+import { Stat } from '../../components/ui/Stat.js';
+import { Table } from '../../components/ui/Table.js';
+import { Pill } from '../../components/ui/Pill.js';
+import { Tabbar } from '../../components/ui/Tabbar.js';
+import { Button } from '../../components/ui/Button.js';
+import { Modal, ModalError, confirmModal } from '../../components/ui/Modal.js';
+import { EmptyState } from '../../components/ui/EmptyState.js';
+import { toast } from '../../components/ui/Feedback.js';
+import { verificationRowCells, openVerificationDrawer } from '../../components/domain/VerificationItem.js';
+import { count } from '../../lib/format.js';
+import { ICONS } from '../../lib/icons.js';
+import { getQueue } from '../../lib/api/verification.js';
+import { listUnmapped, resolveMap, resolveDismiss } from '../../lib/api/queue.js';
+import { listIngredients } from '../../lib/api/inventory.js';
+
+/**
+ * Verification — the setup numbers that still carry a seeded placeholder,
+ * plus the Ingredient Queue: recipe lines a source import could not match to
+ * a real ingredient. Both are "data readiness" problems in the same sense —
+ * a value nobody has confirmed — and both were on one page in the old
+ * console, so they stay together here as a fourth tab rather than a
+ * separate, easy-to-forget top-level section.
+ *
+ * The queue can run to hundreds of items, so it is paged in place rather than
+ * rendered all at once: several hundred cards is both slow and, more to the
+ * point, unusable. The counts stay honest (the KPI cards show the true totals)
+ * while the working area shows a manageable batch.
+ */
+const PAGE_SIZE = 25;
+
+const PRIORITY_LABELS = {
+  1: 'Priority 1 — affects stock deductions',
+  2: 'Priority 2 — affects cost',
+  3: 'Priority 3 — affects expiry only',
+};
+
+export async function render(ctx) {
+  let queue = await getQueue();
+  let unmapped = await listUnmapped();
+  let active = ['1', '2', '3', 'unmapped'].includes(ctx.tab) ? ctx.tab : '1';
+  let shown = PAGE_SIZE;
+
+  const kpis = h('div', { style: { marginBottom: '14px' } });
+  const listHost = h('div');
+
+  // 2026-10-15 recompose: these same four counts used to be four equal
+  // RailCards in their own full-width row, directly repeating the four tabs
+  // right below them (Priority 1/2/3/Ingredient Queue) — a KPI row that told
+  // an admin nothing the tab labels didn't already say right underneath it.
+  // One compact summary card (headline total pending + four inline chips)
+  // replaces the redundant row; the Tabbar remains the one real filter.
+  function drawKpis() {
+    const p1 = queue.byPriority[1] || 0;
+    const p2 = queue.byPriority[2] || 0;
+    const p3 = queue.byPriority[3] || 0;
+    const total = p1 + p2 + p3 + unmapped.count;
+    mount(kpis, Card({ className: 'kpi-primary' },
+      h('div', { class: 'eyebrow' }, 'Setup & verification'),
+      h('div', { class: 'grid', style: { gridTemplateColumns: 'auto 1fr', gap: '18px', alignItems: 'center', margin: '6px 0 0' } },
+        Stat({ value: count(total), label: 'Pending confirmation' }),
+        h('div', { class: 'grid', style: { gridTemplateColumns: 'repeat(4,1fr)', gap: '8px' } },
+          verifyChip(p1, 'Priority 1', 'crit', ICONS.alertTriangle, PRIORITY_LABELS[1]),
+          verifyChip(p2, 'Priority 2', 'warn', ICONS.clockArrowDown, PRIORITY_LABELS[2]),
+          verifyChip(p3, 'Priority 3', 'info', ICONS.history, PRIORITY_LABELS[3]),
+          verifyChip(unmapped.count, 'Ingredient Queue', unmapped.count > 0 ? 'crit' : 'good', ICONS.packageMinus, 'Recipe lines not yet matched to a real ingredient — blocks menu items')))));
+  }
+
+  /** Same compact-chip device as Inventory's Stock Health / Menu's Menu
+   * Health (see OnHand.js, MenuAvailability.js) — kept local a third time
+   * rather than extracted yet; worth promoting to a shared component if a
+   * fourth page needs it. `title` carries PRIORITY_LABELS' fuller
+   * explanation as a hover tooltip, since the compact chip has no room to
+   * print it the way the old full-width RailCard did. */
+  function verifyChip(value, label, severity, iconPaths, title) {
+    return h('div', { class: `rail rail-${severity}`, title, style: { borderRadius: 'var(--radius-sm)', padding: '8px 10px', display: 'flex', alignItems: 'center', gap: '8px' } },
+      h('span', { class: 'rail-icon', style: { width: '26px', height: '26px' } }, icon(iconPaths, 13)),
+      h('div', {},
+        h('div', { style: { fontSize: '17px', fontWeight: '700', lineHeight: '1.1' } }, count(value)),
+        h('div', { class: 't-xs t-faint' }, label)));
+  }
+
+  /** 2026-10-14 redesign: a compact table (Record/Current estimate/Reason/
+   * Review), each row opening the focused review drawer — not one full-width
+   * Card per item repeating the same question/button row down the page. The
+   * underlying resolve flow (confirm/change/keep, all additive — nothing
+   * here rewrites verification_event's own history) is unchanged, just
+   * moved into VerificationItem.js's drawer. */
+  function drawList() {
+    if (active === 'unmapped') { drawUnmapped(); return; }
+    const priority = Number(active);
+    const items = queue.items.filter((i) => i.priority === priority);
+
+    if (items.length === 0) {
+      mount(listHost, Card({}, EmptyState({
+        icon: '✓',
+        title: `Nothing left at priority ${priority}`,
+        description: priority === 1
+          ? 'Every value that affects how much stock a sale deducts has been confirmed.'
+          : priority === 2
+            ? 'Every cost figure has been confirmed against what you actually pay.'
+            : 'Every expiry estimate has been confirmed. These affect the Expiry Watch timeline only — never stock deductions.',
+      })));
+      return;
+    }
+
+    function onResolved(resolved) {
+      // Resolved items leave the queue locally so the table does not jump
+      // under the reader's cursor while they work down it.
+      queue.items = queue.items.filter((i) => i.id !== resolved.id);
+      queue.byPriority[resolved.priority] = Math.max(0, (queue.byPriority[resolved.priority] || 1) - 1);
+      queue.count = Math.max(0, queue.count - 1);
+      drawKpis();
+      drawList();
+      ctx.refreshBadges();
+    }
+
+    const visible = items.slice(0, shown);
+    mount(listHost,
+      Card({},
+        CardHeader({
+          title: `Priority ${priority}`,
+          desc: `${items.length} record${items.length === 1 ? '' : 's'} need review — each decision is recorded with who made it and when`,
+        }),
+        Table({
+          columns: [
+            { key: 'record', label: 'Record', render: (i) => verificationRowCells(i).record },
+            { key: 'current', label: 'Current estimate', render: (i) => verificationRowCells(i).current },
+            { key: 'reason', label: 'Reason', render: (i) => verificationRowCells(i).reason },
+            { key: 'status', label: 'Status', render: (i) => verificationRowCells(i).status },
+            { key: 'review', label: '', render: () => h('span', { class: 't-xs t-faint' }, 'Review →') },
+          ],
+          rows: visible,
+          onRowClick: (item) => openVerificationDrawer({ item, onResolved }),
+        }),
+        visible.length < items.length
+          ? h('div', { style: { marginTop: '14px', textAlign: 'center' } },
+            Button({
+              onClick: () => { shown += PAGE_SIZE; drawList(); },
+            }, `Show ${Math.min(PAGE_SIZE, items.length - visible.length)} more`))
+          : null));
+  }
+
+  function drawUnmapped() {
+    if (unmapped.items.length === 0) {
+      mount(listHost, Card({}, EmptyState({
+        icon: '✓',
+        title: 'No unresolved recipe lines',
+        description: 'Every recipe line from the last import matched a real ingredient.',
+      })));
+      return;
+    }
+    mount(listHost, Card({},
+      CardHeader({
+        title: 'Ingredient Queue',
+        desc: `${unmapped.items.length} recipe line${unmapped.items.length === 1 ? '' : 's'} could not be matched to a real ingredient on import`,
+      }),
+      Table({
+        columns: [
+          {
+            key: 'line',
+            label: 'Recipe line',
+            render: (item) => h('div', {},
+              h('div', { class: 't-sm t-strong' }, item.sourceIngredientLabel),
+              h('div', { class: 'sub' },
+                `From “${item.sourceRecipeName}” · ${item.reasonLabel}`,
+                item.sourceQtyText ? ` · read as "${item.sourceQtyText}"` : '')),
+          },
+          {
+            key: 'impact',
+            label: 'Impact',
+            render: (item) => (item.blocksMenuItems > 0
+              ? Pill('crit', `blocks ${item.blocksMenuItems} menu item${item.blocksMenuItems === 1 ? '' : 's'}`)
+              : h('span', { class: 't-xs t-faint' }, 'not on a live menu item')),
+          },
+          {
+            key: 'actions',
+            label: '',
+            render: (item) => h('div', { style: { display: 'flex', gap: '6px', justifyContent: 'flex-end' } },
+              Button({ size: 'sm', onClick: () => dismissLine(item) }, 'Dismiss'),
+              Button({ variant: 'primary', size: 'sm', onClick: () => openMapModal(item) }, 'Map')),
+          },
+        ],
+        rows: unmapped.items,
+      })));
+  }
+
+  function dismissLine(item) {
+    confirmModal({
+      title: 'Dismiss without mapping?',
+      body: `Use this only for lines that genuinely deduct nothing (e.g. "to taste"). "${item.sourceIngredientLabel}" from ${item.sourceRecipeName} will stop appearing in this queue, but the recipe line it came from stays unresolved.`,
+      confirmLabel: 'Dismiss',
+      onConfirm: async () => {
+        await resolveDismiss(item.id);
+        toast(`Dismissed — ${item.sourceIngredientLabel} will not be asked about again.`, 'info');
+        unmapped = await listUnmapped();
+        drawKpis();
+        drawList();
+        ctx.refreshBadges();
+      },
+    });
+  }
+
+  function openMapModal(item) {
+    const search = h('input', { type: 'text', placeholder: 'Search ingredients…' });
+    const listBox = h('div', { style: { maxHeight: '280px', overflowY: 'auto', border: '1px solid var(--line)', borderRadius: '8px', marginTop: '8px' } });
+    const err = ModalError();
+    let ingredients = [];
+    let picked = null;
+    const submit = Button({ variant: 'primary' }, 'Confirm mapping');
+    submit.disabled = true;
+
+    function drawOptions(query) {
+      const q = (query || '').trim().toLowerCase();
+      const rows = ingredients.filter((i) => !q || i.name.toLowerCase().includes(q)).slice(0, 60);
+      mount(listBox, ...rows.map((i) => h('div', {
+        class: 'row-click',
+        style: {
+          padding: '8px 12px', fontSize: '12.5px',
+          background: picked && picked.pk === i.pk ? 'var(--amber-tint)' : undefined,
+        },
+        onClick: () => { picked = i; submit.disabled = false; drawOptions(query); },
+      }, i.name, h('span', { class: 't-xs t-faint', style: { marginLeft: '6px' } }, `(${i.baseUnit})`))));
+    }
+    search.addEventListener('input', () => drawOptions(search.value));
+
+    submit.addEventListener('click', async () => {
+      if (!picked) return;
+      submit.disabled = true;
+      try {
+        const r = await resolveMap(item.id, picked.pk);
+        modal.close();
+        toast(`Mapped "${item.sourceIngredientLabel}" to ${r.mapped_to}.${item.blocksMenuItems ? ' Menu availability will pick this up on next refresh.' : ''}`, 'good');
+        unmapped = await listUnmapped();
+        drawKpis();
+        drawList();
+        ctx.refreshBadges();
+      } catch (e) {
+        err.textContent = e.message; err.style.display = ''; submit.disabled = false;
+      }
+    });
+
+    const modal = Modal({
+      title: `Map “${item.sourceIngredientLabel}”`,
+      desc: `From ${item.sourceRecipeName}. This also remembers the match for future imports of the same source label.`,
+      onClose: () => {},
+    }, search, listBox, err, h('div', { style: { marginTop: '10px' } }, submit));
+
+    listIngredients({ limit: 500, withRunway: false }).then((list) => {
+      ingredients = list;
+      drawOptions('');
+    });
+  }
+
+  drawKpis();
+  drawList();
+
+  return h('div', {},
+    kpis,
+    Tabbar({
+      items: [
+        { id: '1', label: 'Priority 1' },
+        { id: '2', label: 'Priority 2' },
+        { id: '3', label: 'Priority 3' },
+        { id: 'unmapped', label: `Ingredient Queue${unmapped.count ? ` (${unmapped.count})` : ''}` },
+      ],
+      activeId: active,
+      onChange: (id) => {
+        active = id;
+        shown = PAGE_SIZE;
+        history.replaceState(null, '', `#/verify/${id}`);
+        drawList();
+      },
+    }),
+    listHost);
+}
