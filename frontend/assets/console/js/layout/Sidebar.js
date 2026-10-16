@@ -199,6 +199,42 @@ export function Sidebar({ activeId, onNavigate }) {
     return h('div', { class: 'nav-group' }, toggle, body);
   });
 
+  // 2026-10-16 fix: "Management" (or any group whose active leaf force-
+  // opened it) appeared sprung open above the bottom tab bar on a phone
+  // with no tap -- Sidebar() only evaluates isMobile() once, at
+  // construction. If the sidebar was first built at a wider breakpoint
+  // (desktop's inline accordion, or the page simply hadn't been
+  // reconstructed since the viewport last changed), an already-open
+  // group's body keeps its inline `display:''` from that wider tier; the
+  // <=600px media query only *repositions* a visible body into the
+  // floating-sheet treatment, it was never responsible for hiding it, so
+  // the sheet rendered open on load. Listening for the mobile breakpoint
+  // itself crossing (not every resize pixel) re-syncs actual DOM state
+  // to each tier's own rule: entering mobile force-closes every sheet
+  // (mobile's "closed until tapped" rule), leaving it restores the
+  // desktop accordion to whatever `expanded` already says.
+  const mobileQuery = window.matchMedia('(max-width:860px)');
+  function syncGroupDisplayToTier() {
+    if (isMobile()) {
+      for (const [groupId, body] of groupBodies) {
+        body.style.display = 'none';
+        body.style.top = '';
+        const toggle = groupToggles.get(groupId);
+        if (toggle) toggle.classList.toggle('open', false);
+      }
+      mobileOpenGroup = null;
+    } else {
+      for (const [groupId, body] of groupBodies) {
+        const open = expanded.has(groupId);
+        body.style.display = open ? '' : 'none';
+        const toggle = groupToggles.get(groupId);
+        if (toggle) toggle.classList.toggle('open', open);
+      }
+    }
+  }
+  if (mobileQuery.addEventListener) mobileQuery.addEventListener('change', syncGroupDisplayToTier);
+  else mobileQuery.addListener(syncGroupDisplayToTier); // older WebKit (in-app webviews)
+
   const collapseLabel = h('span', { class: 'nav-item-label' }, collapsed ? '' : 'Collapse');
   const collapseToggle = h('span', { class: 'nav-collapse-chevron' + (collapsed ? '' : ' open') }, icon(COLLAPSE_ICON));
   const collapseBtn = h('button', {

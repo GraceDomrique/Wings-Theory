@@ -15,6 +15,13 @@
  * those still refuse to invent a zero.
  */
 
+/** "Good morning"/"afternoon"/"evening" off the local wall clock — for a header greeting, not a business figure. */
+export function greeting(hour = new Date().getHours()) {
+  if (hour < 12) return 'Good morning';
+  if (hour < 18) return 'Good afternoon';
+  return 'Good evening';
+}
+
 /** True when the backend actually supplied a value. 0 counts as supplied. */
 export function has(v) {
   return v !== null && v !== undefined && !(typeof v === 'number' && Number.isNaN(v));

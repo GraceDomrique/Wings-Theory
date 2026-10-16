@@ -8,10 +8,11 @@ import { BarChart } from '../../components/charts/BarChart.js';
 import { LineChart } from '../../components/charts/LineChart.js';
 import { palette } from '../../components/charts/base.js';
 import {
-  money, count, stamp, ageFromNow,
+  money, count, stamp, ageFromNow, greeting,
 } from '../../lib/format.js';
 import { getOwnerOverview } from '../../lib/api/dashboard.js';
 import { openOrderDetail } from '../reports/orderDetailModal.js';
+import { session } from '../../lib/api/client.js';
 
 /**
  * Owner Overview — business-command-center redesign (2026-10-16):
@@ -85,20 +86,13 @@ export async function render(ctx) {
   // needRestock/expiringSoon counts this tile reads — same honest-missing
   // treatment as a null field, not a crash.
   if (!d.stockAtRisk) d.stockAtRisk = { needRestock: null, expiringSoon: null };
-  const stale = d.dataStaleHours !== null && d.dataStaleHours > 24
-    ? h('div', { class: 'callout callout-warn', style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', flexWrap: 'wrap' } },
-      h('p', { style: { margin: 0 } }, h('strong', {}, 'Order data is stale — '),
-        'the most recent order on file is ', ageFromNow(d.latestOrderAt),
-        '. The figures below reflect that gap, not necessarily a real change in the business.'),
-      Button({ variant: 'ghost', size: 'sm', onClick: () => ctx.navigate('salesoverview'), style: { flexShrink: 0 } }, 'Look at a longer period →'))
-    : null;
 
   const bannerHost = h('div');
   const drawBanner = (expanded) => mount(bannerHost, attentionBanner(d, ctx, expanded, drawBanner));
   drawBanner(false);
 
   return h('div', { class: 'owner-overview' },
-    stale,
+    greetingHeader(d),
     heroBanner(d, ctx),
     bannerHost,
 
@@ -137,6 +131,19 @@ export async function render(ctx) {
 // action when stock actually needs one.
 // =============================================================================
 
+// Sits above the photo-hero card itself, not inside it — a plain-language
+// hello before the business-performance numbers, in the console's own
+// (non-photo) ink colors rather than the hero's white-on-photo treatment.
+function greetingHeader(d) {
+  const p = d.businessPulse;
+  const name = session.user && session.user.displayName;
+  return h('div', { style: { margin: '0 0 12px' } },
+    h('div', { style: { fontSize: '22px', fontWeight: '700', fontFamily: 'var(--font-display)' } },
+      `${greeting()}${name ? `, ${name}` : ''}`),
+    h('div', { class: 't-soft', style: { fontSize: '14px', fontWeight: '500', marginTop: '2px' } },
+      p.interpretation));
+}
+
 function heroBanner(d, ctx) {
   const t = d.todayRevenue;
   const p = d.businessPulse;
@@ -145,8 +152,6 @@ function heroBanner(d, ctx) {
   const avgSpend = t && t.orders ? money(t.revenue / t.orders, '—') : null;
   return Card({ className: 'owner-hero photo-hero', style: { backgroundImage: OWNER_HERO_PHOTO } },
     Pill(sev, statusLabel(p.status)),
-    h('div', { style: { fontSize: '24px', fontWeight: '700', margin: '8px 0 2px', fontFamily: 'var(--font-display)' } },
-      p.interpretation),
     h('div', { class: 'grid store-status-stats', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px', marginTop: '16px' } },
       heroStat(t ? money(t.revenue, '₱0').textContent : '—', "Today's Sales", 'good', ICON.revenue),
       heroStat(t ? count(t.orders).textContent : '—', 'Orders Today', 'info', ICON.orders, () => ctx.navigate('orderhistory')),

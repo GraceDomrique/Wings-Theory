@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 import subprocess
 import sqlite3
 from datetime import date as _date, timedelta as _timedelta
@@ -26,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from . import (
     audit, auth, business_overview as business_overview_mod, db, instructions, permissions,
-    purchasing, refills, sessions, timeutil, unli, user_permissions, verification,
+    purchasing, refills, sessions, system_lock, timeutil, unli, user_permissions, verification,
 )
 from . import dashboard_overview as dashboard_overview_mod
 from . import sales_overview as sales_overview_mod
@@ -140,6 +141,12 @@ _anomaly_cache = TTLCache()
 # since a new order does not change which folds/items get evaluated in any
 # way that matters for a technical-metrics panel refreshed occasionally.
 _model_details_cache = TTLCache(ttl_seconds=1800)
+# Bucket width for forecast_store_demand's Prophet fit (see its own comment
+# below) -- how long a store-wide demand forecast may lag the newest order
+# before the next dashboard load pays for a fresh fit. 10 minutes is short
+# enough that nobody waits on a stale forecast meaningfully, long enough
+# that a busy shift does not refit on every single order.
+STORE_DEMAND_CACHE_SECONDS = 600
 
 
 @app.on_event("startup")
@@ -388,6 +395,18 @@ def login(body: Login, c: sqlite3.Connection = Depends(conn)):
     row = c.execute(
         "SELECT * FROM app_user WHERE username=? AND is_active=1", (body.username,)
     ).fetchone()
+    # Station lock (migration 0053): an admin-closed POS/Kitchen refuses
+    # sign-in for that station's role outright -- checked before the
+    # password itself, so a correct password never gets a chance to open a
+    # station the admin deliberately closed. Admin/owner/manager console
+    # sign-in never goes through this; only 'cashier' (POS) and 'kitchen'
+    # (KDS) are gated.
+    station_by_role = {"cashier": "pos", "kitchen": "kitchen"}
+    station = station_by_role.get(row["role"]) if row else None
+    if station and system_lock.is_closed(c, station):
+        with db.write_tx(c):
+            audit.log_login(c, body.username, row["role"], success=False, reason=f"{station}_closed")
+        raise HTTPException(423, f"{station} is closed by an administrator")
     if row and row["locked_until"] and row["locked_until"] > timeutil.utc_now_sql():
         with db.write_tx(c):
             audit.log_login(c, body.username, row["role"], success=False, reason="locked_out")
@@ -505,6 +524,35 @@ def change_password(
         sessions.revoke_all_for_user(c, row["username"])
         sessions.create(c, issued["jti"], row["username"], row["role"], issued["exp"])
     return {"ok": True, "token": token}
+
+
+class StationLockBody(BaseModel):
+    closed: bool
+    reason: str | None = None
+
+
+@app.get("/console/system-lock", tags=["console"])
+def get_system_lock(c: sqlite3.Connection = Depends(conn), _p: dict = Depends(needs("user.manage"))):
+    """Current POS/Kitchen closed state -- admin-only, same capability as
+    every other account/station administration action."""
+    return system_lock.get_all(c)
+
+
+@app.post("/console/system-lock/{station}", tags=["console"])
+def set_system_lock(
+    station: str, body: StationLockBody,
+    c: sqlite3.Connection = Depends(conn), p: dict = Depends(needs("user.manage")),
+):
+    """Close or reopen the POS or Kitchen station. Closing it blocks sign-in
+    at /auth/login for that station's role immediately -- it does not log
+    anyone currently signed in out (see sessions.py for that, a separate
+    concern), it only stops a new sign-in from succeeding."""
+    if station not in system_lock.STATIONS:
+        raise NotFoundError(f"unknown station '{station}'")
+    with db.write_tx(c):
+        system_lock.set_closed(c, station, body.closed, p["sub"], body.reason)
+        audit.log(c, "system_lock", station, "closed" if body.closed else "reopened", p["sub"])
+    return system_lock.get_all(c)
 
 
 @app.post("/console/users/{username}/reset_password", tags=["console"])
@@ -1789,7 +1837,23 @@ def count_today_endpoint(
     for the full rule set. Reachable by the same two capabilities as the
     quick-lookup endpoint above, for the same reason: kitchen needs to see
     what it is being asked to check without being handed full inventory.read."""
-    return _count_today(c)
+    return _count_today_cached(c)
+
+
+def _count_today_cached(c: sqlite3.Connection) -> dict:
+    """2026-10-16 fix: depletion.count_today() calls ingredient_forecast()
+    directly -- unlike every other caller in this file, it never went
+    through _forecast_cache, so it recomputed the full per-ingredient
+    forecast chain (every deductable ingredient, each with its own
+    day-by-day trajectory) plus a 30-day reconciliation report from scratch
+    on every single call, measured at ~9s on the live database -- the
+    single biggest remaining cost in Admin Today's load. Same
+    _depletion_fingerprint() key as the rest of this file's ingredient-
+    forecast-derived caching (dashboard_summary, _top_risk_ingredients):
+    a new order, ledger row, recipe edit, or ingredient edit invalidates it
+    immediately, same as those."""
+    key = _depletion_fingerprint(c) + ("count_today",)
+    return _forecast_cache.get_or_compute(key, lambda: _count_today(c))
 
 
 @app.post("/console/ingredients", tags=["console"], status_code=201)
@@ -3334,7 +3398,7 @@ def dashboard_admin_today(
     return dashboard_overview_mod.admin_today(
         c, now=now, summary=summary, forecast=forecast,
         stock_loss_anomalies=stock_loss, consumption_anomalies=consumption,
-        counts_due=_count_today(c), top_risks=_top_risk_ingredients(c),
+        counts_due=_count_today_cached(c), top_risks=_top_risk_ingredients(c),
     )
 
 
@@ -3357,7 +3421,19 @@ def dashboard_owner_overview(
     period_overview = business_overview_mod.business_overview(c, now=now, forecast=forecast)
     today_vs_yesterday = business_overview_mod.today_vs_yesterday(c, now=now)
     try:
-        combinations = product_combinations(c, lookback_days=90, top_n=5)
+        # 2026-10-16 fix: product_combinations() always mines FP-Growth fresh
+        # (pandas one-hot encode + fpgrowth + association_rules, twice over
+        # with holdout validation) -- unlike every other expensive
+        # computation this endpoint reads, it had no cache, so it reran in
+        # full on literally every Owner Overview page view. Same
+        # fingerprint-on-new-data pattern _both_anomaly_passes/
+        # forecast_store_demand already use: MAX(customer_order.id) changes
+        # the instant a new order lands, so this never serves a stale
+        # answer, it only avoids recomputing an identical one.
+        max_order = c.execute("SELECT MAX(id) AS m FROM customer_order").fetchone()["m"] or 0
+        combo_key = (str(db.db_path()), "owner_overview_combos", 90, 5, max_order)
+        combinations = _forecast_cache.get_or_compute(
+            combo_key, lambda: product_combinations(c, lookback_days=90, top_n=5))
     except Exception:
         combinations = None
     return dashboard_overview_mod.owner_overview(
@@ -3500,8 +3576,19 @@ def forecast_store_demand(
     in the cache key."""
     if metric not in STORE_METRICS:
         raise ValidationError(f"metric must be one of {STORE_METRICS}")
-    max_order = c.execute("SELECT MAX(id) AS m FROM customer_order").fetchone()["m"] or 0
-    key = (str(db.db_path()), "store-demand", metric, horizon_days, lookback_days, max_order)
+    # 2026-10-16 fix: this was keyed on MAX(customer_order.id), so the
+    # Prophet fit (several seconds, sometimes 15+ with cmdstanpy warmup) was
+    # invalidated and re-run on the very next dashboard load after *any*
+    # single new order -- in a restaurant actually taking orders, Admin
+    # Today and Owner Overview (two separate metrics, two separate fits)
+    # ended up paying that cost on most page loads, not just the first one.
+    # A 7-day-horizon forecast does not need to reflect an order placed 30
+    # seconds ago, so invalidation is bucketed to a coarse time window
+    # instead of the exact order id -- still correct (it refits regularly
+    # and never serves an answer older than the bucket), just no longer
+    # refit per order.
+    time_bucket = int(time.time() // STORE_DEMAND_CACHE_SECONDS)
+    key = (str(db.db_path()), "store-demand", metric, horizon_days, lookback_days, time_bucket)
     return _forecast_cache.get_or_compute(
         key, lambda: store_demand_prophet(c, metric, horizon_days, lookback_days)
     )

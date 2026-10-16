@@ -93,4 +93,17 @@ export function updateUsername(username, newUsername) {
   });
 }
 
+/**
+ * POS/Kitchen station lock (migration 0056) — admin-only (user.manage).
+ * Closing a station refuses sign-in for that role at /auth/login, even with
+ * the correct password, until an admin reopens it.
+ */
+export async function getSystemLock() {
+  return api.get('/console/system-lock');
+}
+
+export async function setSystemLock(station, closed, reason) {
+  return api.post(`/console/system-lock/${encodeURIComponent(station)}`, { closed, reason });
+}
+
 export { MIN_PASSWORD_LENGTH };

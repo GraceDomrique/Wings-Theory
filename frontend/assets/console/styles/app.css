@@ -1125,9 +1125,15 @@ canvas{max-width:100%;}
   .nav-foot{border-top:none; margin:0; padding:0; flex-shrink:0; display:flex;}
   .nav-foot .nav-item-top{min-height:58px; min-width:58px;}
   .nav-group{margin-bottom:0; flex:1; min-width:58px; display:flex;}
+  /* margin-bottom:0 -- .nav-item-top otherwise keeps the base .nav-item
+     rule's margin-bottom:3px (app.css's desktop accordion spacing), which
+     .nav-group-toggle never carries (it isn't a .nav-item). In this row's
+     align-items:stretch layout that extra bottom margin shrank
+     .nav-item-top's own box by 3px versus "Management"'s, throwing its
+     centered icon+label off by half that against every sibling tab. */
   .nav-item-top, .nav-group-toggle{
     flex:1; flex-direction:column; justify-content:center; align-items:center; gap:3px;
-    min-height:58px; padding:6px 2px; border-radius:0; text-align:center;
+    min-height:58px; padding:6px 2px; border-radius:0; text-align:center; margin-bottom:0;
   }
   .nav-item-top .nav-item-label, .nav-group-label{
     font-size:9px; line-height:1.15; white-space:normal; max-width:60px;

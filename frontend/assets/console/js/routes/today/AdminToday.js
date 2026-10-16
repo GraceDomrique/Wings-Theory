@@ -7,11 +7,12 @@ import { Button } from '../../components/ui/Button.js';
 import { EmptyState } from '../../components/ui/EmptyState.js';
 import { BarChart } from '../../components/charts/BarChart.js';
 import { palette } from '../../components/charts/base.js';
-import { money, count, pct, stamp, ageFromNow } from '../../lib/format.js';
+import { money, count, pct, stamp, ageFromNow, greeting } from '../../lib/format.js';
 import { getAdminToday } from '../../lib/api/dashboard.js';
 import { getAnomalies, getIngredientVariance, getFlavorAnomalyEvents } from '../../lib/api/intelligence.js';
 import { ICONS } from '../../lib/icons.js';
 import { openOrderDetail } from '../reports/orderDetailModal.js';
+import { session } from '../../lib/api/client.js';
 
 const INTEL_ANOMALY_LOOKBACK_DAYS = 90;
 const INTEL_VARIANCE_LOOKBACK_DAYS = 30;
@@ -88,6 +89,7 @@ export async function render(ctx) {
   drawSupporting();
 
   return h('div', { class: 'admin-today' },
+    greetingHeader(d),
     heroBanner(d, ctx),
     h('div', { class: 'grid', style: { gridTemplateColumns: '1fr 1fr', gap: '14px', marginTop: '14px' } },
       doNowCard(d, ctx),
@@ -220,6 +222,20 @@ const STAT_ICON = {
 // Inventory Health (inventoryPulseCard) below, where they belong with the
 // rest of the stock-attention picture rather than competing with the
 // day's actual sales performance for the same four hero slots.
+// Sits above the photo-hero card itself, not inside it — a plain-language
+// hello before the operational-status numbers, in the console's own
+// (non-photo) ink colors rather than the hero's white-on-photo treatment.
+function greetingHeader(d) {
+  const s = d.storeStatus;
+  const ok = s.operational;
+  const name = session.user && session.user.displayName;
+  return h('div', { style: { margin: '0 0 12px' } },
+    h('div', { style: { fontSize: '22px', fontWeight: '700', fontFamily: 'var(--font-display)' } },
+      `${greeting()}${name ? `, ${name}` : ''}`),
+    h('div', { class: 't-soft', style: { fontSize: '14px', fontWeight: '500', marginTop: '2px' } },
+      ok ? 'All systems running' : `${s.needAttention} item${s.needAttention === 1 ? '' : 's'} need attention`));
+}
+
 function heroBanner(d, ctx) {
   const s = d.storeStatus;
   const t = d.todaySales;
@@ -232,8 +248,6 @@ function heroBanner(d, ctx) {
     : null;
   return Card({ className: 'store-status-banner photo-hero', style: { backgroundImage: STORE_STATUS_PHOTO } },
     Pill(sev, ok ? 'Store Status' : 'Needs attention'),
-    h('div', { style: { fontSize: '26px', fontWeight: '700', margin: '8px 0 2px', fontFamily: 'var(--font-display)' } },
-      ok ? 'All systems running' : `${s.needAttention} item${s.needAttention === 1 ? '' : 's'} need attention`),
     freshness,
     h('div', { class: 'grid store-status-stats', style: { gridTemplateColumns: 'repeat(4, minmax(0,1fr))', gap: '10px', marginTop: '16px' } },
       heroStat(money(t.revenue, '₱0').textContent, "Today's Sales", 'good', STAT_ICON.check),

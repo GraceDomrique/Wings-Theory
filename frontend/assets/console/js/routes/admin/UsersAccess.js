@@ -10,6 +10,7 @@ import { ageFromNow } from '../../lib/format.js';
 import { session } from '../../lib/api/client.js';
 import {
   listUsers, createUser, resetPassword, updateDisplayName, updateUsername,
+  getSystemLock, setSystemLock,
 } from '../../lib/api/account.js';
 import { getCapabilityMatrix, getUserCapabilities, setUserCapability } from '../../lib/api/permissions.js';
 
@@ -99,10 +100,48 @@ function humanCapability(capability) {
 
 export async function render(ctx) {
   const isAdmin = (session.user || {}).role === 'admin';
-  const [users, capabilities] = await Promise.all([
+  const [users, capabilities, systemLock] = await Promise.all([
     isAdmin ? listUsers().catch(() => null) : Promise.resolve(null),
     getCapabilityMatrix().catch(() => []),
+    isAdmin ? getSystemLock().catch(() => null) : Promise.resolve(null),
   ]);
+
+  // --- Station Access: close/reopen POS or Kitchen sign-in outright (2026-
+  // 10-16). Independent of any individual account's password or lockout —
+  // while a station is closed, nobody can sign in to it even with the
+  // right credentials, until an admin reopens it here.
+  const lockHost = h('div');
+  let lockState = systemLock;
+
+  function stationRow(station, label, desc) {
+    const s = (lockState || {})[station] || { closed: false };
+    const closed = !!s.closed;
+    const btn = Button({
+      size: 'sm',
+      variant: closed ? 'primary' : 'ghost',
+      onClick: async () => {
+        btn.disabled = true;
+        try {
+          lockState = await setSystemLock(station, !closed);
+          toast(`${label} ${!closed ? 'closed — sign-in is blocked' : 'reopened'}.`, !closed ? 'warn' : 'good');
+          drawLock();
+        } catch (e) { toast(e.message, 'bad'); } finally { btn.disabled = false; }
+      },
+    }, closed ? `Reopen ${label}` : `Close ${label}`);
+    return h('div', { style: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px', padding: '10px 0', borderBottom: '1px solid var(--line-soft)' } },
+      h('div', {},
+        h('div', { style: { display: 'flex', alignItems: 'center', gap: '8px' } },
+          h('div', { style: { fontWeight: '600', fontSize: '13.5px' } }, label),
+          closed ? Pill('crit', 'closed') : Pill('good', 'open')),
+        h('div', { class: 't-xs t-soft', style: { marginTop: '2px' } }, desc)),
+      btn);
+  }
+
+  function drawLock() {
+    mount(lockHost, h('div', {}, stationRow('pos', 'POS', 'Blocks cashier sign-in — nobody can open the till while closed.'),
+      stationRow('kitchen', 'Kitchen', 'Blocks kitchen sign-in — nobody can open the kitchen display while closed.')));
+  }
+  if (isAdmin) drawLock();
 
   const roles = ROLE_ORDER.filter((r) => capabilities.length && r in capabilities[0]);
   const usersHost = h('div');
@@ -414,6 +453,15 @@ export async function render(ctx) {
   drawSummary();
 
   return h('div', {},
+    isAdmin
+      ? h('div', { style: { marginBottom: '14px' } },
+        Card({},
+          CardHeader({
+            title: 'Station Access',
+            desc: 'Close POS or Kitchen sign-in entirely — useful at end of shift or during an incident',
+          }),
+          lockHost))
+      : null,
     isAdmin
       ? h('div', { style: { marginBottom: '14px' } },
         Card({},
